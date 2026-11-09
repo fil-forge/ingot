@@ -221,28 +221,22 @@ var errBucketClosing = s3err.APIError{
 // stays empty (queue-bucket.commit refuses it) and gains no multipart upload
 // (queue-bucket.admit-upload refuses it) while the request aborts the ones in
 // flight. A bucket already closing, by a delete that stopped, closes again.
-func (b *Backend) runCloseBucket(ctx context.Context, _ *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
+func (b *Backend) runCloseBucket(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
 	var args BucketTask
 	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
 		return nil, taskrunner.Permanent(fmt.Errorf("decode close: %w", err))
 	}
-	st, err := b.reg.Get(ctx, args.Name)
+	st, err := b.bucketOn(ctx, args.Name, t.Subject)
 	if err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
 		return nil, err
 	}
 	if err := b.refuseNonEmpty(ctx, st); err != nil {
 		return nil, err
 	}
-	if err := b.reg.SetClosing(ctx, args.Name, true); err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
-		return nil, err
-	}
-	return nil, nil
+	// Written with the task's commit, under its lease, as the bucket's
+	// settings are.
+	st2 := registry.ClosingSet(args.Name)
+	return nil, ex.WriteConditional(ctx, st2.SQL, st2.Args...)
 }
 
 // runAdmitUpload is queue-bucket.admit-upload, which
@@ -255,11 +249,8 @@ func (b *Backend) runAdmitUpload(ctx context.Context, _ *taskrunner.Exec, t task
 	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
 		return nil, taskrunner.Permanent(fmt.Errorf("decode admit-upload: %w", err))
 	}
-	st, err := b.reg.Get(ctx, args.Name)
+	st, err := b.bucketOn(ctx, args.Name, t.Subject)
 	if err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
 		return nil, err
 	}
 	if st.Closing {

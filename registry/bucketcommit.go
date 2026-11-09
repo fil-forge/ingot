@@ -283,3 +283,10 @@ func VersioningSet(name string, v VersioningState) (Statement, error) {
 func LockConfigSet(name string, cfg []byte) Statement {
 	return Statement{`UPDATE ingot.buckets SET object_lock_config = $1 WHERE name = $2`, []any{cfg, name}}
 }
+
+// ClosingSet is the write that marks bucket name closing, which
+// queue-bucket.close commits. It is a guard: a bucket gone fails the task's
+// commit.
+func ClosingSet(name string) Statement {
+	return Statement{`UPDATE ingot.buckets SET closing = true WHERE name = $1`, []any{name}}
+}
