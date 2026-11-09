@@ -1305,7 +1305,7 @@ sequenceDiagram
     end
     B->>R: drainSpaceReleases: Expedite the space's pending queue-space-shard.release<br/>tasks (subject space/*), run them inline (/blob/remove each)#59;<br/>a release still waiting fails the delete for the client to retry
     B->>U: DrainSpaceRegistrations: send the space's pending queue-space-upload changes
-    B->>H: /s3/bucket/delete with the signed S3 request (hilt refuses while registrations remain)#59;<br/>a refusal clears the closing mark
+    B->>H: /s3/bucket/delete with the signed S3 request (hilt refuses while registrations remain)#59;<br/>a refusal clears the closing mark, not found finishes the delete,<br/>a failed call leaves the bucket closing for a retry
     B->>R: reg.Delete (the local row, its catalog_journal rows cascading)
     B->>L: RemoveBucketLog, best-effort<br/>(directory + segment rows)
     B-->>C: 204

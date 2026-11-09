@@ -458,14 +458,17 @@ func (b *Backend) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t tas
 		if !ok {
 			return errors.New("s3frontend: delete bucket: no request in context")
 		}
-		if err := b.authority.DeleteBucket(ctx, req); err != nil {
-			// Hilt refused: the bucket works again.
-			if cerr := b.reg.SetClosing(ctx, name, false); cerr != nil {
-				b.logger.Warn("delete bucket: clear the closing mark after hilt refused", zap.String("bucket", name), zap.Error(cerr))
+		// Only an answer that the bucket stands reopens it. Not found means
+		// an earlier delete removed the space, so this one finishes the job
+		// here. A call that failed on its way may have deleted the space all
+		// the same, so the bucket stays closing until a retry settles it.
+		if err := b.authority.DeleteBucket(ctx, req); err != nil && !errors.Is(err, bucketauthority.ErrNotFound) {
+			if errors.Is(err, bucketauthority.ErrNotEmpty) || errors.Is(err, bucketauthority.ErrRefused) {
+				if cerr := b.reg.SetClosing(ctx, name, false); cerr != nil {
+					b.logger.Warn("delete bucket: clear the closing mark after the refusal", zap.String("bucket", name), zap.Error(cerr))
+				}
 			}
-			if errors.Is(err, bucketauthority.ErrNotFound) {
-				return s3err.GetAPIError(s3err.ErrNoSuchBucket)
-			} else if errors.Is(err, bucketauthority.ErrNotEmpty) {
+			if errors.Is(err, bucketauthority.ErrNotEmpty) {
 				return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
 			}
 			return err

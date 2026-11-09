@@ -521,7 +521,9 @@ open upload and `queue-multipart-upload.reap` for each completed one, from the r
 multipart queue is above the bucket queue, and last runs `queue-bucket.delete`. A create holds the
 bucket's subject through `queue-bucket.admit-upload` until it commits, so an upload either exists
 before the close, and the delete aborts it, or is refused. In-flight uploads do not block the
-delete, as on AWS.
+delete, as on AWS. Only Hilt refusing the delete reopens the bucket. Hilt not finding the space
+means an earlier delete removed it, so this one finishes, and a call that failed on its way leaves
+the bucket closing until a retry settles it.
 
 The accept runs on its own queue, apart from the upload's changes, so an abort, an auto-abort or a
 part re-upload can release a blob while an accept is concluding it. The upload service decides the
