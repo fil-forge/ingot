@@ -277,7 +277,6 @@ sequenceDiagram
         B->>B: fresh CEK → FEE envelope (COSE_Encrypt, AES-256-GCM STREAM,<br/>one recipient: ECDH-ES+A256KW to the tenant wrap key)#59;<br/>its length is known from the header + plaintext length
         B->>U: /blob/add (digestCode sha2-256, envelope size, random nonce)
         U-->>B: allocation address, put and accept tasks
-        B->>R: PutStream(add task): the upload's name until parked or accepted
         par
             B->>SP: spool under the CIPHERTEXT digest<br/>(BLAKE3 tree + md5 of the plaintext in the same pass)
         and
@@ -289,7 +288,7 @@ sequenceDiagram
     loop each streamed blob (uploadBlobs → concludeStreamed)
         B->>U: /ucan/conclude the put receipt, reporting the spooled digest
         U-->>B: accept receipt + /assert/location commitment
-        B->>R: PutLocation, then SetIntentState(accepted)#59; DeleteStream
+        B->>R: PutLocation, then SetIntentState(accepted)
         B->>B: BlobCache.Take: the file moves from the spool to the cache
     end
     loop each spooled-first blob (uploadBlobs)
@@ -508,7 +507,7 @@ sequenceDiagram
     B->>R: PutPart(spooled, span_lengths): open sessions only, the row held FOR SHARE<br/>against a concurrent latch#59; writes of one part number serialised on an advisory lock#59;<br/>a release record, due now, for each blob the replaced row named and this part<br/>does not, in the same transaction, returned to run#59; a refused part records its blobs' releases
     loop each part blob (parkBlobs)
         alt streamed while spooled
-            B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked,<br/>DeleteStream: the PUT already went to piri in splitSpool
+            B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked:<br/>the PUT already went to piri in splitSpool
             B->>B: removeLocal (the part's local copy#59; the acceptor concludes from the park)
         else blob_locations already has the digest
             B->>R: intent accepted (dedup, no park)

@@ -118,7 +118,7 @@ Internal:
   `ingot.catalog_journal` until their segment ships),
   `segments.go` (`logstore.Meta`, and `CatalogUsage`, the per-bucket sums
   the catalog usage gauges report), `stores*.go` (intents, locations,
-  inclusions, blob_refs, GC, multipart sessions/parts, parks, streams),
+  inclusions, blob_refs, GC, multipart sessions/parts, parks),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
   all of them.
 - **`taskrunner/`** — durable task queues in Postgres (one tasks table and
