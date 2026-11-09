@@ -130,10 +130,11 @@ func isDeferral(err error) bool {
 var ErrCancelled = errors.New("task cancelled")
 
 // insertSpec returns the statement that adds s's task with the given ID. A
-// replacement keeps whichever of it and a pending, unstarted replacement with
-// the same subject and action has the later NotBefore, and drops the other. A
-// replacement waiting to retry counts as unstarted, as it does for Cancel;
-// the one that takes its place starts its attempts afresh and holds nothing.
+// replacement keeps whichever of it and a pending replacement with the same
+// subject and action that has not yet run has the later NotBefore, and drops
+// the other. One that has run, even if only to fail and wait to retry, is
+// left in place and the new one is added beside it: its attempt may have
+// acted, so it keeps its place and finishes what it started.
 func insertSpec(q *queue, id TaskID, s Spec, sync bool) (string, []any) {
 	args := []any{id, s.Subject, s.Action, s.NotBefore, s.Expires, s.Args, sync, s.Node}
 	if !s.Replace {
@@ -144,7 +145,7 @@ func insertSpec(q *queue, id TaskID, s Spec, sync bool) (string, []any) {
 	ON CONFLICT (subject, action) WHERE state = 'pending' AND replaceable AND started IS NULL
 	DO UPDATE SET id = EXCLUDED.id, seq = DEFAULT, created = EXCLUDED.created,
 		not_before = EXCLUDED.not_before, expires = EXCLUDED.expires, args = EXCLUDED.args,
-		node = EXCLUDED.node, attempts = 0, error = NULL, retry_at = NULL
+		node = EXCLUDED.node
 	WHERE t.not_before < EXCLUDED.not_before`, args
 }
 
@@ -463,13 +464,14 @@ func (f *failures) record(ctx context.Context, tx pgx.Tx, h *hold, a *action, ta
 		} else {
 			// A retry that holds its subject waits in retry_at, which keeps
 			// the tasks behind it waiting too; otherwise, or after a
-			// deferral, it waits in not_before like any delayed task.
+			// deferral, it waits in not_before like any delayed task. A task
+			// that has run is no longer replaceable (see insertSpec).
 			col := "not_before"
 			if p.HoldsSubject && !isDeferral(herr) {
 				col = "retry_at"
 			}
 			sql = `UPDATE ` + h.q.tasks + ` SET attempts = attempts + 1, error = $2, started = NULL,
-				args = coalesce($3, args),
+				replaceable = false, args = coalesce($3, args),
 				` + col + ` = now() + $4 * interval '1 millisecond'
 				WHERE id = $1 AND state = 'pending'`
 			params = append(params, p.delay(t.Attempt+1).Milliseconds())

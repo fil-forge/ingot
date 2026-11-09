@@ -449,10 +449,11 @@ func TestATaskWaitingToRetryCanBeCancelled(t *testing.T) {
 	}
 }
 
-// TestAReplacementTakesTheRetrysPlace: a replacement waiting to retry
-// is replaced like any that has not started, so its retry cannot run ahead of
-// the replacement's time, and the replacement starts its attempts afresh.
-func TestAReplacementTakesTheRetrysPlace(t *testing.T) {
+// TestARetryIsNotReplaced: a replacement that has run, and failed and waits
+// to retry holding its subject, is not replaced: its attempt may have acted.
+// A later replacement is added beside it, the retry keeps its place and
+// runs first, and the new one runs at its own time.
+func TestARetryIsNotReplaced(t *testing.T) {
 	f := newFixture(t, 1)
 	type run struct {
 		id      taskrunner.TaskID
@@ -460,20 +461,20 @@ func TestAReplacementTakesTheRetrysPlace(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var runs []run
-	if err := f.r.Handle(qTop, "evict", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+	if err := f.r.Handle(qTop, "release", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		runs = append(runs, run{task.ID, task.Attempt})
 		if len(runs) == 1 {
-			return nil, errors.New("unavailable")
+			return nil, errors.New("response lost")
 		}
 		return nil, nil
-	}, taskrunner.WithRetry(taskrunner.RetryPolicy{First: 200 * time.Millisecond})); err != nil {
+	}, taskrunner.WithRetry(taskrunner.RetryPolicy{First: 200 * time.Millisecond, HoldsSubject: true})); err != nil {
 		t.Fatal(err)
 	}
 	f.start(t)
 	ctx := waitCtx(t)
-	failing, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "blob", Action: "evict", NotBefore: at(-time.Second), Replace: true})
+	failing, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "blob", Action: "release", NotBefore: at(-time.Second), Replace: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -487,20 +488,22 @@ func TestAReplacementTakesTheRetrysPlace(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	time.Sleep(50 * time.Millisecond)
-	next, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "blob", Action: "evict", NotBefore: at(time.Second), Replace: true})
+	next, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "blob", Action: "release", NotBefore: at(time.Second), Replace: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.r.Wait(ctx, qTop, next); err != nil {
-		t.Fatalf("Wait replacement: %v", err)
+	if next == failing {
+		t.Fatal("the replacement took the retry's place")
 	}
-	if _, err := f.r.Wait(ctx, qTop, failing); !errors.Is(err, taskrunner.ErrNotFound) {
-		t.Errorf("replaced retry: Wait error %v, want ErrNotFound", err)
+	for _, id := range []taskrunner.TaskID{failing, next} {
+		if _, err := f.r.Wait(ctx, qTop, id); err != nil {
+			t.Fatalf("Wait %s: %v", id, err)
+		}
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if want := []run{{failing, 0}, {next, 0}}; !slices.Equal(runs, want) {
-		t.Errorf("runs = %v, want the failed attempt then the replacement's first", runs)
+	if want := []run{{failing, 0}, {failing, 1}, {next, 0}}; !slices.Equal(runs, want) {
+		t.Errorf("runs = %v, want the failed attempt, its retry, then the new task", runs)
 	}
 }
 
