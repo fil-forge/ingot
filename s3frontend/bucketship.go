@@ -51,8 +51,9 @@ func (b *Backend) registerShip(r *taskrunner.Runner) error {
 
 // QueueShip queues a ship of bucket's sealed catalog segments, due now, as
 // a replacement, so a bucket has at most one pending. The log calls it when
-// a segment seals. A failure to queue is logged; the bucket's next seal
-// queues one again.
+// a segment seals. A ship that cannot be queued is owed, and queued again
+// with backoff until it is (retryOwedShips): an idle bucket has no next seal
+// to queue one.
 func (b *Backend) QueueShip(bucket string) {
 	b.shipMu.Lock()
 	if !b.shipReady {
@@ -64,8 +65,91 @@ func (b *Backend) QueueShip(bucket string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := b.queueShip(ctx, bucket); err != nil {
-		b.logger.Warn("could not queue a catalog ship; the bucket's next seal queues one",
+		b.logger.Warn("could not queue a catalog ship; it is retried",
 			zap.String("bucket", bucket), zap.Error(err))
+		b.oweShip(bucket)
+	}
+}
+
+// shipNoticeFirst and shipNoticeMax bound the backoff between attempts to
+// queue an owed ship. Package-level so tests can shrink them.
+var (
+	shipNoticeFirst = time.Second
+	shipNoticeMax   = time.Minute
+)
+
+// oweShip records that bucket's ship could not be queued, and starts the
+// retries unless they run already or the backend is draining.
+func (b *Backend) oweShip(bucket string) {
+	b.shipMu.Lock()
+	defer b.shipMu.Unlock()
+	if b.shipOwed == nil {
+		b.shipOwed = map[string]bool{}
+	}
+	b.shipOwed[bucket] = true
+	if b.shipRetrying || b.shipStopped {
+		return
+	}
+	if b.shipStop == nil {
+		b.shipStop = make(chan struct{})
+	}
+	b.shipRetrying = true
+	go b.retryOwedShips(b.shipStop)
+}
+
+// retryOwedShips queues the owed ships, with backoff while any fails, until
+// none is owed or stop closes. A bucket deleted meanwhile is owed nothing
+// (queueShip). After a restart, the log reports its unshipped segments again.
+func (b *Backend) retryOwedShips(stop <-chan struct{}) {
+	delay := shipNoticeFirst
+	for {
+		select {
+		case <-stop:
+			return
+		case <-time.After(delay):
+		}
+		b.shipMu.Lock()
+		owed := make([]string, 0, len(b.shipOwed))
+		for bucket := range b.shipOwed {
+			owed = append(owed, bucket)
+		}
+		b.shipMu.Unlock()
+		failed := false
+		for _, bucket := range owed {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err := b.queueShip(ctx, bucket)
+			cancel()
+			if err != nil {
+				failed = true
+				continue
+			}
+			b.shipMu.Lock()
+			delete(b.shipOwed, bucket)
+			b.shipMu.Unlock()
+		}
+		b.shipMu.Lock()
+		if len(b.shipOwed) == 0 {
+			b.shipRetrying = false
+			b.shipMu.Unlock()
+			return
+		}
+		b.shipMu.Unlock()
+		if failed {
+			delay = min(2*delay, shipNoticeMax)
+		}
+	}
+}
+
+// stopShipRetries ends the retries of owed ships.
+func (b *Backend) stopShipRetries() {
+	b.shipMu.Lock()
+	defer b.shipMu.Unlock()
+	if b.shipStopped {
+		return
+	}
+	b.shipStopped = true
+	if b.shipStop != nil {
+		close(b.shipStop)
 	}
 }
 

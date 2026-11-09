@@ -107,9 +107,16 @@ type Backend struct {
 	// shipMu guards shipReady and earlyShips: the ships the catalog log
 	// reported before the ship handler was registered, which registering it
 	// queues.
-	shipMu       sync.Mutex
-	shipReady    bool
-	earlyShips   []string
+	shipMu     sync.Mutex
+	shipReady  bool
+	earlyShips []string
+	// shipOwed are the buckets whose ship could not be queued, which
+	// retryOwedShips queues once it can; shipRetrying is set while it runs,
+	// and shipStop, closed by Drain, ends it. shipMu guards them too.
+	shipOwed     map[string]bool
+	shipRetrying bool
+	shipStop     chan struct{}
+	shipStopped  bool
 	releaseGrace time.Duration
 	// releaseRetry is the queue-space-shard.release retry policy; tests
 	// shorten it.
@@ -384,6 +391,7 @@ func (b *Backend) Recover(_ context.Context) error { return nil }
 // again. After Drain returns cleanly, no acked write is unrepresented in
 // Postgres.
 func (b *Backend) Drain(ctx context.Context) error {
+	b.stopShipRetries()
 	if b.txns == nil {
 		return nil
 	}

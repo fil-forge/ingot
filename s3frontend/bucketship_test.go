@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
@@ -77,4 +79,46 @@ func shipState(t *testing.T, mem *testStore) string {
 		}
 	}
 	return state
+}
+
+// flakyGet is a registry whose first fails lookups fail, as a database
+// failing over does.
+type flakyGet struct {
+	registry.Registry
+	fails atomic.Int32
+}
+
+func (f *flakyGet) Get(ctx context.Context, name string) (*registry.State, error) {
+	if f.fails.Add(-1) >= 0 {
+		return nil, errors.New("connection reset")
+	}
+	return f.Registry.Get(ctx, name)
+}
+
+// A ship notice that cannot be queued is retried until it is: an idle bucket
+// has no next seal to queue one.
+func TestAShipThatCannotBeQueuedIsRetried(t *testing.T) {
+	saved := shipNoticeFirst
+	shipNoticeFirst = 20 * time.Millisecond
+	t.Cleanup(func() { shipNoticeFirst = saved })
+	reg := &flakyGet{}
+	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+		reg.Registry = d.Registry
+		d.Registry = reg
+	})
+	reg.fails.Store(2)
+	b.QueueShip("bk")
+
+	require.Eventually(t, func() bool {
+		tasks, err := mem.queued(context.Background(), registry.BucketQueue)
+		if err != nil {
+			return false
+		}
+		for _, task := range tasks {
+			if task.Action == registry.BucketShipAction {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 10*time.Millisecond, "the owed ship was never queued")
 }
