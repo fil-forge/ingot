@@ -713,7 +713,7 @@ flowchart TB
     end
 
     spooled -->|"dedup: blob_locations hit;<br/>file moves to the cache"| accepted
-    spooled -->|"first network call begins<br/>(uploadBlobs, parkBlobs, concludeBlobs fallback)"| uploading
+    spooled -->|"first network call begins<br/>(uploadBlobs for an object, parkBlobs for a part)"| uploading
     uploading -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept;<br/>queue-shard.cache moves the file to the cache"| accepted
     uploading -->|"parkBlobs: the part streamed to its provider;<br/>blob_parks row written;<br/>local copy removed (removeLocal)"| parked
     parked -->|"acceptParked (the upload's acceptor, or Complete for a written part):<br/>/ucan/conclude; ConcludePark swaps the blob_parks row for blob_locations"| accepted
