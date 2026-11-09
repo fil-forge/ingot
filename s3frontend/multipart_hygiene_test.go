@@ -307,13 +307,11 @@ func TestDrainSpaceReleasesIgnoresGrace(t *testing.T) {
 
 	putObj(t, b, "k1", data)
 	d := blobDigestOf(t, b, "k1", "")
+	// A live grace: the delete queues the blob's release an hour out, so
+	// neither a worker nor the ordinary sweep touches it.
+	b.releaseGrace = time.Hour
 	deleteObj(t, b, "k1")
 
-	// Simulate a live grace: push the intent's not_before into the future so
-	// the ordinary sweep would not touch it.
-	if err := mem.EnqueueRelease(ctx, mem.bk(), d, time.Now().Add(time.Hour)); err != nil {
-		t.Fatalf("EnqueueRelease (extend): %v", err)
-	}
 	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 0 {
 		t.Fatalf("sweep executed %d releases (err=%v), want 0 — intent should not be due", n, err)
 	}

@@ -34,7 +34,7 @@ if err := r.Start(ctx); err != nil {
 defer r.Stop(ctx)
 ```
 
-`Workers` is how many of a queue's async tasks this process runs at once. Sync tasks run in their caller's goroutine and need no workers.
+`Workers` is how many of a queue's async tasks this process runs at once. A sync task runs in its caller's goroutine, but only once the tasks due ahead of it on its subject have run, and those need workers on some instance.
 
 ## Handlers
 
@@ -102,7 +102,7 @@ return tx.Commit(ctx)
 
 ### Sync
 
-`Run` records a task and runs it in the calling goroutine once its subject's lease is free, first running any older due tasks on the same subject. It returns once the task has an outcome: its result, the handler's error, or `ErrExpired`. A commit that fails is retried until it lands or the task's `Expires` passes, so `ErrExpired` means nothing was written.
+`Run` records a task and runs it in the calling goroutine once it is its subject's oldest due task and the subject's lease is free. It runs no other task: those due ahead of it are left to the queue's workers, on this instance or another, so the task's `Expires` bounds the caller's whole wait. It returns once the task has an outcome: its result, the handler's error, or `ErrExpired`. A commit that fails is retried until it lands or the task's `Expires` passes, so `ErrExpired` means nothing was written.
 
 ```go
 expires := time.Now().Add(30 * time.Second)
@@ -225,7 +225,7 @@ if len(releasing[subject]) > 0 {
 
 ## Running delayed work now
 
-`Expedite` makes a subject's pending tasks of an action due now, whatever their `NotBefore`, and returns them all by subject, for the caller to wait on or to run inline with a sync task on each subject. A subject ending in `*` stands for every subject that starts with what comes before it, which is why a submitted subject may not end in `*`. A bucket delete uses that to run its space's pending releases before the space goes. No task it returns can be replaced any more, due already or not, so nothing pushes it back again. A task waiting to retry is brought forward too, whether or not it holds its subject: the caller asked for now.
+`Expedite` makes a subject's pending tasks of an action due now, whatever their `NotBefore`, and returns them all by subject, for the caller to wait on, or to wait behind with a sync task on each subject. A subject ending in `*` stands for every subject that starts with what comes before it, which is why a submitted subject may not end in `*`. A bucket delete uses that to run its space's pending releases before the space goes. No task it returns can be replaced any more, due already or not, so nothing pushes it back again. A task waiting to retry is brought forward too, whether or not it holds its subject: the caller asked for now.
 
 ```go
 due, err := r.Expedite(ctx, "queue-space-shard", space+"/*", "release")

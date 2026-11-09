@@ -34,6 +34,15 @@ type queueFixture struct {
 // drain.
 func newQueueFixture(t *testing.T, registrar uploader.UploadRegistrar, workers int, tweak ...func(*Backend)) *queueFixture {
 	t.Helper()
+	f := newStoppedQueueFixture(t, registrar, workers, tweak...)
+	f.start(t)
+	return f
+}
+
+// newStoppedQueueFixture is newQueueFixture with its runner not yet started,
+// so a test can queue changes before any worker takes one (start).
+func newStoppedQueueFixture(t *testing.T, registrar uploader.UploadRegistrar, workers int, tweak ...func(*Backend)) *queueFixture {
+	t.Helper()
 	env := taskrunnertest.NewEnv(t)
 	r, err := taskrunner.New(env.DB, taskrunner.Options{
 		Schema:       env.Schema,
@@ -54,9 +63,14 @@ func newQueueFixture(t *testing.T, registrar uploader.UploadRegistrar, workers i
 	}
 	require.NoError(t, b.RegisterUploadTasks(r))
 	require.NoError(t, r.Migrate(context.Background()))
-	require.NoError(t, r.Start(context.Background()))
-	t.Cleanup(func() { _ = r.Stop(context.Background()) })
 	return &queueFixture{b: b, r: r, space: testutil.RandomDID(t)}
+}
+
+// start starts the fixture's runner.
+func (f *queueFixture) start(t *testing.T) {
+	t.Helper()
+	require.NoError(t, f.r.Start(context.Background()))
+	t.Cleanup(func() { _ = f.r.Stop(context.Background()) })
 }
 
 // queue submits a change for root on the fixture's space, as a commit would.
@@ -113,13 +127,14 @@ func TestRefusedAddIsRetriedAndHoldsBackTheRemove(t *testing.T) {
 // order holds between them.
 func TestChangesBatchByOpInCommitOrder(t *testing.T) {
 	reg := &recordingRegistrar{}
-	f := newQueueFixture(t, reg, 0)
+	f := newStoppedQueueFixture(t, reg, 1)
 	a, b, c := liveRoot(t, "a"), liveRoot(t, "b"), liveRoot(t, "c")
 	f.queue(t, registry.UploadRegistrationAdd, a)
 	f.queue(t, registry.UploadRegistrationAdd, b)
 	f.queue(t, registry.UploadRegistrationRemove, a)
 	f.queue(t, registry.UploadRegistrationRemove, b)
 	f.queue(t, registry.UploadRegistrationAdd, c)
+	f.start(t)
 
 	require.NoError(t, f.b.DrainSpaceRegistrations(context.Background(), f.space))
 	require.Equal(t, []int{2, 2, 1}, reg.roundTrips())
@@ -186,7 +201,7 @@ func TestRenewedAuthorityRescuesAQueuedChange(t *testing.T) {
 // A bucket delete sends its space's queued changes before the space goes.
 func TestDrainSendsTheSpacesQueuedChanges(t *testing.T) {
 	reg := &recordingRegistrar{}
-	f := newQueueFixture(t, reg, 0)
+	f := newQueueFixture(t, reg, 1)
 	root := liveRoot(t, "a")
 	f.queue(t, registry.UploadRegistrationRemove, root)
 
@@ -200,7 +215,7 @@ func TestDrainSendsTheSpacesQueuedChanges(t *testing.T) {
 func TestDrainFailsWhenTheServiceRefuses(t *testing.T) {
 	reg := &failingRegistrar{}
 	reg.refuse("remove", true)
-	f := newQueueFixture(t, reg, 0)
+	f := newQueueFixture(t, reg, 1)
 	f.queue(t, registry.UploadRegistrationRemove, liveRoot(t, "a"))
 
 	err := f.b.DrainSpaceRegistrations(context.Background(), f.space)

@@ -333,6 +333,9 @@ func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64
 	if waited && next != target {
 		return nil, &yieldError{next}
 	}
+	if target != (TaskID{}) && next != target {
+		return nil, &aheadError{next}
+	}
 	first := Task{Queue: q.name, Subject: subject}
 	err := scanTask(r.db.QueryRow(ctx, `UPDATE `+q.tasks+` SET started = coalesce(started, now())
 		WHERE id = $1 AND state = 'pending'

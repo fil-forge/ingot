@@ -53,9 +53,9 @@ var uploadRegistrationRetry = taskrunner.RetryPolicy{
 	HoldsSubject: true,
 }
 
-// uploadFlush is the queue's sync no-op: running it on a space first runs the
-// space's due changes, so a caller that needs them sent before it goes on can
-// wait for them.
+// uploadFlush is the queue's sync no-op: running it on a space waits for the
+// space's due changes to be sent, so a caller that needs them sent before it
+// goes on can wait for them.
 const uploadFlush = "flush"
 
 // uploadDrainTimeout is how long a bucket delete waits for its space's changes
@@ -133,7 +133,7 @@ func (b *Backend) sendRegistrations(ctx context.Context, op registry.UploadRegis
 	batch := make([]uploader.QueuedUpload, 0, len(regs))
 	sent := make([]int, 0, len(regs))
 	for i, reg := range regs {
-		proofs, fresh, err := b.registrar.PrepareAuthority(ctx, reg.Space, registrationCommand(op), reg.Proofs)
+		proofs, fresh, err := b.registrar.PrepareAuthority(b.withLentAuthority(ctx, reg.Space), reg.Space, registrationCommand(op), reg.Proofs)
 		if err != nil {
 			errs[i] = b.spentAuthority(reg, op, attempts[i], err)
 			continue
@@ -320,10 +320,10 @@ func (b *Backend) failedRetractions(ctx context.Context, space did.DID) ([]taskr
 	}
 }
 
-// flushSpaceRegistrations runs the space's due changes now, by running the
-// queue's no-op sync task on it, which runs the older tasks first. A change
-// waiting out a retry holds the space, so the flush expires and the delete
-// asks the client to retry.
+// flushSpaceRegistrations waits for the space's due changes to be sent, by
+// running the queue's no-op sync task on it, which runs once the workers have
+// run the older tasks. A change waiting out a retry holds the space, so the
+// flush expires and the delete asks the client to retry.
 func (b *Backend) flushSpaceRegistrations(ctx context.Context, space did.DID) error {
 	expires := time.Now().Add(b.drainTimeout)
 	_, err := b.tasks.Run(ctx, taskrunner.Spec{Queue: registry.UploadQueue, Subject: space.String(), Action: uploadFlush, Expires: &expires})

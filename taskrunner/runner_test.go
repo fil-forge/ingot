@@ -168,7 +168,7 @@ func TestRunCommitsWritesAtTheEnd(t *testing.T) {
 }
 
 func TestHandlerErrorFailsTaskAndDropsWrites(t *testing.T) {
-	f := newFixture(t, 0)
+	f := newFixture(t, 1)
 	boom := errors.New("boom")
 	f.handle(t, qTop, "fail", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
 		_ = ex.Write(ctx, `INSERT INTO `+f.env.Table("items")+` (k, v) VALUES ('a', 1)`)
@@ -186,11 +186,6 @@ func TestHandlerErrorFailsTaskAndDropsWrites(t *testing.T) {
 
 	id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "fail"})
 	if err != nil {
-		t.Fatal(err)
-	}
-	// No workers: run it through a sync task queued behind it.
-	f.handle(t, qTop, "noop", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil })
-	if _, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "noop"}); err != nil {
 		t.Fatal(err)
 	}
 	_, err = f.r.Wait(ctx, qTop, id)
@@ -644,5 +639,34 @@ func TestSiblingChildrenInOppositeOrderDoNotDeadlock(t *testing.T) {
 		if v, _ := f.item(t, k); v != 2*rounds {
 			t.Errorf("item %s = %d, want %d", k, v, 2*rounds)
 		}
+	}
+}
+
+// TestRunLeavesTasksAheadToWorkers: a Run caller runs only its own task. A
+// task due ahead of it is a worker's: with no worker to run it, the caller
+// waits its own Expires out and the task ahead is untouched.
+func TestRunLeavesTasksAheadToWorkers(t *testing.T) {
+	f := newFixture(t, 0)
+	var ahead atomic.Int32
+	f.handle(t, qTop, "slow", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		ahead.Add(1)
+		return nil, nil
+	})
+	f.handle(t, qTop, "mine", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil })
+	f.start(t)
+	ctx := waitCtx(t)
+	if _, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "slow"}); err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().Add(300 * time.Millisecond)
+	start := time.Now()
+	if _, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "mine", Expires: &expires}); !errors.Is(err, taskrunner.ErrExpired) {
+		t.Fatalf("Run behind a task with no worker: %v, want ErrExpired", err)
+	}
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Errorf("Run waited %v, past its Expires", waited)
+	}
+	if n := ahead.Load(); n != 0 {
+		t.Errorf("the task ahead ran %d times; the caller runs only its own", n)
 	}
 }

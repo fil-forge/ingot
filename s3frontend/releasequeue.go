@@ -97,10 +97,10 @@ func (b *Backend) releaseAuthority(ctx context.Context, space did.DID) registry.
 
 // withReleaseAuthority returns ctx carrying a proof store holding the
 // release's captured chains, which the network calls read before any
-// authority captured since. A release run inside a request, as a bucket
-// delete's drain runs them, reads the request's own chains first, which are
-// fresh, and the captured ones only for a command the request holds none for.
-// With none captured, ctx is returned as is.
+// authority captured since. A store ctx carries already, one a bucket delete
+// lent for the space while it waits on the release (lendAuthority), is read
+// first, since it is fresh, and the captured chains only for a command it
+// holds none for. With none captured, ctx is returned as is.
 func withReleaseAuthority(ctx context.Context, args registry.ReleaseTask) (context.Context, error) {
 	store := tokenstore.NewMemStore()
 	found := false
@@ -199,7 +199,7 @@ func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrun
 	if err != nil {
 		return nil, fmt.Errorf("count other intents: %w", err)
 	}
-	netCtx, err := withReleaseAuthority(ctx, args)
+	netCtx, err := withReleaseAuthority(b.withLentAuthority(ctx, space), args)
 	if err != nil {
 		return nil, taskrunner.Permanent(err)
 	}
@@ -285,11 +285,11 @@ func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrun
 // passes runs in the background.
 var releaseWaitLimit = 10 * time.Second
 
-// releaseNow runs the releases of digests in space now, in this goroutine,
-// best effort, within releaseWaitLimit. A sync no-op on each blob's subject
-// runs the due tasks before it, the release among them, whether or not a
-// worker is free. A release not yet due, as one a commit queued after its
-// reader grace, stays for its time.
+// releaseNow waits, best effort and within releaseWaitLimit, for the queue's
+// workers to run the releases of digests in space that are due now: a sync
+// no-op on each blob's subject runs once the due tasks before it, the release
+// among them, have run. A release not yet due, as one a commit queued after
+// its reader grace, stays for its time.
 func (b *Backend) releaseNow(ctx context.Context, space did.DID, digests []multihash.Multihash) {
 	if len(digests) == 0 {
 		return
@@ -302,9 +302,8 @@ func (b *Backend) releaseNow(ctx context.Context, space did.DID, digests []multi
 	}
 }
 
-// flushRelease runs the queue's no-op on subject, which first runs the due
-// tasks before it, until expires: the deadline bounds the releases it runs
-// inline as well as when it starts.
+// flushRelease runs the queue's no-op on subject, which waits for the due
+// tasks before it to run on the queue's workers, until expires.
 func (b *Backend) flushRelease(ctx context.Context, subject string, expires time.Time) error {
 	ctx, cancel := context.WithDeadline(ctx, expires)
 	defer cancel()

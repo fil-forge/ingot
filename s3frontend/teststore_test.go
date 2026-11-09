@@ -57,9 +57,7 @@ func newTestStore(t testing.TB) *testStore {
 		Schema: "ingot",
 		Queues: []taskrunner.QueueOptions{
 			{Name: registry.UploadQueue, Workers: 2},
-			// No workers: a release runs when a test sweeps (SweepPendingReleases)
-			// or an S3 verb runs it inline, as the tests expect.
-			{Name: registry.ReleaseQueue},
+			{Name: registry.ReleaseQueue, Workers: 2},
 			{Name: ShardQueue, Workers: 2},
 		},
 		LeaseTTL:     time.Second,
