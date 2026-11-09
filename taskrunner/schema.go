@@ -51,7 +51,8 @@ CREATE UNIQUE INDEX %[4]s ON %[1]s (subject, action)
 CREATE INDEX %[5]s ON %[1]s (subject, seq) WHERE state = 'failed';
 CREATE INDEX %[6]s ON %[1]s (finished) WHERE state <> 'pending';
 CREATE TABLE %[2]s (
-	subject      text PRIMARY KEY,
+	-- Compared byte by byte, as the tasks' subjects are.
+	subject      text COLLATE "C" PRIMARY KEY,
 	owner        uuid NOT NULL,
 	expires      timestamptz NOT NULL,
 	tree_created timestamptz NOT NULL,
