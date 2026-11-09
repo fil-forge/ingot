@@ -80,7 +80,8 @@ func listFailedTasks(ctx context.Context, db Querier, q *queue, subject string, 
 // resubmitStatements return the writes that replace a failed async task with
 // a new pending one on the same subject and action: with args when they are
 // not nil, its own otherwise, and none of its delay, expiry or attempts. The
-// old row is marked resubmitted, so it is not listed or resubmitted again.
+// old row is marked resubmitted, so it is not listed or resubmitted again, and
+// its queue's Retention runs from the resubmission rather than the failure.
 func resubmitStatements(q *queue, old, fresh TaskID, args []byte) []write {
 	return []write{
 		{
@@ -91,7 +92,7 @@ func resubmitStatements(q *queue, old, fresh TaskID, args []byte) []write {
 			conditional: true,
 		},
 		{
-			sql:         `UPDATE ` + q.tasks + ` SET state = 'resubmitted' WHERE id = $1 AND state = 'failed'`,
+			sql:         `UPDATE ` + q.tasks + ` SET state = 'resubmitted', finished = now() WHERE id = $1 AND state = 'failed'`,
 			args:        []any{old},
 			conditional: true,
 		},

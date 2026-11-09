@@ -125,6 +125,36 @@ func TestFailedTasksCanBeListedAndResubmitted_Live(t *testing.T) {
 	}
 }
 
+// A resubmitted task is kept for its queue's Retention from the resubmission,
+// however long ago it failed.
+func TestAResubmittedTaskIsKeptFromItsResubmission_Live(t *testing.T) {
+	f := newFixture(t, 1)
+	f.handle(t, qTop, "fail", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, taskrunner.Permanent(errors.New("boom"))
+	})
+	f.start(t)
+	ctx := waitCtx(t)
+	id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "a", Action: "fail"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.r.Wait(ctx, qTop, id)
+	tasks := f.env.Table("queue_top_tasks")
+	if _, err := f.env.DB.Exec(ctx, `UPDATE `+tasks+` SET finished = now() - interval '2 days' WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.r.Resubmit(ctx, qTop, id, nil); err != nil {
+		t.Fatal(err)
+	}
+	var age time.Duration
+	if err := f.env.DB.QueryRow(ctx, `SELECT now() - finished FROM `+tasks+` WHERE id = $1`, id).Scan(&age); err != nil {
+		t.Fatal(err)
+	}
+	if age > time.Minute {
+		t.Errorf("the resubmitted task finished %v ago, want at its resubmission", age)
+	}
+}
+
 // A sync task that fails is listed with the others, but is not resubmitted:
 // its caller has had the failure, and a replay would run it async, without
 // what the caller held.
