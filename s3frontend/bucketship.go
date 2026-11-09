@@ -208,6 +208,22 @@ func (b *Backend) runShip(ctx context.Context, _ *taskrunner.Exec, t taskrunner.
 	if !ok {
 		return nil, nil
 	}
+	// A ship queued for a bucket since deleted, or for an earlier bucket of
+	// the name, has nothing to ship: opening the log would recreate a store
+	// for the name, or ship another space's catalog.
+	st, err := b.reg.Get(ctx, args.Name)
+	if errors.Is(err, registry.ErrNotFound) {
+		b.shipMu.Lock()
+		delete(b.shipAwaiting, args.Name)
+		b.shipMu.Unlock()
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if st.Space.String() != t.Subject {
+		return nil, nil
+	}
 	if err := shipper.ShipBucket(ctx, args.Name); err != nil {
 		err = fmt.Errorf("ship catalog of %q: %w", args.Name, err)
 		if errors.Is(err, uploader.ErrNoShipAuthority) {

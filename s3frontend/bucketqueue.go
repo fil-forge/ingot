@@ -135,6 +135,11 @@ func (b *Backend) runCommit(ctx context.Context, ex *taskrunner.Exec, t taskrunn
 		return nil, err
 	}
 	defer tx.Discard()
+	// A bucket recreated under the name lives in another space, and is not
+	// the bucket the commit was queued for (bucketOn).
+	if tx.State().Space.String() != t.Subject {
+		return nil, taskrunner.Permanent(bucketop.ErrBucketNotFound)
+	}
 	sc := &commitScope{tx: tx, args: &args}
 	res := BucketCommitResult{Versioning: string(tx.State().Versioning), Results: make([]ChangeResult, len(args.Changes))}
 	for i, ch := range args.Changes {

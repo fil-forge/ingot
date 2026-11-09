@@ -109,7 +109,8 @@ func (b *Backend) bucketOn(ctx context.Context, name, subject string) (*registry
 }
 
 // runCreateBucket is queue-bucket.create: it records the bucket, whose space
-// Hilt created for the request beforehand, with its empty root.
+// Hilt created for the request beforehand, with its empty root. It is safe to
+// run again: a bucket already recorded in the task's space is this one.
 func (b *Backend) runCreateBucket(ctx context.Context, _ *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
 	var args BucketCreateTask
 	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
@@ -125,10 +126,16 @@ func (b *Backend) runCreateBucket(ctx context.Context, _ *taskrunner.Exec, t tas
 	}
 	init := registry.CreateState{Tenant: tenant, Versioning: registry.VersioningState(args.Versioning), ObjectLockConfig: args.LockConfig}
 	if err := b.reg.Create(ctx, args.Name, space, init); err != nil {
-		if errors.Is(err, registry.ErrExists) {
-			return nil, s3err.GetAPIError(s3err.ErrBucketAlreadyExists)
+		if !errors.Is(err, registry.ErrExists) {
+			return nil, err
 		}
-		return nil, err
+		// A run of this task that created the bucket and then lost its
+		// lease finds its own row: a bucket is its space, so a row in this
+		// task's space is this create's.
+		if _, err := b.bucketOn(ctx, args.Name, t.Subject); err == nil {
+			return nil, nil
+		}
+		return nil, s3err.GetAPIError(s3err.ErrBucketAlreadyExists)
 	}
 	return nil, nil
 }
