@@ -243,7 +243,7 @@ Internal:
 | `blockstore.BlockReader` | `blockstore.Forge` (in `Cached`) | `testfakes.NopBaseReader` |
 | `registry.Registry` + the store seams + `logstore.Meta` | `*registry.Postgres` (all of them) | (same, on a database per test) |
 | `locator.Locator` | `registry.LocalLocator` | (indexer-backed locator exists, unwired) |
-| `uploader.{Uploader,BodyUploader,DeferredBodyUploader,BlobRemover}` | `uploader.Forge` | `testfakes.NopUploader` |
+| `uploader.{Uploader,DeferredBodyUploader,StreamingBodyUploader,BlobRemover,UploadRegistrar}` | `uploader.Forge` | `testfakes.NopUploader` |
 
 ## fx module
 

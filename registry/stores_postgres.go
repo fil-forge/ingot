@@ -388,7 +388,7 @@ func (r *Postgres) CountOtherIntents(ctx context.Context, space did.DID, digest 
 
 func (r *Postgres) StalledBytes(ctx context.Context, before time.Time) (int64, error) {
 	// The state literal matches the partial index upload_intents_stalled_idx
-	// (migration 00033): the planner uses it only when the query names the
+	// (migration 00035): the planner uses it only when the query names the
 	// same constant, not a parameter. The index carries size, so the sum
 	// comes from it alone.
 	var n int64
