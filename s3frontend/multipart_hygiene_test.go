@@ -1590,14 +1590,24 @@ func TestReleaseFreesSpoolCopyOfDeletedPutObject(t *testing.T) {
 }
 
 // assertLocalCopyReleased fails the test unless the blob's upload intent and
-// spool copy are both gone, as a finished release leaves them.
+// local copy are both gone, as a finished release leaves them. A copy already
+// moved into the cache goes through the queue-shard.evict the release queues,
+// which runs after it, so the copy is waited for.
 func assertLocalCopyReleased(t *testing.T, b *Backend, mem *testStore, d multihash.Multihash) {
 	t.Helper()
 	if in, err := mem.IntentByDigest(context.Background(), d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("blob %x intent = %v/%v after its release, want it deleted", d, in, err)
 	}
-	if _, err := os.Stat(localPath(b, d)); !os.IsNotExist(err) {
-		t.Fatalf("blob %x spool copy after its release: stat err=%v, want not-exist", d, err)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := os.Stat(localPath(b, d))
+		if os.IsNotExist(err) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("blob %x local copy after its release: stat err=%v, want not-exist", d, err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
