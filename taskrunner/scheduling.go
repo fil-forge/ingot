@@ -274,24 +274,21 @@ func (r *Runner) Pending(ctx context.Context, queueName string, subjects []strin
 	return out, nil
 }
 
-// expedite makes the pending tasks of an action whose subject matches $1 due
-// now, and returns every pending task of the action that matches, oldest first.
-// $1 is a LIKE pattern: the subject itself with its wildcards escaped, or a
-// prefix of it followed by %, which the pending index serves since subjects
-// sort byte by byte.
-// expedite brings forward the unstarted pending tasks of an action on the
-// subjects matching $1 that wait for a time, whether a NotBefore or a retry's
-// backoff, and returns all of them. It reads the locked rows, which are the
-// current ones, so a replacement that committed after the statement began is
-// returned by its own ID.
+// expedite makes the unstarted pending tasks of an action on the subjects
+// matching $1 due now and no longer replacements, whether they waited for a
+// NotBefore, a retry's backoff or nothing, and returns every pending task of
+// the action that matches, oldest first. $1 is a LIKE pattern: the subject
+// itself with its wildcards escaped, or a prefix of it followed by %, which
+// the pending index serves since subjects sort byte by byte. It reads the
+// locked rows, which are the current ones, so a replacement that committed
+// after the statement began is returned by its own ID.
 const expedite = `WITH locked AS (
-		SELECT id, subject, seq, started, not_before, retry_at FROM %[1]s
+		SELECT id, subject, seq, started FROM %[1]s
 		WHERE subject LIKE $1 AND action = $2 AND state = 'pending'
 		FOR UPDATE),
 	due AS (
 		UPDATE %[1]s t SET not_before = NULL, retry_at = NULL, replaceable = false
-		FROM locked WHERE t.id = locked.id AND locked.started IS NULL
-		AND (locked.not_before > now() OR locked.retry_at > now()))
+		FROM locked WHERE t.id = locked.id AND locked.started IS NULL)
 	SELECT subject, id FROM locked ORDER BY seq`
 
 // Expedite makes the subject's pending tasks of the action due now, whatever
@@ -300,8 +297,9 @@ const expedite = `WITH locked AS (
 // run inline with a sync task on each subject. A subject ending in * stands for every subject
 // that starts with what comes before the *, so a caller can bring forward a
 // group of subjects at once, such as a bucket delete running its space's
-// pending releases. A task it brings forward is no longer a replacement, so a
-// later submission cannot push it back. A task waiting to retry is brought
+// pending releases. No task it returns is a replacement any more, due
+// already or not, so a later submission cannot push it back or take its ID.
+// A task waiting to retry is brought
 // forward too, whether or not it holds its subject. One placed on another
 // instance still runs only there.
 func (r *Runner) Expedite(ctx context.Context, queueName, subject, action string) (map[string][]TaskID, error) {

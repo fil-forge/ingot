@@ -149,6 +149,8 @@ func TestExpediteRunsAGroupOfSubjectsDelayedTasksNow(t *testing.T) {
 	}
 	a := submit("sp/a", "release", &later, true)
 	b := submit("sp/b", "release", nil, false)
+	earlier := time.Now().Add(-time.Minute)
+	c := submit("sp/c", "release", &earlier, true)
 	otherAction := submit("sp/a", "expire", &later, false)
 	// A wildcard in the prefix is matched literally.
 	otherSpace := submit("spx/a", "release", &later, false)
@@ -157,12 +159,15 @@ func TestExpediteRunsAGroupOfSubjectsDelayedTasksNow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || !slices.Equal(got["sp/a"], []taskrunner.TaskID{a}) || !slices.Equal(got["sp/b"], []taskrunner.TaskID{b}) {
-		t.Fatalf("Expedite = %v, want the group's two releases, by subject", got)
+	if len(got) != 3 || !slices.Equal(got["sp/a"], []taskrunner.TaskID{a}) || !slices.Equal(got["sp/b"], []taskrunner.TaskID{b}) ||
+		!slices.Equal(got["sp/c"], []taskrunner.TaskID{c}) {
+		t.Fatalf("Expedite = %v, want the group's three releases, by subject", got)
 	}
-	ids := []taskrunner.TaskID{a, b}
-	// Brought forward, a replacement can no longer be pushed back.
+	ids := []taskrunner.TaskID{a, b, c}
+	// Expedited, a replacement can no longer be pushed back, whether it was
+	// waiting or due already.
 	submit("sp/a", "release", &later, true)
+	submit("sp/c", "release", &later, true)
 	f.start(t)
 	for _, id := range ids {
 		if _, err := f.r.Wait(ctx, qTop, id); err != nil {
