@@ -869,3 +869,41 @@ func TestPlaintextRelease_StalledRemoveTimesOut(t *testing.T) {
 		t.Fatalf("releases queued after the timed-out attempt = %d, want 1 to retry", len(pending))
 	}
 }
+
+// TestAbortReleasesAPublishedPartBlobItsObjectLeft: two uploads of the same
+// plaintext part share its blob. One completes and its object is deleted; that
+// object's release runs while the other upload's part still names the blob,
+// finds it referenced and does nothing. Aborting the other upload then drops
+// the last reference, and its release frees the blob.
+func TestAbortReleasesAPublishedPartBlobItsObjectLeft(t *testing.T) {
+	rm := &recordingRemover{}
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
+		d.Remover = rm
+	})
+	ctx := context.Background()
+	setNone(t, b)
+	part := testBody(8 << 10)
+
+	doneID, parts := uploadOnePart(t, b, "bk", "done", part)
+	openID, _ := uploadOnePart(t, b, "bk", "open", part)
+	completeIn(t, b, "bk", "done", doneID, parts)
+	d := blobDigestOf(t, b, "done", "")
+	deleteFrom(t, b, "bk", "done")
+	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
+		t.Fatalf("run the deleted object's release: %v", err)
+	}
+	if n := rm.removedDigests()[string(d)]; n != 0 {
+		t.Fatalf("the blob an open upload names was removed %d times", n)
+	}
+
+	bucket, key := "bk", "open"
+	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &openID}); err != nil {
+		t.Fatalf("AbortMultipartUpload: %v", err)
+	}
+	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
+		t.Fatalf("run the abort's releases: %v", err)
+	}
+	if n := rm.removedDigests()[string(d)]; n != 1 {
+		t.Fatalf("the blob nothing references was removed %d times, want once", n)
+	}
+}

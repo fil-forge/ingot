@@ -1104,7 +1104,7 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 	// that point fails the abort and leaves the session latched 'aborting'
 	// for the sweeper to finish.
 	space := sess.Space
-	released, err := b.recordSessionReleases(ctx, space, uploadID)
+	released, err := b.recordSessionReleases(ctx, space, uploadID, true)
 	if err != nil {
 		return fmt.Errorf("s3frontend: abort: %w", err)
 	}
@@ -1128,7 +1128,7 @@ func (b *Backend) abortOpenSession(ctx context.Context, sess registry.MultipartS
 	if err != nil || !won {
 		return false
 	}
-	released, err := b.recordSessionReleases(ctx, space, sess.UploadID)
+	released, err := b.recordSessionReleases(ctx, space, sess.UploadID, true)
 	if err != nil {
 		// Leave the session latched 'aborting': deleting it now would
 		// cascade away the part rows — the only index to the blobs. The
@@ -1145,11 +1145,16 @@ func (b *Backend) abortOpenSession(ctx context.Context, sess registry.MultipartS
 }
 
 // recordSessionReleases queues a release for every blob of uploadID's parts
-// that is still there to release. The blob's upload intent says which those
-// are. A published intent is a committed blob — the state its first
-// reference claim wrote — so a completed session's winners, even after their
-// object is deleted, are left to the object path's own releases. No intent
-// at all is a blob already released in full: every written blob gets an
+// that is still there to release, as every reference that goes does (see
+// runRelease). The blob's upload intent says which those are. A published
+// intent is a committed blob — the state its first reference claim wrote — so
+// it may have been readable through an object. While the session was in
+// flight its parts were references, so an object's release that ran then
+// found the blob referenced and did nothing: for an in-flight session's
+// teardown (inFlight), this release is the one that frees it, after the
+// reader grace. A completed session's parts were never references, so its
+// published blobs are its object's to release. The others are due at once.
+// No intent at all is a blob already released in full: every written blob gets an
 // intent, and only a release's commit removes one. Queueing such a blob again
 // would queue a release that then finds neither rows nor intent, takes the
 // network arm and asks to remove a blob that may never have left this node,
@@ -1162,7 +1167,7 @@ func (b *Backend) abortOpenSession(ctx context.Context, sess registry.MultipartS
 // session out of 'open' and 'completing'; the upload's acceptor is waited
 // out first (see quiesceAcceptor), so no conclude is in flight when the
 // releases run.
-func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uploadID string) ([]mh.Multihash, error) {
+func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uploadID string, inFlight bool) ([]mh.Multihash, error) {
 	if err := b.quiesceAcceptor(ctx, uploadID); err != nil {
 		return nil, fmt.Errorf("wait for the upload's acceptor: %w", err)
 	}
@@ -1170,7 +1175,7 @@ func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uplo
 	if err != nil {
 		return nil, fmt.Errorf("list parts: %w", err)
 	}
-	var digests []mh.Multihash
+	var digests, published []mh.Multihash
 	keep := map[string]bool{}
 	seen := map[string]bool{}
 	for _, p := range parts {
@@ -1188,12 +1193,22 @@ func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uplo
 			case err != nil:
 				return nil, fmt.Errorf("lookup intent: %w", err)
 			case in.State == registry.IntentPublished:
-				// Committed: the object path owns its release.
+				// Committed, so possibly read: released after the grace.
 				keep[string(d)] = true
+				if inFlight {
+					published = append(published, d)
+				}
 				continue
 			}
 			digests = append(digests, d)
 		}
+	}
+	due := time.Now().Add(b.releaseGrace)
+	if b.releaseGrace <= 0 {
+		due = registry.DueNow()
+	}
+	if err := b.claims.QueueReleases(ctx, space, published, due, b.releaseAuthority(ctx, space)); err != nil {
+		return nil, fmt.Errorf("queue releases: %w", err)
 	}
 	return b.enqueuePartReleases(ctx, space, digests, keep)
 }
@@ -2044,7 +2059,7 @@ func (b *Backend) latchStaleSession(ctx context.Context, s registry.MultipartSes
 // again is what makes that best-effort pass safe to lose. Reports whether
 // the row was removed; a failure leaves it for the next sweep.
 func (b *Backend) reapCompletedSession(ctx context.Context, s registry.MultipartSession) bool {
-	released, err := b.recordSessionReleases(ctx, s.Space, s.UploadID)
+	released, err := b.recordSessionReleases(ctx, s.Space, s.UploadID, false)
 	if err != nil {
 		b.logger.Warn("sweep: record completed session's releases failed; retrying next sweep",
 			zap.String("uploadID", s.UploadID), zap.Error(err))
@@ -2066,7 +2081,7 @@ func (b *Backend) reapCompletedSession(ctx context.Context, s registry.Multipart
 func (b *Backend) reapAbortingSession(ctx context.Context, s registry.MultipartSession) bool {
 	// Records first, then the row: the part rows are the only index to the
 	// blobs and cascade away with the session.
-	released, err := b.recordSessionReleases(ctx, s.Space, s.UploadID)
+	released, err := b.recordSessionReleases(ctx, s.Space, s.UploadID, true)
 	if err != nil {
 		b.logger.Warn("sweep: queue part releases failed; retrying next sweep",
 			zap.String("uploadID", s.UploadID), zap.Error(err))
