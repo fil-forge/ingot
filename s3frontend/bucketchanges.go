@@ -55,11 +55,13 @@ type PutChange struct {
 	// as the manifest's blob list; otherwise the manifest's own body is
 	// claimed.
 	HasBlobs bool
-	// Blobs are the body's blobs in order.
-	Blobs []msbucket.BlobRef
+	// Blobs are the body's blobs in order, up to msbucket.MaxBodyBlobs
+	// (8,389,632), the most one body holds; the codec's default cap is far
+	// lower.
+	Blobs []msbucket.BlobRef `cborgen:"maxlen=8389632"`
 	// Refs are the write's pending references to the blobs, which the
-	// commit's claims take over.
-	Refs []BlobRefTask
+	// commit's claims take over: at most one per blob.
+	Refs []BlobRefTask `cborgen:"maxlen=8389632"`
 	// InitState is the version's creation-time state (lock and tags), or
 	// nil.
 	InitState *msbucket.VersionState

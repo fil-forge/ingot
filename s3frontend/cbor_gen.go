@@ -993,7 +993,7 @@ func (t *PutChange) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	if len(t.Refs) > 8192 {
+	if len(t.Refs) > 8389632 {
 		return xerrors.Errorf("Slice value in field t.Refs was too long")
 	}
 
@@ -1019,7 +1019,7 @@ func (t *PutChange) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	if len(t.Blobs) > 8192 {
+	if len(t.Blobs) > 8389632 {
 		return xerrors.Errorf("Slice value in field t.Blobs was too long")
 	}
 
@@ -1265,7 +1265,7 @@ func (t *PutChange) UnmarshalCBOR(r io.Reader) (err error) {
 				return err
 			}
 
-			if extra > 8192 {
+			if extra > 8389632 {
 				return fmt.Errorf("t.Refs: array too large (%d)", extra)
 			}
 
@@ -1304,7 +1304,7 @@ func (t *PutChange) UnmarshalCBOR(r io.Reader) (err error) {
 				return err
 			}
 
-			if extra > 8192 {
+			if extra > 8389632 {
 				return fmt.Errorf("t.Blobs: array too large (%d)", extra)
 			}
 
