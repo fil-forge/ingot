@@ -9,11 +9,13 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	cmds3 "github.com/fil-forge/libforge/commands/s3"
+	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
 
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // pendingUploadTasks returns the pending queue-multipart-upload tasks of
@@ -163,5 +165,31 @@ func TestDeleteBucketAbortsUploadsInFlight(t *testing.T) {
 	_, err := b.ListParts(ctx, &s3.ListPartsInput{Bucket: &bucket, Key: &key, UploadId: &uploadID})
 	if err == nil {
 		t.Fatal("ListParts of the aborted upload succeeded")
+	}
+}
+
+// TestAnAbandonedAddPartTakesNothing: an add-part left queued by an
+// UploadPart whose caller went away runs on a worker, with no request's part
+// to record, and fails without acting. The next UploadPart, queued behind it,
+// records its own part with its own references.
+func TestAnAbandonedAddPartTakesNothing(t *testing.T) {
+	b, mem := newDeferredBackend(t, &parkingUploader{})
+	ctx := context.Background()
+	key := "abandoned-add-part"
+	uploadID := mpCreate(t, b, key, "", "")
+	abandoned, err := b.uploads.Submit(ctx, uploadSpec(uploadID, registry.MultipartAddPartAction, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err != nil {
+		t.Fatalf("UploadPart behind an abandoned add-part: %v", err)
+	}
+	var failed *taskrunner.HandlerError
+	if _, err := b.uploads.Wait(ctx, registry.MultipartQueue, abandoned); !errors.As(err, &failed) {
+		t.Fatalf("the abandoned add-part: %v, want it failed", err)
+	}
+	if parts, err := mem.ListParts(ctx, uploadID); err != nil || len(parts) != 1 {
+		t.Fatalf("parts after the UploadPart = %d, %v; want its own", len(parts), err)
 	}
 }
