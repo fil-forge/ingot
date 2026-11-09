@@ -51,15 +51,19 @@ const shardSubmitTimeLimit = 5 * time.Second
 // renews it again.
 const renewalCapacity = 65536
 
-// shardEvictRetry retries a failed eviction a few times. The budget pass
-// removes whatever is left over budget.
-var shardEvictRetry = taskrunner.RetryPolicy{First: time.Second, Multiplier: 2, Attempts: 3}
+// shardEvictRetry retries a failed eviction for about half an hour, which
+// rides out a passing fault such as a database failover. One that fails for
+// longer, such as a disk that refuses the removal, is left a failed task to
+// see and resubmit once it is fixed, rather than retried for good. Until then
+// the copy stays, unless the budget pass removes it or a read of the blob
+// schedules a new eviction.
+var shardEvictRetry = taskrunner.RetryPolicy{First: time.Second, Max: 5 * time.Minute, Multiplier: 2, Attempts: 14}
 
-// shardCacheRetry retries a failed move or renewal a few times, since a copy
-// left without its eviction stays on disk until the budget pass, or for good
-// in the spool. The task is safe to run again: a copy already moved leaves
-// nothing to move.
-var shardCacheRetry = taskrunner.RetryPolicy{First: time.Second, Multiplier: 2, Attempts: 3}
+// shardCacheRetry retries a failed move or renewal as shardEvictRetry does,
+// since a copy left without its eviction stays on disk until the budget pass,
+// or for good in the spool. The task is safe to run again: a copy already
+// moved leaves nothing to move.
+var shardCacheRetry = shardEvictRetry
 
 // ShardCacheTask is a queue-shard.cache task's arguments.
 type ShardCacheTask struct {
