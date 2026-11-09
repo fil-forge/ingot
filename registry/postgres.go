@@ -203,35 +203,6 @@ func (r *Postgres) SetForgeRoot(ctx context.Context, name string, root cid.Cid) 
 	return nil
 }
 
-func (r *Postgres) SetVersioning(ctx context.Context, name string, v VersioningState) error {
-	if v != VersioningEnabled && v != VersioningSuspended {
-		return fmt.Errorf("registry: set versioning %q: invalid state %q", name, v)
-	}
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.buckets SET versioning = $1 WHERE name = $2`,
-		string(v), name)
-	if err != nil {
-		return fmt.Errorf("registry: set versioning %q: %w", name, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-func (r *Postgres) SetObjectLockConfig(ctx context.Context, name string, cfg []byte) error {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.buckets SET object_lock_config = $1 WHERE name = $2`,
-		cfg, name)
-	if err != nil {
-		return fmt.Errorf("registry: set object lock config %q: %w", name, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
 func (r *Postgres) SetBucketTagging(ctx context.Context, name string, tags []byte) error {
 	tag, err := r.pool.Exec(ctx,
 		`UPDATE ingot.buckets SET bucket_tagging = $1 WHERE name = $2`,

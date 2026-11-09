@@ -223,9 +223,10 @@ ALTER TABLE ingot.multipart_sessions
 // registry.State gains the raw config document.
 ObjectLockConfig []byte // nil = never configured
 
-// Registry gains:
-// SetObjectLockConfig stores the bucket's lock configuration document verbatim.
-SetObjectLockConfig(ctx context.Context, name string, cfg []byte) error
+// The registry gains a statement queue-bucket.set-object-lock-config writes
+// with its commit: LockConfigSet stores the bucket's lock configuration
+// document verbatim.
+func LockConfigSet(name string, cfg []byte) Statement
 
 // Create gains an initial-state parameter so a bucket created with
 // x-amz-bucket-object-lock-enabled is versioned and locked atomically
@@ -258,7 +259,7 @@ one `registry.Get` the stub already performs.
 **PutObjectLockConfiguration** runs `queue-bucket.set-object-lock-config` on the bucket's subject,
 which requires `State.Versioning == Enabled` and answers
 `ErrObjectLockConfigurationNotAllowed` (409) otherwise, then stores the controller's document
-verbatim via `SetObjectLockConfig`. Enabling lock on an existing versioned bucket is allowed
+verbatim with the task's commit (`registry.LockConfigSet`). Enabling lock on an existing versioned bucket is allowed
 (pinned by `Versioning_Enable_object_lock`); the controller has already validated the document
 and rejects a non-Enabled status, so a stored config always has `Enabled: true`.
 
@@ -504,7 +505,7 @@ now points here.
 |---|---|
 | `bucket/leaf.go`, `gen/main.go`, `make gen` | `VersionState` + the `"/versionstate/0"` arm and `EnvelopedVersionState`; `ObjectLeaf.State` (§4.1) |
 | `migrations/sql/` (new) | `buckets.object_lock_config`, `multipart_sessions` lock columns (§4.2) |
-| `registry/registry.go`, `postgres.go`, `inmem/store.go` | `State.ObjectLockConfig`, `SetObjectLockConfig`, `Create` initial state (§4.2) |
+| `registry/registry.go`, `postgres.go`, `inmem/store.go` | `State.ObjectLockConfig`, `LockConfigSet` (bucketcommit.go), `Create` initial state (§4.2) |
 | `s3frontend/objectlock.go` (new) | the four per-version methods: the §6 check order, the state-tree read and commit paths, the Head/Get echo helper (§8) |
 | `s3frontend/version.go` | `applyPut` in-commit stamping incl. forced leaf (§7); `applyDeleteVersion` + `spliceLeaf` state-tree threading and cleanup (§9) |
 | `s3frontend/bucket.go`, `bucketadmin.go` | `CreateBucket` lock header (§5), `PutObjectLockConfiguration` (new), `GetObjectLockConfiguration` (real config), `PutBucketVersioning` suspend guard (`queue-bucket.set-versioning`, `queue-bucket.set-object-lock-config`) |

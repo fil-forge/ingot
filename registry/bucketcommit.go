@@ -286,3 +286,18 @@ func takeoverGuard(refs []taskrunner.TaskID) Statement {
 	}
 }
 
+// VersioningSet is the write that sets bucket name's versioning state, which
+// must be enabled or suspended. It is a guard: a bucket gone fails the task's
+// commit.
+func VersioningSet(name string, v VersioningState) (Statement, error) {
+	if v != VersioningEnabled && v != VersioningSuspended {
+		return Statement{}, fmt.Errorf("registry: set versioning %q: invalid state %q", name, v)
+	}
+	return Statement{`UPDATE ingot.buckets SET versioning = $1 WHERE name = $2`, []any{string(v), name}}, nil
+}
+
+// LockConfigSet is the write that stores bucket name's object-lock
+// configuration. It is a guard: a bucket gone fails the task's commit.
+func LockConfigSet(name string, cfg []byte) Statement {
+	return Statement{`UPDATE ingot.buckets SET object_lock_config = $1 WHERE name = $2`, []any{cfg, name}}
+}

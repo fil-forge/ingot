@@ -125,7 +125,7 @@ func (b *Backend) runCreateBucket(ctx context.Context, _ *taskrunner.Exec, t tas
 // bucket is always versioning-Enabled" an invariant (docs/s3-object-lock.md
 // §5): the configuration changes on this subject too, so the check holds
 // until the state is written.
-func (b *Backend) runSetVersioning(ctx context.Context, _ *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
+func (b *Backend) runSetVersioning(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
 	var args BucketSetVersioningTask
 	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
 		return nil, taskrunner.Permanent(fmt.Errorf("decode set-versioning: %w", err))
@@ -141,20 +141,20 @@ func (b *Backend) runSetVersioning(ctx context.Context, _ *taskrunner.Exec, t ta
 	if v == registry.VersioningSuspended && st.ObjectLockConfig != nil {
 		return nil, s3err.GetAPIError(s3err.ErrSuspendedVersioningNotAllowed)
 	}
-	if err := b.reg.SetVersioning(ctx, args.Name, v); err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
-		return nil, fmt.Errorf("s3frontend: put bucket versioning: %w", err)
+	st2, err := registry.VersioningSet(args.Name, v)
+	if err != nil {
+		return nil, taskrunner.Permanent(err)
 	}
-	return nil, nil
+	// Written with the task's commit, under its lease, so a handler that lost
+	// its lease cannot overwrite a newer setting.
+	return nil, ex.WriteConditional(ctx, st2.SQL, st2.Args...)
 }
 
 // runSetLockConfig is queue-bucket.set-object-lock-config: it stores the
 // bucket's lock configuration, which needs versioning Enabled — enabling lock
 // on an existing versioned bucket is allowed, a suspended or unversioned one
 // is a 409 (docs/s3-object-lock.md §5).
-func (b *Backend) runSetLockConfig(ctx context.Context, _ *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
+func (b *Backend) runSetLockConfig(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
 	var args BucketSetLockConfigTask
 	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
 		return nil, taskrunner.Permanent(fmt.Errorf("decode set-object-lock-config: %w", err))
@@ -169,11 +169,7 @@ func (b *Backend) runSetLockConfig(ctx context.Context, _ *taskrunner.Exec, t ta
 	if st.Versioning != registry.VersioningEnabled {
 		return nil, s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotAllowed)
 	}
-	if err := b.reg.SetObjectLockConfig(ctx, args.Name, args.Config); err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
-		return nil, fmt.Errorf("s3frontend: put object lock configuration: %w", err)
-	}
-	return nil, nil
+	st2 := registry.LockConfigSet(args.Name, args.Config)
+	// Written with the task's commit, as the versioning state is.
+	return nil, ex.WriteConditional(ctx, st2.SQL, st2.Args...)
 }

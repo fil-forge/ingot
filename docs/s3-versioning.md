@@ -291,13 +291,13 @@ depends on hiding this; the exposure is operational and accepted.
 - `registry.State` gains `Versioning VersioningState` (a `string` type with constants
   `VersioningUnversioned` (`"unversioned"`, the default), `VersioningEnabled`, `VersioningSuspended`);
   `Postgres.Get` (postgres.go:64) selects the column; `Create` leaves the default.
-- `registry.Registry` gains two methods (implemented by `*registry.Postgres` and
-  `inmem.MemStore`):
+- The registry gains a statement and a method:
 
 ```go
-// SetVersioning updates the bucket's versioning state. Only "enabled" and
-// "suspended" are settable (S3 has no way back to unversioned).
-SetVersioning(ctx context.Context, name string, v VersioningState) error
+// VersioningSet is the write queue-bucket.set-versioning commits: the
+// bucket's versioning state. Only "enabled" and "suspended" are settable (S3
+// has no way back to unversioned).
+func VersioningSet(name string, v VersioningState) (Statement, error)
 // AllocVersionSeq atomically advances and returns the bucket's version
 // ordinal (first call returns 1). Gaps from failed commits are harmless.
 AllocVersionSeq(ctx context.Context, name string) (uint64, error)
@@ -311,8 +311,8 @@ metadata — the Hilt forwarding path (forge-mode create/delete/list) is not inv
 
 - **`PutBucketVersioning`** (new override; interface at versitygw backend.go:42) — the controller
   pre-validates the status to `Enabled|Suspended`; the backend runs `queue-bucket.set-versioning`
-  on the bucket's subject, which resolves the bucket (`ErrNoSuchBucket` otherwise) and calls
-  `SetVersioning`. It runs one at a time with the bucket's commits, so a commit sees one
+  on the bucket's subject, which resolves the bucket (`ErrNoSuchBucket` otherwise) and writes
+  the state with its commit (`registry.VersioningSet`). It runs one at a time with the bucket's commits, so a commit sees one
   versioning state throughout.
 - **`GetBucketVersioning`** (bucket.go:143, currently a zero-value stub) — returns `Status` nil
   when the bucket is `unversioned` (never configured → empty `<VersioningConfiguration/>`,
@@ -663,7 +663,7 @@ the one instance that holds its catalog log. Object lock / retention / legal hol
 |---|---|
 | `bucket/leaf.go` (new) + `gen/main.go` + `make gen` | `ObjectLeaf`, `VersionNode`, `ValueUnion` (cborgen-registered); the strict `ObjectValue` / `EnvelopedManifest` / `EnvelopedLeaf` wrappers (§2.1) |
 | `bucket/manifest.go` | `Seq`, `VersionID` fields (§2.3) |
-| `registry/registry.go`, `postgres.go`, `inmem/store.go` | `State.Versioning`, `VersioningState`, `SetVersioning`, `AllocVersionSeq` (§4.1) |
+| `registry/registry.go`, `postgres.go`, `inmem/store.go` | `State.Versioning`, `VersioningState`, `VersioningSet` (bucketcommit.go), `AllocVersionSeq` (§4.1) |
 | `s3frontend/version.go` (new) | token mint/parse/classify (§3), `revSeqKey`, the value-union dispatch (§2.1), `resolveVersion` (§6.1), the write rule (§5.2), prev-tree helpers |
 | `s3frontend/object.go` | `PutObject` splice → write rule; reads resolve via `resolveVersion`; `GetObject`/`HeadObject` versionId + marker semantics + output ids; `DeleteObject`/`applyDeleteKey`/`DeleteObjects` (§7); `addClaims` / `dropClaims` call sites carry real version ids (§8); `listWalk` marker skip (§9.1) |
 | `s3frontend/copy.go`, `multipart.go`, `uploadpartcopy.go` | `commitManifest` → write rule; source-version resolution for `CopyObject` and `UploadPartCopy`; `CopySourceVersionId` on both; Complete's `versionid` return |

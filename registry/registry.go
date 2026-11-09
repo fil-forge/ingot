@@ -165,14 +165,6 @@ type Registry interface {
 	// ForgeRoot needs to be re-submitted on startup.
 	SetForgeRoot(ctx context.Context, name string, root cid.Cid) error
 
-	// SetVersioning updates the bucket's versioning state. Only Enabled and
-	// Suspended are settable. Returns ErrNotFound if the bucket is absent.
-	SetVersioning(ctx context.Context, name string, v VersioningState) error
-
-	// SetObjectLockConfig stores the bucket's object-lock configuration
-	// document verbatim. Returns ErrNotFound if the bucket is absent.
-	SetObjectLockConfig(ctx context.Context, name string, cfg []byte) error
-
 	// SetBucketTagging stores the bucket's tag set, replacing any previous
 	// one; nil clears it. Returns ErrNotFound if the bucket is absent.
 	SetBucketTagging(ctx context.Context, name string, tags []byte) error
