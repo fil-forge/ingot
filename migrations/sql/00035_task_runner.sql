@@ -54,7 +54,7 @@ CREATE INDEX upload_intents_stalled_idx
 -- its queue-space-shard.expire drops it at the deadline.
 CREATE TABLE ingot.blob_pending_refs (
     add_task    uuid        PRIMARY KEY,
-    expire_task uuid        NOT NULL,
+    expire_task uuid        NOT NULL UNIQUE,
     space       text        NOT NULL,
     digest      bytea       NOT NULL,
     deadline    timestamptz NOT NULL

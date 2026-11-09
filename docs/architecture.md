@@ -794,7 +794,7 @@ CREATE INDEX blob_refs_claim_idx ON ingot.blob_refs (space, digest);
 -- queue-space-shard.expire.
 CREATE TABLE ingot.blob_pending_refs (
     add_task    uuid        PRIMARY KEY,                 -- the queue-space-shard.add that took it
-    expire_task uuid        NOT NULL,                    -- the queue-space-shard.expire due at deadline
+    expire_task uuid        NOT NULL UNIQUE,             -- the queue-space-shard.expire due at deadline
     space       text        NOT NULL,
     digest      bytea       NOT NULL,
     deadline    timestamptz NOT NULL                     -- 24 h after the add

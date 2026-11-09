@@ -1132,7 +1132,7 @@ erDiagram
     }
     blob_pending_refs {
         uuid add_task PK "the queue-space-shard.add that took it"
-        uuid expire_task "the queue-space-shard.expire due at the deadline"
+        uuid expire_task UK "the queue-space-shard.expire due at the deadline"
         text space
         bytea digest
         timestamptz deadline "24 h after the add"
