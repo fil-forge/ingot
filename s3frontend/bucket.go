@@ -295,7 +295,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 	if err := b.runBucket(ctx, st.Space, registry.BucketCloseAction, &BucketTask{Name: name}); err != nil {
 		return err
 	}
-	sessions, err := b.multipart.ListSessions(ctx, name)
+	sessions, err := b.multipart.ListSessions(ctx, name, st.Space)
 	if err != nil {
 		return fmt.Errorf("s3frontend: delete bucket: list mp sessions: %w", err)
 	}
@@ -377,7 +377,7 @@ func (b *Backend) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t tas
 		if err := b.refuseNonEmpty(ctx, st); err != nil {
 			return err
 		}
-		sessions, err := b.multipart.ListSessions(ctx, name)
+		sessions, err := b.multipart.ListSessions(ctx, name, st.Space)
 		if err != nil {
 			return fmt.Errorf("s3frontend: delete bucket: list mp sessions: %w", err)
 		}

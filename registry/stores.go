@@ -464,11 +464,14 @@ type MultipartStore interface {
 	// nothing reads the parts' again, while the part rows themselves stay
 	// for the idempotent re-Complete. A missing upload is not an error.
 	DeletePartTrees(ctx context.Context, uploadID string) error
-	// ListSessions returns bucket's sessions ordered by (object_key, created_at,
-	// upload_id) — the S3 ListMultipartUploads presentation order. Filtering
-	// (prefix/markers/max) happens in the handler; in-flight session counts are
-	// small.
-	ListSessions(ctx context.Context, bucket string) ([]MultipartSession, error)
+	// ListSessions returns the sessions of bucket name in space, ordered by
+	// (object_key, created_at, upload_id) — the S3 ListMultipartUploads
+	// presentation order. A name outlives the bucket that bore it, and a
+	// session of a predecessor bucket lives in that bucket's space, so it is
+	// never listed for the bucket that has the name now. Filtering
+	// (prefix/markers/max) happens in the handler; in-flight session counts
+	// are small.
+	ListSessions(ctx context.Context, bucket string, space did.DID) ([]MultipartSession, error)
 	// CountPartRefs returns how many parts OUTSIDE excludeUploadID reference
 	// digest — the shared-blob guard for abort/supersede cleanup
 	// (content-addressed part blobs may be deduped across sessions).

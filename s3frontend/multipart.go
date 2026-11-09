@@ -1326,19 +1326,15 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, input *s3.ListMultip
 		maxUploads = int(*input.MaxUploads)
 	}
 
-	all, err := b.multipart.ListSessions(ctx, bucket)
+	all, err := b.multipart.ListSessions(ctx, bucket, st.Space)
 	if err != nil {
 		return s3response.ListMultipartUploadsResult{}, fmt.Errorf("s3frontend: list sessions: %w", err)
 	}
-	// In-flight uploads of THIS bucket only, honoring the prefix. Sessions
-	// are listed by bucket name, and a name outlives the bucket that bore
-	// it: an upload of a predecessor bucket parked its parts in another
-	// space, and its key and upload id are that space's to know, not this
-	// one's. The point operations reject such a session already
-	// (checkSessionSpace); the listing must not show it either.
+	// In-flight uploads only, honoring the prefix. The listing is of this
+	// bucket's space, so a predecessor bucket's uploads are not in it.
 	inflight := all[:0]
 	for _, s := range all {
-		if s.State == registry.SessionOpen && s.Space == st.Space && strings.HasPrefix(s.ObjectKey, prefix) {
+		if s.State == registry.SessionOpen && strings.HasPrefix(s.ObjectKey, prefix) {
 			inflight = append(inflight, s)
 		}
 	}

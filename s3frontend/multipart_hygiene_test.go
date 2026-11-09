@@ -24,11 +24,13 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
+	cmds3 "github.com/fil-forge/libforge/commands/s3"
 )
 
 // Multipart hygiene: every path that orphans a part blob — Complete omitting
@@ -1367,6 +1369,15 @@ func TestRecreatedBucketDisownsItsPredecessorsUploads(t *testing.T) {
 	}
 	if _, err := mem.GetSession(ctx, uploadID); err != nil {
 		t.Fatalf("the disowned session should stand for the sweeper: %v", err)
+	}
+	// Deleting the new bucket neither waits on the predecessor's upload nor
+	// tears it down.
+	del := context.WithValue(ctx, reqscope.RequestKey(), cmds3.Request{})
+	if err := b.DeleteBucket(del, bucket); err != nil {
+		t.Fatalf("DeleteBucket of the recreated bucket: %v", err)
+	}
+	if _, err := mem.GetSession(ctx, uploadID); err != nil {
+		t.Fatalf("the predecessor's session after the new bucket's delete: %v", err)
 	}
 
 	if n, err := sweepUploads(ctx, b); err != nil || n == 0 {

@@ -680,16 +680,16 @@ func (r *Postgres) ListPartTrees(ctx context.Context, uploadID string) (map[int]
 	return out, nil
 }
 
-func (r *Postgres) ListSessions(ctx context.Context, bucket string) ([]MultipartSession, error) {
+func (r *Postgres) ListSessions(ctx context.Context, bucket string, space did.DID) ([]MultipartSession, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
 		        content_encoding, content_disposition, content_language, cache_control, expires,
 		        website_redirect_location, checksum_algorithm, checksum_type,
 		        lock_mode, lock_retain_until, lock_legal_hold, tagging,
 		        committed_etag, committed_version_id, space, state_changed_at, plaintext
-		 FROM ingot.multipart_sessions WHERE bucket = $1
+		 FROM ingot.multipart_sessions WHERE bucket = $1 AND space = $2
 		 ORDER BY object_key ASC, created_at ASC, upload_id ASC`,
-		bucket)
+		bucket, space.String())
 	if err != nil {
 		return nil, fmt.Errorf("registry: list sessions: %w", err)
 	}

@@ -660,7 +660,7 @@ func TestPostgresStores(t *testing.T) {
 		}
 
 		// ListSessions: (object_key, created_at, upload_id) order.
-		sessions, err := r.ListSessions(ctx, "b")
+		sessions, err := r.ListSessions(ctx, "b", lsSpace)
 		if err != nil || len(sessions) != 3 ||
 			sessions[0].UploadID != "ls-1" || sessions[1].UploadID != "ls-3" || sessions[2].UploadID != "ls-2" {
 			ids := make([]string, len(sessions))
@@ -668,6 +668,10 @@ func TestPostgresStores(t *testing.T) {
 				ids[i] = x.UploadID
 			}
 			t.Fatalf("ListSessions order = %v, err %v (want [ls-1 ls-3 ls-2])", ids, err)
+		}
+		// A bucket of the same name in another space lists none of them.
+		if other, err := r.ListSessions(ctx, "b", testutil.RandomDID(t)); err != nil || len(other) != 0 {
+			t.Fatalf("ListSessions for another space = %v, err %v; want none", other, err)
 		}
 
 		// CountPartRefs: bytea[] ANY-match across sessions, excluding one.
