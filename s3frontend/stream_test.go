@@ -329,6 +329,10 @@ func TestStreamedPutObjectWrongLength(t *testing.T) {
 			require.Error(t, su.putErrs[last.AddTask], "the PUT of the failing blob fails too")
 			require.Empty(t, su.concluded)
 			require.Contains(t, su.aborted, last.AddTask, "the failed stream's allocation is aborted at once")
+			require.Greater(t, len(su.started), 1, "the body streamed a blob before the failing one")
+			for _, sb := range su.started {
+				require.Contains(t, su.aborted, sb.AddTask, "every allocation the failed body streamed is aborted")
+			}
 		})
 	}
 }
@@ -353,7 +357,7 @@ func TestStreamedPutObjectStalledAbort(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the request waited on the stalled abort")
 	}
-	require.Len(t, su.aborted, 1, "the abort was tried")
+	require.Len(t, su.aborted, 2, "each allocation's abort was tried")
 }
 
 func TestStreamedUploadPart(t *testing.T) {

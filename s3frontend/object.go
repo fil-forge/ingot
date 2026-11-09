@@ -408,11 +408,13 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 		enc = newEncryptingBlobWriter(b.spool, b.regionKeys, space, []fee.Recipient{recipient})
 	}
 	// Each spooled blob is published held, until its upload has read it; a
-	// failed split leaves no caller to end the holds.
+	// failed split leaves no caller to end the holds, or to conclude the
+	// blobs it streamed before the failure.
 	enc.holdWrites = true
 	defer func() {
 		if err != nil {
 			enc.unholdAll()
+			enc.abandonStreamed(ctx)
 		}
 	}()
 	splitOpts := append([]msbucket.SplitOption(nil), opts...)

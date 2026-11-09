@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/filecoin-project/go-fee"
@@ -164,6 +165,23 @@ func (w *bodyWriter) abandon(ctx context.Context, sb uploader.StreamedBlob) {
 	if err := w.stream.AbortBlob(ctx, w.space, sb.AddTask); err != nil {
 		w.logger.Warn("abandoning streamed upload failed; the provider expires it", zap.Stringer("add", sb.AddTask), zap.Error(err))
 	}
+}
+
+// abandonStreamed releases the allocation of every blob the body has
+// streamed, for a body that failed after streaming some: nothing will
+// conclude them. The aborts run at once, so the wait is one abandon's at
+// most, and outlive the request, as abandon's does.
+func (w *bodyWriter) abandonStreamed(ctx context.Context) {
+	ctx = context.WithoutCancel(ctx)
+	var wg sync.WaitGroup
+	for _, sb := range w.streamed() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.abandon(ctx, sb)
+		}()
+	}
+	wg.Wait()
 }
 
 // errPutFinished closes the PUT's end of the pipe once the PUT has returned.
