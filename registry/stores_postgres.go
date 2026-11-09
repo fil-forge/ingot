@@ -196,6 +196,19 @@ func (r *Postgres) CountReferences(ctx context.Context, space did.DID, digest mu
 	return n, nil
 }
 
+func (r *Postgres) ExpiriesOf(ctx context.Context, refs []taskrunner.TaskID) ([]taskrunner.TaskID, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	var expires []taskrunner.TaskID
+	if err := r.pool.QueryRow(ctx,
+		`SELECT coalesce(array_agg(expire_task), '{}') FROM ingot.blob_pending_refs WHERE add_task = ANY($1)`,
+		refs).Scan(&expires); err != nil {
+		return nil, fmt.Errorf("registry: expiries of pending references: %w", err)
+	}
+	return expires, nil
+}
+
 func (r *Postgres) PendingRefByExpiry(ctx context.Context, expire taskrunner.TaskID) (taskrunner.TaskID, error) {
 	var add taskrunner.TaskID
 	err := r.pool.QueryRow(ctx, `SELECT add_task FROM ingot.blob_pending_refs WHERE expire_task = $1`, expire).Scan(&add)

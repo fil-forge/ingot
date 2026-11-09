@@ -665,7 +665,7 @@ func TestPlaintextRelease_ExpiredReferenceRefusesTheCommit(t *testing.T) {
 	data := testBody(8 << 10)
 	first, second := digestOf(t, data[:4<<10]), digestOf(t, data[4<<10:])
 	reg.start = func() {
-		b.dropRefsNow(context.Background(), mem.bk(), []multihash.Multihash{second})
+		expireRefsTo(t, b, mem.bk(), second)
 	}
 
 	bucket, key := "bk", "k"

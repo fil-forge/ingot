@@ -411,7 +411,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		// the blobs nothing else references. Should the row in fact have
 		// landed and only its result been lost, it took the references
 		// over, and the session's teardown releases its blobs.
-		b.dropRefsNow(ctx, space, written.Blobs.DigestList())
+		b.dropRefsNow(ctx, space, refs, written.Blobs.DigestList())
 		if errors.Is(err, registry.ErrNotFound) {
 			return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
 		}

@@ -355,18 +355,23 @@ func (b *Backend) runExpire(ctx context.Context, ex *taskrunner.Exec, t taskrunn
 	return nil, err
 }
 
-// dropRefsNow expires the write's pending references to digests in space at
-// once, for a write that failed before anything took them over, and runs
-// the releases they leave due, best effort, as releaseNow does.
-func (b *Backend) dropRefsNow(ctx context.Context, space did.DID, digests []multihash.Multihash) {
-	for _, d := range digests {
-		if _, err := b.releases.Expedite(ctx, registry.ReleaseQueue, registry.ReleaseSubject(space, d), registry.ExpireAction); err != nil {
-			b.logger.Warn("expire a failed write's references; they expire at their deadline",
-				zap.Stringer("space", space), zap.Error(err))
-			return
-		}
+// dropRefsNow expires refs, the write's pending references to digests in
+// space, at once, for a write that failed before anything took them over, and
+// waits for the releases they leave due, best effort, as releaseNow does. It
+// brings forward only these references' expiries: another write's references
+// to the same blobs keep their deadlines.
+func (b *Backend) dropRefsNow(ctx context.Context, space did.DID, refs []taskrunner.TaskID, digests []multihash.Multihash) {
+	expiries, err := b.claims.ExpiriesOf(ctx, refs)
+	if err == nil {
+		err = b.releases.ExpediteTasks(ctx, registry.ReleaseQueue, expiries...)
 	}
-	// The first pass runs the expiries, the second the releases they queue.
+	if err != nil {
+		b.logger.Warn("expire a failed write's references; they expire at their deadline",
+			zap.Stringer("space", space), zap.Error(err))
+		return
+	}
+	// The first pass waits for the expiries, the second for the releases
+	// they queue.
 	b.releaseNow(ctx, space, digests)
 	b.releaseNow(ctx, space, digests)
 }

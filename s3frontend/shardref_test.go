@@ -14,6 +14,7 @@ import (
 
 	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 )
 
@@ -101,7 +102,8 @@ func TestPendingReferenceHoldsTheBlobUntilItExpires(t *testing.T) {
 	blobs := storedBlobs(t, b, rv)
 	d := blobs[0].Digest
 	// A same-space copy that takes its reference and dies before its commit.
-	if _, err := b.pinBlobs(ctx, st, blobs); err != nil {
+	refs, err := b.pinBlobs(ctx, st, blobs)
+	if err != nil {
 		t.Fatalf("pinBlobs: %v", err)
 	}
 
@@ -111,12 +113,49 @@ func TestPendingReferenceHoldsTheBlobUntilItExpires(t *testing.T) {
 		t.Fatalf("the blob the copy references was removed %d times", n)
 	}
 
-	b.dropRefsNow(ctx, mem.bk(), []multihash.Multihash{d})
+	b.dropRefsNow(ctx, mem.bk(), []taskrunner.TaskID{refs[string(d)]}, []multihash.Multihash{d})
 	if n := rm.removedDigests()[string(d)]; n != 1 {
 		t.Fatalf("removes of %x once its reference expired = %d, want 1", d, n)
 	}
 	if n, _ := mem.CountReferences(ctx, mem.bk(), d, uuid.Nil); n != 0 {
 		t.Fatalf("references to %x after the expiry = %d, want 0", d, n)
+	}
+}
+
+// TestAFailedWritesCleanupLeavesAnotherWritesReference: two writes in flight
+// hold references to the same blob. One fails and expires its own at once;
+// the other's reference keeps its deadline, so the blob stays.
+func TestAFailedWritesCleanupLeavesAnotherWritesReference(t *testing.T) {
+	rm := &recordingRemover{}
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) { d.Remover = rm })
+	ctx := context.Background()
+	putIn(t, b, "bk", "k", testBody(4<<10))
+	st, err := mem.Get(ctx, "bk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rv, err := b.resolveVersion(ctx, "bk", "k", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs := storedBlobs(t, b, rv)
+	d := blobs[0].Digest
+	failed, err := b.pinBlobs(ctx, st, blobs)
+	if err != nil {
+		t.Fatalf("pinBlobs: %v", err)
+	}
+	if _, err := b.pinBlobs(ctx, st, blobs); err != nil {
+		t.Fatalf("pinBlobs: %v", err)
+	}
+	deleteFrom(t, b, "bk", "k")
+	drainReleases(t, b)
+
+	b.dropRefsNow(ctx, mem.bk(), []taskrunner.TaskID{failed[string(d)]}, []multihash.Multihash{d})
+	if n, _ := mem.CountReferences(ctx, mem.bk(), d, uuid.Nil); n != 1 {
+		t.Fatalf("references to %x after one write's cleanup = %d, want the other write's", d, n)
+	}
+	if n := rm.removedDigests()[string(d)]; n != 0 {
+		t.Fatalf("the blob another write references was removed %d times", n)
 	}
 }
 
@@ -143,4 +182,16 @@ func TestCommitCancelsItsReferencesExpiries(t *testing.T) {
 	if expiries == 0 {
 		t.Fatal("the write queued no expiry")
 	}
+}
+
+// expireRefsTo expires every pending reference to digest in space at once, as
+// their deadlines passing would, and waits for the release they leave due.
+func expireRefsTo(t *testing.T, b *Backend, space did.DID, digest multihash.Multihash) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := b.releases.Expedite(ctx, registry.ReleaseQueue, registry.ReleaseSubject(space, digest), registry.ExpireAction); err != nil {
+		t.Fatalf("expedite the expiries: %v", err)
+	}
+	b.releaseNow(ctx, space, []multihash.Multihash{digest})
+	b.releaseNow(ctx, space, []multihash.Multihash{digest})
 }

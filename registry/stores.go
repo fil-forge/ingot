@@ -318,6 +318,9 @@ type BlobRefStore interface {
 	// whose queue-space-shard.expire is expire, or ErrNotFound once nothing
 	// holds it: a claim or a part row took it over, or it was dropped.
 	PendingRefByExpiry(ctx context.Context, expire taskrunner.TaskID) (taskrunner.TaskID, error)
+	// ExpiriesOf returns the queue-space-shard.expire task of each of refs
+	// that is still a pending reference, in no particular order.
+	ExpiriesOf(ctx context.Context, refs []taskrunner.TaskID) ([]taskrunner.TaskID, error)
 	// QueueReleases queues the release of each of digests in space, due at
 	// notBefore and carrying release's authority, in one transaction. A
 	// digest repeated is released once, and a release already pending keeps

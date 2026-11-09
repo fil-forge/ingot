@@ -251,7 +251,7 @@ const expedite = `WITH locked AS (
 // Expedite makes the subject's pending tasks of the action due now, whatever
 // their NotBefore or retry backoff, and returns all of the action's pending
 // tasks on it, by subject and oldest first, for the caller to Wait on or to
-// run inline with a sync task on each subject. A subject ending in * stands for every subject
+// wait behind with a sync task on each subject. A subject ending in * stands for every subject
 // that starts with what comes before the *, so a caller can bring forward a
 // group of subjects at once, such as a bucket delete running its space's
 // pending releases. No task it returns is a replacement any more, due
@@ -274,6 +274,29 @@ func (r *Runner) Expedite(ctx context.Context, queueName, subject, action string
 	}
 	r.pokeQueue(q)
 	return out, nil
+}
+
+// ExpediteTasks makes the given pending tasks of the queue due now, as
+// Expedite does those of an action on a subject: whatever their NotBefore or
+// retry backoff, and no longer replacements. It brings forward exactly these
+// tasks, so a caller cleaning up after itself leaves others' tasks of the same
+// subject and action at their own times. A task that has started, finished or
+// gone is left as it is.
+func (r *Runner) ExpediteTasks(ctx context.Context, queueName string, ids ...TaskID) error {
+	q, ok := r.byName[queueName]
+	if !ok {
+		return fmt.Errorf("task runner: unknown queue %q", queueName)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	if _, err := r.db.Exec(ctx, `UPDATE `+q.tasks+` SET not_before = NULL, retry_at = NULL, replaceable = false
+		WHERE id = ANY($1) AND state = 'pending' AND started IS NULL
+		AND (not_before > now() OR retry_at > now())`, ids); err != nil {
+		return fmt.Errorf("expedite %d %s tasks: %w", len(ids), queueName, err)
+	}
+	r.pokeQueue(q)
+	return nil
 }
 
 // collectBySubject reads rows of (subject, id) into IDs by subject, in row
