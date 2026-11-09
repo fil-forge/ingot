@@ -241,16 +241,20 @@ func (r *Runner) renew(ctx context.Context, q *queue, tokens []uuid.UUID) {
 	// A row a commit holds locked is skipped rather than waited for: the
 	// commit extended it when it took the lock (lockLease), and waiting would
 	// hold up the renewal of every other lease until that commit ends. A
-	// skipped row is still ours, and counts as kept.
+	// skipped row is still ours, and counts as kept whatever expiry it shows:
+	// this statement sees the expiry from before the commit extended it, which
+	// a long commit outlasts. Only a row renewal could lock is judged by its
+	// expiry.
 	rows, err := r.db.Query(ctx, `WITH mine AS (
-			SELECT subject, owner FROM `+q.leases+` WHERE owner = ANY($1) AND expires >= now()
+			SELECT subject, owner, expires FROM `+q.leases+` WHERE owner = ANY($1)
 			FOR UPDATE SKIP LOCKED),
 		renewed AS (
 			UPDATE `+q.leases+` l SET expires = now() + $2 * interval '1 millisecond'
-			FROM mine WHERE l.subject = mine.subject AND l.owner = mine.owner RETURNING l.owner)
+			FROM mine WHERE l.subject = mine.subject AND l.owner = mine.owner
+				AND mine.expires >= now() RETURNING l.owner)
 		SELECT owner FROM renewed
 		UNION ALL
-		SELECT owner FROM `+q.leases+` WHERE owner = ANY($1) AND expires >= now()
+		SELECT owner FROM `+q.leases+` WHERE owner = ANY($1)
 			AND owner NOT IN (SELECT owner FROM mine)`, tokens, r.opts.LeaseTTL.Milliseconds())
 	if err != nil {
 		if ctx.Err() == nil {

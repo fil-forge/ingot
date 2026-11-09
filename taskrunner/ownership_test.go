@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
@@ -484,7 +486,11 @@ func TestChildDoesNotStartOnceTheRootLeaseIsLost(t *testing.T) {
 // locked it, so neither lapses. Here one task's commit runs a second and
 // another task holds its lease meanwhile; the lease TTL is 300 ms.
 func TestALongCommitStopsNoRenewal(t *testing.T) {
-	f := newFixture(t, 0, func(o *taskrunner.Options) { o.LeaseTTL = 300 * time.Millisecond })
+	core, logs := observer.New(zap.WarnLevel)
+	f := newFixture(t, 0, func(o *taskrunner.Options) {
+		o.LeaseTTL = 300 * time.Millisecond
+		o.Logger = zap.New(core)
+	})
 	f.handle(t, qTop, "slow-commit", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
 		return nil, ex.Write(ctx, `SELECT pg_sleep(1)`)
 	})
@@ -514,5 +520,10 @@ func TestALongCommitStopsNoRenewal(t *testing.T) {
 	}
 	if n := runs.Load(); n != 1 {
 		t.Fatalf("the task holding its lease ran %d times: its lease lapsed during the slow commit", n)
+	}
+	// Renewal skipped the slow commit's lease past the expiry it had before
+	// the commit extended it, and still counted it kept.
+	if n := logs.FilterMessage("lease lost to another consumer").Len(); n != 0 {
+		t.Fatalf("renewal took %d leases for lost during the slow commit", n)
 	}
 }
