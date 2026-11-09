@@ -274,10 +274,11 @@ func (r *Runner) Pending(ctx context.Context, queueName string, subjects []strin
 	return out, nil
 }
 
-// expedite makes the unstarted pending tasks of an action on the subjects
-// matching $1 due now and no longer replacements, whether they waited for a
-// NotBefore, a retry's backoff or nothing, and returns every pending task of
-// the action that matches, oldest first. $1 is a LIKE pattern: the subject
+// expedite makes the pending tasks of an action on the subjects matching $1
+// no longer replacements, and the unstarted ones due now, whether they waited
+// for a NotBefore, a retry's backoff or nothing, and returns them all, oldest
+// first. A started one keeps its timing but not its replaceability: a retry
+// clears its start, and a replacement must not take its ID then. $1 is a LIKE pattern: the subject
 // itself with its wildcards escaped, or a prefix of it followed by %, which
 // the pending index serves since subjects sort byte by byte. It reads the
 // locked rows, which are the current ones, so a replacement that committed
@@ -287,8 +288,10 @@ const expedite = `WITH locked AS (
 		WHERE subject LIKE $1 AND action = $2 AND state = 'pending'
 		FOR UPDATE),
 	due AS (
-		UPDATE %[1]s t SET not_before = NULL, retry_at = NULL, replaceable = false
-		FROM locked WHERE t.id = locked.id AND locked.started IS NULL)
+		UPDATE %[1]s t SET replaceable = false,
+			not_before = CASE WHEN locked.started IS NULL THEN NULL ELSE t.not_before END,
+			retry_at = CASE WHEN locked.started IS NULL THEN NULL ELSE t.retry_at END
+		FROM locked WHERE t.id = locked.id)
 	SELECT subject, id FROM locked ORDER BY seq`
 
 // Expedite makes the subject's pending tasks of the action due now, whatever

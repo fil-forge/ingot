@@ -440,3 +440,61 @@ func TestExpediteBringsRetriesForward(t *testing.T) {
 		})
 	}
 }
+
+// A replacement running when Expedite returns it stays unreplaceable after it
+// fails and waits to retry, which clears its start: a later replacement does
+// not take its ID from the caller waiting on it.
+func TestExpediteKeepsARunningReplacementsID(t *testing.T) {
+	f := newFixture(t, 1)
+	entered, fail := make(chan struct{}), make(chan struct{})
+	var runs atomic.Int32
+	if err := f.r.Handle(qTop, "release", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		if runs.Add(1) == 1 {
+			close(entered)
+			<-fail
+		}
+		return nil, errors.New("unavailable")
+	}, taskrunner.WithRetry(taskrunner.RetryPolicy{First: time.Hour})); err != nil {
+		t.Fatal(err)
+	}
+	f.start(t)
+	ctx := waitCtx(t)
+	submit := func(at *time.Time) taskrunner.TaskID {
+		t.Helper()
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "sp/r", Action: "release", NotBefore: at, Replace: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	now := time.Now()
+	id := submit(&now)
+	<-entered
+	got, err := f.r.Expedite(ctx, qTop, "sp/r", "release")
+	if err != nil || !slices.Equal(got["sp/r"], []taskrunner.TaskID{id}) {
+		t.Fatalf("Expedite = %v, %v; want the running task", got, err)
+	}
+	close(fail)
+	tasks := f.env.Table(queueTable(qTop) + "_tasks")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting bool
+		if err := f.env.DB.QueryRow(ctx, `SELECT attempts > 0 AND started IS NULL FROM `+tasks+` WHERE id = $1`, id).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the task never failed into its retry")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	later := time.Now().Add(2 * time.Hour)
+	if replacement := submit(&later); replacement == id {
+		t.Fatal("the replacement took the expedited task's ID")
+	}
+	if got := f.state(t, qTop, id); got != "pending" {
+		t.Fatalf("the expedited task is %s, want pending", got)
+	}
+}
