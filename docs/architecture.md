@@ -401,7 +401,11 @@ bucket runs as a task on `queue-bucket`, whose subject is the bucket's space, pl
 that holds the bucket's catalog log, so one change to a bucket runs at a time. An object write is a
 `queue-bucket.commit` run sync for the request. Its root update is a **guarded root advance**: the
 bucket's MST root moves only if it still equals the root the commit started from; on mismatch the
-task runs again from the current root and repeats the (cheap) splice.
+task runs again from the current root and repeats the (cheap) splice. A task finds its bucket by
+name and acts only while the bucket's space is still its subject: a bucket deleted and recreated
+under the same name has another space, so a task queued for the first answers `NoSuchBucket`, and
+a ship ships nothing. A `queue-bucket.create` that runs again after recording the bucket finds its
+own row, in its own space, and succeeds.
 
 ### 7.1 Write (single-shot `PutObject`)
 
