@@ -105,8 +105,8 @@ Internal:
   the per-key version tree), `multipart.go`, `bucket.go`, `listversions.go`,
   `backend.go`, `stream.go` (each body blob streams to its
   provider as the body arrives, teeing an object's bytes into the cache; a
-  failed stream fails the request and aborts its allocation, and one a dead
-  request leaves is expired by the provider).
+  failed stream fails the request and aborts its allocation, and an
+  allocation a dead request leaves is expired by the provider).
 - **`bucketop/`** — `Coordinator`/`Tx`: per-bucket write transaction (lock,
   snapshot root, staging buffer, CAS commit).
 - **`blockstore/`** — block I/O contracts + impls: `log.go` (`Log`, `Plane`
