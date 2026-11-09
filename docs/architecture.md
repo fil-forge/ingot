@@ -251,7 +251,7 @@ manifest and the MST nodes added by the splice — never MST nodes that already 
 durable. The catalog plane is the per-operation delta. A commit also copies its blocks into
 `catalog_journal` in its own transaction; when a segment seals, a `queue-bucket.ship` on the
 bucket's subject ships every sealed, unshipped segment, oldest first, and drops their journal rows.
-A ship that fails retries with no attempt limit, backing off from 1 s to 5 min, unless it has no authority to ship with: no retry can find any before the bucket's next write captures some, and that write's seal queues a ship of every segment left unshipped, so it fails for good.
+A ship that fails retries with no attempt limit, backing off from 1 s to 5 min, unless it has no authority to ship with: no retry can find any before the bucket's next write captures some, so it fails for good, and that write's commit queues the ship again rather than wait for its seal.
 
 Because many tiny blocks share a CAR, catalog retrieval uses the indexer's **index-claim /
 sharded-dag-index path** (block CID → byte range within its CAR shard). This two-level lookup is
@@ -1208,8 +1208,8 @@ harness (`make itest`); unit tests cover libraries and pure logic only:
   in-flight sessions only).
 - **Multipart hygiene.** Abort, part re-upload and Complete (for parts omitted from its list) queue
   a `queue-space-shard.release` task, due at once, for each now-unreferenced part blob (guarded
-  against content-addressed sharing with other sessions and committed objects), and run those
-  releases inline, for up to 10 s, before answering. The release shreds the blob's key, unwinds it
+  against content-addressed sharing with other sessions and committed objects), and wait up to
+  10 s for the runner's workers to run those releases before answering. The release shreds the blob's key, unwinds it
   on the network as its state requires, then removes its intent; the task runner
   retries a release that fails, with no attempt limit, backing off from 1 s to 5 min, and the retry
   holds the blob's subject, so a write's `queue-space-shard.add` of the same blob waits behind it. Each
@@ -1221,8 +1221,9 @@ harness (`make itest`); unit tests cover libraries and pure logic only:
   never aborts them); `s3:DeleteBucket` delegates `blob.Abort` and
   `blob.Remove`, so the abort and every other release leg signs with the request's own proofs; each
   release task carries the proof chains captured from the request that queued it. `DeleteBucket`
-  also brings the space's pending releases forward, runs them inline, and fails for the client to
-  retry while one still waits. The network-side `/blob/abort` unwind remains a parking-flow concern (above).
+  also brings the space's pending releases forward and waits for the workers to run them, lending
+  its own authority for the space meanwhile, which a release reads before what it captured, and
+  fails for the client to retry while one still waits. The network-side `/blob/abort` unwind remains a parking-flow concern (above).
 
 ### Reference index and root commit
 

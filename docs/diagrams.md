@@ -544,7 +544,7 @@ sequenceDiagram
     B->>M: run sync: queue-multipart-upload.add-part, behind the upload's other changes<br/>(waiting past 30 s: SlowDown)
     M->>R: PartWrites, with the task's commit: the part row (parked, span_lengths), open sessions<br/>only (otherwise NoSuchUpload)#59; the adds' references taken over (rows deleted, expiries<br/>cancelled)#59; a queue-space-shard.release task, due now, for each blob the replaced row<br/>named and this part does not, returned to run#59; a refused part expires its references at once (dropRefsNow)
     M->>A: in the same commit: queue the upload's accept,<br/>a replacement due now (at most one pending per upload)
-    B->>U: releaseNow: the tasks above, due at once, run inline (/blob/abort of the parks#59;<br/>a blob another part or the session still names is stale for that reference)
+    B->>U: releaseNow: wait for the workers to run the tasks above, due at once (/blob/abort of the parks#59;<br/>a blob another part or the session still names is stale for that reference)
     B-->>C: part ETag (part md5#59; for a copy, of the copied bytes)
     A->>R: GetSession (nothing to do unless open)
     loop while a parked part is left after the part-number cursor
@@ -1325,7 +1325,7 @@ sequenceDiagram
     loop each digest
         Q->>U: /blob/remove (release the space's registration)
     end
-    Q->>R: drainSpaceReleases: Expedite the space's pending queue-space-shard.release<br/>tasks (subject space/*), run them inline (/blob/remove each)#59;<br/>a release still waiting fails the delete for the client to retry
+    Q->>R: drainSpaceReleases: lend the request's authority for the space, Expedite its pending<br/>queue-space-shard.release tasks (subject space/*) and wait for the workers to run them (/blob/remove each)#59;<br/>a release still waiting fails the delete for the client to retry
     Q->>U: DrainSpaceRegistrations: send the space's pending queue-space-upload changes,<br/>then resend its failed retractions with the request's authority
     Q->>H: /s3/bucket/delete with the signed S3 request (hilt refuses while registrations remain)#59;<br/>a refusal clears the closing mark, not found finishes the delete,<br/>a failed call leaves the bucket closing for a retry
     Q->>R: reg.Delete (the local row, its catalog_journal rows cascading)
