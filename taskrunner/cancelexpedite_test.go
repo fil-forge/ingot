@@ -345,3 +345,42 @@ func TestExpediteKeepsARunningReplacementsID(t *testing.T) {
 		t.Fatalf("the expedited task is %s, want pending", got)
 	}
 }
+
+// ExpediteTasks brings forward exactly the given tasks, and none of them can
+// be replaced afterwards, whether it was waiting or due already. Another task
+// of the same subject and action is left to its time.
+func TestExpediteTasksBringsForwardOnlyTheGivenTasks(t *testing.T) {
+	f := newFixture(t, 2)
+	f.handle(t, qTop, "release", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, nil
+	})
+	f.migrate(t)
+	ctx := waitCtx(t)
+	later, earlier := time.Now().Add(time.Hour), time.Now().Add(-time.Minute)
+	submit := func(subject string, at *time.Time, replace bool) taskrunner.TaskID {
+		t.Helper()
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: subject, Action: "release", NotBefore: at, Replace: replace})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	waiting := submit("sp/a", &later, true)
+	due := submit("sp/b", &earlier, true)
+	other := submit("sp/a", &later, false)
+
+	if err := f.r.ExpediteTasks(ctx, qTop, waiting, due); err != nil {
+		t.Fatal(err)
+	}
+	submit("sp/a", &later, true)
+	submit("sp/b", &later, true)
+	f.start(t)
+	for _, id := range []taskrunner.TaskID{waiting, due} {
+		if _, err := f.r.Wait(ctx, qTop, id); err != nil {
+			t.Fatalf("Wait %s: %v", id, err)
+		}
+	}
+	if got := f.state(t, qTop, other); got != "pending" {
+		t.Errorf("the other task is %s, want left to its time", got)
+	}
+}

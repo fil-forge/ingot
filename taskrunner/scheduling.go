@@ -278,7 +278,7 @@ func (r *Runner) Expedite(ctx context.Context, queueName, subject, action string
 
 // ExpediteTasks makes the given pending tasks of the queue due now, as
 // Expedite does those of an action on a subject: whatever their NotBefore or
-// retry backoff, and no longer replacements. It brings forward exactly these
+// retry backoff, and no longer replacements, due already or not. It brings forward exactly these
 // tasks, so a caller cleaning up after itself leaves others' tasks of the same
 // subject and action at their own times. A task that has started, finished or
 // gone is left as it is.
@@ -291,8 +291,7 @@ func (r *Runner) ExpediteTasks(ctx context.Context, queueName string, ids ...Tas
 		return nil
 	}
 	if _, err := r.db.Exec(ctx, `UPDATE `+q.tasks+` SET not_before = NULL, retry_at = NULL, replaceable = false
-		WHERE id = ANY($1) AND state = 'pending' AND started IS NULL
-		AND (not_before > now() OR retry_at > now())`, ids); err != nil {
+		WHERE id = ANY($1) AND state = 'pending' AND started IS NULL`, ids); err != nil {
 		return fmt.Errorf("expedite %d %s tasks: %w", len(ids), queueName, err)
 	}
 	r.pokeQueue(q)
