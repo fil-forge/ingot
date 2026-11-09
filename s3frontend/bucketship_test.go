@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -28,8 +30,8 @@ func (s *shipFails) ShipBucket(context.Context, string) error {
 }
 
 // TestShipWithoutAuthorityFailsForGood: a ship with no authority to send
-// with fails at once, since only the bucket's next write can bring some, and
-// that write's seal queues a ship of its own. Any other failure is retried.
+// with fails at once, since only the bucket's next write can bring some. Any
+// other failure is retried.
 func TestShipWithoutAuthorityFailsForGood(t *testing.T) {
 	for name, tc := range map[string]struct {
 		err   error
@@ -60,6 +62,43 @@ func TestShipWithoutAuthorityFailsForGood(t *testing.T) {
 			}
 		})
 	}
+}
+
+// shipAuthorized is a catalog log with no ship authority until a write has
+// been committed.
+type shipAuthorized struct {
+	blockstore.Log
+	b     *Backend
+	ships atomic.Int32
+}
+
+func (s *shipAuthorized) ShipBucket(ctx context.Context, bucket string) error {
+	s.ships.Add(1)
+	if _, err := s.b.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &bucket, Key: aws.String("k")}); err != nil {
+		return fmt.Errorf("ship segment 1: %w", uploader.ErrNoShipAuthority)
+	}
+	return nil
+}
+
+// A ship that found no authority is queued again by the bucket's next write,
+// which brings authority of its own: the next seal can be a long way off.
+func TestTheNextWriteQueuesAShipThatFoundNoAuthority(t *testing.T) {
+	log := &shipAuthorized{}
+	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+		log.Log = d.Log
+		d.Log = log
+	})
+	log.b = b
+	if err := b.queueShip(context.Background(), "bk"); err != nil {
+		t.Fatalf("queue ship: %v", err)
+	}
+	require.Eventually(t, func() bool { return shipState(t, mem) == "failed" },
+		10*time.Second, 10*time.Millisecond, "the ship without authority never failed")
+
+	putObj(t, b, "k", []byte("brings authority"))
+	require.Eventually(t, func() bool { return !b.awaitingShip("bk") },
+		10*time.Second, 10*time.Millisecond, "the write never shipped the bucket")
+	require.EqualValues(t, 2, log.ships.Load())
 }
 
 // shipState is the state of bk's only queue-bucket.ship task.

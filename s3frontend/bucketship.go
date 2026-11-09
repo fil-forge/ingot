@@ -71,6 +71,27 @@ func (b *Backend) QueueShip(bucket string) {
 	}
 }
 
+// awaitShipAuthority records that bucket's ship found no authority to send
+// with. Retrying cannot help, but each commit that appends to the bucket's
+// log captures fresh authority and queues the ship again with its own writes
+// (awaitingShip), until a ship succeeds. A seal can be a long way off, so the
+// ship does not wait for one.
+func (b *Backend) awaitShipAuthority(bucket string) {
+	b.shipMu.Lock()
+	defer b.shipMu.Unlock()
+	if b.shipAwaiting == nil {
+		b.shipAwaiting = map[string]bool{}
+	}
+	b.shipAwaiting[bucket] = true
+}
+
+// awaitingShip reports whether bucket's ship awaits authority.
+func (b *Backend) awaitingShip(bucket string) bool {
+	b.shipMu.Lock()
+	defer b.shipMu.Unlock()
+	return b.shipAwaiting[bucket]
+}
+
 // shipNoticeFirst and shipNoticeMax bound the backoff between attempts to
 // queue an owed ship. Package-level so tests can shrink them.
 var (
@@ -176,7 +197,7 @@ func (b *Backend) queueShip(ctx context.Context, bucket string) error {
 // runShip is queue-bucket.ship. No authority to ship with
 // (uploader.ErrNoShipAuthority) fails it for good: no retry can find any
 // until the bucket's next write captures fresh authority, and that write's
-// seal queues a ship of every segment left unshipped. Any other failure is
+// commit queues the ship again (awaitShipAuthority). Any other failure is
 // retried.
 func (b *Backend) runShip(ctx context.Context, _ *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
 	var args BucketTask
@@ -190,9 +211,13 @@ func (b *Backend) runShip(ctx context.Context, _ *taskrunner.Exec, t taskrunner.
 	if err := shipper.ShipBucket(ctx, args.Name); err != nil {
 		err = fmt.Errorf("ship catalog of %q: %w", args.Name, err)
 		if errors.Is(err, uploader.ErrNoShipAuthority) {
+			b.awaitShipAuthority(args.Name)
 			return nil, taskrunner.Permanent(err)
 		}
 		return nil, err
 	}
+	b.shipMu.Lock()
+	delete(b.shipAwaiting, args.Name)
+	b.shipMu.Unlock()
 	return nil, nil
 }

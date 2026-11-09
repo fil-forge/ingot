@@ -180,6 +180,20 @@ func (b *Backend) runCommit(ctx context.Context, ex *taskrunner.Exec, t taskrunn
 				return nil, err
 			}
 		}
+		// The append captured fresh ship authority: a ship that found none
+		// is queued again with this commit.
+		if b.awaitingShip(args.Bucket) {
+			raw, err := encodeBucketTask(&BucketTask{Name: args.Bucket})
+			if err != nil {
+				return nil, err
+			}
+			spec := b.bucketSpec(tx.State().Space, registry.BucketShipAction, raw)
+			now := registry.DueNow()
+			spec.NotBefore, spec.Replace = &now, true
+			if _, err := ex.Submit(ctx, spec); err != nil {
+				return nil, err
+			}
+		}
 		if err := ex.Cancel(ctx, registry.ReleaseQueue, w.Expiries...); err != nil {
 			return nil, err
 		}

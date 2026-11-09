@@ -113,7 +113,10 @@ type Backend struct {
 	// shipOwed are the buckets whose ship could not be queued, which
 	// retryOwedShips queues once it can; shipRetrying is set while it runs,
 	// and shipStop, closed by Drain, ends it. shipMu guards them too.
-	shipOwed     map[string]bool
+	shipOwed map[string]bool
+	// shipAwaiting are the buckets whose ship found no authority to send
+	// with, which the bucket's next commit queues again (awaitShipAuthority).
+	shipAwaiting map[string]bool
 	shipRetrying bool
 	shipStop     chan struct{}
 	shipStopped  bool
