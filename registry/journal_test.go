@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5"
@@ -22,6 +23,7 @@ import (
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/libforge/testutil"
 )
 
@@ -660,4 +662,56 @@ func waitForLockWaiters(t *testing.T, pool *pgxpool.Pool, n int) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("fewer than %d backends blocked on a lock", n)
+}
+
+// TestTakeoverGuardFailsOnAPartialTakeover: an expiry that deletes one of a
+// commit's pending references while the take-over's delete runs leaves it
+// fewer rows than references, and the guard fails rather than letting the
+// commit claim a blob whose reference has gone.
+func TestTakeoverGuardFailsOnAPartialTakeover(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.New(t)
+	space := testutil.RandomDID(t)
+	refs := []taskrunner.TaskID{uuid.New(), uuid.New()}
+	for i, ref := range refs {
+		if _, err := pool.Exec(ctx, `INSERT INTO ingot.blob_pending_refs (add_task, expire_task, space, digest, deadline)
+			VALUES ($1, $2, $3, $4, now() + interval '1 hour')`, ref, uuid.New(), space.String(), []byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The expiry: deletes one reference and holds its lock until released.
+	expiry, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = expiry.Rollback(ctx) }()
+	if _, err := expiry.Exec(ctx, `DELETE FROM ingot.blob_pending_refs WHERE add_task = $1`, refs[1]); err != nil {
+		t.Fatal(err)
+	}
+
+	guard := registry.TakeoverGuard(refs)
+	done := make(chan int64, 1)
+	errs := make(chan error, 1)
+	go func() {
+		tag, err := pool.Exec(ctx, guard.SQL, guard.Args...)
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- tag.RowsAffected()
+	}()
+	waitForLockWaiters(t, pool, 1) // the guard reached the locked row
+	if err := expiry.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errs:
+		t.Fatalf("guard: %v", err)
+	case n := <-done:
+		if n != 0 {
+			t.Fatalf("guard affected %d rows after a partial take-over, want 0 so the commit rolls back", n)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the guard never finished")
+	}
 }

@@ -5,6 +5,8 @@ import (
 	"fmt"
 
 	"github.com/ipfs/go-cid"
+
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // CommitRoot applies RootCommitWrites as a queue-bucket.commit commits
@@ -67,3 +69,6 @@ func (r *Postgres) CommitRoot(ctx context.Context, name string, expect, next cid
 func (r *Postgres) CASRoot(ctx context.Context, name string, expect, next cid.Cid) error {
 	return r.CommitRoot(ctx, name, expect, next, RootCommit{})
 }
+
+// TakeoverGuard exposes takeoverGuard to the package's tests.
+func TakeoverGuard(refs []taskrunner.TaskID) Statement { return takeoverGuard(refs) }

@@ -150,13 +150,7 @@ func (r *Postgres) claimWrites(ctx context.Context, w *CommitWrites, claims []Bl
 		if len(expires) != len(refs) {
 			return ErrReferenceExpired
 		}
-		// An expiry that drops a reference after the read above leaves fewer
-		// than all, and the delete then takes none and fails the commit.
-		w.Guards = append(w.Guards, Statement{
-			SQL: `DELETE FROM ingot.blob_pending_refs WHERE add_task = ANY($1)
-			       AND (SELECT count(*) FROM ingot.blob_pending_refs WHERE add_task = ANY($1)) = $2`,
-			Args: []any{refs, len(refs)},
-		})
+		w.Guards = append(w.Guards, takeoverGuard(refs))
 		w.Expiries = append(w.Expiries, expires...)
 	}
 	w.Statements = append(w.Statements,
@@ -277,3 +271,18 @@ func CompletedSession(uploadID, etag, versionID string) Statement {
 		[]any{uploadID, SessionCompleted, etag, nullString(versionID), SessionCompleting},
 	}
 }
+
+// takeoverGuard is the guard that takes refs, pending references, over for
+// the rows a commit writes: it deletes them and holds only if it deleted every
+// one. An expiry that drops a reference after the commit read them, even while
+// this statement runs, leaves fewer rows deleted than references: the
+// statement then returns no row, the guard fails, and the commit rolls back
+// with the rows it did delete.
+func takeoverGuard(refs []taskrunner.TaskID) Statement {
+	return Statement{
+		SQL: `WITH taken AS (DELETE FROM ingot.blob_pending_refs WHERE add_task = ANY($1) RETURNING 1)
+		      SELECT 1 WHERE (SELECT count(*) FROM taken) = $2`,
+		Args: []any{refs, len(refs)},
+	}
+}
+
