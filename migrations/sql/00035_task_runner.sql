@@ -35,8 +35,32 @@ ALTER TABLE ingot.multipart_parts
         CHECK (state IN ('written','parked','accepted')),
     ALTER COLUMN state SET DEFAULT 'written';
 
+-- Every body blob streams to its provider as the body arrives, so an intent
+-- starts 'uploading', none is 'spooled', and there is no local path for it to
+-- record. A stalled upload is one left 'uploading'.
+DROP INDEX ingot.upload_intents_stalled_idx;
+DELETE FROM ingot.upload_intents WHERE state = 'spooled';
+ALTER TABLE ingot.upload_intents
+    DROP CONSTRAINT upload_intents_state_check,
+    ADD CONSTRAINT upload_intents_state_check
+        CHECK (state IN ('uploading','parked','accepted','published')),
+    DROP COLUMN local_path;
+CREATE INDEX upload_intents_stalled_idx
+    ON ingot.upload_intents (updated_at) INCLUDE (size)
+    WHERE state = 'uploading';
+
 -- +goose Down
 -- In reverse order of the Up statements.
+DROP INDEX ingot.upload_intents_stalled_idx;
+ALTER TABLE ingot.upload_intents
+    ADD COLUMN local_path text NOT NULL DEFAULT '',
+    DROP CONSTRAINT upload_intents_state_check,
+    ADD CONSTRAINT upload_intents_state_check
+        CHECK (state IN ('spooled','uploading','parked','accepted','published'));
+ALTER TABLE ingot.upload_intents ALTER COLUMN local_path DROP DEFAULT;
+CREATE INDEX upload_intents_stalled_idx
+    ON ingot.upload_intents (updated_at) INCLUDE (size, state)
+    WHERE state IN ('spooled', 'uploading');
 ALTER TABLE ingot.multipart_parts DROP CONSTRAINT multipart_parts_state_check;
 UPDATE ingot.multipart_parts SET state = 'spooled' WHERE state = 'written';
 ALTER TABLE ingot.multipart_parts

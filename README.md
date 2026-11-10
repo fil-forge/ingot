@@ -68,10 +68,11 @@ to the new one. That split is the heart of the design:
 
 A write splits into two paths:
 
-- **Bodies** stream into a local spool (the BLAKE3 tree and md5 in one pass), split
-  into blobs of at most `max_blob_size`, and upload to Forge storage
-  synchronously: `/blob/add` via sprue, an HTTP PUT to the allocated piri,
-  and the accepted location commitment, all before the catalog commit.
+- **Bodies** split into blobs of at most `max_blob_size` as they arrive (the
+  BLAKE3 tree and md5 in the same pass) and stream to Forge storage
+  synchronously: `/blob/add` via sprue, an HTTP PUT to the allocated piri as
+  the bytes arrive, and the accepted location commitment, all before the
+  catalog commit.
   Identical bytes dedup by digest; a reference index (`blob_refs`) counts
   which versions still claim each blob and releases it (`/blob/remove`) when
   the count reaches zero.
@@ -81,7 +82,7 @@ A write splits into two paths:
   `forge_root_cid` under a guard. See
   [`logstore/README.md`](./logstore/README.md).
 
-Reads fall through tiers: local disk (cache, then spool), the local log
+Reads fall through tiers: the local cache, the local log
 (catalog blocks), and finally the network, resolved by a local locator
 (`blob_locations` + `shard_inclusions`) and fetched with a ranged
 `content/retrieve` against the storing piri. The two routes are drawn side by side in
@@ -153,13 +154,10 @@ library, ingot records them on the global meter provider.
 
 ### Local disk
 
-`serve` keeps object bodies in two directories under `data_dir`, which
-must be on one filesystem (`serve` checks this at startup):
-
-- `<data_dir>/spool` holds each body as it is written and uploaded, until
-  the provider holds it;
-- `<data_dir>/cache` holds a body once the provider holds it (it moves there
-  by rename), so a read soon after a write is served from local disk.
+`serve` keeps copies of object bodies in `<data_dir>/cache`. A write tees
+each body blob into a temporary file there as it streams the blob to its
+provider, and keeps the file once the provider holds the blob, before the
+PUT answers, so a read soon after a write is served from local disk.
 
 A cached copy is not needed, so it goes:
 
@@ -171,34 +169,29 @@ A cached copy is not needed, so it goes:
   has passed fails when it reaches a blob it has not yet opened:
   `release_grace` bounds how long such a read may take;
 - with `local_blob_max_bytes` set, when a sweeper, checking every 30 seconds,
-  finds the two directories over the budget and evicts cached bodies, the
-  least recently cached or read first, down to 90% of the budget, however
-  much of their time to live is left.
+  finds the cache over the budget and evicts cached bodies, the least
+  recently cached or read first, down to 90% of the budget, however much of
+  their time to live is left.
 
 Later reads of an evicted body go to the provider and take provider-read
 latency. A read from the cache extends the body's time to live only once
 less than half of it is left, so most reads cost nothing. Each time to live
 is a task in Postgres, so it survives a restart.
 
-A multipart part's copy goes from the spool as soon as the part parks on its
-provider, so Complete relies on the provider keeping the parked allocation
-until then; keep `multipart_session_ttl` (default `168h`) well under how
-long the provider keeps parked allocations. The TTL counts from the
-session's last state change, and a failed Complete returns the session to
-open, which restarts it, so a part can outlive the TTL. The budget is off by default
-(`local_blob_max_bytes: 0`): without it the cache grows with every live
-object's bodies. A node that rarely reads back what it just wrote can keep
-no written bodies at all: with `cache_writes: false`, each body's copy goes
-as soon as the provider accepts it instead of moving to the cache, and every
-read goes to the provider. The spool then holds only bodies still being
-written or uploaded and the bodies of failed uploads, apart from a copy
-whose removal failed, which waits for its object's release or the budget;
-bodies cached before the setting was turned off stay until they are
-released or evicted. With or without a
-budget, the sweeper also deletes, at startup and then hourly, unfinished
-`.tmp-*` writes in either directory and spool files with no upload intent,
-once they are older than `local_blob_orphan_age` (default `24h`, at least
-`1h`).
+A multipart part keeps no local copy, so Complete relies on the provider
+keeping each parked allocation until it runs; keep `multipart_session_ttl`
+(default `168h`) well under how long the provider keeps parked allocations.
+The TTL counts from the session's last state change, and a failed Complete
+returns the session to open, which restarts it, so a part can outlive the
+TTL. The budget is off by default (`local_blob_max_bytes: 0`): without it
+the cache grows with every live object's bodies. A node that rarely reads
+back what it just wrote can keep no written bodies at all: with
+`cache_writes: false`, a write keeps no copy and every read goes to the
+provider. Bodies cached before the setting was turned off stay until they
+are released or evicted. With or without a budget, the sweeper also
+deletes, hourly, unfinished `.tmp-*` writes once they are older than
+`local_blob_orphan_age` (default `24h`, at least `1h`); startup deletes
+every one it finds.
 
 **Sizing.** The filesystem needs room for:
 
@@ -207,19 +200,11 @@ once they are older than `local_blob_orphan_age` (default `24h`, at least
   `cache_ttl`, the budget must also exceed the bodies written or read within
   it (7.2 TB at 2 GB/s of ingest for the default `1h`); below that, sweeps
   evict bodies before their time runs out;
-- the spool's bodies in flight, when they outgrow the budget: each
-  concurrent PUT or UploadPart writes its body as it streams, and a part can
-  be up to 5 GiB. The budget counts those bytes as they land, so the sweeper
-  evicts cached bodies to make room for them. But a body cannot be evicted
-  until the provider holds it, so if the spool alone exceeds the budget,
-  usage runs over it by the difference;
-- the bodies of uploads that failed: their upload intents stay `spooled` or
-  `uploading`, and nothing reclaims a failed PUT's spool files yet, so they
-  stay and count against the budget. (A multipart part's go with its
-  session, at Complete, Abort or `multipart_session_ttl`.) They are not safe
-  to delete by hand (see *Manual cleanup* below), so size the budget with
-  headroom for them. `ingot.local_blobs.stalled_bytes` reports how much they
-  hold;
+- writes in progress, when they outgrow the budget: each concurrent object
+  write tees its body into the cache as it streams. The budget counts
+  those bytes as they land, so the sweeper evicts cached bodies to make room
+  for them. But a write in progress cannot be evicted, so if writes alone
+  exceed the budget, usage runs over it by the difference;
 - the catalog log, if it shares the filesystem: `<data_dir>/segments`, per
   bucket about (`retain` + the open and unshipped segments) × `seal_bytes`.
 
@@ -227,10 +212,10 @@ once they are older than `local_blob_orphan_age` (default `24h`, at least
 
 | Metric | Meaning |
 | -- | -- |
-| `ingot.local_blobs.usage` | Bytes held, by `dir`: `spool` (writes in progress and bodies awaiting upload, which eviction cannot touch) or `cache` |
+| `ingot.local_blobs.usage` | Bytes held, by `dir` (always `cache`): cached bodies, and writes in progress (which eviction cannot touch) |
 | `ingot.local_blobs.budget` | `local_blob_max_bytes` (0: no budget) |
-| `ingot.local_blobs.stalled_bytes` | Bytes of bodies whose upload has stalled, by `state`: intents still `spooled` or `uploading` an hour after their last state change, which nothing reclaims yet for a failed PUT (a multipart part's go with its session). `spooled` bodies never left this node; `uploading` ones may have reached their provider. Growth means uploads are failing |
-| `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `parked`, `accepted` (with `cache_writes: false`), `expired` (its `cache_ttl` ran out), `budget`, `orphan` |
+| `ingot.local_blobs.stalled_bytes` | Bytes of bodies whose upload has stalled, by `state`: intents still `uploading` an hour after their last state change. They hold no local bytes; the provider expires an allocation that is never concluded. Growth means uploads are failing |
+| `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `expired` (its `cache_ttl` ran out), `budget`, `orphan` (an unfinished write's temporary file) |
 | `ingot.local_blobs.reads` | Body-blob reads, by `tier`: `local` or `network` (the local hit ratio) |
 
 Multipart uploads' parts are accepted in the background while the client
@@ -251,22 +236,10 @@ catalog only this host's disk would otherwise hold. The journal reports:
 | `ingot.catalog_journal.blocks`, `ingot.catalog_journal.bytes` | Catalog blocks, and their bytes, journaled in Postgres whose segment has not shipped yet |
 | `ingot.catalog_journal.oldest_age` | Seconds since the oldest journaled block was written; 0 when the journal is empty. Segments ship within seconds of sealing, so growth means shipping has stalled and the unshipped catalog is building up in Postgres |
 
-**Manual cleanup.** Every file in `<data_dir>/cache` is safe to delete: the
-provider holds its body. A file in `<data_dir>/spool` may be the only copy.
-The one kind safe to delete is a body the provider already holds, left in
-the spool by an interrupted move; this query lists those (the file names are
-the hex digests):
-
-```sql
-SELECT encode(i.digest, 'hex') FROM ingot.upload_intents i
-WHERE i.state IN ('accepted', 'published')
-  AND EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.digest = i.digest);
-```
-
-Never delete the spool file of a `spooled` or `uploading` intent: it may be
-the only copy. Restart `serve` after deleting files by hand: the byte counts
-see such a change at startup, or only at an hourly scan that no write
-overlapped.
+**Manual cleanup.** Every blob file in `<data_dir>/cache` is safe to
+delete: the provider holds its body. Restart `serve` after deleting files by
+hand: the byte count sees such a change at startup, or only at an hourly
+scan that no write overlapped.
 
 ### Catalog storage on Forge
 

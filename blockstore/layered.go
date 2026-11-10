@@ -16,9 +16,9 @@ import (
 )
 
 // Layered is the production ReadStore: a read-only seam that consults the local
-// blob copies first (LocalBlobs: the cache, then the spool, holding copies of
-// object-body blobs written here, kept until evicted or released; network
-// reads do not fill them), then the local LSM log (catalog blocks: manifests,
+// blob copies first (the BlobCache, holding copies of object-body blobs
+// written here, kept until evicted or released; network reads do not fill
+// them), then the local LSM log (catalog blocks: manifests,
 // MST nodes), then a base blockstore (typically *Forge, which resolves
 // locations through its Locator and reads the bytes from piri).
 //
@@ -29,11 +29,11 @@ import (
 //     via an internal Store wrapped around our own GetBlock so the
 //     local → log → base ordering is preserved.
 //
-// Layered has no Put: body blobs are written to the spool by the write path;
+// Layered has no Put: body blobs stream to their providers from the write path;
 // catalog blocks flow through bucketop.Tx → OpStaging → Log.AppendBatch.
 //
 // A body blob is found locally (until evicted); a catalog block is never
-// spooled, so it misses the local tier and resolves from the log. The single
+// cached, so it misses the local tier and resolves from the log. The single
 // local → log → base order therefore serves both without distinguishing codecs.
 type Layered struct {
 	local BlockReader // local blob copies; may be nil (then skipped)

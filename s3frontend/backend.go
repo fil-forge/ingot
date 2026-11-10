@@ -67,9 +67,7 @@ type Backend struct {
 	multipart registry.MultipartStore
 	txns      *bucketop.Coordinator
 	log       blockstore.Log
-	spool     *blockstore.Spool
 	cache     *blockstore.BlobCache
-	uploader  uploader.BodyUploader
 	deferred  uploader.DeferredBodyUploader
 	parks     registry.ParkStore
 	remover   uploader.BlobRemover
@@ -91,7 +89,7 @@ type Backend struct {
 	// lists per query, for tests; zero takes uploadRegistrationBatch.
 	failedPage int
 	encParams  registry.EncryptionParamsStore
-	// streaming sends a body blob to its provider while it is spooled.
+	// streaming sends each body blob to its provider as the body arrives.
 	streaming uploader.StreamingBodyUploader
 	// claims counts a blob's claims for a release's recheck; releases runs
 	// the queue-space-shard tasks (RegisterReleaseTasks); releaseGrace is how
@@ -105,8 +103,6 @@ type Backend struct {
 	releaseRetry taskrunner.RetryPolicy
 	// Local blob sweeper knobs (see Deps). localBlobSweepMu serialises
 	// SweepLocalBlobs; lastOrphanPass is when its orphan pass last ran.
-	// localBlobSweepBatch overrides the rows a pass reads per query, for
-	// tests; zero takes the default.
 	localBlobMaxBytes  int64
 	localBlobOrphanAge time.Duration
 	dropAcceptedBodies bool
@@ -120,11 +116,12 @@ type Backend struct {
 	blobKeys syncutil.KeyedMutex
 	// acceptors runs each multipart upload's acceptor (see acceptor.go).
 	acceptors acceptors
-	// concluding counts, by blobKey, the conclusions in flight in this
-	// process (see markConcluding).
-	concluding          concludingSet
-	lastOrphanPass      time.Time
-	localBlobSweepBatch int
+	// concluding marks the conclusions in flight in this process (see
+	// markConcluding), and writing the blobs a write in flight has sent and
+	// not yet recorded as parked or accepted (see bodyWriter.hold).
+	concluding     blobMarks
+	writing        blobMarks
+	lastOrphanPass time.Time
 	// overBudgetWarned and timeLimitLogged are set once the sweeper has
 	// logged that usage is over budget with nothing left to evict, or that the
 	// budget pass ran out of time, and cleared when usage falls back to the
@@ -132,10 +129,9 @@ type Backend struct {
 	// localBlobSweepMu.
 	overBudgetWarned bool
 	timeLimitLogged  bool
-	// stalledSpooled and stalledUploading are the sweeper's latest sums of
-	// stalled uploads by intent state (see SweepLocalBlobs), read by the
-	// stalled_bytes gauge; stalledKnown is set once a sweep has computed them.
-	stalledSpooled   atomic.Int64
+	// stalledUploading is the sweeper's latest sum of stalled uploads (see
+	// SweepLocalBlobs), read by the stalled_bytes gauge; stalledKnown is set
+	// once a sweep has computed it.
 	stalledUploading atomic.Int64
 	stalledKnown     atomic.Bool
 	// localBlobMetrics counts local blob removals; localBlobGauges is the
@@ -199,11 +195,9 @@ type Deps struct {
 	Reads blockstore.ReadStore
 	Log   blockstore.Log
 
-	// Spool is where SplitBody writes body blobs on PUT and where each waits
-	// until the provider holds it; Cache then holds it as a read-after-write
-	// copy until it is evicted. Reads serves both (blockstore.LocalBlobs).
-	// Both are required.
-	Spool *blockstore.Spool
+	// Cache holds a read-after-write copy of each object-body blob written
+	// here, from when the provider holds it until it is evicted. Reads serves
+	// it first. Required.
 	Cache *blockstore.BlobCache
 
 	// Ships is the catalog log's ship uploader. Each commit hands it its
@@ -211,13 +205,10 @@ type Deps struct {
 	// (bucketop.Deps.Ships). Optional.
 	Ships bucketop.ShipAuthority
 
-	// Uploader makes each spooled body blob durable on Forge (allocate→PUT→
-	// accept) synchronously, before the manifest commits. Remover releases a
-	// space's claim on a blob when its last reference is dropped.
-	Uploader uploader.BodyUploader
-	// Deferred extends Uploader for multipart's deferred accept
-	// (WithConclude(false), then ConcludeBlobs/AbortBlob); Parks persists
-	// park state between UploadPart and Complete/Abort.
+	// Deferred concludes and aborts blobs parked on their providers
+	// (ConcludeBlobs/AbortBlob); Parks persists park state between
+	// UploadPart and Complete/Abort. Remover releases a space's claim on a
+	// blob when its last reference is dropped.
 	Deferred uploader.DeferredBodyUploader
 	Parks    registry.ParkStore
 	Remover  uploader.BlobRemover
@@ -226,9 +217,8 @@ type Deps struct {
 	// service counts to report the space's object count.
 	Registrar uploader.UploadRegistrar
 
-	// Streaming uploads each body blob while it is spooled,
-	// allocating it by size and hash function before its digest is known.
-	// Without Streaming every blob is spooled first and uploaded by digest.
+	// Streaming uploads each body blob as the body arrives, allocating it by
+	// size and hash function before its digest is known. Required.
 	Streaming uploader.StreamingBodyUploader
 
 	// EncParams is the per-blob FEE encryption-parameter table: what the
@@ -253,8 +243,8 @@ type Deps struct {
 	// queued).
 	ReleaseGrace time.Duration
 
-	// LocalBlobMaxBytes is the byte budget for the spool and the cache
-	// together, writes in progress included, enforced by SweepLocalBlobs.
+	// LocalBlobMaxBytes is the byte budget for the cache, writes in progress
+	// included, enforced by SweepLocalBlobs.
 	// Zero turns the budget pass off: eviction needs a network read tier to
 	// serve evicted blobs, which the test fakes do not have.
 	LocalBlobMaxBytes int64
@@ -263,18 +253,16 @@ type Deps struct {
 	// DefaultCacheTTL.
 	CacheTTL time.Duration
 	// LocalBlobOrphanAge is the age at which SweepLocalBlobs deletes a .tmp-*
-	// file in either directory, or a spool blob file with no intent row. Zero →
-	// DefaultLocalBlobOrphanAge.
+	// file in the cache. Zero → DefaultLocalBlobOrphanAge.
 	LocalBlobOrphanAge time.Duration
-	// DropAcceptedBodies removes each body's local copy as soon as its
-	// location is recorded and its intent accepted, instead of moving it
-	// into the cache for reads. Off in tests whose base tier cannot serve a
-	// body. It gives up the read-after-write copy, which
-	// is safe while reads resolve through the local location table; an
-	// indexer-backed locator could miss a digest not yet published.
+	// DropAcceptedBodies keeps no local copy of a body, so every read goes to
+	// its provider. Off in tests whose base tier cannot serve a body. It
+	// gives up the read-after-write copy, which is safe while reads resolve
+	// through the local location table; an indexer-backed locator could miss
+	// a digest not yet published.
 	DropAcceptedBodies bool
 
-	// MeterProvider supplies the spool's instruments: usage and budget
+	// MeterProvider supplies the cache's instruments: usage and budget
 	// gauges, and removals by reason. Nil → the global provider, a no-op
 	// until a host installs one.
 	MeterProvider metric.MeterProvider
@@ -343,9 +331,7 @@ func New(d Deps) *Backend {
 		multipart:    d.Multipart,
 		txns:         bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads, Ships: d.Ships}),
 		log:          d.Log,
-		spool:        d.Spool,
 		cache:        d.Cache,
-		uploader:     d.Uploader,
 		deferred:     d.Deferred,
 		parks:        d.Parks,
 		remover:      d.Remover,

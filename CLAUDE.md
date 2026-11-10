@@ -104,14 +104,15 @@ Internal:
   (Put/Get/Head/Delete/List), `version.go` (resolveVersion / commitVersion,
   the per-key version tree), `multipart.go`, `bucket.go`, `listversions.go`,
   `backend.go`, `stream.go` (each body blob streams to its
-  provider while spooling it; a failed stream aborts its allocation, and one
-  a dead request leaves is expired by the provider).
+  provider as the body arrives, teeing an object's bytes into the cache; a
+  failed stream fails the request and aborts its allocation, and an
+  allocation a dead request leaves is expired by the provider).
 - **`bucketop/`** — `Coordinator`/`Tx`: per-bucket write transaction (lock,
   snapshot root, staging buffer, CAS commit).
 - **`blockstore/`** — block I/O contracts + impls: `log.go` (`Log`, `Plane`
-  [catalog-only], `OpRoot`), `staging.go` (`OpStaging`), `spool.go`
-  (`Spool`: writes and bodies awaiting upload), `blobcache.go` (`BlobCache`:
-  copies the provider holds; `LocalBlobs` reads both), `blobdir.go`,
+  [catalog-only], `OpRoot`), `staging.go` (`OpStaging`), `blobcache.go`
+  (`BlobCache`: copies the provider holds, and writes in progress as
+  `TempBlob`s it adopts), `blobdir.go`,
   `layered.go`, `forge.go` (the network read tier), `cache.go` (`Cached` LRU),
   `locator/` (carried from guppy; the indexer-backed locator is never
   injected).
@@ -152,9 +153,9 @@ Internal:
   by reads. Its own tests each use a schema of their own
   (`taskrunnertest`), so the runner tests need no Ingot tables.
 - **`uploader/`** — `forge.go`/`blob.go`: `Forge` behind `Uploader`
-  (`SubmitShard`), `BodyUploader`/`DeferredBodyUploader` (`UploadBlob`,
-  `ConcludeBlobs`, `AbortBlob`), `StreamingBodyUploader` (`StartBlob`,
-  `PutBlob`: allocate by digest code, send while spooling), and
+  (`SubmitShard`), `DeferredBodyUploader` (`ConcludeBlobs`, `AbortBlob`),
+  `StreamingBodyUploader` (`StartBlob`, `PutBlob`: allocate by digest
+  code, send as the body arrives), and
   `BlobRemover`; captures the per-space
   ship authority (1h TTL) from in-request writes: `shipProofs` from body
   uploads (also the background releases' and aborts' fallback), and
@@ -242,7 +243,7 @@ Internal:
 | `blockstore.BlockReader` | `blockstore.Forge` (in `Cached`) | `testfakes.NopBaseReader` |
 | `registry.Registry` + the store seams + `logstore.Meta` | `*registry.Postgres` (all of them) | (same, on a database per test) |
 | `locator.Locator` | `registry.LocalLocator` | (indexer-backed locator exists, unwired) |
-| `uploader.{Uploader,BodyUploader,DeferredBodyUploader,BlobRemover}` | `uploader.Forge` | `testfakes.NopUploader` |
+| `uploader.{Uploader,DeferredBodyUploader,StreamingBodyUploader,BlobRemover,UploadRegistrar}` | `uploader.Forge` | `testfakes.NopUploader` |
 
 ## fx module
 
@@ -284,7 +285,8 @@ path or string-encoded UCAN container, required alongside the URL and
 validated at startup down to holding at least one delegation),
 `TokenStoreDir` (→
 `DataDir`), `MultipartSessionTTL` (0 → 7d, negative → sweeper off),
-`LocalBlobMaxBytes` (0 → no budget for the spool and cache together) with
+`LocalBlobMaxBytes` (0 → no budget for the cache, writes in progress
+included) with
 `CacheTTL` (1h: how long a body stays cached after it was cached or last
 read) and
 `LocalBlobOrphanAge` (24h, ≥ 1h) for the local blob sweeper
@@ -315,7 +317,7 @@ forge-mode daemon. Two tiers:
     *unexpected pass* fails the test — the cue to promote the row). One
     shared stack serves all categories (`TestForgeVersity`).
   - **`scenarios_test.go`** — ingot-unique behaviors upstream can't assert
-    (blob-split/spool-by-digest, zero-byte objects, part-spans-blobs
+    (blob-split/cache-by-digest, zero-byte objects, part-spans-blobs
     multipart, failed-Complete session recovery), on a small-`max_blob_size`
     config (`testdata/config-smallblob.yaml` via smelt's WithServiceConfig).
   - **`forge_*_test.go`** — forge-native behaviors on dedicated stacks:

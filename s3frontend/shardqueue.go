@@ -11,16 +11,16 @@ import (
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // A cached blob's lifetime is kept by queue-shard tasks, serialized on the
 // digest, since the cache holds one file per digest whichever spaces wrote it.
-// Once the provider holds a blob, a queue-shard.cache task moves its spool copy
-// into the cache and schedules a queue-shard.evict for when the copy's time to
-// live runs out. A read from the cache with less than half that time left runs
-// queue-shard.cache again with nothing to move, which schedules a later
-// eviction. Evictions are submitted as replacements, so the later one is kept
+// Once a write has adopted its copy into the cache, a queue-shard.cache task
+// schedules a queue-shard.evict for when the copy's time to live runs out. A
+// read from the cache with less than half that time left runs
+// queue-shard.cache again, which schedules a later eviction. Evictions are submitted as replacements, so the later one is kept
 // and the earlier dropped. The budget pass bounds the disk besides (see
 // SweepLocalBlobs), since a burst of writes can fill it before anything
 // expires: it runs queue-shard.evict as a sync task, so its removals take
@@ -41,9 +41,10 @@ const (
 // written or read, when Deps.CacheTTL is zero.
 const DefaultCacheTTL = time.Hour
 
-// shardSubmitTimeLimit bounds how long a request waits to queue a cached
-// blob's move or renewal, which goes on after the request itself ends, so a
-// stalled database delays a PUT or a cached GET by this much at most.
+// shardSubmitTimeLimit bounds how long a request waits to cache a written
+// blob or queue a cached blob's renewal, which goes on after the request
+// itself ends, so a stalled database delays a PUT or a cached GET by this
+// much at most.
 const shardSubmitTimeLimit = 5 * time.Second
 
 // renewalCapacity caps how many blobs' last renewals the backend remembers.
@@ -59,17 +60,13 @@ const renewalCapacity = 65536
 // schedules a new eviction.
 var shardEvictRetry = taskrunner.RetryPolicy{First: time.Second, Max: 5 * time.Minute, Multiplier: 2, Attempts: 14}
 
-// shardCacheRetry retries a failed move or renewal as shardEvictRetry does,
-// since a copy left without its eviction stays on disk until the budget pass,
-// or for good in the spool. The task is safe to run again: a copy already
-// moved leaves nothing to move.
+// shardCacheRetry retries a failed renewal as shardEvictRetry does, since a
+// copy left without its eviction stays on disk until the budget pass. The task
+// is safe to run again: the later eviction replaces the earlier.
 var shardCacheRetry = shardEvictRetry
 
 // ShardCacheTask is a queue-shard.cache task's arguments.
 type ShardCacheTask struct {
-	// Take moves the blob's spool copy into the cache first. Without it the
-	// task only extends the time a cached copy has left.
-	Take bool
 	// TTL is how long the copy stays cached from when the task runs, in
 	// nanoseconds.
 	TTL int64
@@ -89,7 +86,7 @@ type ShardEvictTask struct {
 // for submitting them. Call it before r starts.
 func (b *Backend) RegisterShardTasks(r *taskrunner.Runner) error {
 	b.shards = r
-	if err := r.Handle(ShardQueue, shardCache, b.runShardCache, taskrunner.WithRetry(shardCacheRetry)); err != nil {
+	if err := r.Handle(ShardQueue, shardCache, b.handleShardCache, taskrunner.WithRetry(shardCacheRetry)); err != nil {
 		return err
 	}
 	if err := r.Handle(ShardQueue, shardEvict, b.runShardEvict, taskrunner.WithRetry(shardEvictRetry)); err != nil {
@@ -112,24 +109,54 @@ func (b *Backend) shardNode() *string {
 // the renewal so the reads that follow do not repeat it. The request may end
 // before the task is queued; the task should not, but it waits no longer than
 // shardSubmitTimeLimit.
-func (b *Backend) submitShardCache(ctx context.Context, digest multihash.Multihash, take bool) error {
+func (b *Backend) submitShardCache(ctx context.Context, digest multihash.Multihash) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shardSubmitTimeLimit)
 	defer cancel()
-	var buf bytes.Buffer
-	if err := (&ShardCacheTask{Take: take, TTL: int64(b.cacheTTL)}).MarshalCBOR(&buf); err != nil {
-		return fmt.Errorf("encode cache task: %w", err)
+	spec, err := b.shardCacheSpec(digest)
+	if err != nil {
+		return err
 	}
-	if _, err := b.shards.Submit(ctx, taskrunner.Spec{
+	if _, err := b.shards.Submit(ctx, spec); err != nil {
+		return err
+	}
+	b.renewals.touch(string(digest), time.Now())
+	return nil
+}
+
+// runShardCache adopts local into the cache under digest in a sync
+// queue-shard.cache task, which holds the digest's subject while it adopts
+// the copy and schedules its eviction.
+func (b *Backend) runShardCache(ctx context.Context, digest multihash.Multihash, local *blockstore.TempBlob) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shardSubmitTimeLimit)
+	defer cancel()
+	spec, err := b.shardCacheSpec(digest)
+	if err != nil {
+		return err
+	}
+	if _, err := b.shards.Run(context.WithValue(ctx, adoptKey{}, local), spec); err != nil {
+		return err
+	}
+	b.renewals.touch(string(digest), time.Now())
+	return nil
+}
+
+// adoptKey is the context key a sync queue-shard.cache task finds the
+// temporary copy it adopts under.
+type adoptKey struct{}
+
+// shardCacheSpec is digest's queue-shard.cache task.
+func (b *Backend) shardCacheSpec(digest multihash.Multihash) (taskrunner.Spec, error) {
+	var buf bytes.Buffer
+	if err := (&ShardCacheTask{TTL: int64(b.cacheTTL)}).MarshalCBOR(&buf); err != nil {
+		return taskrunner.Spec{}, fmt.Errorf("encode cache task: %w", err)
+	}
+	return taskrunner.Spec{
 		Queue:   ShardQueue,
 		Subject: hex.EncodeToString(digest),
 		Action:  shardCache,
 		Args:    buf.Bytes(),
 		Node:    b.shardNode(),
-	}); err != nil {
-		return err
-	}
-	b.renewals.touch(string(digest), time.Now())
-	return nil
+	}, nil
 }
 
 // renewCached extends a cached blob's time in the cache when a read finds it
@@ -143,19 +170,19 @@ func (b *Backend) renewCached(ctx context.Context, digest multihash.Multihash) {
 	if !b.renewals.claim(string(digest), time.Now(), b.cacheTTL/2) {
 		return
 	}
-	if err := b.submitShardCache(ctx, digest, false); err != nil {
+	if err := b.submitShardCache(ctx, digest); err != nil {
 		b.renewals.forget(string(digest))
 		b.logger.Warn("could not extend a cached blob's time in the cache",
 			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
 	}
 }
 
-// runShardCache is queue-shard.cache: it moves the blob's spool copy into the
-// cache when asked to, then, if the cache holds the blob, dates the file now,
-// which orders the budget pass, and schedules its eviction for when its time
-// to live runs out. A failed step retries the task (shardCacheRetry); a copy
-// whose move keeps failing stays in the spool, where reads find it.
-func (b *Backend) runShardCache(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
+// handleShardCache is queue-shard.cache: run sync by a write, it first adopts
+// the write's copy into the cache. Then, if the cache holds the blob, it
+// dates the file now, which orders the budget pass, and schedules its
+// eviction for when its time to live runs out. A failed step retries the
+// task (shardCacheRetry).
+func (b *Backend) handleShardCache(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
 	digest, err := hex.DecodeString(t.Subject)
 	if err != nil {
 		return nil, taskrunner.Permanent(fmt.Errorf("cache task digest: %w", err))
@@ -164,9 +191,9 @@ func (b *Backend) runShardCache(ctx context.Context, ex *taskrunner.Exec, t task
 	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
 		return nil, taskrunner.Permanent(fmt.Errorf("decode cache task: %w", err))
 	}
-	if args.Take {
-		if _, err := b.cache.Take(b.spool, digest); err != nil {
-			return nil, err
+	if local, _ := ctx.Value(adoptKey{}).(*blockstore.TempBlob); local != nil && !local.Ended() {
+		if _, err := b.cache.Adopt(local, digest); err != nil {
+			return nil, taskrunner.Permanent(fmt.Errorf("adopt the written copy: %w", err))
 		}
 	}
 	now := time.Now()

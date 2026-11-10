@@ -97,7 +97,7 @@ func assertStoredAsReceived(t *testing.T, b *Backend, key string, data []byte) {
 	}
 	stored, err := os.ReadFile(localPath(b, d))
 	if err != nil {
-		t.Fatalf("read spooled blob: %v", err)
+		t.Fatalf("read stored blob: %v", err)
 	}
 	if !bytes.Equal(stored, data) {
 		t.Fatalf("%s: stored %d bytes differ from the %d plaintext bytes", key, len(stored), len(data))
@@ -334,7 +334,7 @@ func TestPlaintextWrite_StoredAsReceived(t *testing.T) {
 		}
 		stored, err := os.ReadFile(localPath(b, d))
 		if err != nil {
-			t.Fatalf("read spooled blob %d: %v", i, err)
+			t.Fatalf("read stored blob %d: %v", i, err)
 		}
 		if !bytes.Equal(stored, piece) {
 			t.Fatalf("blob %d: stored %d bytes differ from the %d plaintext bytes", i, len(stored), len(piece))

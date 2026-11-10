@@ -67,8 +67,9 @@ func (NopBaseReader) OpenBlob(_ context.Context, _ did.DID, _ multihash.Multihas
 }
 
 // NopUploader is a no-op upload sink. SubmitShard ships nothing (a catalog
-// plane is marked shipped without touching the network); UploadBlob accepts a
-// body blob without touching the network, so the local copy serves all reads.
+// plane is marked shipped without touching the network); a body blob streams
+// nowhere and is accepted without touching the network, so only the cached
+// copy serves reads.
 type NopUploader struct{}
 
 func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ did.DID, _ uploader.CARShard) (uploader.BlobLocation, multihash.Multihash, error) {
@@ -78,10 +79,9 @@ func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ did.DID,
 // CaptureShipAuthority is a no-op: SubmitShard needs no authority.
 func (NopUploader) CaptureShipAuthority(_ context.Context, _ did.DID) {}
 
-// UploadBlob accepts immediately, even with WithConclude(false) — there is
-// no network to park on, so the deferred flow degenerates to the synchronous
-// one and reads keep coming from local disk.
-func (NopUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+// UploadBlob parks a blob that streamed, for a test's streaming fake to name
+// the park: it accepts immediately, as there is no network to park on.
+func (NopUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string) (uploader.UploadedBlob, error) {
 	return uploader.UploadedBlob{Digest: digest, Size: size, Location: &uploader.BlobLocation{Size: size}}, nil
 }
 
@@ -151,8 +151,6 @@ var (
 	_ blockstore.BlockReader          = NopBaseReader{}
 	_ blockstore.BlobReader           = NopBaseReader{}
 	_ uploader.Uploader               = NopUploader{}
-	_ uploader.BodyUploader           = NopUploader{}
-	_ uploader.DeferredBodyUploader   = NopUploader{}
 	_ uploader.StreamingBodyUploader  = NopUploader{}
 	_ uploader.BlobRemover            = NopUploader{}
 	_ uploader.UploadRegistrar        = NopUploader{}

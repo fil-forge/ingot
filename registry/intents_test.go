@@ -42,10 +42,10 @@ func runIntentSuite(t *testing.T, fresh func(t *testing.T) intentStore) {
 	// seed records an intent in state, optionally with a location or a park.
 	seed := func(t *testing.T, st intentStore, d multihash.Multihash, state string, located, parked bool) {
 		t.Helper()
-		if err := st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentSpooled}); err != nil {
+		if err := st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: d, Size: 7, State: registry.IntentUploading}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
-		if state != registry.IntentSpooled {
+		if state != registry.IntentUploading {
 			if err := st.SetIntentState(ctx, space, d, state); err != nil {
 				t.Fatalf("SetIntentState: %v", err)
 			}
@@ -90,45 +90,22 @@ func runIntentSuite(t *testing.T, fresh func(t *testing.T) intentStore) {
 		}
 	})
 
-	t.Run("MissingIntents returns only unknown digests", func(t *testing.T) {
+	t.Run("StalledBytes sums uploading intents older than the cutoff", func(t *testing.T) {
 		st := fresh(t)
-		known := intentDigest(t, "known")
-		unknown := intentDigest(t, "unknown")
-		seed(t, st, known, registry.IntentSpooled, false, false)
-		got, err := st.MissingIntents(ctx, []multihash.Multihash{known, unknown})
-		if err != nil {
-			t.Fatalf("MissingIntents: %v", err)
-		}
-		if !reflect.DeepEqual(got, []multihash.Multihash{unknown}) {
-			t.Fatalf("MissingIntents = %x, want [%x]", got, unknown)
-		}
-	})
-
-	t.Run("StalledBytes sums spooled and uploading intents older than the cutoff", func(t *testing.T) {
-		st := fresh(t)
-		seed(t, st, intentDigest(t, "spooled"), registry.IntentSpooled, false, false)
-		// A different size from seed's, so a sum credited to the wrong
-		// state shows.
-		uploading := intentDigest(t, "uploading")
-		if err := st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: uploading, LocalPath: "/spool/x", Size: 11, State: registry.IntentSpooled}); err != nil {
-			t.Fatalf("PutIntent: %v", err)
-		}
-		if err := st.SetIntentState(ctx, space, uploading, registry.IntentUploading); err != nil {
-			t.Fatalf("SetIntentState: %v", err)
-		}
+		seed(t, st, intentDigest(t, "uploading"), registry.IntentUploading, false, false)
 		seed(t, st, intentDigest(t, "accepted"), registry.IntentAccepted, true, false)
 		seed(t, st, intentDigest(t, "parked"), registry.IntentParked, false, true)
-		var got []registry.StalledSizes
+		var got []int64
 		// An hour either side of now, so a database clock off from this
 		// one by less still puts every row on the same side.
 		for _, before := range []time.Time{time.Now().Add(-time.Hour), time.Now().Add(time.Hour)} {
-			s, err := st.StalledBytes(ctx, before)
+			n, err := st.StalledBytes(ctx, before)
 			if err != nil {
 				t.Fatalf("StalledBytes: %v", err)
 			}
-			got = append(got, s)
+			got = append(got, n)
 		}
-		if want := []registry.StalledSizes{{}, {Spooled: 7, Uploading: 11}}; !reflect.DeepEqual(got, want) {
+		if want := []int64{0, 7}; !reflect.DeepEqual(got, want) {
 			t.Fatalf("StalledBytes before [an hour ago, an hour from now] = %v, want %v", got, want)
 		}
 	})
@@ -148,7 +125,7 @@ func runIntentSuite(t *testing.T, fresh func(t *testing.T) intentStore) {
 		}
 		var got []int
 		got = append(got, count())
-		if err := st.PutIntent(ctx, registry.UploadIntent{Space: other, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentSpooled}); err != nil {
+		if err := st.PutIntent(ctx, registry.UploadIntent{Space: other, Digest: d, Size: 7, State: registry.IntentUploading}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		got = append(got, count())

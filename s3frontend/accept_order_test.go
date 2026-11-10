@@ -32,9 +32,9 @@ func TestUploadBlobRecordsLocationBeforeAccepted(t *testing.T) {
 		if err != nil || in.State != registry.IntentUploading {
 			t.Fatalf("intent = %+v/%v, want uploading", in, err)
 		}
-		sizes, err := mem.StalledBytes(t.Context(), time.Now().Add(time.Hour))
-		if err != nil || sizes.Uploading != in.Size {
-			t.Fatalf("stalled = %+v/%v, want %d uploading", sizes, err, in.Size)
+		stalled, err := mem.StalledBytes(t.Context(), time.Now().Add(time.Hour))
+		if err != nil || stalled != in.Size {
+			t.Fatalf("stalled = %d/%v, want %d uploading", stalled, err, in.Size)
 		}
 		return in
 	}

@@ -140,15 +140,15 @@ type Config struct {
 	// immediately.
 	ReleaseGrace string `mapstructure:"release_grace" yaml:"release_grace"`
 
-	// LocalBlobMaxBytes is the byte budget for local blob storage: the spool
-	// (<data_dir>/spool: writes in progress, counted as their bytes land, and
-	// bodies waiting for upload) plus the cache (<data_dir>/cache: copies of
-	// bodies the provider holds). It does not cover the catalog log. A
+	// LocalBlobMaxBytes is the byte budget for local blob storage: the cache
+	// (<data_dir>/cache: copies of bodies the provider holds, and writes in
+	// progress, counted as their bytes land). It does not cover the catalog
+	// log. A
 	// sweeper checks it every 30 seconds and evicts cached blobs, the least
 	// recently cached or read first, down to 90% of the budget; reads of an
 	// evicted blob go to the provider. Usage can exceed the budget by ingest rate × 30 seconds
-	// between sweeps, and by files that must stay (the spool's, and orphans
-	// younger than LocalBlobOrphanAge). 0 → no budget (the default); negative
+	// between sweeps, and by files that must stay (writes in progress, and
+	// orphans younger than LocalBlobOrphanAge). 0 → no budget (the default); negative
 	// is an error.
 	LocalBlobMaxBytes int64 `mapstructure:"local_blob_max_bytes" yaml:"local_blob_max_bytes"`
 	// CacheTTL is how long a blob stays in the cache (Go duration string)
@@ -158,11 +158,11 @@ type Config struct {
 	// cache_writes to false to cache nothing).
 	CacheTTL string `mapstructure:"cache_ttl" yaml:"cache_ttl"`
 	// LocalBlobOrphanAge is the age (file modification time) at which the
-	// sweeper deletes a .tmp-* file in the spool or the cache, or a spool blob
-	// file with no upload intent (Go duration string), hourly, whether or not a
-	// budget is set. It must exceed the longest time one request body takes to
-	// stream: the server sets no body read timeout, and a body still streaming
-	// past it can have its first blobs deleted, failing the request. Empty →
+	// sweeper deletes a .tmp-* file in the cache (Go duration string), hourly,
+	// whether or not a budget is set. It must exceed the longest time one
+	// request body takes to stream: the server sets no body read timeout, and
+	// a body still streaming past it loses its local copy, so it is not
+	// cached. Empty →
 	// default 24h; under 1h is an error.
 	LocalBlobOrphanAge string `mapstructure:"local_blob_orphan_age" yaml:"local_blob_orphan_age"`
 	// CacheWrites moves each body's local copy into the cache once the
