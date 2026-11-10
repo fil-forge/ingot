@@ -1037,11 +1037,10 @@ CREATE TABLE ingot.gc_candidates (
 );
 
 -- The revocation-firehose cursor: one row holding the resume point in the
--- revocation service's stream. No row means "connect from now".
+-- revocation service's stream. No row means "start at the stream's head".
 CREATE TABLE ingot.revocation_cursor (
     id          boolean PRIMARY KEY DEFAULT true CHECK (id), -- single-row latch
-    recorded_at timestamptz NOT NULL,                    -- the {since} of the next reconnect
-    revoke      bytea NOT NULL,                          -- revoked delegation CID, for observability
+    token       text NOT NULL,                           -- the service's cursor the next reconnect resumes after
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 ```

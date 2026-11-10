@@ -161,7 +161,10 @@ func TestExtents_MultipartPartNumberAcrossExtents(t *testing.T) {
 	saved := acceptWaitBudget
 	acceptWaitBudget = 5 * time.Minute
 	t.Cleanup(func() { acceptWaitBudget = saved })
-	b, _, _ := newRefTestBackend(t, extentBlobSize)
+	// Complete holds the upload's lease while it waits on those accepts, long
+	// enough under the race detector for a late renewal to lapse a
+	// one-second lease.
+	b, _, _ := newRefTestBackendOn(t, newTestStoreWithLease(t, 10*time.Second), extentBlobSize)
 	part1 := testBody(5 << 20) // 5,120 blobs
 	part2 := bytes.Repeat([]byte("second part "), 30000)
 	key := "mp"

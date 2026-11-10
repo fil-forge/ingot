@@ -53,12 +53,17 @@ func (r *recordingRemover) removedDigests() map[string]int {
 // test can drive PutObject/DeleteObject and inspect blob_refs + releases.
 func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *testStore, *recordingRemover) {
 	t.Helper()
+	return newRefTestBackendOn(t, newTestStore(t), maxBlob...)
+}
+
+// newRefTestBackendOn is newRefTestBackend over a given store.
+func newRefTestBackendOn(t *testing.T, mem *testStore, maxBlob ...int64) (*Backend, *testStore, *recordingRemover) {
+	t.Helper()
 	var mbs int64
 	if len(maxBlob) > 0 {
 		mbs = maxBlob[0]
 	}
 	ctx := context.Background()
-	mem := newTestStore(t)
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(t.TempDir(), "segments"),
 		Meta:    mem,
