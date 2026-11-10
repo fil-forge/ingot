@@ -161,6 +161,9 @@ func (ps proofStores) ProofChain(ctx context.Context, aud did.DID, cmd ucan.Comm
 // running release and behind its retries, so a release that may already have
 // acted never finds one. Each way a reference goes queues a release again: a
 // drop of the last claim, an expiry, a superseded part, a session's teardown.
+// Two of those can queue a blob's release while an earlier one runs; the
+// later finds the blob's upload intent gone, which only a release's commit
+// removes, and does nothing.
 // A conclude of the blob in flight here defers it, without holding the
 // subject.
 func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
@@ -177,6 +180,11 @@ func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrun
 		return nil, fmt.Errorf("count references: %w", err)
 	} else if n > 0 {
 		return nil, nil // referenced again since it was queued: stale
+	}
+	if _, err := b.intents.GetIntent(ctx, space, digest); errors.Is(err, registry.ErrNotFound) {
+		return nil, nil // released in full since it was queued: stale
+	} else if err != nil {
+		return nil, fmt.Errorf("lookup intent: %w", err)
 	}
 	if b.isConcluding(space, digest) {
 		// Its accept may be registered after a remove sent now (see
