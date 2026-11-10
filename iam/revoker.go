@@ -36,10 +36,10 @@ func NewRevoker(proofs *KeyProofs, keys *VerificationKeyCache, tenants *TenantCa
 // request falls through to Hilt, which re-authorizes it, or refuses a deleted
 // one. The record of revoked CIDs is kept. Stores already captured, such as
 // the uploader's ship authority, are not reached (see
-// [KeyProofs.InvalidateAll]). It returns how many keys' proof stores it
+// [KeyProofs.ClearAll]). It returns how many keys' proof stores it
 // dropped.
 func (r *Revoker) ClearAll() int {
-	n := r.proofs.InvalidateAll()
+	n := r.proofs.ClearAll()
 	r.keys.Clear()
 	r.tenants.Clear()
 	r.logger.Info("iam: every access key's caches cleared", zap.Int("proof_stores", n))
