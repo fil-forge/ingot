@@ -75,7 +75,14 @@ func (r *Runner) tryLease(ctx context.Context, q *queue, subject string, age tre
 	var taken, tookOver bool
 	var holderCreated *time.Time
 	var holderID *uuid.UUID
-	err := r.db.QueryRow(ctx, `
+	// The take runs past ctx's end, so that its caller learns whether it took
+	// the lease: cut off by ctx, it can take the lease on the server and
+	// still fail here, leaving a lease no hold records, which nothing would
+	// renew or release. The lease's own TTL bounds it instead; a lease left
+	// by that bound has all but expired by the time the take gives up.
+	takeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.opts.LeaseTTL)
+	defer cancel()
+	err := r.db.QueryRow(takeCtx, `
 WITH taken AS (
 	INSERT INTO `+q.leases+` AS l (subject, owner, expires, tree_created, tree_id)
 	VALUES ($1, $2, now() + $3 * interval '1 millisecond', $4, $5)
@@ -96,6 +103,8 @@ SELECT false, false, tree_created, tree_id FROM `+q.leases+`
 		// The holder committed after this statement's snapshot was taken.
 		return nil, nil, nil
 	case err != nil:
+		// The take may still have reached the database.
+		r.dropUntracked(ctx, q, subject, token)
 		return nil, nil, fmt.Errorf("take lease %s/%s: %w", q.name, subject, err)
 	}
 	if !taken {
@@ -128,6 +137,18 @@ func (r *Runner) setAge(ctx context.Context, h *hold, age treeAge) error {
 	}
 	h.age = age
 	return nil
+}
+
+// dropUntracked deletes the lease a failed take may have written under token,
+// which only that take knows. Like release, it runs after ctx has ended; if it
+// fails too, the lease expires on its own.
+func (r *Runner) dropUntracked(ctx context.Context, q *queue, subject string, token uuid.UUID) {
+	ctx = context.WithoutCancel(ctx)
+	if _, err := r.db.Exec(ctx, `DELETE FROM `+q.leases+` WHERE subject = $1 AND owner = $2`,
+		subject, token); err != nil {
+		r.log.Warn("drop a lease a failed take may have written; it expires on its own",
+			zapSubject(q.name, subject), zapErr(err))
+	}
 }
 
 // release deletes the lease and wakes this process's waiters on the subject.
