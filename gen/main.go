@@ -8,6 +8,8 @@ package main
 
 import (
 	"github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/s3frontend"
 	cbg "github.com/whyrusleeping/cbor-gen"
 )
 
@@ -26,6 +28,36 @@ func main() {
 		bucket.ValueUnion{},
 		bucket.VersionState{},
 		bucket.StateUnion{},
+	); err != nil {
+		panic(err)
+	}
+	if err := cfg.WriteMapEncodersToFile("../registry/cbor_gen.go", "registry",
+		registry.UploadTask{},
+		registry.ReleaseTask{},
+	); err != nil {
+		panic(err)
+	}
+	if err := cfg.WriteMapEncodersToFile("../s3frontend/cbor_gen.go", "s3frontend",
+		s3frontend.ShardCacheTask{},
+		s3frontend.ShardEvictTask{},
+		s3frontend.ShardAddTask{},
+		s3frontend.BucketCommitTask{},
+		s3frontend.KeyChange{},
+		s3frontend.PutChange{},
+		s3frontend.BlobRefTask{},
+		s3frontend.ReservedVersion{},
+		s3frontend.DeleteChange{},
+		s3frontend.DeletePreconditions{},
+		s3frontend.SetAttributesChange{},
+		s3frontend.BucketCommitResult{},
+		s3frontend.ChangeResult{},
+		s3frontend.ChangeError{},
+		s3frontend.BucketTask{},
+		s3frontend.BucketCreateTask{},
+		s3frontend.BucketSetVersioningTask{},
+		s3frontend.BucketSetLockConfigTask{},
+		s3frontend.BucketSetConfigTask{},
+		s3frontend.MultipartAbortTask{},
 	); err != nil {
 		panic(err)
 	}

@@ -24,25 +24,34 @@ for the as-built diagrams.
 modules in; ingot is a standalone module and must build on its own `go.mod`:
 
 ```bash
-make build      # GOWORK=off go build ./...
-make test       # unit tests: GOWORK=off go test ./... (fast, no Docker)
-make itest      # integration tests: boots the Forge stack in Docker (~6 min)
-make gen        # regenerate bucket/cbor_gen.go after changing bucket types
+make build      # the daemon binary, ./ingot (GOWORK=off go build -o ingot ./cmd/ingot)
+make test       # every package's tests, with Postgres and OpenBao in Docker
+make itest      # integration tests: boots the Forge stack in Docker (~20 min)
+make itest-group GROUP=auth   # one CI group: encryption|conformance|uploads|releases|auth|rest
+make s3compat   # the S3 compatibility corpus, written as an HTML report
+make gen        # regenerate the cbor-gen marshalers (go generate ./... runs gen/)
+make gen-check  # make gen, then fail if bucket/cbor_gen*.go changed
 GOWORK=off go vet ./...
 GOWORK=off go test -tags itest ./itest -run 'TestForgeVersity/PutObject' -v  # one S3 category
 GOWORK=off go build -o /tmp/ingot ./cmd/ingot               # the daemon binary
 ```
 
-**go directive: 1.26.4.**
+**go directive: 1.27.0.**
 
-**The test pattern — unit first, integration when you're ready to wait.**
-`make test` runs library/unit tests in seconds with no Docker. `make itest`
+**The test pattern — the suite first, integration when you're ready to wait.**
+`make test` (`scripts/test.sh`) runs every package's tests in a minute or two.
+They need Postgres, and the region-key provider's need OpenBao: it starts both
+in Docker unless `INGOT_TEST_DSN` and `INGOT_TEST_BAO_ADDR` name running ones,
+and a test fails, rather than skips, without them. `internal/pgtest` gives
+each test a database of its own, copied from a migrated template, so tests
+share nothing; `internal/testfakes` stands in for the network. `make itest`
 runs `itest/` (build tag `itest`): it boots the full smelt Forge stack in
 Docker, mounts THIS working tree's binary over the published ingot image, and
 validates the real network path — including the curated S3 conformance
 partition (`itest/versity_*_test.go`); see `itest/README.md`. CI mirrors the
-same ordering: the `itest` job only runs after the unit job passes
-(`.github/workflows/go-test.yml`).
+same ordering: the `itest-groups` jobs (one runner per `make itest-group`
+group) and the `s3compat` job run only after the `test` job passes, and the
+`itest` job reports the groups as one check (`.github/workflows/go-test.yml`).
 
 ## Dependency stack
 
@@ -82,7 +91,9 @@ Public surface (what hosts import):
 - **`ingot` (root)** — `Module(cfg) fx.Option`, `ServerModule`,
   `PreStartHook`; the non-fx `New(ctx, ServerConfig,
   ServerDeps)` + `Server.{Start,Stop}`. `module.go` (fx wiring), `server.go`
-  (`New`, lifecycle, `newBucketFlushFunc`, the versitygw `s3api` mount).
+  (`New`, lifecycle, `newBucketFlushFunc`, the versitygw `s3api` mount, the
+  local blob sweeper), `auditlog.go` (the versitygw audit-log sink, which
+  names each request's span for its S3 action and logs failed requests).
 - **`config/`** — the host `Config`, `Config.ServerConfig()` (the single
   mapping site), the `CatalogPlane` block, validation.
 
@@ -96,16 +107,30 @@ Internal:
   with an access key from the environment, as JSON, for benchmark runs);
   `deps.go` (agent identity from the PEM key + optional did:web, pgx pool).
 - **`s3frontend/`** — versitygw `backend.Backend`: `object.go`
-  (Put/Get/Head/Delete/List), `version.go` (resolveVersion / commitVersion,
-  the per-key version tree), `multipart.go`, `bucket.go`, `listversions.go`,
+  (Put/Get/Head/Delete/List), `version.go` (resolveVersion / applyPut,
+  the per-key version tree), `bucketqueue.go` (`queue-bucket.commit`: one
+  task per bucket change, sync for the request, on the bucket's subject;
+  applies an ordered list of key changes, `bucketchanges.go`, to one Tx),
+  `bucketadmin.go` (`queue-bucket.create`, `.set-versioning`,
+  `.set-object-lock-config`, `.set-tagging`, `.set-cors`, `.set-encryption`,
+  `.close`, `.admit-upload`), `bucketship.go`
+  (`queue-bucket.ship`, queued on each seal), `multipart.go`,
+  `multipartqueue.go` (`queue-multipart-upload`: every change to an upload,
+  on the upload ID's subject), `acceptor.go`
+  (`queue-multipart-upload.accept`, queueing a `queue-space-shard.accept` per
+  parked blob, which concludes it while the client uploads), `bucket.go` (`queue-bucket.delete`), `listversions.go`,
   `backend.go`, `stream.go` (each body blob streams to its
-  provider while spooling it; the stale-stream sweeper).
-- **`bucketop/`** — `Coordinator`/`Tx`: per-bucket write transaction (lock,
-  snapshot root, staging buffer, CAS commit).
+  provider as the body arrives, teeing an object's bytes into the cache; a
+  failed stream fails the request and aborts its allocation, and an
+  allocation a dead request leaves is expired by the provider).
+- **`bucketop/`** — `Coordinator`/`Tx`: per-bucket write transaction
+  (snapshot root, staging buffer, `Mark`/`Restore` per change, `Append`:
+  one fsynced batch to the log). It takes no lock: the bucket's
+  `queue-bucket` subject serializes its commits.
 - **`blockstore/`** — block I/O contracts + impls: `log.go` (`Log`, `Plane`
-  [catalog-only], `OpRoot`), `staging.go` (`OpStaging`), `spool.go`
-  (`Spool`: writes and bodies awaiting upload), `blobcache.go` (`BlobCache`:
-  copies the provider holds; `LocalBlobs` reads both), `blobdir.go`,
+  [catalog-only], `OpRoot`), `staging.go` (`OpStaging`), `blobcache.go`
+  (`BlobCache`: copies the provider holds, and writes in progress as
+  `TempBlob`s it adopts), `blobdir.go`,
   `layered.go`, `forge.go` (the network read tier), `cache.go` (`Cached` LRU),
   `locator/` (carried from guppy; the indexer-backed locator is never
   injected).
@@ -113,21 +138,67 @@ Internal:
   production `blockstore.Log`), `store.go`, `planelog.go`, `segment.go`,
   `recovery.go`. See `logstore/README.md`.
 - **`registry/`** — Postgres metadata: `postgres.go` (`Registry` + `State`;
-  `CommitRoot` also journals each commit's catalog blocks in
-  `ingot.catalog_journal` until their segment ships),
-  `segments.go` (`logstore.Meta`, and `CatalogUsage`, the per-bucket sums
-  the catalog usage gauges report), `stores*.go` (intents, locations,
-  inclusions, blob_refs, GC, multipart sessions/parts, parks, streams),
+  `EmptyRoot`, DeleteBucket's first write), `bucketcommit.go` (`queue-bucket`
+  names, `RootCommitWrites`: the guarded root advance, claims, drops, GC
+  candidates and the journal rows of each commit's catalog blocks in
+  `ingot.catalog_journal` until their segment ships, written with the commit
+  task), `segments.go` (`logstore.Meta`, and `CatalogUsage`, the per-bucket
+  sums the catalog usage gauges report), `stores*.go` (intents, locations,
+  inclusions, blob_refs and pending refs (`CountReferences`), GC,
+  multipart sessions/parts, parks, encryption params, the revocation
+  cursor),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
   all of them.
-- **`uploader/`** — `forge.go`/`blob.go`: `Forge` behind `Uploader`
-  (`SubmitShard`), `BodyUploader`/`DeferredBodyUploader` (`UploadBlob`,
-  `ConcludeBlobs`, `AbortBlob`), `StreamingBodyUploader` (`StartBlob`,
-  `PutBlob`: allocate by digest code, send while spooling), and
-  `BlobRemover`; captures the per-space
+- **`taskrunner/`** — durable task queues in Postgres (one tasks table and
+  one leases table per queue), serialized per (queue, subject) by a lease
+  row. A task's tree (its handler plus sync children in later queues) adds
+  writes to an ordered list that commits in one transaction at the end, with
+  the rows of the tasks it spawned; sibling children taking leases in
+  opposite orders resolve by the younger tree giving way. Async tasks can be
+  replacements (the later `NotBefore` wins), cancelled before they start,
+  batched (`HandleBatch`, each task with its own outcome) and retried
+  (`WithRetry`; `Permanent` stops retries). Failed tasks stay as the
+  dead-letter queue (`ListFailed`, `Resubmit`); finished ones are deleted
+  past their queue's `Retention`. `Spec.Node` places a task on the runner whose `Options.Node`
+  matches. Metrics (`taskrunner.*`: ready, delayed and failed tasks, oldest
+  ready age, lease waits and takeovers, task duration by outcome, busy
+  workers and the worker limit) go to
+  `Options.MeterProvider`, or the global provider when unset. Imports nothing
+  else from ingot (a test enforces it), so it can ship as a library.
+  `taskrunnertest` makes a fresh schema per test and runs a tree with writes
+  held and applied straight away (`CheckOwnWrites`). The daemon runs one
+  runner (`provideTaskRunner` in `module.go`) over the `ingot` schema; its
+  tables are migrated in the migration hook, and `Server` starts and stops
+  it. Queues in order: `queue-multipart-upload`, `queue-bucket`,
+  `queue-space-upload`, `queue-space-shard`, `queue-shard`.
+  `queue-multipart-upload` (`s3frontend/multipartqueue.go`), subject the
+  upload ID: an upload's create, add-part, accept, complete, abort and reap,
+  one at a time, the accept (`s3frontend/acceptor.go`) queuing a
+  `queue-space-shard.accept` for each blob of the upload's parked parts;
+  `queue-bucket` (`s3frontend/bucketqueue.go`), subject the bucket's space
+  DID: every change to a bucket, placed on the instance holding its catalog
+  log; `queue-space-upload` (`s3frontend/uploadqueue.go`), the
+  object-count changes a `queue-bucket.commit` spawns with its own
+  commit; `queue-shard` (`s3frontend/shardqueue.go`), subject the hex
+  digest: a cached blob's time to live, `queue-shard.cache` scheduling its
+  `queue-shard.evict` at `CacheTTL`, run again by reads with under half
+  left, and the budget pass's evictions as sync `queue-shard.evict`s;
+  `queue-space-shard` (`s3frontend/releasequeue.go`,
+  `shardref.go`, `acceptor.go`), subject space/hex digest: a blob's release,
+  a parked blob's `queue-space-shard.accept` (its conclude), a write's sync
+  `queue-space-shard.add` (its pending reference, in `blob_pending_refs`)
+  and the reference's `queue-space-shard.expire` at 24 h. Its own tests each use a schema of their own
+  (`taskrunnertest`), so the runner tests need no Ingot tables.
+- **`uploader/`** — `forge.go`/`blob.go`/`stream.go`/`upload.go`: `Forge`
+  behind `Uploader` (`SubmitShard`), `DeferredBodyUploader` (`ConcludeBlobs`,
+  `AbortBlob`), `StreamingBodyUploader` (`StartBlob`, `PutBlob`: allocate by
+  digest code, send as the body arrives), `BlobRemover`, and
+  `UploadRegistrar` (`RegisterUploads`/`RetractUploads`, the object-count
+  entries `queue-space-upload` sends, each with authority captured in the
+  request by `CaptureAuthority`); captures the per-space
   ship authority (1h TTL) from in-request writes: `shipProofs` from body
   uploads (also the background releases' and aborts' fallback), and
-  `commitProofs` from every `bucketop` commit (`CaptureShipAuthority`), which
+  `commitProofs` from every `queue-bucket.commit` append (`CaptureShipAuthority`), which
   the ship prefers. Both take only stores `reqscope.BorrowableProofStore`
   returns, and their chains skip revoked delegations.
 - **`bucketauthority/`** — hilt bucket ops: forwards CreateBucket /
@@ -157,7 +228,13 @@ Internal:
   its own database and saved before the stream opens; a cursor Swarf refuses
   → its head again).
 - **`tokenstore/`** — carried-from-guppy delegation store (`tokens.cbor`);
-  empty today, read only by the dormant login paths.
+  empty, read only by the dormant login paths.
+- **`regionkey/`** — the region CEK wrap (`Provider`): `openbao` (the
+  region's OpenBao transit engine, production) or `inprocess` (tests and
+  development), selected by `regionkey.provider`.
+- **`tenantkey/`** — resolves a tenant's wrap key, the FEE tenant recipient,
+  from its did:plc document (`tenantkey.plc_directory_url`, cached for
+  `tenantkey.cache_ttl`).
 - **`blake3tree/`** — the BLAKE3 Merkle-tree material of a body: the
   whole-object digest (the `x-cid` header), the block-aligned block chaining
   values the manifest records for verifying ranged reads, and the aligned
@@ -169,8 +246,9 @@ Internal:
   a body of declared length), `cbor_gen.go`.
 - **`mst/`** — the forked MST (deps: go-cid, blockstore, ucantone/did — trees
   carry their bucket's space for network-backed reads).
-- **`inmem/`** — in-memory fakes (`MemStore`, `NopBaseReader`, `NopUploader`);
-  test-only.
+- **`internal/pgtest`** — a fresh, migrated Postgres database per test;
+  **`internal/testfakes`** — the network's stand-ins (`NopBaseReader`,
+  `NopUploader`, a bucket `Authority` in place of hilt). Both test-only.
 - **`cars/`**, **`migrations/`**,
   **`internal/{reqscope,ucanexec,fasthttputil,cors,build}`**, **`gen/`**,
   **`testing/`** — CAR codec, goose SQL (`ingot` schema), request-scoped ctx
@@ -181,13 +259,15 @@ Internal:
   with. The daemon's exporter setup is `cmd/telemetry.go` (traces and, under
   the same `OTEL_EXPORTER_OTLP_*` variables, metrics). Local blob storage's
   instruments (`ingot.local_blobs.*`: usage by directory, budget and
-  stalled-upload gauges, removals by reason, reads by tier) and the multipart
-  acceptor's (`ingot.multipart.*`: parked-part age, passes by outcome,
-  deferred Completes) are created on the global meter provider, through `s3frontend.Deps.MeterProvider` and
-  `Layered.CountBlobReads`; with no provider installed they are no-ops.
-  So are the catalog usage gauges (`ingot.catalog.*`: each bucket's shipped
-  catalog bytes and how much was dead on arrival, labeled by space DID,
-  never bucket name), which a `server.go` sweep refreshes every five
+  stalled-upload gauges, removals by reason, reads by tier), the multipart
+  accept's (`ingot.multipart.*`: parked-part age, blob concludes by outcome,
+  deferred Completes) and the catalog journal's (`ingot.catalog_journal.*`:
+  blocks, bytes, oldest age) are created on the global meter provider,
+  through `s3frontend.Deps.MeterProvider` and `Layered.CountBlobReads`, and
+  the runner's `taskrunner.*` on it too; with no provider installed they are
+  no-ops. So are the catalog usage gauges (`ingot.catalog.*`: each bucket's
+  shipped catalog bytes and how much was dead on arrival, labeled by space
+  DID, never bucket name), which a `server.go` sweep refreshes every five
   minutes from `registry.CatalogUsageStore`.
   versitygw passes
   the backend the bare `*fasthttp.RequestCtx` as its context, so the
@@ -197,10 +277,11 @@ Internal:
   `tracing.Start` / `tracing.End` (an S3 error table outcome does not mark a
   span failed); reads report their tier with `tracing.CountRead`, which lands
   on the server span as `ingot.reads.*`. A streamed response (GetObject) keeps
-  its server span open until fasthttp has written the body. Each background
-  sweep (`server.go`) starts a root span of its own (`sweep.*`), so its
-  registry queries, which `otelpgx` traces only under a recording span, show
-  up too.
+  its server span open until fasthttp has written the body. The local blob
+  sweeper (`server.go`) starts a root span per run (`sweep.local_blobs`), so
+  its registry queries, which `otelpgx` traces only under a recording span,
+  show up too. A sync task runs in its caller's context, inside the request's
+  span; an async task's handler has no parent span.
 
 ## Interface seams
 
@@ -209,26 +290,30 @@ Internal:
 | `versitygw/backend.Backend` | `s3frontend.Backend` | (same) |
 | versitygw `auth.IAMService` + `middlewares.RequestIAMService` | `iam.Service` (versitygw's root account is disabled; every key resolves here) | (same; hilt-issued credentials) |
 | `blockstore.Log` | `logstore.Manager` (one `Store` per bucket) | in-memory fake |
-| `blockstore.BlockReader` | `blockstore.Forge` (in `Cached`) | `inmem.NopBaseReader` |
-| `registry.Registry` + the store seams + `logstore.Meta` | `*registry.Postgres` (all of them) | `inmem.MemStore` |
+| `blockstore.BlockReader` | `blockstore.Forge` (in `Cached`) | `testfakes.NopBaseReader` |
+| `registry.Registry` + the store seams + `logstore.Meta` | `*registry.Postgres` (all of them) | (same, on a database per test) |
 | `locator.Locator` | `registry.LocalLocator` | (indexer-backed locator exists, unwired) |
-| `uploader.{Uploader,BodyUploader,DeferredBodyUploader,BlobRemover}` | `uploader.Forge` | `inmem.NopUploader` |
+| `uploader.{Uploader,StreamingBodyUploader,DeferredBodyUploader,BlobRemover,UploadRegistrar}` | `uploader.Forge` | `testfakes.NopUploader` |
 
 ## fx module
 
 - **`ServerModule`** (composable core) — consumes `ServerConfig`,
-  `*zap.Logger`, and the collaborator seams (`blockstore.BlockReader`; the
-  four `uploader` seams; `bucketauthority.BucketAuthority`;
-  `registry.Registry` plus the intent/location/inclusion/blob-ref/GC/
-  multipart/park stores; `logstore.Meta`; `auth.IAMService`; optionally
-  `registry.CatalogUsageStore`) +
-  a `PreStartHook` group; runs pre-start → `New` → `Start` on the fx
+  `*zap.Logger`, the `*taskrunner.Runner`, the agent `identity.Identity`, and
+  the collaborator seams (`blockstore.BlockReader`; the five `uploader`
+  seams; `bucketauthority.BucketAuthority`; `registry.Registry` plus the
+  intent/location/inclusion/blob-ref/GC/multipart/park/encryption-params
+  stores; `logstore.Meta`; `auth.IAMService`; `regionkey.Provider`;
+  `tenantkey.Source`; optionally `registry.CatalogUsageStore`) + a
+  `PreStartHook` group; runs pre-start → `New` → `Start` on the fx
   lifecycle.
 - **`Module(cfg)`** (production wrapper) — supplies Postgres as Registry +
   Meta + every store (one `*registry.Postgres` behind them all), the Forge
-  reader (`LocalLocator` inside `Cached`), the sprue edge client + uploader,
-  the hilt client + `iam.Service` + `KeyProofs`, `bucketauthority`, the
-  (empty) token store, and the goose migration `PreStartHook`. Empty option
+  reader (`LocalLocator` inside `Cached`), the task runner
+  (`provideTaskRunner`), the sprue edge client + uploader, the hilt client +
+  `iam.Service` + `KeyProofs`, `bucketauthority`, the region-key provider,
+  the tenant key source, the (empty) token store, and the migration
+  `PreStartHook` (goose, then the runner's tables); with
+  `revocation_service_url` set, the revocation consumer too. Empty option
   when `cfg.Enabled` is false.
 
 A host provides `*zap.Logger`, `*pgxpool.Pool`, libforge's `identity.Identity` (the
@@ -238,8 +323,11 @@ agent) and sets `Config.UploadServiceURL`/`UploadServiceDID` (sprue) +
 
 ## Configuration (`config.Config`)
 
-Viper/yaml-bindable (env prefix `INGOT_`, `.` → `_`). Key fields: `Enabled`,
-`Addr` (default `0.0.0.0:8080`), `DataDir`, `Region`, `MaxBlobSize`,
+Viper/yaml-bindable (env prefix `INGOT_`, `.` → `_`; `Load` binds every
+field, so each has a variable whether or not the YAML names it). Key fields:
+`Enabled`, `Addr` (default `0.0.0.0:8080`), `DataDir`, `Region` (default
+`us-east-1`), `MaxBlobSize` (0 → `bucket.DefaultMaxBlobSize`; at least
+1 KiB, and its encrypted envelope must fit piri's blob ceiling),
 `MultipartRehashBudget` (0 → 5 GiB; the re-read Complete allows for non-final
 parts hashed at a wrong assumed offset, past which Complete is refused with
 InvalidPartLayout; the final part is always re-hashed),
@@ -252,17 +340,27 @@ Ship, Retain}` override block (the only plane), `ReadCacheBytes` (0 → 256 MiB,
 `AuthServiceURL`/`AuthServiceDID`/`AuthServiceProofs` (hilt; proofs = file
 path or string-encoded UCAN container, required alongside the URL and
 validated at startup down to holding at least one delegation),
-`TokenStoreDir` (→
-`DataDir`), `MultipartSessionTTL` (0 → 7d, negative → sweeper off),
-`LocalBlobMaxBytes` (0 → no budget for the spool and cache together) with
-`CacheMinResidency` (10m), `CacheReadRetention` (1h) and
+`RevocationServiceURL`/`RevocationServiceDID` (Swarf; optional, both or
+neither), `TokenStoreDir` (→ `DataDir`), `MultipartSessionTTL` (empty → 7d,
+negative → never: an open upload's auto-abort and a completed one's reap are
+due this long out), `ReleaseGrace` (empty → 60s, negative → 0: how long a
+blob's release waits after its last claim drops),
+`LocalBlobMaxBytes` (0 → no budget for the cache, writes in progress
+included) with
+`CacheTTL` (1h: how long a body stays cached after it was cached or last
+read) and
 `LocalBlobOrphanAge` (24h, ≥ 1h) for the local blob sweeper
 (`s3frontend.SweepLocalBlobs`), `CacheWrites` (unset → true; false drops
 each body's local copy once accepted),
-`CORSAllowedOrigins`, `LogLevel`. `Config.ServerConfig()` is the single
-mapping site. The daemon's config (cmd/) adds `postgres_dsn`,
-`identity.key_file` (the agent's PEM key) and `identity.service_id` (optional
-did:web the key is wrapped with). The listener always serves the agent's DID
+`CORSAllowedOrigins`, `LogLevel` (default `info`), `PostgresDSN`,
+`Identity` (`key_file`: the agent's PEM key; `service_id`: optional did:web
+the key is wrapped with), `RegionKey` (`provider`: `openbao` with
+`openbao.{address,token,mount,key}`, mount default `transit`, or
+`inprocess` with `inprocess.{kek,version}`, version default `v1`),
+`TenantKey` (`plc_directory_url`, required; `cache_ttl`, default 10m) and
+`Encryption.AllowNone` (lets PutBucketEncryption choose `none`).
+`Config.ServerConfig()` is the single mapping site; `Config.Validate` checks
+the daemon's required fields. The listener always serves the agent's DID
 document at `/.well-known/did.json` — see `didDocumentHandler` in
 `server.go`, mounted via versitygw's `s3api.WithRoute` ahead of the S3
 route table.
@@ -272,19 +370,19 @@ route table.
 There is no in-memory ingot: the deployment under test is always the real
 forge-mode daemon. Two tiers:
 
-- **`make test` — unit** (seconds, no Docker): library/unit tests across the
-  packages, plus the thin S3-client glue in `testing/` (`Config`/`NewS3Conf`,
-  roundtrip helpers).
+- **`make test`** (a minute or two, Postgres and OpenBao in Docker): every
+  package's tests, the registry on Postgres and the network faked, plus the
+  thin S3-client glue in `testing/` (`Config`/`NewS3Conf`, roundtrip helpers).
 - **`make itest` — integration** (`itest/`, build tag `itest`, Docker):
   boots the smelt Forge stack with THIS working tree's binary mounted over
   the published image.
-  - **`versity_{bucket,object,multipart,versioning}_test.go`** — the S3
+  - **`versity_{bucket,object,multipart,versioning,lock,tagging}_test.go`** — the S3
     conformance partition: per upstream versitygw group, a curated pass table (every case
     must pass) and an XFail table (known-failing, reported as SKIP; an
     *unexpected pass* fails the test — the cue to promote the row). One
     shared stack serves all categories (`TestForgeVersity`).
   - **`scenarios_test.go`** — ingot-unique behaviors upstream can't assert
-    (blob-split/spool-by-digest, zero-byte objects, part-spans-blobs
+    (blob-split/cache-by-digest, zero-byte objects, part-spans-blobs
     multipart, failed-Complete session recovery), on a small-`max_blob_size`
     config (`testdata/config-smallblob.yaml` via smelt's WithServiceConfig).
   - **`forge_*_test.go`** — forge-native behaviors on dedicated stacks:
@@ -294,8 +392,12 @@ forge-mode daemon. Two tiers:
     multipart accept (`forge_multipart_deferred`), catalog retention
     (`forge_retention`), `ingot catalog usage` inside the container
     (`forge_catalog_usage`), the read-after-eviction network tier and the
-    local blob budget sweeper (`forge_eviction`), and a real `aws s3 cp`
-    multipart round trip from the official CLI image (`forge_awscli`).
+    local blob budget sweeper (`forge_eviction`), a real `aws s3 cp`
+    multipart round trip from the official CLI image (`forge_awscli`), and
+    encryption, authorization, object counts, bucket deletes and the
+    Complete keepalive in the other `forge_*_test.go` files.
+  - **`forge_s3compat_test.go`** — the S3 compatibility corpus behind
+    `make s3compat` (skips unless `INGOT_S3COMPAT` is set).
 - **Suite-composition-sensitive upstream cases** — a few versitygw cases
   depend on run position rather than S3 semantics: `ListBuckets_truncated`
   names buckets from a process-global counter and asserts *creation-order*
@@ -310,8 +412,12 @@ forge-mode daemon. Two tiers:
 
 ## Code generation & migrations
 
-- **cborgen:** `make gen` (`go run ./gen`) regenerates `bucket/cbor_gen.go`.
-  `mst/cbor_gen.go` is separate. Verify a no-op diff after touching `bucket` types.
+- **cborgen:** `make gen` (`go generate ./...`, whose one directive runs
+  `gen/`) regenerates `bucket/cbor_gen.go`, `bucket/cbor_gen_tuple.go`,
+  `registry/cbor_gen.go` and `s3frontend/cbor_gen.go` (the task argument
+  types). `mst/cbor_gen.go` is separate. `make gen-check` fails on a stale
+  `bucket/cbor_gen*.go`; verify a no-op diff after touching any generated
+  type.
 - **migrations:** SQL in `migrations/sql/*.sql` (`go:embed`), applied by
   `migrations.Up` under the `ingot` schema at startup via a `PreStartHook`.
   Once a migration has merged, change the schema with a new migration, never
@@ -375,7 +481,8 @@ When a change adds or alters something operational, decide how on-call would
 know it had broken, and add what is useful in the same PR: metrics, trace
 spans, and an alert or dashboard panel in fil-forge/infra-central. Skip it for
 changes nothing operational depends on. List each new metric in a metrics
-table in the README: the local blob one, or a new one beside it. "Adding a
+table in the README, beside the local blob, multipart and catalog journal
+ones. "Adding a
 signal" in [`docs/observability.md`](docs/observability.md) says how to do
 each.
 

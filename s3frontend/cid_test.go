@@ -37,7 +37,7 @@ func TestCIDHeader(t *testing.T) {
 
 	bucket, key := "bk", "k"
 	t.Run("head", func(t *testing.T) {
-		rc := &fasthttp.RequestCtx{}
+		rc := newRequestCtx()
 		if _, err := b.HeadObject(rc, &s3.HeadObjectInput{Bucket: &bucket, Key: &key}); err != nil {
 			t.Fatalf("HeadObject: %v", err)
 		}
@@ -46,7 +46,7 @@ func TestCIDHeader(t *testing.T) {
 		}
 	})
 	t.Run("get", func(t *testing.T) {
-		rc := &fasthttp.RequestCtx{}
+		rc := newRequestCtx()
 		out, err := b.GetObject(rc, &s3.GetObjectInput{Bucket: &bucket, Key: &key})
 		if err != nil {
 			t.Fatalf("GetObject: %v", err)
@@ -60,7 +60,7 @@ func TestCIDHeader(t *testing.T) {
 		}
 	})
 	t.Run("ranged get", func(t *testing.T) {
-		rc := &fasthttp.RequestCtx{}
+		rc := newRequestCtx()
 		out, err := b.GetObject(rc, &s3.GetObjectInput{Bucket: &bucket, Key: &key, Range: aws.String("bytes=4000-4200")})
 		if err != nil {
 			t.Fatalf("GetObject: %v", err)
@@ -129,7 +129,7 @@ func TestBlake3AttributeGating(t *testing.T) {
 	b, _, _ := newRefTestBackend(t, 4096)
 	putObj(t, b, "gate", bytes.Repeat([]byte("g"), 50_000))
 	bucket, key := "bk", "gate"
-	rc := &fasthttp.RequestCtx{}
+	rc := newRequestCtx()
 	res, err := b.GetObjectAttributes(rc, &s3.GetObjectAttributesInput{
 		Bucket: &bucket, Key: &key, ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesEtag},
 	})
@@ -149,4 +149,12 @@ func TestBlake3AttributeGating(t *testing.T) {
 	if err != nil || res.Blake3 == nil {
 		t.Fatalf("with no attribute list the attribute must be built: %v", err)
 	}
+}
+
+// newRequestCtx returns a request context as a server hands one to a handler:
+// one whose Done works, which the registry's queries wait on.
+func newRequestCtx() *fasthttp.RequestCtx {
+	rc := &fasthttp.RequestCtx{}
+	rc.Init(&fasthttp.Request{}, nil, nil)
+	return rc
 }

@@ -97,12 +97,12 @@ func assertStoredAsReceived(t *testing.T, b *Backend, key string, data []byte) {
 	}
 	stored, err := os.ReadFile(localPath(b, d))
 	if err != nil {
-		t.Fatalf("read spooled blob: %v", err)
+		t.Fatalf("read stored blob: %v", err)
 	}
 	if !bytes.Equal(stored, data) {
 		t.Fatalf("%s: stored %d bytes differ from the %d plaintext bytes", key, len(stored), len(data))
 	}
-	if _, err := b.encParams.GetEncryptionParams(context.Background(), did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := b.encParams.GetEncryptionParams(context.Background(), b.reg.(*testStore).bk(), d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("%s: encryption params lookup = %v, want ErrNotFound (no key material for a plaintext blob)", key, err)
 	}
 	if sse := headObj(t, b, key).ServerSideEncryption; sse != "" {
@@ -118,7 +118,7 @@ func assertStoredEncrypted(t *testing.T, b *Backend, key string, data []byte) {
 	if bytes.Equal(d, digestOf(t, data)) {
 		t.Fatalf("%s: stored digest equals hash(plaintext); the blob was not encrypted", key)
 	}
-	if _, err := b.encParams.GetEncryptionParams(context.Background(), did.Undef, d); err != nil {
+	if _, err := b.encParams.GetEncryptionParams(context.Background(), b.reg.(*testStore).bk(), d); err != nil {
 		t.Fatalf("%s: GetEncryptionParams: %v", key, err)
 	}
 	if sse := headObj(t, b, key).ServerSideEncryption; sse != types.ServerSideEncryptionAes256 {
@@ -334,15 +334,15 @@ func TestPlaintextWrite_StoredAsReceived(t *testing.T) {
 		}
 		stored, err := os.ReadFile(localPath(b, d))
 		if err != nil {
-			t.Fatalf("read spooled blob %d: %v", i, err)
+			t.Fatalf("read stored blob %d: %v", i, err)
 		}
 		if !bytes.Equal(stored, piece) {
 			t.Fatalf("blob %d: stored %d bytes differ from the %d plaintext bytes", i, len(stored), len(piece))
 		}
-		if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := mem.GetEncryptionParams(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("blob %d: encryption params lookup = %v, want ErrNotFound", i, err)
 		}
-		loc, err := mem.GetLocation(ctx, did.Undef, d)
+		loc, err := mem.GetLocation(ctx, mem.bk(), d)
 		if err != nil {
 			t.Fatalf("blob %d: GetLocation: %v", i, err)
 		}
@@ -537,7 +537,7 @@ func TestPlaintextMultipart_SessionCarriesTheMode(t *testing.T) {
 				t.Fatalf("HEAD reports %q, want %q", sse, tc.want)
 			}
 			for i, d := range blobDigestsOf(t, b, key, "") {
-				_, err := mem.GetEncryptionParams(ctx, did.Undef, d)
+				_, err := mem.GetEncryptionParams(ctx, mem.bk(), d)
 				if tc.want == "" && !errors.Is(err, registry.ErrNotFound) {
 					t.Fatalf("plaintext part blob %d has key material (%v)", i, err)
 				}

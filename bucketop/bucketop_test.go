@@ -15,8 +15,9 @@ import (
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketop"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/internal/reqscope"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/tokenstore"
@@ -41,12 +42,12 @@ func (r *recordingShips) CaptureShipAuthority(ctx context.Context, space did.DID
 	r.captured = append(r.captured, capture{space: space, store: store})
 }
 
-// TestCommitCapturesShipAuthority checks that a commit hands its request to
-// Ships under the bucket's space, so a write that uploads no body still
-// leaves the authority its segment's ship needs.
+// TestCommitCapturesShipAuthority checks that a commit's append hands its
+// request to Ships under the bucket's space, so a write that uploads no body
+// still leaves the authority its segment's ship needs.
 func TestCommitCapturesShipAuthority(t *testing.T) {
 	ctx := context.Background()
-	mem := inmem.NewMemStore()
+	mem := registry.NewPostgres(pgtest.New(t))
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(t.TempDir(), "segments"),
 		Meta:    mem,
@@ -58,11 +59,11 @@ func TestCommitCapturesShipAuthority(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = log.Close(ctx) })
 	space := testutil.RandomDID(t)
-	if err := mem.Create(ctx, "bk", space, registry.CreateState{}); err != nil {
+	if err := mem.Create(ctx, "bk", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
 	ships := &recordingShips{}
-	reads := blockstore.NewLayered(inmem.NopBaseReader{}, log, inmem.NopBaseReader{})
+	reads := blockstore.NewLayered(testfakes.NopBaseReader{}, log, testfakes.NopBaseReader{})
 	c := bucketop.NewCoordinator(bucketop.Deps{Reg: mem, Log: log, Reads: reads, Ships: ships})
 
 	store := ucanlib.ProofStore(tokenstore.NewMemStore())
@@ -76,8 +77,9 @@ func TestCommitCapturesShipAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatalf("multihash: %v", err)
 	}
-	if err := tx.Commit(reqCtx, cid.NewCidV1(cid.DagCBOR, mh)); err != nil {
-		t.Fatalf("Commit: %v", err)
+	tx.Advance(cid.NewCidV1(cid.DagCBOR, mh))
+	if _, ok, err := tx.Append(reqCtx); err != nil || !ok {
+		t.Fatalf("Append = %v, %v", ok, err)
 	}
 
 	ships.mu.Lock()

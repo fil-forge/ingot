@@ -21,8 +21,7 @@ import (
 )
 
 // blobDir is a directory of finished blob files, each named by the hex of
-// its digest, with a running byte count of them. Spool and BlobCache are
-// both built on it. It knows a blob only as bytes under a digest: whether one
+// its digest, with a running byte count of them. BlobCache is built on it. It knows a blob only as bytes under a digest: whether one
 // may be removed is the caller's question.
 //
 // At most one blobDir may use a directory at a time: the byte count assumes
@@ -35,10 +34,9 @@ type blobDir struct {
 	kind string
 	// mu orders the changes that move the count: count holds it
 	// exclusively while it measures, and each removal holds it shared, so
-	// the count sees every file either before or after the change. A commit
-	// into the directory (Spool.commit) and a move between directories
-	// (BlobCache.Take) hold it exclusively, so neither overlaps a removal of
-	// the same digest. ScanAndCorrect holds it
+	// the count sees every file either before or after the change. Adopting a
+	// written file under its digest (BlobCache.Adopt) holds it exclusively, so
+	// it never overlaps a removal of the same digest. ScanAndCorrect holds it
 	// exclusively for its final check, which is why every change counts
 	// itself in changes before releasing it.
 	mu sync.RWMutex
@@ -61,7 +59,7 @@ func newBlobDir(dir, kind string) (*blobDir, error) {
 }
 
 // BlobFile is one file Scan found: a finished blob (Digest set) or a .tmp-*
-// file (Digest nil), which only a Spool holds.
+// file (Digest nil), a blob still being written.
 type BlobFile struct {
 	Name    string
 	Digest  mh.Multihash
@@ -107,7 +105,7 @@ func (d *blobDir) ScanAndCorrect(ctx context.Context, fn func(BlobFile)) (int64,
 
 // count sets the byte count to the blob files on disk, holding the directory
 // exclusively while it measures, and calls fn for each file as Scan does. A
-// Spool or BlobCache counts once, when it opens; after that every change it
+// BlobCache counts once, when it opens; after that every change it
 // makes keeps the count itself. fn must not call back into this directory.
 func (d *blobDir) count(fn func(BlobFile)) error {
 	d.mu.Lock()
@@ -166,7 +164,7 @@ func (d *blobDir) visit(de fs.DirEntry, fn func(BlobFile)) (size int64, ok bool,
 	}
 	name := de.Name()
 	var digest mh.Multihash
-	if !strings.HasPrefix(name, spoolTempPrefix) {
+	if !strings.HasPrefix(name, tempPrefix) {
 		digest = digestFromName(name)
 		if digest == nil {
 			return 0, false, nil
@@ -186,11 +184,11 @@ func (d *blobDir) visit(de fs.DirEntry, fn func(BlobFile)) (size int64, ok bool,
 // RemoveTemp deletes one .tmp-* file by name and returns its size. Idempotent.
 // It refuses any other name, so it cannot be used to delete a finished blob.
 // It leaves every count alone: a temp file is counted only while a live write
-// holds it (Spool's in-flight count), and only an abandoned write's file is
+// holds it (BlobCache.Usage), and only an abandoned write's file is
 // safe to remove; a write that is still live takes its own bytes off when it
 // fails.
 func (d *blobDir) RemoveTemp(name string) (int64, error) {
-	if !strings.HasPrefix(name, spoolTempPrefix) || filepath.Base(name) != name {
+	if !strings.HasPrefix(name, tempPrefix) || filepath.Base(name) != name {
 		return 0, fmt.Errorf("blockstore: %s remove temp: %q is not a temp file", d.kind, name)
 	}
 	path := filepath.Join(d.dir, name)

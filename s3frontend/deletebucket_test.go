@@ -2,6 +2,8 @@ package s3frontend
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,12 +15,14 @@ import (
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketauthority"
-	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/internal/reqscope"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // releasableLog stands in for the production catalog log as DeleteBucket sees
@@ -108,14 +112,14 @@ func TestDeleteBucket_RefusalLeavesBucketReadable(t *testing.T) {
 		auth *refusingAuthority
 		rm   *catalogRemover
 	)
-	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
 		log = &releasableLog{
 			Log:     d.Log,
 			segment: digestOf(t, []byte("catalog segment")),
 			retired: digestOf(t, []byte("retired catalog segment")),
 		}
 		d.Log = log
-		d.Reads = blockstore.NewLayered(blockstore.LocalBlobs{Cache: d.Cache, Spool: d.Spool}, log, inmem.NopBaseReader{})
+		d.Reads = blockstore.NewLayered(d.Cache, log, testfakes.NopBaseReader{})
 		auth = &refusingAuthority{BucketAuthority: d.Authority}
 		d.Authority = auth
 		rm = &catalogRemover{log: log, reg: d.Registry}
@@ -186,5 +190,120 @@ func TestDeleteBucket_RefusalDropsTheJournal(t *testing.T) {
 	wantAPIErr(t, b.DeleteBucket(ctx, "bk"), s3err.ErrBucketNotEmpty)
 	if st, err := mem.CatalogJournalStats(ctx); err != nil || st.Blocks != 0 {
 		t.Fatalf("journal after the refused delete = %+v (err %v), want empty", st, err)
+	}
+}
+
+// An abandoned delete, left queued by a DeleteBucket whose caller went away,
+// never acts on another request's authority: run with a later PUT's context,
+// which carries that PUT's signed request, as a drain of the bucket's tasks
+// would, it finds no mark of its own DeleteBucket and fails without touching
+// the bucket.
+func TestAnAbandonedDeleteNeverActs(t *testing.T) {
+	b, mem := newDeferredBackend(t, &parkingUploader{})
+	ctx := context.Background()
+	args, err := encodeBucketTask(&BucketTask{Name: "bk"})
+	require.NoError(t, err)
+
+	put := context.WithValue(ctx, reqscope.RequestKey(), cmds3.Request{})
+	_, err = b.runDeleteBucket(put, nil, taskrunner.Task{Queue: registry.BucketQueue, Action: registry.BucketDeleteAction, Args: args})
+	if err == nil || !taskrunner.IsPermanent(err) {
+		t.Fatalf("delete run with another request's context: %v, want a permanent refusal", err)
+	}
+	if _, err := mem.Get(ctx, "bk"); err != nil {
+		t.Fatalf("the bucket after the refused delete: %v", err)
+	}
+}
+
+// answeringAuthority answers DeleteBucket with err.
+type answeringAuthority struct {
+	bucketauthority.BucketAuthority
+	err error
+}
+
+func (a *answeringAuthority) DeleteBucket(context.Context, cmds3.Request) error { return a.err }
+
+// TestDeleteBucket_OnlyARefusalReopens: Hilt not finding the space means an
+// earlier delete removed it, so the delete finishes; a refusal reopens the
+// bucket; a call that failed on its way may have deleted the space, so the
+// bucket stays closing.
+func TestDeleteBucket_OnlyARefusalReopens(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err     error
+		gone    bool
+		closing bool
+	}{
+		"not found":   {err: bucketauthority.ErrNotFound, gone: true},
+		"refused":     {err: fmt.Errorf("%w: access denied", bucketauthority.ErrRefused)},
+		"not empty":   {err: bucketauthority.ErrNotEmpty},
+		"unreachable": {err: errors.New("connection reset"), closing: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
+				d.Authority = &answeringAuthority{BucketAuthority: d.Authority, err: tc.err}
+			})
+			ctx := context.WithValue(context.Background(), reqscope.RequestKey(), cmds3.Request{})
+			err := b.DeleteBucket(ctx, "bk")
+			if tc.gone != (err == nil) {
+				t.Fatalf("DeleteBucket: %v", err)
+			}
+			st, gerr := mem.Get(ctx, "bk")
+			if tc.gone {
+				if !errors.Is(gerr, registry.ErrNotFound) {
+					t.Fatalf("the bucket after the delete: %v, want gone", gerr)
+				}
+				return
+			}
+			if gerr != nil {
+				t.Fatal(gerr)
+			}
+			if st.Closing != tc.closing {
+				t.Fatalf("closing = %v, want %v", st.Closing, tc.closing)
+			}
+		})
+	}
+}
+
+// nameHeldLog is a catalog log that records, for each bucket log it removes,
+// whether the bucket's row still held the name.
+type nameHeldLog struct {
+	blockstore.Log
+	reg registry.Registry
+
+	mu   sync.Mutex
+	held map[string]bool
+}
+
+func (l *nameHeldLog) RemoveBucketLog(ctx context.Context, bucket string) error {
+	_, err := l.reg.Get(ctx, bucket)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.held[bucket] = err == nil
+	return nil
+}
+
+// TestDeleteBucketRemovesItsLogWhileHoldingTheName: the log is the name's,
+// and a bucket created under the name once the row goes runs apart from the
+// delete, so the delete removes the log before it gives the name up.
+func TestDeleteBucketRemovesItsLogWhileHoldingTheName(t *testing.T) {
+	log := &nameHeldLog{held: map[string]bool{}}
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
+		log.Log, log.reg = d.Log, d.Registry
+		d.Log = log
+	})
+	ctx := context.WithValue(context.Background(), reqscope.RequestKey(), cmds3.Request{})
+	if err := b.DeleteBucket(ctx, "bk"); err != nil {
+		t.Fatalf("DeleteBucket: %v", err)
+	}
+	if _, err := mem.Get(ctx, "bk"); err == nil {
+		t.Fatal("the bucket row survived the delete")
+	}
+	log.mu.Lock()
+	held, removed := log.held["bk"]
+	log.mu.Unlock()
+	if !removed {
+		t.Fatal("the delete never removed the bucket's log")
+	}
+	if !held {
+		t.Fatal("the delete removed the bucket's log after giving its name up")
 	}
 }

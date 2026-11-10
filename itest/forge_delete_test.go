@@ -44,7 +44,7 @@ func TestForgeDeleteReleasesNetworkBlob(t *testing.T) {
 
 	// Precondition: the blob really lives on piri — wipe the local copies and prove
 	// the GET re-fetches from the network (same tier the eviction test pins).
-	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/spool /data/cache"); err != nil {
+	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/cache"); err != nil {
 		t.Fatalf("wipe local blob copies: %v (stdout=%s stderr=%s)", err, out, errOut)
 	}
 	if got, err := ingottest.GetBytes(ctx, cfg, bucket, key); err != nil || len(got) != len(data) {
@@ -62,7 +62,7 @@ func TestForgeDeleteReleasesNetworkBlob(t *testing.T) {
 
 	// And the release traversed the network: piri's /blob/release handler ran
 	// and, with the last claim gone, queued the piece for removal. Byte
-	// release is fully asynchronous — ingot's release sweeper runs it
+	// release is fully asynchronous — ingot's release task runs it
 	// after the release grace, and piri's removal sweep (PDPRemoveSweep, 30s ticks)
 	// re-verifies claims and pipeline state before finalizing — so poll the
 	// provider's logs through to the finalization line.

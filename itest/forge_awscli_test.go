@@ -32,7 +32,7 @@ const awsCLIImage = "amazon/aws-cli:2.36.44"
 
 // TestForgeAWSCLI drives a real, unmodified `aws s3 cp` against the
 // forge-mode ingot: a 20 MiB object crosses the CLI's 8 MiB multipart
-// switchover, so the CLI itself chooses multipart (three 8 MiB parts) and
+// switchover, so the CLI itself chooses multipart (three parts: 8, 8 and 4 MiB) and
 // sends its default per-part checksums — the client behavior the Go SDK
 // conformance tables cannot stand in for. The CLI runs in its official
 // image, reaching ingot's host-mapped port through host.docker.internal;
@@ -135,8 +135,8 @@ func TestForgeAWSCLI(t *testing.T) {
 	if head.ContentLength != size {
 		t.Fatalf("head-object ContentLength = %d, want %d", head.ContentLength, size)
 	}
-	// 20 MiB at the CLI's default 8 MiB part size is three parts: the CLI
-	// chose multipart on its own, and ingot completed it.
+	// 20 MiB at the CLI's default 8 MiB part size is three parts (8, 8 and
+	// 4 MiB): the CLI chose multipart on its own, and ingot completed it.
 	if et := strings.Trim(head.ETag, `"`); !strings.HasSuffix(et, "-3") {
 		t.Fatalf("head-object ETag = %q, want a 3-part multipart ETag", et)
 	}
@@ -159,7 +159,10 @@ func TestForgeAWSCLI(t *testing.T) {
 
 // crc64NVMEBase64 is the S3 x-amz-checksum-crc64nvme encoding of data: the
 // CRC-64/NVME (reflected polynomial 0x9a6c9329ac4bc9b5) as 8 big-endian
-// bytes, base64.
+// bytes, base64. hash/crc64 applies the algorithm's all-ones initial value
+// and final XOR itself, so Checksum over the reflected table is the complete
+// CRC-64/NVME: Checksum("123456789") is the spec's check value
+// 0xae8b14860a799888.
 func crc64NVMEBase64(data []byte) string {
 	sum := crc64.Checksum(data, crc64.MakeTable(0x9a6c_9329_ac4b_c9b5))
 	var b [8]byte

@@ -1,0 +1,1176 @@
+package registry_test
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/ipfs/go-cid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/multiformats/go-multihash"
+
+	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/internal/pgtest"
+	"github.com/fil-forge/ingot/logstore"
+	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
+	"github.com/fil-forge/libforge/testutil"
+	"github.com/fil-forge/ucantone/did"
+)
+
+// liveDigest is the sha256 multihash of s: a digest the batch reads decode.
+func liveDigest(t *testing.T, s string) multihash.Multihash {
+	t.Helper()
+	d, err := multihash.Sum([]byte(s), multihash.SHA2_256, -1)
+	if err != nil {
+		t.Fatalf("multihash: %v", err)
+	}
+	return d
+}
+
+func liveCid(t *testing.T, s string) cid.Cid {
+	t.Helper()
+	mh, err := multihash.Sum([]byte(s), multihash.SHA2_256, -1)
+	if err != nil {
+		t.Fatalf("multihash: %v", err)
+	}
+	return cid.NewCidV1(cid.DagCBOR, mh)
+}
+
+// TestPostgresStores exercises the SQL-backed store methods against a
+// real Postgres (jsonb, bytea[], ON CONFLICT, the latch's RowsAffected
+// semantics).
+func TestPostgresStores(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.New(t)
+
+	r := registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool)))
+	// seedBucket inserts a bucket row directly, bypassing Create, and returns
+	// the space DID it generated. space and tenant have no default — Create
+	// always supplies the DIDs Hilt returns — so the seed supplies them too,
+	// with the tenant sentinel a pre-column row would carry.
+	seedBucket := func(t *testing.T, name string) did.DID {
+		t.Helper()
+		space := testutil.RandomDID(t)
+		if _, err := pool.Exec(ctx, `INSERT INTO ingot.buckets (name, space, tenant) VALUES ($1, $2, $3)`,
+			name, space.String(), registry.UnknownTenant.String()); err != nil {
+			t.Fatalf("seed bucket %q: %v", name, err)
+		}
+		return space
+	}
+	digest := []byte{0x12, 0x20, 0xab, 0xcd} // binary, to exercise bytea round-trips
+
+	t.Run("bucket space round trips", func(t *testing.T) {
+		space := seedBucket(t, "b")
+		st, err := r.Get(ctx, "b")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if st.Space != space {
+			t.Fatalf("space = %q, want %q", st.Space, space)
+		}
+		// The backfill sentinel reads back as the constant, no special case.
+		if st.Tenant != registry.UnknownTenant {
+			t.Fatalf("tenant = %q, want the sentinel %q", st.Tenant, registry.UnknownTenant)
+		}
+	})
+
+	t.Run("bucket tenant round trips", func(t *testing.T) {
+		tenant := testutil.RandomDID(t)
+		if err := r.Create(ctx, "owned", testutil.RandomDID(t), registry.CreateState{Tenant: tenant}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		st, err := r.Get(ctx, "owned")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if st.Tenant != tenant {
+			t.Fatalf("tenant = %q, want %q", st.Tenant, tenant)
+		}
+	})
+
+	t.Run("create rejects an undefined tenant", func(t *testing.T) {
+		if err := r.Create(ctx, "tenantless", testutil.RandomDID(t), registry.CreateState{}); err == nil {
+			t.Fatal("Create without a tenant succeeded; the row would be unreadable")
+		}
+		if _, err := r.Get(ctx, "tenantless"); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("Get after rejected Create = %v, want ErrNotFound (no row written)", err)
+		}
+	})
+
+	t.Run("blob claims count to zero", func(t *testing.T) {
+		// The blob_refs PK is (digest, bucket, object_key, version_id); space is
+		// denormalized, so a given (bucket, key, version) belongs to one space
+		// (a bucket has one space). A second space therefore implies a second
+		// bucket — bucket "b2" below, not a re-keyed "b".
+		space := testutil.RandomDID(t)
+		space2 := testutil.RandomDID(t)
+		add := func(bucket, key string, sp did.DID) {
+			if err := r.PutLocation(ctx, registry.BlobLocation{Space: sp, Digest: digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+				t.Fatalf("PutLocation: %v", err)
+			}
+			mustClaim(t, r, registry.BlobClaim{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: registry.NullVersionID, Space: sp})
+		}
+		add("b", "k1", space)
+		add("b", "k2", space)
+		add("b", "k1", space) // ON CONFLICT DO NOTHING — does not inflate the count
+		add("b2", "k1", space2)
+		if n, _ := r.CountReferences(ctx, space, digest, uuid.Nil); n != 2 {
+			t.Fatalf("count space1 = %d, want 2", n)
+		}
+		if n, _ := r.CountReferences(ctx, space2, digest, uuid.Nil); n != 1 {
+			t.Fatalf("count space2 = %d, want 1", n)
+		}
+		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "b", ObjectKey: "k1", VersionID: registry.NullVersionID, Space: space})
+		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "b", ObjectKey: "k2", VersionID: registry.NullVersionID, Space: space})
+		if n, _ := r.CountReferences(ctx, space, digest, uuid.Nil); n != 0 {
+			t.Fatalf("count after release = %d, want 0", n)
+		}
+
+		// A claim publishes the digest's upload intent, and the state stays
+		// once the claims are gone: it is the durable mark of a committed blob.
+		pubDigest := multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa1})
+		if err := r.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: pubDigest, Size: 1, State: registry.IntentAccepted, Bucket: "b"}); err != nil {
+			t.Fatalf("PutIntent: %v", err)
+		}
+		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: pubDigest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
+		mustClaim(t, r, registry.BlobClaim{Digest: pubDigest, Bucket: "b", ObjectKey: "kp", VersionID: registry.NullVersionID, Space: space})
+		if in, err := r.GetIntent(ctx, space, pubDigest); err != nil || in.State != registry.IntentPublished {
+			t.Fatalf("intent after claim = %+v, err %v (want published)", in, err)
+		}
+		drop(t, r, registry.ClaimDrop{Digest: pubDigest, Bucket: "b", ObjectKey: "kp", VersionID: registry.NullVersionID, Space: space})
+		if in, err := r.GetIntent(ctx, space, pubDigest); err != nil || in.State != registry.IntentPublished {
+			t.Fatalf("intent after the claim dropped = %+v, err %v (want still published)", in, err)
+		}
+		// A claim on a digest with no intent row (a shipped segment) is fine.
+		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
+		mustClaim(t, r, registry.BlobClaim{Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Bucket: "b", ObjectKey: "kn", VersionID: registry.NullVersionID, Space: space})
+	})
+
+	t.Run("claims and parts take pending references over", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		d := multihash.Multihash([]byte{0x12, 0x20, 0xb1, 0x01})
+		ref := func(t *testing.T) uuid.UUID {
+			t.Helper()
+			add, expire := uuid.New(), uuid.New()
+			st := registry.PendingRef(add, expire, space, d, time.Now().Add(time.Hour))
+			if _, err := pool.Exec(ctx, st.SQL, st.Args...); err != nil {
+				t.Fatalf("pending ref: %v", err)
+			}
+			return add
+		}
+		count := func(t *testing.T, except uuid.UUID) int {
+			t.Helper()
+			n, err := r.CountReferences(ctx, space, d, except)
+			if err != nil {
+				t.Fatalf("CountReferences: %v", err)
+			}
+			return n
+		}
+		first, second := ref(t), ref(t)
+		if got := [2]int{count(t, uuid.Nil), count(t, first)}; got != [2]int{2, 1} {
+			t.Fatalf("[references, references but the first] = %v, want [2 1]", got)
+		}
+		// The claim takes the first reference over: still two references.
+		mustClaim(t, r, registry.BlobClaim{Digest: d, Bucket: "pb", ObjectKey: "k", VersionID: "null#1", Space: space, Ref: first})
+		if n := count(t, uuid.Nil); n != 2 {
+			t.Fatalf("references after the claim = %d, want 2 (the claim and the second reference)", n)
+		}
+		// A reference already taken over, or dropped, refuses the commit,
+		// and the root stays where it was.
+		before, _ := r.Get(ctx, "pb")
+		err := claim(t, r, registry.BlobClaim{Digest: d, Bucket: "pb", ObjectKey: "k2", VersionID: "null#2", Space: space, Ref: first})
+		if !errors.Is(err, registry.ErrReferenceExpired) {
+			t.Fatalf("claim of a reference taken over: err=%v, want ErrReferenceExpired", err)
+		}
+		if after, _ := r.Get(ctx, "pb"); before != nil && !after.Root.Equals(before.Root) {
+			t.Fatalf("a refused claim advanced the root: %v -> %v", before.Root, after.Root)
+		}
+		// A part takes the second reference over in its own write.
+		seedBucket(t, "pp")
+		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: "refs-up", Bucket: "pp", ObjectKey: "o", Space: space}); err != nil {
+			t.Fatalf("CreateSession: %v", err)
+		}
+		t.Cleanup(func() { _ = r.DeleteSession(context.Background(), "refs-up") })
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "refs-up", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, Refs: []uuid.UUID{second}}, nil, registry.ReleaseTask{}); err != nil {
+			t.Fatalf("PutPart: %v", err)
+		}
+		if n := count(t, uuid.Nil); n != 2 {
+			t.Fatalf("references after the part = %d, want 2 (the claim and the part)", n)
+		}
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "refs-up", PartNumber: 2, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, Refs: []uuid.UUID{second}}, nil, registry.ReleaseTask{}); !errors.Is(err, registry.ErrReferenceExpired) {
+			t.Fatalf("part with a reference taken over: err=%v, want ErrReferenceExpired", err)
+		}
+	})
+
+	t.Run("drop claim enqueues release atomically", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		add := func(key string) {
+			if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+				t.Fatalf("PutLocation: %v", err)
+			}
+			mustClaim(t, r, registry.BlobClaim{Digest: digest, Bucket: "rb", ObjectKey: key, VersionID: "null#1", Space: space})
+		}
+		add("k1")
+		add("k2")
+
+		// A zero grace (the commit helper's) makes the record due at once.
+		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "rb", ObjectKey: "k1", VersionID: "null#1", Space: space})
+		if releaseRecorded(t, pool, space, digest) {
+			t.Fatalf("first drop recorded a release while a claim remains")
+		}
+		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "rb", ObjectKey: "k2", VersionID: "null#1", Space: space})
+		if !releaseRecorded(t, pool, space, digest) {
+			t.Fatalf("last drop recorded no release")
+		}
+
+		// A later queueing of the same release keeps the later time, and a
+		// batch of digests queues each once.
+		later := time.Now().Add(time.Hour).Truncate(time.Millisecond)
+		if err := r.QueueReleases(ctx, space, []multihash.Multihash{digest}, later, registry.ReleaseTask{}); err != nil {
+			t.Fatalf("QueueReleases (later): %v", err)
+		}
+		d2 := multihash.Multihash([]byte{0xbb, 0x02})
+		if err := r.QueueReleases(ctx, space, []multihash.Multihash{digest, d2, d2}, registry.DueNow(), registry.ReleaseTask{}); err != nil {
+			t.Fatalf("QueueReleases (batch): %v", err)
+		}
+		queued := mustListReleases(t, pool, space)
+		if len(queued) != 2 {
+			t.Fatalf("queued releases = %v, want two", queued)
+		}
+		for _, q := range queued {
+			if string(q.Digest) == string(digest) && !q.NotBefore.Equal(later) {
+				t.Fatalf("release of %x due %v, want the later time %v", digest, q.NotBefore, later)
+			}
+		}
+	})
+
+	t.Run("intent lifecycle", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		if err := r.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: digest, Size: 9, State: registry.IntentUploading, Bucket: "b"}); err != nil {
+			t.Fatalf("PutIntent: %v", err)
+		}
+		if err := r.SetIntentState(ctx, space, digest, registry.IntentUploading); err != nil {
+			t.Fatalf("SetIntentState (uploading, the constraint admits it): %v", err)
+		}
+		if err := r.SetIntentState(ctx, space, digest, registry.IntentParked); err != nil {
+			t.Fatalf("SetIntentState: %v", err)
+		}
+		got, err := r.GetIntent(ctx, space, digest)
+		if err != nil || got.State != registry.IntentParked || got.Bucket != "b" {
+			t.Fatalf("GetIntent = %+v, err %v", got, err)
+		}
+		parked, _ := r.ListIntentsByState(ctx, registry.IntentParked)
+		if len(parked) != 1 {
+			t.Fatalf("parked = %d, want 1", len(parked))
+		}
+		if err := r.SetIntentState(ctx, space, []byte("missing"), registry.IntentParked); err != registry.ErrNotFound {
+			t.Fatalf("SetIntentState missing = %v, want ErrNotFound", err)
+		}
+		if err := r.DeleteIntent(ctx, space, digest); err != nil {
+			t.Fatalf("DeleteIntent: %v", err)
+		}
+		if _, err := r.GetIntent(ctx, space, digest); err != registry.ErrNotFound {
+			t.Fatalf("GetIntent after delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("location round trip", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:piri", URL: "http://piri/b", Size: 100}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
+		loc, err := r.GetLocation(ctx, space, digest)
+		if err != nil || loc.URL != "http://piri/b" || loc.Size != 100 {
+			t.Fatalf("GetLocation = %+v, err %v", loc, err)
+		}
+		if err := r.DeleteLocation(ctx, space, digest); err != nil {
+			t.Fatalf("DeleteLocation: %v", err)
+		}
+		if _, err := r.GetLocation(ctx, space, digest); err != registry.ErrNotFound {
+			t.Fatalf("GetLocation after delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("locations batch", func(t *testing.T) {
+		// Only the space's own rows come back, keyed by digest; a digest
+		// without a row is simply absent.
+		space, other := testutil.RandomDID(t), testutil.RandomDID(t)
+		a, b, missing := liveDigest(t, "loc a"), liveDigest(t, "loc b"), liveDigest(t, "loc missing")
+		for _, loc := range []registry.BlobLocation{
+			{Space: space, Digest: a, Provider: "did:piri", URL: "http://piri/a", Size: 10},
+			{Space: space, Digest: b, Provider: "did:piri", URL: "http://piri/b", Size: 20},
+			{Space: other, Digest: missing, Provider: "did:piri", URL: "http://piri/c", Size: 30},
+		} {
+			if err := r.PutLocation(ctx, loc); err != nil {
+				t.Fatalf("PutLocation: %v", err)
+			}
+		}
+		got, err := r.GetLocations(ctx, space, []multihash.Multihash{a, b, missing})
+		if err != nil {
+			t.Fatalf("GetLocations: %v", err)
+		}
+		if len(got) != 2 || got[string(a)].URL != "http://piri/a" || got[string(b)].Size != 20 ||
+			!bytes.Equal(got[string(b)].Digest, b) || got[string(a)].Space != space {
+			t.Fatalf("GetLocations = %+v", got)
+		}
+		if empty, err := r.GetLocations(ctx, space, nil); err != nil || len(empty) != 0 {
+			t.Fatalf("GetLocations(nil) = %+v, %v", empty, err)
+		}
+		// A stored digest that is not a multihash fails the read.
+		bad := []byte{0x0c}
+		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: bad, Provider: "did:piri", URL: "http://piri/x", Size: 1}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
+		if _, err := r.GetLocations(ctx, space, []multihash.Multihash{a, bad}); err == nil {
+			t.Fatal("GetLocations over a non-multihash digest: want an error")
+		}
+	})
+
+	// liveFEEParams is a complete parameter set whose bytea values carry
+	// embedded NULs and high bytes, to exercise real byte round-trips.
+	liveFEEParams := func(space did.DID, d []byte) registry.BlobEncryptionParams {
+		return registry.BlobEncryptionParams{
+			Space:            space,
+			Digest:           d,
+			RegionWrappedCEK: []byte{0xde, 0xad, 0x00, 0xbe, 0xef, 0xff},
+			RegionKeyVersion: "region-kek-v1",
+			HeaderLen:        212,
+			AAD:              []byte{0xa1, 0x00, 0x18, 0x20},
+		}
+	}
+
+	t.Run("encryption params round trip", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		encDigest := []byte{0x00, 0x01, 0x02, 0xff}
+		want := liveFEEParams(space, encDigest)
+		if err := r.PutEncryptionParams(ctx, want); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
+		}
+		got, err := r.GetEncryptionParams(ctx, space, encDigest)
+		if err != nil {
+			t.Fatalf("GetEncryptionParams: %v", err)
+		}
+		if !reflect.DeepEqual(*got, want) {
+			t.Fatalf("GetEncryptionParams = %+v, want %+v", *got, want)
+		}
+	})
+
+	t.Run("encryption params batch", func(t *testing.T) {
+		space, other := testutil.RandomDID(t), testutil.RandomDID(t)
+		a, b, missing := liveDigest(t, "params a"), liveDigest(t, "params b"), liveDigest(t, "params missing")
+		for _, p := range []registry.BlobEncryptionParams{
+			liveFEEParams(space, a), liveFEEParams(space, b), liveFEEParams(other, missing),
+		} {
+			if err := r.PutEncryptionParams(ctx, p); err != nil {
+				t.Fatalf("PutEncryptionParams: %v", err)
+			}
+		}
+		got, err := r.GetEncryptionParamsBatch(ctx, space, []multihash.Multihash{a, b, missing})
+		if err != nil {
+			t.Fatalf("GetEncryptionParamsBatch: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("GetEncryptionParamsBatch returned %d rows, want 2", len(got))
+		}
+		for _, d := range []multihash.Multihash{a, b} {
+			if want := liveFEEParams(space, d); !reflect.DeepEqual(got[string(d)], want) {
+				t.Fatalf("row %x = %+v, want %+v", d, got[string(d)], want)
+			}
+		}
+		if empty, err := r.GetEncryptionParamsBatch(ctx, space, nil); err != nil || len(empty) != 0 {
+			t.Fatalf("GetEncryptionParamsBatch(nil) = %+v, %v", empty, err)
+		}
+		// A stored digest that is not a multihash fails the read.
+		bad := []byte{0x1c}
+		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, bad)); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
+		}
+		if _, err := r.GetEncryptionParamsBatch(ctx, space, []multihash.Multihash{a, bad}); err == nil {
+			t.Fatal("GetEncryptionParamsBatch over a non-multihash digest: want an error")
+		}
+	})
+
+	t.Run("encryption params delete removes the row", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		encDigest := []byte{0x05, 0x06}
+		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
+		}
+		if err := r.DeleteEncryptionParams(ctx, space, encDigest); err != nil {
+			t.Fatalf("DeleteEncryptionParams: %v", err)
+		}
+		if _, err := r.GetEncryptionParams(ctx, space, encDigest); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("GetEncryptionParams after delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("encryption params rewrap in place", func(t *testing.T) {
+		// A rotation replaces only the wrapped CEK and its key version; the
+		// parameters describing the unchanged ciphertext must survive.
+		space := testutil.RandomDID(t)
+		encDigest := []byte{0x0a, 0x0b}
+		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
+		}
+		if err := r.RewrapEncryptionParams(ctx, space, encDigest, []byte{0xca, 0xfe, 0x00, 0x01}, "region-kek-v2"); err != nil {
+			t.Fatalf("RewrapEncryptionParams: %v", err)
+		}
+		got, err := r.GetEncryptionParams(ctx, space, encDigest)
+		if err != nil {
+			t.Fatalf("GetEncryptionParams: %v", err)
+		}
+		want := liveFEEParams(space, encDigest)
+		want.RegionWrappedCEK = []byte{0xca, 0xfe, 0x00, 0x01}
+		want.RegionKeyVersion = "region-kek-v2"
+		if !reflect.DeepEqual(*got, want) {
+			t.Fatalf("after rewrap = %+v, want %+v", *got, want)
+		}
+	})
+
+	t.Run("encryption params rewrap of a missing row is ErrNotFound", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		err := r.RewrapEncryptionParams(ctx, space, []byte{0x0c}, []byte{0x01}, "region-kek-v2")
+		if !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("RewrapEncryptionParams(absent) = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("incomplete encryption params rejected", func(t *testing.T) {
+		// The column constraints are the invariant: a half-populated set never
+		// reaches the table.
+		space := testutil.RandomDID(t)
+		d := []byte{0x77}
+		for name, mutate := range map[string]func(*registry.BlobEncryptionParams){
+			"nil AAD":           func(p *registry.BlobEncryptionParams) { p.AAD = nil },
+			"nil wrapped CEK":   func(p *registry.BlobEncryptionParams) { p.RegionWrappedCEK = nil },
+			"empty key version": func(p *registry.BlobEncryptionParams) { p.RegionKeyVersion = "" },
+		} {
+			partial := liveFEEParams(space, d)
+			mutate(&partial)
+			if err := r.PutEncryptionParams(ctx, partial); err == nil {
+				t.Fatalf("PutEncryptionParams(%s) = nil, want a constraint error", name)
+			}
+			if _, err := r.GetEncryptionParams(ctx, space, d); !errors.Is(err, registry.ErrNotFound) {
+				t.Fatalf("incomplete params (%s) leaked a row: %v", name, err)
+			}
+		}
+		// A rewrap cannot blank out the key material either.
+		encDigest := []byte{0x78}
+		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
+		}
+		if err := r.RewrapEncryptionParams(ctx, space, encDigest, nil, "region-kek-v2"); err == nil {
+			t.Fatal("RewrapEncryptionParams(nil CEK) = nil, want a constraint error")
+		}
+		if err := r.RewrapEncryptionParams(ctx, space, encDigest, []byte{0x01}, ""); err == nil {
+			t.Fatal("RewrapEncryptionParams(empty version) = nil, want a constraint error")
+		}
+	})
+
+	t.Run("encryption params independent of location", func(t *testing.T) {
+		// No foreign key and no cascade: the params outlive their location row,
+		// so a caller removing a blob must delete from both tables.
+		space := testutil.RandomDID(t)
+		encDigest := []byte{0x08, 0x09}
+		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
+		}
+		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: encDigest, Provider: "did:piri", URL: "http://piri/enc", Size: 4096}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
+		if err := r.DeleteLocation(ctx, space, encDigest); err != nil {
+			t.Fatalf("DeleteLocation: %v", err)
+		}
+		if _, err := r.GetEncryptionParams(ctx, space, encDigest); err != nil {
+			t.Fatalf("DeleteLocation shredded the encryption params: %v", err)
+		}
+	})
+
+	t.Run("park round trip", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		park := registry.BlobPark{
+			Space:         space,
+			Digest:        digest,
+			AddTask:       []byte{0x01, 0x02},
+			AcceptTask:    []byte{0x03, 0x04},
+			PutInvocation: []byte("sealed-inv"),
+			Size:          42,
+		}
+		if recorded, err := r.PutPark(ctx, park); err != nil || !recorded {
+			t.Fatalf("PutPark = %v, %v; want recorded", recorded, err)
+		}
+		got, err := r.GetPark(ctx, space, digest)
+		if err != nil || string(got.PutInvocation) != "sealed-inv" || got.Size != 42 {
+			t.Fatalf("GetPark = %+v, err %v", got, err)
+		}
+		// A second park for the key is refused and the first stands.
+		park.Size = 43
+		if recorded, err := r.PutPark(ctx, park); err != nil || recorded {
+			t.Fatalf("PutPark (duplicate) = %v, %v; want refused", recorded, err)
+		}
+		if got, err := r.GetPark(ctx, space, digest); err != nil || got.Size != 42 {
+			t.Fatalf("GetPark after the refused put = %+v, err %v; want the first park", got, err)
+		}
+		if err := r.DeletePark(ctx, space, digest); err != nil {
+			t.Fatalf("DeletePark: %v", err)
+		}
+		if _, err := r.GetPark(ctx, space, digest); err != registry.ErrNotFound {
+			t.Fatalf("GetPark after delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("multipart session parts latch metadata", func(t *testing.T) {
+		const id = "upl-1"
+		meta := map[string]string{"x-amz-meta-foo": "bar"}
+		bSpace := testutil.RandomDID(t)
+		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k", Space: bSpace, ContentType: "text/plain", Metadata: meta}); err != nil {
+			t.Fatalf("CreateSession: %v", err)
+		}
+		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k", Space: bSpace}); err != registry.ErrExists {
+			t.Fatalf("duplicate CreateSession = %v, want ErrExists", err)
+		}
+		s, err := r.GetSession(ctx, id)
+		if err != nil || s.ContentType != "text/plain" || s.Metadata["x-amz-meta-foo"] != "bar" || s.Space != bSpace {
+			t.Fatalf("GetSession = %+v, err %v (metadata jsonb round-trip, space)", s, err)
+		}
+		// The space is required: a session without one is refused.
+		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id + "-nospace", Bucket: "b", ObjectKey: "k"}); err == nil {
+			t.Fatal("CreateSession without a space was accepted")
+		}
+		// The bucket's space rides on the session, for teardown once the
+		// bucket row is gone.
+		space := testutil.RandomDID(t)
+		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id + "-space", Bucket: "b", ObjectKey: "k", Space: space}); err != nil {
+			t.Fatalf("CreateSession (space): %v", err)
+		}
+		if got, err := r.GetSession(ctx, id+"-space"); err != nil || got.Space != space {
+			t.Fatalf("GetSession space = %v, err %v (want %v)", got.Space, err, space)
+		}
+		_ = r.DeleteSession(ctx, id+"-space")
+
+		// bytea[] round trip + ordering.
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}, nil, registry.ReleaseTask{}); err != nil {
+			t.Fatalf("PutPart 2: %v", err)
+		}
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1, 0xa}, {0xd1, 0xb}}},
+			&registry.PartTree{Offset: 0, ChunkLog: 4, Nodes: []byte{0x0a}, Blocks: []byte{0x0b, 0x0c}, Head: []byte{0x0d}, Tail: []byte{0x0e}, Root: []byte{0x0f}}, registry.ReleaseTask{}); err != nil {
+			t.Fatalf("PutPart 1: %v", err)
+		}
+		parts, err := r.ListParts(ctx, id)
+		if err != nil || len(parts) != 2 || parts[0].PartNumber != 1 || len(parts[0].BlobDigests) != 2 {
+			t.Fatalf("ListParts = %+v, err %v", parts, err)
+		}
+		// The tree listing round-trips the tree rows by part number, absent
+		// where none was recorded.
+		trees, err := r.ListPartTrees(ctx, id)
+		if err != nil || len(trees) != 1 || trees[1] == nil {
+			t.Fatalf("ListPartTrees = %+v, err %v; want part 1's tree only", trees, err)
+		}
+		if tr := trees[1]; tr.ChunkLog != 4 || !bytes.Equal(tr.Blocks, []byte{0x0b, 0x0c}) || !bytes.Equal(tr.Head, []byte{0x0d}) || !bytes.Equal(tr.Tail, []byte{0x0e}) || !bytes.Equal(tr.Root, []byte{0x0f}) {
+			t.Fatalf("part 1 tree = %+v", tr)
+		}
+		// A superseding part without a tree drops its predecessor's row; one
+		// with a tree replaces it.
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil, registry.ReleaseTask{}); err != nil {
+			t.Fatalf("PutPart 1 again: %v", err)
+		}
+		if again, _ := r.ListPartTrees(ctx, id); again[1] != nil {
+			t.Fatalf("superseded part kept its tree: %+v", again[1])
+		}
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}},
+			&registry.PartTree{Offset: 1, ChunkLog: 5, Nodes: []byte{0x1a}, Blocks: []byte{0x1b}}, registry.ReleaseTask{}); err != nil {
+			t.Fatalf("PutPart 2 with tree: %v", err)
+		}
+		if again, _ := r.ListPartTrees(ctx, id); again[2] == nil || again[2].Offset != 1 || again[2].ChunkLog != 5 || again[2].Head != nil {
+			t.Fatalf("part 2 tree = %+v", again[2])
+		}
+		// Deleting the trees keeps the part records.
+		if err := r.DeletePartTrees(ctx, id); err != nil {
+			t.Fatalf("DeletePartTrees: %v", err)
+		}
+		if after, _ := r.ListPartTrees(ctx, id); len(after) != 0 {
+			t.Fatalf("after DeletePartTrees = %+v, want no trees", after)
+		}
+		if after, _ := r.ListParts(ctx, id); len(after) != 2 {
+			t.Fatalf("after DeletePartTrees = %+v, want two part records", after)
+		}
+
+		// A Complete records the session completed, once.
+		completed := registry.CompletedSession(id, "etag", "v1")
+		if tag, err := pool.Exec(ctx, completed.SQL, completed.Args...); err != nil || tag.RowsAffected() != 1 {
+			t.Fatalf("complete the session: %v rows, err %v", tag.RowsAffected(), err)
+		}
+		// A part cannot land once the session has left 'open', nor on a
+		// session that does not exist.
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagMD5: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}, nil, registry.ReleaseTask{}); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("PutPart on a completed session = %v, want ErrNotFound", err)
+		}
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil, registry.ReleaseTask{}); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("PutPart on a missing session = %v, want ErrNotFound", err)
+		}
+		if parts, _ := r.ListParts(ctx, id); len(parts) != 2 {
+			t.Fatalf("parts after the refused writes = %d, want 2", len(parts))
+		}
+		if tag, err := pool.Exec(ctx, completed.SQL, completed.Args...); err != nil || tag.RowsAffected() != 0 {
+			t.Fatalf("complete the completed session again: %v rows, err %v; want none", tag.RowsAffected(), err)
+		}
+
+		// delete cascades parts
+		if err := r.DeleteSession(ctx, id); err != nil {
+			t.Fatalf("DeleteSession: %v", err)
+		}
+		if after, _ := r.ListParts(ctx, id); len(after) != 0 {
+			t.Fatalf("parts after session delete = %d, want 0 (cascade)", len(after))
+		}
+	})
+
+	t.Run("multipart listing and part refs", func(t *testing.T) {
+		lsSpace := testutil.RandomDID(t)
+		mk := func(id, key string) {
+			t.Helper()
+			if err := r.CreateSession(ctx, registry.MultipartSession{
+				UploadID: id, Bucket: "b", ObjectKey: key, Space: lsSpace,
+				ContentEncoding: "testenc", ChecksumAlgorithm: "CRC32", ChecksumType: "FULL_OBJECT",
+			}); err != nil {
+				t.Fatalf("CreateSession %s: %v", id, err)
+			}
+		}
+		mk("ls-2", "zeta")
+		mk("ls-1", "alpha")
+		mk("ls-3", "alpha") // same key, created after ls-1
+
+		// New session columns round-trip.
+		s, err := r.GetSession(ctx, "ls-1")
+		if err != nil || s.ContentEncoding != "testenc" || s.ChecksumAlgorithm != "CRC32" ||
+			s.ChecksumType != "FULL_OBJECT" || s.CreatedAt.IsZero() {
+			t.Fatalf("GetSession new columns = %+v, err %v", s, err)
+		}
+
+		// ListSessions: (object_key, created_at, upload_id) order.
+		sessions, err := r.ListSessions(ctx, "b", lsSpace)
+		if err != nil || len(sessions) != 3 ||
+			sessions[0].UploadID != "ls-1" || sessions[1].UploadID != "ls-3" || sessions[2].UploadID != "ls-2" {
+			ids := make([]string, len(sessions))
+			for i, x := range sessions {
+				ids[i] = x.UploadID
+			}
+			t.Fatalf("ListSessions order = %v, err %v (want [ls-1 ls-3 ls-2])", ids, err)
+		}
+		// A bucket of the same name in another space lists none of them.
+		if other, err := r.ListSessions(ctx, "b", testutil.RandomDID(t)); err != nil || len(other) != 0 {
+			t.Fatalf("ListSessions for another space = %v, err %v; want none", other, err)
+		}
+
+		// CountPartRefs: bytea[] ANY-match across sessions, excluding one.
+		shared := []byte{0xee, 0x01}
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{shared}}, nil, registry.ReleaseTask{}); err != nil {
+			t.Fatalf("PutPart ls-1: %v", err)
+		}
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-2", PartNumber: 1, ETagMD5: []byte{2}, Size: 1, BlobDigests: []multihash.Multihash{shared, {0xee, 0x02}}}, nil, registry.ReleaseTask{}); err != nil {
+			t.Fatalf("PutPart ls-2: %v", err)
+		}
+		if n, err := r.CountPartRefs(ctx, shared, "ls-1"); err != nil || n != 1 {
+			t.Fatalf("CountPartRefs(shared, exclude ls-1) = %d, err %v (want 1)", n, err)
+		}
+		if n, err := r.CountPartRefs(ctx, []byte{0xee, 0x02}, "ls-2"); err != nil || n != 0 {
+			t.Fatalf("CountPartRefs(unique, exclude owner) = %d, err %v (want 0)", n, err)
+		}
+
+		// CountReferences: parts of open sessions count.
+		if n, err := r.CountReferences(ctx, lsSpace, shared, uuid.Nil); err != nil || n != 2 {
+			t.Fatalf("CountReferences(shared) = %d, err %v (want 2)", n, err)
+		}
+
+		// A completed session's parts are no longer live, and the
+		// completion stamps the state's change.
+		completed := registry.CompletedSession("ls-1", "etag", "")
+		if _, err := pool.Exec(ctx, completed.SQL, completed.Args...); err != nil {
+			t.Fatalf("complete ls-1: %v", err)
+		}
+		if s, err := r.GetSession(ctx, "ls-1"); err != nil || s.StateChangedAt.Before(s.CreatedAt) || s.StateChangedAt.IsZero() {
+			t.Fatalf("StateChangedAt after the completion = %v (created %v), err %v", s.StateChangedAt, s.CreatedAt, err)
+		}
+		if n, err := r.CountReferences(ctx, lsSpace, shared, uuid.Nil); err != nil || n != 1 {
+			t.Fatalf("CountReferences(shared) after ls-1 completed = %d, err %v (want 1)", n, err)
+		}
+
+		for _, id := range []string{"ls-1", "ls-2", "ls-3"} {
+			_ = r.DeleteSession(ctx, id)
+		}
+	})
+
+	t.Run("gc candidate idempotent", func(t *testing.T) {
+		if err := r.AddGCCandidate(ctx, digest, "b"); err != nil {
+			t.Fatalf("AddGCCandidate: %v", err)
+		}
+		if err := r.AddGCCandidate(ctx, digest, "b"); err != nil {
+			t.Fatalf("AddGCCandidate (dup): %v", err)
+		}
+	})
+
+	t.Run("revocation cursor upsert round trip", func(t *testing.T) {
+		if _, err := r.GetRevocationCursor(ctx); err != registry.ErrNotFound {
+			t.Fatalf("GetRevocationCursor before put err = %v, want ErrNotFound", err)
+		}
+		// A head saved before the first record has no record to describe.
+		first := registry.RevocationCursor{Token: "1733"}
+		if err := r.PutRevocationCursor(ctx, first); err != nil {
+			t.Fatalf("PutRevocationCursor: %v", err)
+		}
+		got, err := r.GetRevocationCursor(ctx)
+		if err != nil {
+			t.Fatalf("GetRevocationCursor: %v", err)
+		}
+		if got.Token != first.Token || !got.RecordedAt.IsZero() || got.Revoke.Defined() {
+			t.Fatalf("cursor = %+v, want %+v", got, first)
+		}
+		// The row is a single latch: a second put overwrites, never adds.
+		second := registry.RevocationCursor{
+			Token:      "1734",
+			RecordedAt: time.Now().UTC().Truncate(time.Microsecond), // timestamptz is µs-precision
+			Revoke:     liveCid(t, "revoked-2"),
+		}
+		if err := r.PutRevocationCursor(ctx, second); err != nil {
+			t.Fatalf("PutRevocationCursor (upsert): %v", err)
+		}
+		got, err = r.GetRevocationCursor(ctx)
+		if err != nil {
+			t.Fatalf("GetRevocationCursor after upsert: %v", err)
+		}
+		if got.Token != second.Token || !got.RecordedAt.Equal(second.RecordedAt) || !got.Revoke.Equals(second.Revoke) {
+			t.Fatalf("cursor after upsert = %+v, want %+v", got, second)
+		}
+	})
+
+	t.Run("forge_root advance guarded on root", func(t *testing.T) {
+		committed := liveCid(t, "fg-committed")
+		stale := liveCid(t, "fg-stale")
+		seedBucket(t, "fg")
+		if err := r.CASRoot(ctx, "fg", cid.Undef, committed); err != nil {
+			t.Fatalf("CASRoot: %v", err)
+		}
+		seq, err := r.NextSegmentSeq(ctx)
+		if err != nil {
+			t.Fatalf("NextSegmentSeq: %v", err)
+		}
+		if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, "fg"); err != nil {
+			t.Fatalf("InsertSegmentOpen: %v", err)
+		}
+		// Ship a segment whose op-roots include a stale root the bucket never
+		// adopted; only the committed root may advance forge_root.
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), nil, -1,
+			[]blockstore.OpRoot{{Bucket: "fg", Root: stale}, {Bucket: "fg", Root: committed}}); err != nil {
+			t.Fatalf("MarkSegmentShipped: %v", err)
+		}
+		st, err := r.Get(ctx, "fg")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if !st.ForgeRoot.Equals(committed) {
+			t.Fatalf("forge_root = %v, want committed root (stale op-root must be skipped)", st.ForgeRoot)
+		}
+	})
+
+	t.Run("retired segment keeps its row", func(t *testing.T) {
+		seq, err := r.NextSegmentSeq(ctx)
+		if err != nil {
+			t.Fatalf("NextSegmentSeq: %v", err)
+		}
+		bucket := fmt.Sprintf("rt-%d", seq)
+		sha := make([]byte, 32)
+		sha[0] = 0x5e
+		indexDigest := multihash.Multihash(digest)
+		now := time.Now().Unix()
+		if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, bucket); err != nil {
+			t.Fatalf("InsertSegmentOpen: %v", err)
+		}
+		if err := r.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, seq, now, 10, sha,
+			[]blockstore.OpRoot{{Bucket: bucket, Root: liveCid(t, "rt-root")}}); err != nil {
+			t.Fatalf("MarkSegmentSealed: %v", err)
+		}
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, now, indexDigest, 7, nil); err != nil {
+			t.Fatalf("MarkSegmentShipped: %v", err)
+		}
+		for range 2 { // idempotent
+			if err := r.RetireSegment(ctx, blockstore.PlaneCatalog, seq, now); err != nil {
+				t.Fatalf("RetireSegment: %v", err)
+			}
+		}
+
+		live, err := r.ListSegments(ctx, blockstore.PlaneCatalog, bucket)
+		if err != nil || len(live) != 0 {
+			t.Fatalf("ListSegments = %+v (err %v), want none", live, err)
+		}
+		retired, err := r.ListRetiredSegments(ctx, blockstore.PlaneCatalog, bucket)
+		if err != nil || len(retired) != 1 {
+			t.Fatalf("ListRetiredSegments = %+v (err %v), want one row", retired, err)
+		}
+		got := retired[0]
+		if got.Seq != seq || got.RetiredAt != now || got.ShippedAt != now || got.DeadBytes != 7 ||
+			!bytes.Equal(got.SHA256, sha) || !bytes.Equal(got.IndexDigest, indexDigest) {
+			t.Fatalf("retired row = %+v", got)
+		}
+		var opRoots int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM ingot.segment_op_roots WHERE seq = $1`,
+			int64(seq)).Scan(&opRoots); err != nil || opRoots != 0 {
+			t.Fatalf("op-root rows after retirement = %d (err %v), want 0", opRoots, err)
+		}
+		buckets, err := r.ListSegmentBuckets(ctx, blockstore.PlaneCatalog)
+		if err != nil {
+			t.Fatalf("ListSegmentBuckets: %v", err)
+		}
+		if slices.Contains(buckets, bucket) {
+			t.Fatalf("ListSegmentBuckets lists %q, which has only retired segments", bucket)
+		}
+
+		if err := r.DeleteSegment(ctx, blockstore.PlaneCatalog, seq); err != nil {
+			t.Fatalf("DeleteSegment: %v", err)
+		}
+		if retired, err := r.ListRetiredSegments(ctx, blockstore.PlaneCatalog, bucket); err != nil || len(retired) != 0 {
+			t.Fatalf("ListRetiredSegments after delete = %+v (err %v)", retired, err)
+		}
+	})
+
+	t.Run("catalog usage sums shipped segments", func(t *testing.T) {
+		bucket := fmt.Sprintf("cu-%d", time.Now().UnixNano())
+		space := seedBucket(t, bucket)
+		// segment records a sealed segment of bucket b, ships it unless
+		// dead is nil, and retires it if asked; it returns the seq.
+		segment := func(b string, size int64, dead *int64, indexDigest multihash.Multihash, retire bool) uint64 {
+			t.Helper()
+			seq, err := r.NextSegmentSeq(ctx)
+			if err != nil {
+				t.Fatalf("NextSegmentSeq: %v", err)
+			}
+			if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, b); err != nil {
+				t.Fatalf("InsertSegmentOpen: %v", err)
+			}
+			if err := r.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, seq, 1, size, nil, nil); err != nil {
+				t.Fatalf("MarkSegmentSealed: %v", err)
+			}
+			if dead != nil {
+				if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, 2, indexDigest, *dead, nil); err != nil {
+					t.Fatalf("MarkSegmentShipped: %v", err)
+				}
+			}
+			if retire {
+				if err := r.RetireSegment(ctx, blockstore.PlaneCatalog, seq, 3); err != nil {
+					t.Fatalf("RetireSegment: %v", err)
+				}
+			}
+			return seq
+		}
+		dead := func(n int64) *int64 { return &n }
+		segment(bucket, 1000, dead(300), digest, false)
+		unmeasured := segment(bucket, 500, dead(-1), digest, false)
+		segment(bucket, 2000, dead(900), digest, true) // retired: its CAR is still on Forge
+		segment(bucket, 59, dead(0), nil, false)       // shipped without registering anything
+		segment(bucket, 700, nil, nil, false)          // not shipped
+		// Rows of a bucket with no row of its own are nobody's usage.
+		orphan := bucket + "-orphan"
+		segment(orphan, 4000, dead(0), digest, false)
+
+		usage, err := r.CatalogUsage(ctx)
+		if err != nil {
+			t.Fatalf("CatalogUsage: %v", err)
+		}
+		want := registry.CatalogUsage{Bucket: bucket, Space: space, Bytes: 3500, DeadOnArrivalBytes: 1200, UnmeasuredBytes: 500}
+		i := slices.IndexFunc(usage, func(u registry.CatalogUsage) bool { return u.Bucket == bucket })
+		if i < 0 || usage[i] != want {
+			t.Fatalf("CatalogUsage = %+v, want an entry %+v", usage, want)
+		}
+		if slices.ContainsFunc(usage, func(u registry.CatalogUsage) bool { return u.Bucket == orphan }) {
+			t.Fatalf("CatalogUsage = %+v, lists %q, which has no bucket row", usage, orphan)
+		}
+		if !slices.IsSortedFunc(usage, func(a, b registry.CatalogUsage) int { return strings.Compare(a.Bucket, b.Bucket) }) {
+			t.Fatalf("CatalogUsage = %+v, not ordered by bucket", usage)
+		}
+
+		// An unmeasured segment's dead_bytes is NULL, read back as -1.
+		segs, err := r.ListSegments(ctx, blockstore.PlaneCatalog, bucket)
+		if err != nil {
+			t.Fatalf("ListSegments: %v", err)
+		}
+		j := slices.IndexFunc(segs, func(m logstore.SegmentMeta) bool { return m.Seq == unmeasured })
+		if j < 0 || segs[j].DeadBytes != -1 {
+			t.Fatalf("ListSegments = %+v, want seq %d with DeadBytes -1", segs, unmeasured)
+		}
+		var isNull bool
+		if err := pool.QueryRow(ctx, `SELECT dead_bytes IS NULL FROM ingot.segments WHERE seq = $1`,
+			int64(unmeasured)).Scan(&isNull); err != nil || !isNull {
+			t.Fatalf("unmeasured segment's dead_bytes IS NULL = %v (err %v), want true", isNull, err)
+		}
+	})
+}
+
+// TestCommitRootOnASingleConnection proves the
+// enqueueing CAS never needs two pooled connections at once. Resolving a
+// conflict or a missing bucket by reading through the pool, while the
+// transaction already holds a connection, deadlocks outright on a
+// single-connection pool and deadlocks any pool once enough concurrent
+// commits exhaust it.
+func TestCommitRootOnASingleConnection(t *testing.T) {
+	ctx := context.Background()
+
+	// Migrations and the fixture run on an ordinary pool; only the calls under
+	// test get the single connection, so a hang can only be them.
+	setupPool, dsn := pgtest.NewWithDSN(t)
+
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	cfg.MaxConns, cfg.MinConns = 1, 1
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+	tasks := liveUploadTasks(t, setupPool)
+	reg := registry.NewPostgres(pool, registry.WithTasks(tasks))
+	setup := registry.NewPostgres(setupPool)
+
+	space := testutil.RandomDID(t)
+	regs := []registry.UploadRegistration{{
+		Bucket: "cas-single-conn", ObjectKey: "k", Space: space,
+		Root: liveCid(t, "root"), Op: registry.UploadRegistrationAdd, Proofs: []byte("proofs"),
+	}}
+
+	// A deadlock hangs rather than fails, so every call below is bounded.
+	bounded := func(name string, fn func(context.Context) error) error {
+		c, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		err := fn(c)
+		if c.Err() != nil {
+			t.Fatalf("%s: needed a second pooled connection: %v", name, c.Err())
+		}
+		return err
+	}
+
+	// A bucket that does not exist: the conflict path has to say so without
+	// reaching back to the pool.
+	err = bounded("missing bucket", func(c context.Context) error {
+		return reg.CommitRoot(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), registry.RootCommit{Registrations: regs})
+	})
+	if !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("missing bucket: got %v, want ErrNotFound", err)
+	}
+
+	if err := setup.Create(ctx, "cas-single-conn", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	t.Cleanup(func() { _ = setup.Delete(context.Background(), "cas-single-conn", space) })
+
+	// A root that does not match: the same path, reporting a conflict.
+	err = bounded("stale root", func(c context.Context) error {
+		return reg.CommitRoot(c, "cas-single-conn", liveCid(t, "stale"), liveCid(t, "next"), registry.RootCommit{Registrations: regs})
+	})
+	if !errors.Is(err, registry.ErrConflict) {
+		t.Fatalf("stale root: got %v, want ErrConflict", err)
+	}
+
+	// And the happy path still commits both the root and its rows.
+	if err := bounded("commit", func(c context.Context) error {
+		return reg.CommitRoot(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), registry.RootCommit{Registrations: regs})
+	}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	// Scoped to this run's space: the suite's database persists, so a global
+	// count would depend on what ran before.
+	if queued := queuedUploads(t, setupPool, space); len(queued) != 1 {
+		t.Fatalf("queued %d registrations for the space, want 1", len(queued))
+	}
+}
+
+// liveUploadTasks returns a migrated runner holding the upload queue, for the
+// registry to queue registrations through.
+func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
+	t.Helper()
+	r, err := taskrunner.New(pool, taskrunner.Options{Schema: "ingot", Queues: []taskrunner.QueueOptions{
+		{Name: registry.UploadQueue}, {Name: registry.ReleaseQueue},
+	}})
+	if err != nil {
+		t.Fatalf("task runner: %v", err)
+	}
+	// Submitting a task needs its handler registered, though these tests
+	// never run one.
+	noop := func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil }
+	for _, op := range []registry.UploadRegistrationOp{registry.UploadRegistrationAdd, registry.UploadRegistrationRemove} {
+		if err := r.Handle(registry.UploadQueue, string(op), noop); err != nil {
+			t.Fatalf("register %s: %v", op, err)
+		}
+	}
+	if err := r.Handle(registry.ReleaseQueue, registry.ReleaseAction, noop); err != nil {
+		t.Fatalf("register release: %v", err)
+	}
+	if err := r.Migrate(context.Background()); err != nil {
+		t.Fatalf("task runner migrate: %v", err)
+	}
+	return r
+}
+
+// queuedUploads returns the space's pending registrations, in queue order.
+func queuedUploads(t *testing.T, pool *pgxpool.Pool, space did.DID) []registry.UploadRegistration {
+	t.Helper()
+	tasks, err := taskrunnertest.Tasks(context.Background(), pool, "ingot", registry.UploadQueue)
+	if err != nil {
+		t.Fatalf("list queued uploads: %v", err)
+	}
+	var out []registry.UploadRegistration
+	for _, q := range tasks {
+		if q.Subject != space.String() || q.State != "pending" {
+			continue
+		}
+		reg, err := registry.UploadRegistrationFromTask(taskrunner.Task{Subject: q.Subject, Action: q.Action, Args: q.Args})
+		if err != nil {
+			t.Fatalf("decode queued upload: %v", err)
+		}
+		out = append(out, reg)
+	}
+	return out
+}
+
+// livePool returns a pool on a migrated database of the test's own.
+func livePool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	pool := pgtest.New(t)
+	return pool
+}
+
+// TestCommitRootQueuesUploadRegistrations: a commit's registrations become
+// tasks in its own transaction, in commit order, carrying what the worker
+// needs; a commit that fails queues none.
+func TestCommitRootQueuesUploadRegistrations(t *testing.T) {
+	pool := livePool(t)
+	ctx := context.Background()
+	r := registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool)))
+	space := testutil.RandomDID(t)
+	if err := r.Create(ctx, "queue-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Delete(context.Background(), "queue-bucket", space) })
+
+	regs := []registry.UploadRegistration{
+		{Bucket: "queue-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "new"), Op: registry.UploadRegistrationAdd, Proofs: []byte("add proofs")},
+		{Bucket: "queue-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "old"), Op: registry.UploadRegistrationRemove, Proofs: []byte("remove proofs")},
+	}
+	if err := r.CommitRoot(ctx, "queue-bucket", liveCid(t, "stale"), liveCid(t, "root"), registry.RootCommit{Registrations: regs}); !errors.Is(err, registry.ErrConflict) {
+		t.Fatalf("stale commit: %v, want ErrConflict", err)
+	}
+	if queued := queuedUploads(t, pool, space); len(queued) != 0 {
+		t.Fatalf("a failed commit queued %d registrations", len(queued))
+	}
+	if err := r.CommitRoot(ctx, "queue-bucket", cid.Undef, liveCid(t, "root"), registry.RootCommit{Registrations: regs}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if queued := queuedUploads(t, pool, space); !reflect.DeepEqual(queued, regs) {
+		t.Fatalf("queued %+v, want %+v", queued, regs)
+	}
+}
+
+// TestCommitRootWithoutTasksRefusesRegistrations: a registry with no runner
+// cannot queue a commit's registrations, so it refuses the commit rather than
+// dropping them.
+func TestCommitRootWithoutTasksRefusesRegistrations(t *testing.T) {
+	pool := livePool(t)
+	ctx := context.Background()
+	r := registry.NewPostgres(pool)
+	space := testutil.RandomDID(t)
+	if err := r.Create(ctx, "no-tasks-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Delete(context.Background(), "no-tasks-bucket", space) })
+	err := r.CommitRoot(ctx, "no-tasks-bucket", cid.Undef, liveCid(t, "root"), registry.RootCommit{
+		Registrations: []registry.UploadRegistration{{Bucket: "no-tasks-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "mf"), Op: registry.UploadRegistrationAdd}},
+	})
+	if err == nil {
+		t.Fatal("a commit with registrations succeeded without a task runner")
+	}
+	if st, _ := r.Get(ctx, "no-tasks-bucket"); st != nil && st.Root.Defined() {
+		t.Fatal("the refused commit moved the root")
+	}
+}
+
+// TestABucketIsItsOwnSpace: a second bucket in a space another holds is
+// refused, and not as the name clash ErrExists reports.
+func TestABucketIsItsOwnSpace(t *testing.T) {
+	ctx := context.Background()
+	r := registry.NewPostgres(pgtest.New(t))
+	space, tenant := testutil.RandomDID(t), testutil.RandomDID(t)
+	if err := r.Create(ctx, "first", space, registry.CreateState{Tenant: tenant}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(ctx, "first", testutil.RandomDID(t), registry.CreateState{Tenant: tenant}); !errors.Is(err, registry.ErrExists) {
+		t.Fatalf("a second bucket named first: %v, want ErrExists", err)
+	}
+	err := r.Create(ctx, "second", space, registry.CreateState{Tenant: tenant})
+	if err == nil || errors.Is(err, registry.ErrExists) {
+		t.Fatalf("a second bucket in first's space: %v, want a refusal other than ErrExists", err)
+	}
+}
+
+// TestBucketCORSConfig round-trips a bucket's own CORS document through
+// the SQL store: the column scans back as the bytes stored, NULL reads as
+// nil, a nil write restores NULL, and a missing bucket's write affects no
+// row, which fails a queue-bucket.set-cors's commit.
+func TestBucketCORSConfig(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.New(t)
+	r := registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool)))
+	if err := r.Create(ctx, "b", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	st, err := r.Get(ctx, "b")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if st.CORSConfig != nil {
+		t.Fatalf("CORSConfig on a new bucket = %q, want nil", st.CORSConfig)
+	}
+
+	// Binary, with a zero byte, to exercise the bytea round trip rather than
+	// a text one.
+	doc := []byte("<CORSConfiguration>\x00</CORSConfiguration>")
+	set := func(name string, cfg []byte) int64 {
+		t.Helper()
+		st := registry.CORSSet(name, cfg)
+		tag, err := pool.Exec(ctx, st.SQL, st.Args...)
+		if err != nil {
+			t.Fatalf("CORSSet: %v", err)
+		}
+		return tag.RowsAffected()
+	}
+	set("b", doc)
+	if st, err = r.Get(ctx, "b"); err != nil {
+		t.Fatalf("Get after set: %v", err)
+	}
+	if !bytes.Equal(st.CORSConfig, doc) {
+		t.Fatalf("CORSConfig = %q, want %q", st.CORSConfig, doc)
+	}
+
+	set("b", nil)
+	if st, err = r.Get(ctx, "b"); err != nil {
+		t.Fatalf("Get after clear: %v", err)
+	}
+	if st.CORSConfig != nil {
+		t.Fatalf("CORSConfig after clear = %q, want nil", st.CORSConfig)
+	}
+
+	if n := set("missing", doc); n != 0 {
+		t.Fatalf("CORSSet on a missing bucket affected %d rows, want none", n)
+	}
+}

@@ -23,8 +23,8 @@ therefore stores one manifest per key and nothing more.
 
 Every version carries two identifiers with separate jobs:
 
-- **`seq`** — a per-bucket ordinal, allocated once per write inside the bucket's commit
-  critical section (§5.1). It orders a key's versions by recency and never leaves the server.
+- **`seq`** — a per-bucket ordinal, allocated once per write inside the bucket's
+  `queue-bucket.commit` (§5.1). It orders a key's versions by recency and never leaves the server.
 - **`version_id`** — the client handle (`x-amz-version-id`). On an Enabled bucket it is a ULID
   token whose low 64 entropy bits hold the seq (§3), so the id itself says where the version
   sits. On a Suspended or unversioned bucket, S3 fixes the id to the literal string `"null"`.
@@ -190,7 +190,7 @@ Noncurrent versions live in a **per-key sub-MST** (the same forked `mst` package
 blockstore — its nodes are ordinary catalog-plane blocks):
 
 - **key** — `revSeqKey(seq)`: fixed-width 16-char lowercase hex of `math.MaxUint64 − seq`.
-  Because the MST iterates forward-only (`mst.go:835 WalkLeavesFrom`), the inversion makes
+  Because the MST iterates forward-only (`WalkLeavesFrom`, `mst/mst.go`), the inversion makes
   iteration **newest-first**. Scoped to one object key, the key is *just an integer rendered
   order-preservingly*, valid under `mst.IsValidKey` (hex is UTF-8, NUL-free, short).
 - **value** — the version's manifest CID (its manifest-arm block, §2.1) and nothing
@@ -202,10 +202,10 @@ blockstore — its nodes are ordinary catalog-plane blocks):
 
 A direct version-scoped seek is `prev.Get(revSeqKey(seq))` — O(log n), no scan.
 
-### 2.3 Manifest additions
+### 2.3 Manifest identity fields
 
-`ObjectManifest` (bucket/manifest.go) gains two fields; `DeleteMarker bool \`cborgen:"dm"\``
-already exists (manifest.go:25) and finally gets read:
+`ObjectManifest` (`bucket/manifest.go`) carries the version's identity beside
+`DeleteMarker bool \`cborgen:"dm"\``:
 
 ```go
 Seq       uint64 `cborgen:"sq"` // the version's ordinal (== leaf/prev position)
@@ -223,8 +223,8 @@ A **delete marker** is an `ObjectManifest` with `DeleteMarker: true`, a zero `Bo
 digests — it contributes nothing to `blob_refs`), no ETag, and `Created` = marker time. Markers
 are versions like any other: they occupy `Current` or a `Prev` slot and carry a `Seq`/`VersionID`.
 
-Run `make gen` after the type changes (the `ObjectManifest` map header count changes; `gen/main.go`
-must also register `ObjectLeaf` and `VersionNode`).
+`gen/main.go` registers `ObjectManifest`, `ObjectLeaf`, and `VersionNode` with cbor-gen; run
+`make gen` after changing any of them.
 
 ### 2.4 Invariants
 
@@ -235,8 +235,8 @@ must also register `ObjectLeaf` and `VersionNode`).
    version as `Current`; deleting the current version promotes the largest remaining seq (§7.2).
 3. **`Prev` holds exactly the noncurrent versions**, keyed newest-first.
 4. **`seq` is strictly increasing in commit order per bucket, except for a reserved seq.**
-   Allocation happens inside the per-bucket critical section (§5.1); in-process the `bucketop`
-   mutex serializes it, and the `CASRoot` conflict behavior covers cross-process races. A
+   Allocation happens inside the bucket's commit (§5.1); a bucket's `queue-bucket.commit` tasks
+   run one at a time on its subject, and the guarded root advance backs that up. A
    multipart Complete in an Enabled bucket reserves its seq before it accepts the parts (§5.1),
    so writes to other keys can commit with later seqs ahead of it. Within a key, invariant 2
    still holds: the commit refuses a reservation older than the key's current version.
@@ -285,19 +285,20 @@ depends on hiding this; the exposure is operational and accepted.
 
 ### 4.1 Registry
 
-`buckets.versioning` and `buckets.next_version_seq` already exist in the schema
-(migrations/sql/00003_stores.sql:18-23) — **no new migration**. Code changes:
+`buckets.versioning` and `buckets.next_version_seq` hold the state
+(`migrations/sql/00003_stores.sql`).
 
-- `registry.State` gains `Versioning VersioningState` (a `string` type with constants
+- `registry.State` carries `Versioning VersioningState` (a `string` type with constants
   `VersioningUnversioned` (`"unversioned"`, the default), `VersioningEnabled`, `VersioningSuspended`);
-  `Postgres.Get` (postgres.go:64) selects the column; `Create` leaves the default.
-- `registry.Registry` gains two methods (implemented by `*registry.Postgres` and
-  `inmem.MemStore`):
+  `Postgres.Get` selects the column; `Create` takes it from `CreateState`, unversioned unless a
+  bucket is created with object lock.
+- The registry has a statement and a method for it:
 
 ```go
-// SetVersioning updates the bucket's versioning state. Only "enabled" and
-// "suspended" are settable (S3 has no way back to unversioned).
-SetVersioning(ctx context.Context, name string, v VersioningState) error
+// VersioningSet is the write queue-bucket.set-versioning commits: the
+// bucket's versioning state. Only "enabled" and "suspended" are settable (S3
+// has no way back to unversioned).
+func VersioningSet(name string, v VersioningState) (Statement, error)
 // AllocVersionSeq atomically advances and returns the bucket's version
 // ordinal (first call returns 1). Gaps from failed commits are harmless.
 AllocVersionSeq(ctx context.Context, name string) (uint64, error)
@@ -309,14 +310,15 @@ metadata — the Hilt forwarding path (forge-mode create/delete/list) is not inv
 
 ### 4.2 S3 API
 
-- **`PutBucketVersioning`** (new override; interface at versitygw backend.go:42) — the controller
-  pre-validates the status to `Enabled|Suspended`; the backend resolves the bucket
-  (`ErrNoSuchBucket` otherwise) and calls `SetVersioning`.
-- **`GetBucketVersioning`** (bucket.go:143, currently a zero-value stub) — returns `Status` nil
+- **`PutBucketVersioning`** (interface at versitygw `backend/backend.go:42`) — the controller
+  pre-validates the status to `Enabled|Suspended`; the backend runs `queue-bucket.set-versioning`
+  on the bucket's subject, which resolves the bucket (`ErrNoSuchBucket` otherwise) and writes
+  the state with its commit (`registry.VersioningSet`). It runs one at a time with the bucket's commits, so a commit sees one
+  versioning state throughout.
+- **`GetBucketVersioning`** (`s3frontend/bucket.go`) — returns `Status` nil
   when the bucket is `unversioned` (never configured → empty `<VersioningConfiguration/>`,
   matching `GetBucketVersioning_empty_response`), else the corresponding
-  `types.BucketVersioningStatus`. The stale doc comment at bucket.go:138-142 ("returns
-  Suspended") gets fixed.
+  `types.BucketVersioningStatus`.
 
 ### 4.3 Version headers by bucket state
 
@@ -337,16 +339,17 @@ reports ids — `"null"` for null versions — regardless of state.
 
 ## 5. The write rule
 
-One commit helper implements every version-creating mutation — `PutObject`, `CopyObject`
-(destination), `CompleteMultipartUpload`, and delete-marker insertion — replacing the
-`Add`-then-`Update`-on-exists splice duplicated at object.go:181-183 and multipart.go:289-292.
+One commit step implements every version-creating mutation — `PutObject`, `CopyObject`
+(destination), `CompleteMultipartUpload`, and delete-marker insertion: the Put change
+(`applyPut`, `s3frontend/version.go`) of a `queue-bucket.commit`.
 
 ### 5.1 Sequence allocation
 
-Inside the `bucketop.MutateFn` (per-bucket mutex held, root snapshot taken):
+Inside the `queue-bucket.commit`'s Put change (`applyPut`, on the bucket's subject, root snapshot
+taken):
 
 ```
-seq := reg.AllocVersionSeq(ctx, bucket)          // ordinal, commit-ordered under the lock
+seq := reg.AllocVersionSeq(ctx, bucket)          // ordinal, commit-ordered on the bucket's subject
 vid := state == Enabled ? ulidToken(now, seq) : "null"
 ```
 
@@ -356,23 +359,23 @@ depends on this: a pre-versioning object must list *below* later numbered versio
 commit fails or retries, the seq is a gap; gaps are harmless (`architecture.md` §3).
 
 **Reserved seq.** A multipart Complete in an Enabled bucket allocates its seq and mints its id
-before it accepts the parts, outside the lock, and reports the id to versitygw
+before it accepts the parts, before the commit, and reports the id to versitygw
 (`backend.CompleteMultipartUploadReporter`). A slow Complete's response commits its headers before
 the completion finishes, after waiting for the report, and S3 sends `x-amz-version-id` with them.
-The reported id is binding, so the commit installs it unchanged, and under the lock refuses it
-(`errReservationSuperseded`, a retryable InternalError that reopens the upload) when:
+The reported id is binding, so the commit installs it unchanged, and refuses it
+(`errReservationSuperseded`, a retryable InternalError that leaves the upload open) when:
 
 - the key's current version has a larger seq: another write to the key committed during the
   Complete, and the reservation can no longer be the newest version (invariant 2); or
 - the bucket is no longer Enabled, so the version would be null.
 
 The client's retry reserves a fresh seq. Unversioned and suspended buckets send no version id, so
-their Completes report `""` and allocate under the lock as every other write does. So does a
-Complete that waited on another Complete of its upload: it reports `""` before waiting, since the
-other one's id isn't known yet. A Complete that reported `""` commits only a null version: if the
-bucket is Enabled at its commit (versioning was enabled meanwhile, or the Complete it waited on
-failed and this one won), the commit is refused the same way, since the client could never learn
-the numbered version's id.
+their Completes report `""` and allocate in the commit as every other write does. A Complete
+that waits behind another Complete of its upload (`queue-multipart-upload.complete`) reports
+nothing until it runs, and then replays the other one's result if it committed, or reserves its own id. A Complete
+that reported `""` commits only a null version: if the bucket is Enabled at its commit (versioning
+was enabled meanwhile), the commit is refused the same way, since the client could never learn the
+numbered version's id.
 
 ### 5.2 Supersession
 
@@ -443,8 +446,10 @@ MST is.
 
 ### 6.1 Resolution
 
-Every versionId-taking read resolves through one helper, `resolveVersion(ctx, state, key,
-versionId)` → `(leaf, VersionNode, *ObjectManifest, error)` (`leaf` is nil for a manifest-valued key):
+Every versionId-taking read resolves through one helper, `resolveVersion(ctx, bucket, key,
+versionId)` (or `resolveVersionIn` with the registry state in hand) → a `resolvedVersion`
+holding the leaf, the `VersionNode`, the `*ObjectManifest`, and whether the version is the
+latest (`leaf` is nil for a manifest-valued key):
 
 ```
 val := topMST.Get(key)                   → miss: NoSuchKey
@@ -486,8 +491,9 @@ Copying *from* a marker: without a versionId the current-marker case is `404 NoS
 marker's versionId is `400 InvalidRequest`. Conditional requests (`If-Match` etc.) evaluate
 against the resolved **current** version, including the at-commit re-check.
 
-`GetObjectAttributes` remains unimplemented (`ErrNotImplemented`); its versioning conformance
-rows stay out of scope with it.
+`GetObjectAttributes` resolves through `headObject`, so it takes the same versionId grammar and
+answers `405 MethodNotAllowed` for a version-scoped marker. Its `Versioning_*` conformance rows
+are excluded from the versioning tables.
 
 ---
 
@@ -497,9 +503,13 @@ rows stay out of scope with it.
 
 | state | behavior |
 |---|---|
-| unversioned | permanent delete (object.go:607 `deleteObjectKey`): drop the key and its manifest, release claims. No marker, no version headers. |
+| unversioned | permanent delete (`applyDeleteKey`, `s3frontend/object.go`): drop the key and its manifest, release claims. No marker, no version headers. |
 | enabled | insert a **numbered delete marker** via the write rule (§5). This happens **even if the key does not exist** (S3 semantics; `Versioning_DeleteObject_non_existing_object` deletes a nonexistent key and succeeds) — the key is created with the marker's manifest as its value. Response: `DeleteMarker: true`, `VersionId: <marker token>`. |
 | suspended | insert a **null delete marker** via the write rule — as a null write it replaces the existing null (current) or evicts a prev null, per §5.2; repeatable idempotently (`Versioning_DeleteObject_suspended` runs it five times). Response: `DeleteMarker: true`, `VersionId: "null"`. |
+
+The request sends a Delete change without a version id, and the `queue-bucket.commit` picks the row
+from the bucket's versioning state at the commit: a marker when versioning is configured, removal
+of the key otherwise.
 
 ### 7.2 `DeleteObject` with versionId
 
@@ -536,8 +546,8 @@ echoes the id with no marker flag.
 
 ### 7.3 `DeleteObjects`
 
-Each entry dispatches to §7.1 or §7.2 by the presence of `ObjectIdentifier.VersionId` (the loop
-at object.go:689-704 currently drops it). Per-entry results populate `types.DeletedObject`
+Each entry dispatches to §7.1 or §7.2 by the presence of `ObjectIdentifier.VersionId`.
+Per-entry results populate `types.DeletedObject`
 (`DeleteMarker`, `DeleteMarkerVersionId`, `VersionId`); per-entry errors (e.g.
 `InvalidArgVersionId`) go to the error list. Batch cap and Quiet mode follow the plain-delete
 semantics; the batch is not atomic.
@@ -551,20 +561,21 @@ and to version-scoped deletes, evaluated against the target version.
 
 ## 8. The reference index
 
-`blob_refs` rows carry each version's id: the `registry.NullVersionID` sentinel at
-object.go:336/:345 is replaced by each version's `VersionID` (null versions carry the id
-`"null"`, so rows for unversioned buckets keep that id). The interfaces already carry
-`versionID` everywhere (`registry.BlobClaim`, `registry.ClaimDrop`); no schema change.
+`blob_refs` rows carry each version's claim id (`claimVersionID`: the version's `VersionID`,
+with null versions keyed by their seq so each generation is distinct). The claim and drop
+types carry it (`registry.BlobClaim`, `registry.ClaimDrop`).
 
 Rules. Every claim and drop is carried by the commit (`bucketop.Tx.ClaimBlobs` /
-`DropClaims`, written by `registry.CommitRoot` in the root swap's transaction), so a version
+`DropClaims`, written by `registry.Postgres.RootCommitWrites` with the root's advance, in the
+`queue-bucket.commit` task's transaction), so a version
 is published with its claims and its discards' drops or not at all:
 
 - **New version** → a claim for each body digest with the new `VersionID`. Retained
   superseded versions keep their rows untouched — under Enabled, an overwrite **releases nothing**.
 - **Discarded versions** (§5.2 discards, §7.2 removals, unversioned overwrite/delete) → a drop
-  per digest with the *discarded* version's id; a drop of the space's last claim on a digest
-  records the blob's release in the same transaction, due the release grace after the commit.
+  per digest with the *discarded* version's claim id; a drop of the space's last claim on a
+  digest queues the blob's `queue-space-shard.release` in the same transaction, due the release
+  grace after the commit.
   The evicted-prev-null case fetches the evicted manifest during the commit to learn its
   digests.
 - **Same-id replacement** (null replacing null — the only case where new and discarded share a
@@ -587,7 +598,7 @@ ingot's index answers only "does any version in this bucket still need the diges
 
 ### 9.1 `ListObjects` / `ListObjectsV2`
 
-`listWalk` (object.go:849) reads each key's current version — the manifest arm itself, or the
+`listWalk` (`s3frontend/object.go`) reads each key's current version — the manifest arm itself, or the
 leaf's `Current` manifest (fetched anyway for ETag/size) — and **skips keys whose current
 version is a delete marker**: they don't count toward `MaxKeys`, don't produce entries, and
 don't seed a `CommonPrefix`. Prefix, delimiter, markers, and truncation keep their usual
@@ -595,7 +606,7 @@ semantics; the walk costs one manifest per manifest-valued key, or a leaf and a 
 key, with no descent into `Prev`. The manifest fetch applies even to keys a delimiter rolls
 into a `CommonPrefix`: a prefix whose keys all sit under delete markers must not appear.
 
-### 9.2 `ListObjectVersions` (new; interface at versitygw backend.go:78)
+### 9.2 `ListObjectVersions` (`s3frontend/listversions.go`; interface at versitygw `backend/backend.go:78`)
 
 The walk composes the top-MST key walk with the per-key newest-first version sequence — a
 manifest-valued key's single version, or `Current` then the `Prev` walk:
@@ -641,9 +652,8 @@ Union-keyed blocks are a different case: a revision adds a key and keeps reading
 dev and staging data stays readable without a reset. `"/objectmanifest/1"` (§2.1) is the first
 revision made that way.
 
-Out of scope: `ListParts`/`ListMultipartUploads`, `GetObjectAttributes`,
-MFA delete, lifecycle expiration, and multi-instance seq arbitration beyond the existing
-`CASRoot` conflict surface. Object lock / retention / legal hold are specified in
+Out of scope: MFA delete, lifecycle expiration, and multi-instance seq arbitration: a bucket's commits run on
+the one instance that holds its catalog log. Object lock / retention / legal hold are specified in
 [`s3-object-lock.md`](./s3-object-lock.md); object tagging in
 [`s3-object-tagging.md`](./s3-object-tagging.md).
 
@@ -655,13 +665,13 @@ MFA delete, lifecycle expiration, and multi-instance seq arbitration beyond the 
 |---|---|
 | `bucket/leaf.go` (new) + `gen/main.go` + `make gen` | `ObjectLeaf`, `VersionNode`, `ValueUnion` (cborgen-registered); the strict `ObjectValue` / `EnvelopedManifest` / `EnvelopedLeaf` wrappers (§2.1) |
 | `bucket/manifest.go` | `Seq`, `VersionID` fields (§2.3) |
-| `registry/registry.go`, `postgres.go`, `inmem/store.go` | `State.Versioning`, `VersioningState`, `SetVersioning`, `AllocVersionSeq` (§4.1) |
-| `s3frontend/version.go` (new) | token mint/parse/classify (§3), `revSeqKey`, the value-union dispatch (§2.1), `resolveVersion` (§6.1), the write rule (§5.2), prev-tree helpers |
-| `s3frontend/object.go` | `PutObject` splice → write rule; reads resolve via `resolveVersion`; `GetObject`/`HeadObject` versionId + marker semantics + output ids; `DeleteObject`/`deleteObjectKey`/`DeleteObjects` (§7); `addClaims` / `dropClaims` call sites carry real version ids (§8); `listWalk` marker skip (§9.1) |
-| `s3frontend/copy.go`, `multipart.go`, `uploadpartcopy.go` | `commitManifest` → write rule; source-version resolution for `CopyObject` and `UploadPartCopy`; `CopySourceVersionId` on both; Complete's `versionid` return |
-| `s3frontend/bucket.go` | `PutBucketVersioning` (new), `GetBucketVersioning` (real states), versioned `DeleteBucket` guard (§7) |
+| `registry/registry.go`, `postgres.go`, `bucketcommit.go` | `State.Versioning`, `VersioningState`, `VersioningSet`, `AllocVersionSeq` (§4.1) |
+| `s3frontend/version.go` (new) | token mint/parse/classify (§3), `revSeqKey`, the value-union dispatch (§2.1), `resolveVersion` (§6.1), the write rule (`applyPut`, §5.2), version reservation (§5.1), `applyDeleteVersion` and `spliceLeaf` (§7.2), prev-tree helpers |
+| `s3frontend/object.go` | `PutObject` splice → write rule; reads resolve via `resolveVersion`; `GetObject`/`HeadObject` versionId + marker semantics + output ids; `DeleteObject`/`applyDeleteKey`/`DeleteObjects` (§7); `addClaims` / `dropClaims` call sites carry real version ids (§8); `listWalk` marker skip (§9.1) |
+| `s3frontend/copy.go`, `multipart.go`, `uploadpartcopy.go` | commits through the write rule (a Put change); source-version resolution for `CopyObject` and `UploadPartCopy`; `CopySourceVersionId` on both; Complete's `versionid` return |
+| `s3frontend/bucket.go`, `bucketadmin.go` | `PutBucketVersioning` (`queue-bucket.set-versioning`), `GetBucketVersioning`, versioned `DeleteBucket` guard (§7) |
 | `s3frontend/listversions.go` (new) | `ListObjectVersions` (§9.2) |
 | `s3frontend/conditions.go` | `currentObjectETag` resolves the current version via `resolveVersion` |
 | unit tests | token codec + classification; union codec round-trip + unknown-key and pre-union-block rejection; write-rule table tests (all four supersession rows + first-supersession leaf creation + null eviction + non-existent-key marker); promotion; per-version claim add/release on the `refindex_test.go` harness; list pagination |
-| `itest/versity_versioning_test.go` (new) + `versity_test.go` categories | curate upstream `TestVersioning` / `ListObjectVersions_*` / `GetBucketVersioning_*` / `PutBucketVersioning_*` rows into pass/xfail tables (tagging, object-lock, `GetObjectAttributes` rows → xfail/omitted; the `UploadPartCopy` and cross-bucket `CopyObject` rows pass; note the teardown-blocked caveat, itest/README.md:40-47) |
+| `itest/versity_versioning_test.go` (new) + `versity_test.go` categories | curate upstream `TestVersioning` / `ListObjectVersions_*` / `GetBucketVersioning_*` / `PutBucketVersioning_*` rows into pass/xfail tables (the tagging and object-lock rows pass; the `GetObjectAttributes`, `UploadPartCopy`, and `AccessControl` rows and the `VersioningDisabled_*` pair are excluded) |
 | `docs/architecture.md` | point §3 at this doc for versioning |

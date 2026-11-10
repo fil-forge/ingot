@@ -31,7 +31,7 @@ type BlockLoc struct {
 }
 
 // Plane identifies a segment's block plane. The log is now a single-plane
-// pipeline: object bodies are spooled and uploaded per-blob (see Spool), so the
+// pipeline: object bodies are streamed to their providers per-blob, so the
 // only journaled plane is the catalog.
 //
 //   - PlaneCatalog: the dag-cbor MST nodes and ObjectManifests that describe a
@@ -82,7 +82,7 @@ func (p Plane) String() string {
 // ObjectManifest) plus the op-root record into the open segment before
 // returning, so a successful append is locally durable before the bucket Root
 // is allowed to advance. Object-body blobs do not flow through the log — they
-// are spooled and uploaded per-blob (see Spool) before the manifest commits.
+// are streamed to their providers per-blob before the manifest commits.
 // It returns the seq of the segment the batch went into, which the commit
 // journals the blocks under until that segment ships.
 //
@@ -94,7 +94,7 @@ type Log interface {
 }
 
 // Appended is one committed batch as the log took it: the catalog blocks and
-// the segment they went into. The root swap journals the blocks in Postgres
+// the segment they went into. The commit journals the blocks in Postgres
 // under that segment until it ships (registry.RootCommit.Journal), so a copy
 // of Postgres holds every block the host's disk alone would otherwise hold.
 type Appended struct {

@@ -59,8 +59,8 @@ mostly means *not* aggregating across objects.)
 
 **1 — Rethink Piri's aggregation strategy.** The target is **no cross-object aggregation** (object =
 piece), with a generational background aggregator as the optional relief valve for root-count/throughput,
-and the size floor (`MinAggregateSize` lowered to a configurable ~8 MiB) as the **fallback** if the
-contracts can't take the piece volume. Piri's aggregator is already size-driven,
+and the size floor (`MinAggregateSize`, set by Piri's `min_aggregate_size` and 128 MiB by default,
+lowered to ~8 MiB) as the **fallback** if the contracts can't take the piece volume. Piri's aggregator is already size-driven,
 so the floor-fallback is a small change; the object=piece target mostly means *not* aggregating across
 objects.
 

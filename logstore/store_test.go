@@ -70,7 +70,7 @@ func (f *fakeMeta) EnsureSegmentSeqAbove(_ context.Context, seq uint64) error {
 }
 
 // The fake keeps no journal; rebuild_test.go drives the journal through
-// inmem.MemStore.
+// the Postgres registry.
 func (f *fakeMeta) JournalBuckets(context.Context) ([]string, error)          { return nil, nil }
 func (f *fakeMeta) JournalSegments(context.Context, string) ([]uint64, error) { return nil, nil }
 func (f *fakeMeta) ReadJournal(context.Context, uint64, cid.Cid, int) ([]block.Block, error) {
@@ -255,18 +255,62 @@ func newTestStore(t *testing.T, sealBytes int64, sealAge time.Duration, retain i
 		flushCalls.add(1)
 		return nil, nil
 	}
+	sh := &shipper{}
 	cfg := Config{
 		Dir:     dir,
 		Meta:    meta,
-		Catalog: PlaneConfig{SealBytes: sealBytes, SealAge: sealAge, Ship: true, Flush: flush, Retain: retain},
+		Catalog: PlaneConfig{SealBytes: sealBytes, SealAge: sealAge, Ship: true, Flush: flush, Retain: retain, OnSealed: sh.sealed},
 		Logger:  logger,
 	}
 	s, err := Open(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	t.Cleanup(func() { _ = s.Close(context.Background()) })
+	sh.start(t, s)
 	return s, meta, flushCalls
+}
+
+// shipper stands in for the ship queue: each seal starts a Ship, retried
+// until it succeeds or the test ends.
+type shipper struct {
+	mu   sync.Mutex
+	s    *Store
+	ctx  context.Context
+	wg   sync.WaitGroup
+	todo bool
+}
+
+func (sh *shipper) sealed() {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if sh.s == nil {
+		sh.todo = true
+		return
+	}
+	sh.wg.Add(1)
+	go func() {
+		defer sh.wg.Done()
+		for sh.s.Ship(sh.ctx) != nil && sh.ctx.Err() == nil {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+}
+
+// start ships through s from now on, and ships what sealed before.
+func (sh *shipper) start(t *testing.T, s *Store) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sh.mu.Lock()
+	sh.s, sh.ctx = s, ctx
+	todo := sh.todo
+	sh.mu.Unlock()
+	t.Cleanup(func() {
+		cancel()
+		sh.wg.Wait()
+		_ = s.Close(context.Background())
+	})
+	if todo {
+		sh.sealed()
+	}
 }
 
 type atomicCounter struct{ n int64 }
@@ -737,14 +781,11 @@ func TestFailedShipStampRetriedWithoutReshipping(t *testing.T) {
 // ships, so the row it stamps shipped is sealed, with its sha256 for
 // DeleteBucket's release.
 func TestFailedSealStampRecordedBeforeShip(t *testing.T) {
-	prev := shipBackoff
-	shipBackoff = 20 * time.Millisecond
-	t.Cleanup(func() { shipBackoff = prev })
 	ctx := context.Background()
 	s, meta, flushes := newTestStore(t, 64, 50*time.Millisecond, 6)
 	sealFailed := make(chan uint64, 8)
 	meta.mu.Lock()
-	meta.failSeals = 2 // the seal itself, then the ship's first try
+	meta.failSeals = 2 // the seal itself, then the first ship's
 	meta.onSealFail = func(seq uint64) { sealFailed <- seq }
 	meta.mu.Unlock()
 
@@ -945,63 +986,11 @@ func readSegmentSeqs(dir, plane string) ([]string, error) {
 	return out, nil
 }
 
-// shortShipBackoff shortens the queued ship's backoff for one test, restoring
-// it after the test's stores have closed.
-func shortShipBackoff(t *testing.T) {
-	t.Helper()
-	prev := shipBackoff
-	shipBackoff = time.Millisecond
-	t.Cleanup(func() { shipBackoff = prev })
-}
-
-// TestExhaustedShipRetriedBySweep checks that a segment whose queued ship ran
-// out of attempts isn't left until a restart: the retry sweep keeps trying
-// it, and it ships once the upload service is back.
-func TestExhaustedShipRetriedBySweep(t *testing.T) {
-	shortShipBackoff(t)
-	var down atomic.Bool
-	down.Store(true)
-	var attempts atomicCounter
-	meta := newFakeMeta()
-	s, err := Open(context.Background(), Config{
-		Dir:  t.TempDir(),
-		Meta: meta,
-		Catalog: PlaneConfig{SealBytes: 64, SealAge: 50 * time.Millisecond, Ship: true, ShipRetry: 50 * time.Millisecond,
-			Flush: func(context.Context, *Segment) (multihash.Multihash, error) {
-				attempts.add(1)
-				if down.Load() {
-					return nil, errors.New("upload service down")
-				}
-				return nil, nil
-			}},
-		Logger: zaptest.NewLogger(t),
-	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close(context.Background()) })
-
-	blk := makeBlock(t, append([]byte("sweep-"), make([]byte, 80)...))
-	if _, err := s.AppendBatch(context.Background(), []block.Block{blk},
-		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "sweep")}); err != nil {
-		t.Fatalf("append: %v", err)
-	}
-	waitFor(t, "the queued ship's attempts and a sweep's", func() bool {
-		return attempts.load() > queuedShipAttempts
-	})
-	down.Store(false)
-	waitFor(t, "the segment to ship", func() bool {
-		meta.mu.Lock()
-		defer meta.mu.Unlock()
-		return len(meta.shipped) == 1
-	})
-}
-
-// TestRetrySweepOldestFirst checks the sweep's order and its stop: it tries
-// the oldest unshipped segment first, stops at the first that fails, and
-// once ships succeed, ships them all in seq order.
-func TestRetrySweepOldestFirst(t *testing.T) {
-	shortShipBackoff(t)
+// TestShipStopsAtTheFirstFailure checks Ship's order and its stop: it
+// tries the oldest unshipped segment first, stops at the first that fails
+// and returns its error, and once ships succeed, ships them all in seq
+// order. A segment already shipped never goes to Flush again.
+func TestShipStopsAtTheFirstFailure(t *testing.T) {
 	var down atomic.Bool
 	down.Store(true)
 	var mu sync.Mutex
@@ -1010,9 +999,7 @@ func TestRetrySweepOldestFirst(t *testing.T) {
 	s, err := Open(context.Background(), Config{
 		Dir:  t.TempDir(),
 		Meta: meta,
-		// No sweep runs on its own (the first lands at a random point within
-		// ShipRetry): the test runs them.
-		Catalog: PlaneConfig{SealBytes: 64, SealAge: time.Hour, Ship: true, ShipRetry: 1000 * time.Hour,
+		Catalog: PlaneConfig{SealBytes: 64, SealAge: time.Hour, Ship: true,
 			Flush: func(_ context.Context, seg *Segment) (multihash.Multihash, error) {
 				mu.Lock()
 				tried = append(tried, seg.Seq())
@@ -1029,49 +1016,41 @@ func TestRetrySweepOldestFirst(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close(context.Background()) })
 
-	// distinct returns the seqs tried so far, in ascending order.
-	distinct := func() []uint64 {
-		mu.Lock()
-		defer mu.Unlock()
-		var out []uint64
-		for _, seq := range tried {
-			if !slices.Contains(out, seq) {
-				out = append(out, seq)
-			}
-		}
-		slices.Sort(out)
-		return out
-	}
-	// Each batch is over SealBytes, so it seals its segment; waiting for
-	// that segment's ship keeps the next batch out of it.
+	// Each batch is over SealBytes, so it seals its segment.
 	for i := 0; i < 3; i++ {
 		blk := makeBlock(t, append([]byte(fmt.Sprintf("order-%d-", i)), make([]byte, 80)...))
 		if _, err := s.AppendBatch(context.Background(), []block.Block{blk},
 			blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, fmt.Sprintf("order-%d", i))}); err != nil {
 			t.Fatalf("append %d: %v", i, err)
 		}
-		waitFor(t, fmt.Sprintf("segment %d to seal and start shipping", i), func() bool {
-			return len(distinct()) == i+1
+		waitFor(t, fmt.Sprintf("segment %d to seal", i), func() bool {
+			s.catalog.catMu.RLock()
+			defer s.catalog.catMu.RUnlock()
+			return len(s.catalog.sealed) == i+1
 		})
 	}
-	waitFor(t, "every queued ship to run out of attempts", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(tried) == 3*queuedShipAttempts
-	})
-	seqs := distinct()
+	s.catalog.catMu.RLock()
+	var seqs []uint64
+	for _, seg := range s.catalog.sealed {
+		seqs = append(seqs, seg.Seq())
+	}
+	s.catalog.catMu.RUnlock()
+	slices.Sort(seqs)
 
-	s.catalog.retryUnshipped()
+	if err := s.Ship(context.Background()); err == nil {
+		t.Fatal("Ship succeeded with the upload service down")
+	}
 	mu.Lock()
-	if n, last := len(tried), tried[len(tried)-1]; n != 3*queuedShipAttempts+1 || last != seqs[0] {
+	if !slices.Equal(tried, seqs[:1]) {
 		mu.Unlock()
-		t.Fatalf("a failing sweep made %d attempts, the last on seq %d; want one attempt, on the oldest (%d)",
-			n-3*queuedShipAttempts, last, seqs[0])
+		t.Fatalf("a failing Ship tried %v; want one attempt, on the oldest (%d)", tried, seqs[0])
 	}
 	mu.Unlock()
 
 	down.Store(false)
-	s.catalog.retryUnshipped()
+	if err := s.Ship(context.Background()); err != nil {
+		t.Fatalf("Ship: %v", err)
+	}
 	meta.mu.Lock()
 	shippedSeqs := make([]uint64, len(meta.shipped))
 	for i, ev := range meta.shipped {
@@ -1082,24 +1061,16 @@ func TestRetrySweepOldestFirst(t *testing.T) {
 		t.Fatalf("shipped seqs %v, want %v in order", shippedSeqs, seqs)
 	}
 
-	// A segment the sweep has shipped may still be queued: shipping it from
-	// the queue again must not reach Flush.
 	mu.Lock()
 	before := len(tried)
 	mu.Unlock()
-	s.catalog.catMu.RLock()
-	shipped := s.catalog.sealed[0]
-	s.catalog.catMu.RUnlock()
-	if !shipped.IsShipped() {
-		t.Fatalf("segment %d not shipped", shipped.Seq())
-	}
-	if !s.catalog.flushOne(shipped, queuedShipAttempts) {
-		t.Fatalf("flushOne on shipped segment %d reported it unshipped", shipped.Seq())
+	if err := s.Ship(context.Background()); err != nil {
+		t.Fatalf("Ship of nothing: %v", err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	if len(tried) != before {
-		t.Fatalf("shipped segment %d went to Flush again", shipped.Seq())
+		t.Fatalf("shipped segments went to Flush again: %v", tried[before:])
 	}
 }
 

@@ -15,7 +15,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3response"
 	"github.com/filecoin-project/go-fee"
@@ -25,7 +24,7 @@ import (
 )
 
 // These tests drive the full write path (PutObject → SplitBody →
-// encryptingBlobWriter → spool + registry rows) through the public S3
+// encryptingBlobWriter → stream + registry rows) through the public S3
 // surface and check the encryption RFC's two observable criteria:
 // correctness (every read returns the plaintext bytes) and opacity (what
 // lands in storage shares nothing with the plaintext).
@@ -109,7 +108,7 @@ func TestEncryptedWrite_Opacity(t *testing.T) {
 	}
 	stored, err := os.ReadFile(localPath(b, d))
 	if err != nil {
-		t.Fatalf("read spooled blob: %v", err)
+		t.Fatalf("read stored blob: %v", err)
 	}
 	if len(stored) <= len(data) {
 		t.Fatalf("stored %d bytes for %d plaintext; an envelope must be larger", len(stored), len(data))
@@ -118,7 +117,7 @@ func TestEncryptedWrite_Opacity(t *testing.T) {
 		t.Fatalf("stored blob contains plaintext bytes")
 	}
 
-	params, err := mem.GetEncryptionParams(ctx, did.Undef, d)
+	params, err := mem.GetEncryptionParams(ctx, mem.bk(), d)
 	if err != nil {
 		t.Fatalf("GetEncryptionParams: %v", err)
 	}
@@ -130,7 +129,7 @@ func TestEncryptedWrite_Opacity(t *testing.T) {
 	}
 	// The registry records the STORED size: what decryption geometry is
 	// derived from, and what gets uploaded.
-	loc, err := mem.GetLocation(ctx, did.Undef, d)
+	loc, err := mem.GetLocation(ctx, mem.bk(), d)
 	if err != nil {
 		t.Fatalf("GetLocation: %v", err)
 	}
@@ -168,13 +167,13 @@ func TestEncryptedWrite_DeleteShredsParams(t *testing.T) {
 
 	putObj(t, b, "k1", data)
 	d := blobDigestOf(t, b, "k1", "")
-	if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); err != nil {
+	if _, err := mem.GetEncryptionParams(ctx, mem.bk(), d); err != nil {
 		t.Fatalf("params row missing before delete: %v", err)
 	}
 
 	deleteObj(t, b, "k1")
 	drainReleases(t, b) // the release is deferred; the sweep executes it
-	if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); err == nil {
+	if _, err := mem.GetEncryptionParams(ctx, mem.bk(), d); err == nil {
 		t.Fatalf("params row survived the last-claim release; want it crypto-shredded")
 	}
 	if rm.removedDigests()[string(d)] != 1 {
@@ -203,7 +202,7 @@ func testTenantKeys() tenantkey.Source {
 	return tenantkey.NewStatic(testWrapKey.PublicKey())
 }
 
-// recipientOf decodes a spooled envelope and returns its single COSE
+// recipientOf decodes a stored envelope and returns its single COSE
 // recipient, failing if the envelope is not a one-recipient COSE_Encrypt.
 func recipientOf(t *testing.T, stored []byte) *cose.Recipient {
 	t.Helper()
@@ -230,10 +229,7 @@ func recipientOf(t *testing.T, stored []byte) *cose.Recipient {
 // recoverability criterion: no region, no database).
 func assertTenantRecipient(t *testing.T, b *Backend, digest []byte, plaintext []byte) {
 	t.Helper()
-	stored, err := os.ReadFile(localPath(b, digest))
-	if err != nil {
-		t.Fatalf("read spooled blob: %v", err)
-	}
+	stored := storedBytes(t, b, digest)
 	kid := tenantkey.EncodePublicKey(testWrapKey.PublicKey())
 	rec := recipientOf(t, stored)
 	if got, ok := rec.Headers.Unprotected.Bytes(cose.HeaderLabelKID); !ok || string(got) != kid {
@@ -285,7 +281,7 @@ func TestEncryptedWrite_TenantRecipient(t *testing.T) {
 }
 
 // TestEncryptedWrite_MultipartTenantRecipient: part blobs carry the tenant
-// recipient too (UploadPart shares splitSpool with PutObject).
+// recipient too (UploadPart shares splitBody with PutObject).
 func TestEncryptedWrite_MultipartTenantRecipient(t *testing.T) {
 	b, _, _ := newRefTestBackend(t)
 	key := "mp-recipient"
@@ -311,7 +307,7 @@ func (f failingTenantKeys) WrapKey(context.Context) (string, *ecdh.PublicKey, er
 }
 
 // TestEncryptedWrite_FailsClosedWithoutRecipient: a write whose tenant wrap
-// key cannot be obtained is refused before anything is spooled or recorded —
+// key cannot be obtained is refused before anything is stored or recorded —
 // there is no region-only fallback.
 func TestEncryptedWrite_FailsClosedWithoutRecipient(t *testing.T) {
 	b, _, _ := newRefTestBackend(t)
@@ -320,19 +316,19 @@ func TestEncryptedWrite_FailsClosedWithoutRecipient(t *testing.T) {
 
 	bucket, key := "bk", "k1"
 	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{
-		Bucket: &bucket, Key: &key, Body: bytes.NewReader(data),
+		Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data),
 	}); !errors.Is(err, tenantkey.ErrNoTenant) {
 		t.Fatalf("PutObject err = %v, want ErrNoTenant", err)
 	}
 	if _, _, err := getObjV(t, b, key, ""); err == nil {
 		t.Fatalf("object exists after a refused write")
 	}
-	entries, err := os.ReadDir(b.spool.Path(nil)) // Path of the empty digest is the spool dir itself
+	entries, err := os.ReadDir(b.cache.Path(nil)) // Path of the empty digest is the cache dir itself
 	if err != nil {
-		t.Fatalf("read spool dir: %v", err)
+		t.Fatalf("read cache dir: %v", err)
 	}
 	if len(entries) != 0 {
-		t.Fatalf("spool holds %d files after a refused write, want 0", len(entries))
+		t.Fatalf("cache holds %d files after a refused write, want 0", len(entries))
 	}
 
 	uploadID := mpCreate(t, b, "mp", "", "")

@@ -43,10 +43,10 @@ func collectMultipartMetrics(t *testing.T, reader *sdkmetric.ManualReader) map[s
 	return got
 }
 
-// TestMultipartMetrics_AcceptPasses: a pass that fails and its retry that
-// accepts are counted by outcome; a pass that found nothing to do is not.
+// TestMultipartMetrics_AcceptPasses: a blob's conclude that fails and the
+// retry's that accepts are counted by outcome; an accept that found the blob
+// located counts nothing.
 func TestMultipartMetrics_AcceptPasses(t *testing.T) {
-	shrinkAcceptBackoff(t)
 	reader := sdkmetric.NewManualReader()
 	cc := &countingConcluder{fails: 1}
 	b, _ := newDeferredBackend(t, cc, meteredBackend(reader))
@@ -54,9 +54,11 @@ func TestMultipartMetrics_AcceptPasses(t *testing.T) {
 	uploadID := mpCreate(t, b, key, "", "")
 	uploadDistinctParts(t, b, key, uploadID, 1)
 
-	startAcceptors(t, b)
-	drainUntilIdle(t, b, uploadID)
-
+	for range 3 {
+		if err := runAccepts(t, b, uploadID); err != nil {
+			t.Fatalf("accept: %v", err)
+		}
+	}
 	got := collectMultipartMetrics(t, reader)
 	if got["ingot.multipart.accept_passes/failed"] != 1 || got["ingot.multipart.accept_passes/accepted"] != 1 {
 		t.Fatalf("accept passes = %v, want one failed and one accepted", got)
@@ -64,7 +66,7 @@ func TestMultipartMetrics_AcceptPasses(t *testing.T) {
 }
 
 // TestMultipartMetrics_CompleteDeferred: a Complete answered OperationAborted
-// because its part is still queued is counted.
+// because the upload's accept did not start in time is counted.
 func TestMultipartMetrics_CompleteDeferred(t *testing.T) {
 	saved := acceptWaitBudget
 	acceptWaitBudget = 20 * time.Millisecond
@@ -73,13 +75,14 @@ func TestMultipartMetrics_CompleteDeferred(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	g := newGatedConcluder()
 	b, _ := newDeferredBackend(t, g, meteredBackend(reader))
-	startAcceptors(t, b)
-	// Registered after startAcceptors, so it runs before the acceptors'
-	// shutdown waits on the conclude it releases.
-	t.Cleanup(func() { close(g.open) })
 	key := "metrics-deferred"
 	uploadID := mpCreate(t, b, key, "", "")
 	parts := uploadDistinctParts(t, b, key, uploadID, 1)
+	background := acceptInBackground(t, b, uploadID)
+	t.Cleanup(func() {
+		close(g.open)
+		<-background
+	})
 	<-g.entered
 
 	_, err := mpComplete(t, b, key, uploadID, parts, nil)
@@ -92,43 +95,24 @@ func TestMultipartMetrics_CompleteDeferred(t *testing.T) {
 	}
 }
 
-// TestMultipartMetrics_ParkedAge: the accept sweep measures how long the
-// oldest parked part has waited, and reports 0 once it is accepted. Before
-// any sweep the gauge reports nothing.
+// TestMultipartMetrics_ParkedAge: the gauge reports how long the oldest
+// parked part has waited, read when it is collected, and 0 once the part is
+// accepted.
 func TestMultipartMetrics_ParkedAge(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
-	cc := &countingConcluder{}
-	b, mem := newDeferredBackend(t, cc, meteredBackend(reader))
-	ctx := context.Background()
+	b, mem := newDeferredBackend(t, &countingConcluder{}, meteredBackend(reader))
 	key := "metrics-parked-age"
 	uploadID := mpCreate(t, b, key, "", "")
 	uploadDistinctParts(t, b, key, uploadID, 1)
 
-	if _, ok := collectMultipartMetrics(t, reader)["ingot.multipart.parked_age"]; ok {
-		t.Fatal("parked_age reported before any sweep measured it")
-	}
-
-	// The part as recorded an hour ago, still parked: no acceptor runs yet.
-	part := partRecord(t, mem, uploadID, 1)
-	part.CreatedAt = time.Now().Add(-time.Hour)
-	trees, err := mem.ListPartTrees(ctx, uploadID)
-	if err != nil {
-		t.Fatalf("ListPartTrees: %v", err)
-	}
-	if _, err := mem.PutPart(ctx, part, trees[1]); err != nil {
-		t.Fatalf("PutPart: %v", err)
-	}
-	if _, err := b.NudgeParkedUploads(ctx); err != nil {
-		t.Fatalf("NudgeParkedUploads: %v", err)
-	}
+	// The part as recorded an hour ago, still parked.
+	mem.AgePart(uploadID, 1, time.Hour)
 	if age := collectMultipartMetrics(t, reader)["ingot.multipart.parked_age"]; age < 3590 || age > 3700 {
 		t.Fatalf("parked_age = %d, want about 3600", age)
 	}
 
-	startAcceptors(t, b)
-	drainUntilIdle(t, b, uploadID)
-	if _, err := b.NudgeParkedUploads(ctx); err != nil {
-		t.Fatalf("NudgeParkedUploads: %v", err)
+	if err := runAccepts(t, b, uploadID); err != nil {
+		t.Fatalf("accept: %v", err)
 	}
 	if age, ok := collectMultipartMetrics(t, reader)["ingot.multipart.parked_age"]; !ok || age != 0 {
 		t.Fatalf("parked_age after acceptance = %d (reported %v), want 0", age, ok)

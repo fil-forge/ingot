@@ -25,19 +25,18 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 )
 
 // streamingUploader is a provider that takes blobs allocated by digest code.
 // It records every allocation, the bytes each PUT received, and what was
-// concluded, uploaded by digest and aborted.
+// concluded and aborted.
 type streamingUploader struct {
-	inmem.NopUploader
+	testfakes.NopUploader
 
 	// unsupported refuses every allocation by digest code.
 	unsupported bool
@@ -50,10 +49,12 @@ type streamingUploader struct {
 	puts      map[cid.Cid][]byte
 	putErrs   map[cid.Cid]error
 	concluded []uploader.UploadedBlob
-	uploaded  []multihash.Multihash
 	aborted   []cid.Cid
 	// abortErr, when set, is what AbortBlob answers.
 	abortErr error
+	// abortStalls makes AbortBlob wait for its context to end, as a stalled
+	// upload service does.
+	abortStalls bool
 	// concludeErr, when set, is returned by ConcludeBlobs alongside the
 	// locations, as a batch that failed after its accepts ran returns it.
 	concludeErr error
@@ -67,7 +68,7 @@ func (s *streamingUploader) StartBlob(_ context.Context, _ did.DID, size int64) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.unsupported {
-		return uploader.StreamedBlob{}, uploader.ErrUnsupportedDigestCode
+		return uploader.StreamedBlob{}, errors.New("the upload service cannot add a blob by digest code")
 	}
 	n := len(s.started)
 	sb := uploader.StreamedBlob{
@@ -108,18 +109,16 @@ func (s *streamingUploader) ConcludeBlobs(ctx context.Context, space did.DID, pa
 	return locations, concludeErr
 }
 
-func (s *streamingUploader) UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, path string, opts ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+func (s *streamingUploader) AbortBlob(ctx context.Context, _ did.DID, cause cid.Cid) error {
 	s.mu.Lock()
-	s.uploaded = append(s.uploaded, digest)
-	s.mu.Unlock()
-	return s.NopUploader.UploadBlob(ctx, space, digest, size, path, opts...)
-}
-
-func (s *streamingUploader) AbortBlob(_ context.Context, _ did.DID, cause cid.Cid) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.aborted = append(s.aborted, cause)
-	return s.abortErr
+	stalls, err := s.abortStalls, s.abortErr
+	s.mu.Unlock()
+	if stalls {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return err
 }
 
 // GetBlock serves no catalog blocks: those come from the log tier.
@@ -128,7 +127,7 @@ func (s *streamingUploader) GetBlock(context.Context, did.DID, cid.Cid) (block.B
 }
 
 // OpenBlob serves a blob from the bytes a successful PUT delivered, so a test
-// can read an object whose spool copies are gone, as the network tier would.
+// can read an object that keeps no local copy, as the network tier would.
 func (s *streamingUploader) OpenBlob(_ context.Context, _ did.DID, digest multihash.Multihash) (io.ReadCloser, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -151,12 +150,11 @@ func mustSum(b []byte) multihash.Multihash {
 
 const streamBlobCeiling = 300 << 10
 
-func newStreamingBackend(t *testing.T, su *streamingUploader, mods ...func(*Deps)) (*Backend, *inmem.MemStore) {
+func newStreamingBackend(t *testing.T, su *streamingUploader, mods ...func(*Deps)) (*Backend, *testStore) {
 	t.Helper()
 	return newDeferredBackend(t, su, append([]func(*Deps){func(d *Deps) {
 		d.Streaming = su
-		d.Streams = d.Parks.(*inmem.MemStore)
-		d.Reads = blockstore.NewLayered(blockstore.LocalBlobs{Cache: d.Cache, Spool: d.Spool}, d.Log, su)
+		d.Reads = blockstore.NewLayered(d.Cache, d.Log, su)
 		d.MaxBlobSize = streamBlobCeiling
 	}}, mods...)...)
 }
@@ -173,18 +171,11 @@ func putSized(t *testing.T, b *Backend, key string, data []byte, declared int64)
 	return err
 }
 
-func spooled(t *testing.T, b *Backend, digest multihash.Multihash) []byte {
+func cached(t *testing.T, b *Backend, digest multihash.Multihash) []byte {
 	t.Helper()
 	data, err := os.ReadFile(localPath(b, digest))
 	require.NoError(t, err)
 	return data
-}
-
-func staleStreams(t *testing.T, mem *inmem.MemStore) []registry.BlobStream {
-	t.Helper()
-	rows, err := mem.ListStaleStreams(context.Background(), time.Now().Add(time.Hour), 1000)
-	require.NoError(t, err)
-	return rows
 }
 
 func TestStreamedPutObject(t *testing.T) {
@@ -198,22 +189,20 @@ func TestStreamedPutObject(t *testing.T) {
 	digests := blobDigestsOf(t, b, "k", "")
 	require.Len(t, digests, 3)
 	require.Len(t, su.started, 3, "every blob is allocated before its digest is known")
-	require.Empty(t, su.uploaded, "nothing is uploaded by digest")
 	require.Len(t, su.concluded, 3)
 	for i, d := range digests {
 		sb := su.started[i]
-		envelope := spooled(t, b, d)
-		require.Equal(t, envelope, su.puts[sb.AddTask], "the provider got the spooled envelope")
+		envelope := cached(t, b, d)
+		require.Equal(t, envelope, su.puts[sb.AddTask], "the provider got the envelope the cache holds")
 		require.Equal(t, int64(len(envelope)), sb.Size, "the allocation was the envelope's length")
 
-		require.Equal(t, d, su.concluded[i].Digest, "the conclude reports the spooled digest")
+		require.Equal(t, d, su.concluded[i].Digest, "the conclude reports the envelope's digest")
 		require.Equal(t, sb.AddTask, su.concluded[i].AddTask)
 
 		in, err := mem.IntentByDigest(ctx, d)
 		require.NoError(t, err)
 		require.Equal(t, registry.IntentPublished, in.State, "the committed blob's intent is published")
 	}
-	require.Empty(t, staleStreams(t, mem), "no upload is left for the sweeper")
 	require.Equal(t, data, getRange(t, b, "k", ""))
 }
 
@@ -243,38 +232,76 @@ func TestStreamedPutObjectEmpty(t *testing.T) {
 	b, _ := newStreamingBackend(t, su)
 	require.NoError(t, putSized(t, b, "k", nil, 0))
 	require.Empty(t, su.started, "an empty body has no blob to send")
-	require.Empty(t, su.uploaded)
 	require.Empty(t, getRange(t, b, "k", ""))
 }
 
+// TestStreamedPutObjectFailedPut: a PUT that fails fails the request, its
+// allocation is aborted at once, and its local copy is discarded.
 func TestStreamedPutObjectFailedPut(t *testing.T) {
 	su := newStreamingUploader()
 	su.failPuts = 1000
-	b, mem := newStreamingBackend(t, su)
+	b, _ := newStreamingBackend(t, su)
 	data := testBody(400 << 10) // 2 blobs
 
-	require.NoError(t, putSized(t, b, "k", data, int64(len(data))))
-
-	digests := blobDigestsOf(t, b, "k", "")
-	require.Len(t, su.started, 2)
-	require.Equal(t, digests, su.uploaded, "each blob falls back to uploading its spooled copy")
+	require.Error(t, putSized(t, b, "k", data, int64(len(data))))
+	require.Len(t, su.started, 1, "the body stops at the failed blob")
 	require.Empty(t, su.concluded)
-	require.Equal(t, []cid.Cid{su.started[0].AddTask, su.started[1].AddTask}, su.aborted,
-		"the allocations that took the failed PUTs are released")
-	require.Empty(t, staleStreams(t, mem))
-	require.Equal(t, data, getRange(t, b, "k", ""))
+	require.Equal(t, []cid.Cid{su.started[0].AddTask}, su.aborted, "the failed stream's allocation is aborted")
+	requireNoLocalCopies(t, b)
+	bucket, key := "bk", "k"
+	_, err := b.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &bucket, Key: &key})
+	require.Error(t, err, "nothing was committed")
 }
 
+// TestStreamedPutObjectUnsupportedDigestCode: an upload service that cannot
+// add by digest code fails the request, having stored nothing.
 func TestStreamedPutObjectUnsupportedDigestCode(t *testing.T) {
 	su := newStreamingUploader()
 	su.unsupported = true
 	b, _ := newStreamingBackend(t, su)
 	data := testBody(700 << 10)
 
-	require.NoError(t, putSized(t, b, "k", data, int64(len(data))))
+	require.Error(t, putSized(t, b, "k", data, int64(len(data))))
 	require.Empty(t, su.started)
-	require.Len(t, su.uploaded, 3, "every blob uploads by digest")
+	requireNoLocalCopies(t, b)
+}
+
+// TestStreamedPutObjectUncachedWhenTheCopyFails: a local copy that cannot be
+// written costs only the cached copy: the blob still streams and is
+// accepted, and reads go to the provider.
+func TestStreamedPutObjectUncachedWhenTheCopyFails(t *testing.T) {
+	su := newStreamingUploader()
+	b, _ := newStreamingBackend(t, su)
+	data := testBody(400 << 10) // 2 blobs
+	require.NoError(t, os.RemoveAll(b.cache.Path(nil)))
+
+	require.NoError(t, putSized(t, b, "k", data, int64(len(data))))
+	require.Len(t, su.concluded, 2, "the blobs were accepted")
+	require.Zero(t, b.cache.Usage(), "nothing was cached")
 	require.Equal(t, data, getRange(t, b, "k", ""))
+}
+
+// TestStreamedPutObjectUncachedBodies: with written bodies not cached, a
+// PUT keeps no local copy at all.
+func TestStreamedPutObjectUncachedBodies(t *testing.T) {
+	su := newStreamingUploader()
+	b, _ := newStreamingBackend(t, su, func(d *Deps) { d.DropAcceptedBodies = true })
+	data := testBody(400 << 10) // 2 blobs
+
+	require.NoError(t, putSized(t, b, "k", data, int64(len(data))))
+	require.Len(t, su.concluded, 2)
+	requireNoLocalCopies(t, b)
+	require.Equal(t, data, getRange(t, b, "k", ""))
+}
+
+// requireNoLocalCopies fails unless the cache holds no files at all, cached
+// or in progress, and counts none.
+func requireNoLocalCopies(t *testing.T, b *Backend) {
+	t.Helper()
+	entries, err := os.ReadDir(b.cache.Path(nil))
+	require.NoError(t, err)
+	require.Empty(t, entries, "the cache holds no files")
+	require.Zero(t, b.cache.Usage(), "the cache counts no bytes")
 }
 
 // feePlaintextLengthLabel is the FEE protected header that records an
@@ -285,29 +312,23 @@ const feePlaintextLengthLabel = -65789
 // TestStreamedPutObjectRecordsPlaintextLength: a sized PUT declares each
 // blob's length to the encryptor, so every envelope records its plaintext
 // length in the protected header. A reader checks it against the blob size,
-// detecting a truncated blob from the header alone. That holds both when the
-// blob streams and when it falls back to spooling first.
+// detecting a truncated blob from the header alone.
 func TestStreamedPutObjectRecordsPlaintextLength(t *testing.T) {
-	for name, unsupported := range map[string]bool{"streamed": false, "digest first": true} {
-		t.Run(name, func(t *testing.T) {
-			su := newStreamingUploader()
-			su.unsupported = unsupported
-			b, _ := newStreamingBackend(t, su)
-			data := testBody(700 << 10) // 3 blobs, of 2, 2 and 1 chunks
+	su := newStreamingUploader()
+	b, _ := newStreamingBackend(t, su)
+	data := testBody(700 << 10) // 3 blobs, of 2, 2 and 1 chunks
 
-			require.NoError(t, putSized(t, b, "k", data, int64(len(data))))
-			digests := blobDigestsOf(t, b, "k", "")
-			require.Len(t, digests, 3)
-			for _, d := range digests {
-				env, ciphertext, err := cose.Decode(spooled(t, b, d))
-				require.NoError(t, err)
-				declared, ok := env.Headers.Protected.Int(feePlaintextLengthLabel)
-				require.True(t, ok, "the envelope records its plaintext length")
-				want, err := aesstream.DecryptedSize(int64(len(ciphertext)), aesstream.DefaultChunkSize)
-				require.NoError(t, err)
-				require.Equal(t, want, declared)
-			}
-		})
+	require.NoError(t, putSized(t, b, "k", data, int64(len(data))))
+	digests := blobDigestsOf(t, b, "k", "")
+	require.Len(t, digests, 3)
+	for _, d := range digests {
+		env, ciphertext, err := cose.Decode(cached(t, b, d))
+		require.NoError(t, err)
+		declared, ok := env.Headers.Protected.Int(feePlaintextLengthLabel)
+		require.True(t, ok, "the envelope records its plaintext length")
+		want, err := aesstream.DecryptedSize(int64(len(ciphertext)), aesstream.DefaultChunkSize)
+		require.NoError(t, err)
+		require.Equal(t, want, declared)
 	}
 }
 
@@ -322,7 +343,7 @@ func TestStreamedPutObjectWrongLength(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			su := newStreamingUploader()
-			b, mem := newStreamingBackend(t, su)
+			b, _ := newStreamingBackend(t, su)
 			err := putSized(t, b, "k", testBody(tc.body), tc.declared)
 			var apiErr s3err.APIError
 			require.ErrorAs(t, err, &apiErr)
@@ -331,9 +352,36 @@ func TestStreamedPutObjectWrongLength(t *testing.T) {
 			last := su.started[len(su.started)-1]
 			require.Error(t, su.putErrs[last.AddTask], "the PUT of the failing blob fails too")
 			require.Empty(t, su.concluded)
-			require.NotEmpty(t, staleStreams(t, mem), "the sweeper aborts what the request left")
+			require.Contains(t, su.aborted, last.AddTask, "the failed stream's allocation is aborted at once")
+			require.Greater(t, len(su.started), 1, "the body streamed a blob before the failing one")
+			for _, sb := range su.started {
+				require.Contains(t, su.aborted, sb.AddTask, "every allocation the failed body streamed is aborted")
+			}
 		})
 	}
+}
+
+// TestStreamedPutObjectStalledAbort: a body of the wrong length still gets its
+// error when the upload service stalls the abort, which runs past the request
+// for at most abandonTimeLimit and is then left to the provider's expiry.
+func TestStreamedPutObjectStalledAbort(t *testing.T) {
+	defer func(d time.Duration) { abandonTimeLimit = d }(abandonTimeLimit)
+	abandonTimeLimit = 50 * time.Millisecond
+	su := newStreamingUploader()
+	su.abortStalls = true
+	b, _ := newStreamingBackend(t, su)
+
+	done := make(chan error, 1)
+	go func() { done <- putSized(t, b, "k", testBody(400<<10), 500<<10) }()
+	select {
+	case err := <-done:
+		var apiErr s3err.APIError
+		require.ErrorAs(t, err, &apiErr)
+		require.Equal(t, "IncompleteBody", apiErr.Code)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the request waited on the stalled abort")
+	}
+	require.Len(t, su.aborted, 2, "each allocation's abort was tried")
 }
 
 func TestStreamedUploadPart(t *testing.T) {
@@ -363,120 +411,20 @@ func TestStreamedUploadPart(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, registry.IntentParked, in.State)
 		_, err = os.Stat(localPath(b, d))
-		require.True(t, os.IsNotExist(err), "a parked blob keeps no spool copy (stat err=%v)", err)
+		require.True(t, os.IsNotExist(err), "a part keeps no local copy (stat err=%v)", err)
 	}
-	require.Empty(t, staleStreams(t, mem))
 
 	_, err = mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: ptrInt32(1), ETag: out.ETag}}, nil)
 	require.NoError(t, err)
-	require.Len(t, su.concluded, len(digests))
-	for i, d := range digests {
-		require.Equal(t, d, su.concluded[i].Digest)
+	// Each blob is concluded on its own, in no set order.
+	var concluded []multihash.Multihash
+	su.mu.Lock()
+	for _, c := range su.concluded {
+		concluded = append(concluded, c.Digest)
 	}
-	require.Empty(t, su.uploaded)
+	su.mu.Unlock()
+	require.ElementsMatch(t, digests, concluded)
 	require.Equal(t, part, getRange(t, b, key, ""))
-}
-
-func TestSweepStaleStreams(t *testing.T) {
-	su := newStreamingUploader()
-	b, mem := newStreamingBackend(t, su)
-	ctx := context.Background()
-	space := did.Undef
-	row := func(n byte, age time.Duration) registry.BlobStream {
-		return registry.BlobStream{
-			AddTask:   cid.NewCidV1(cid.Raw, mustSum([]byte{'s', n})).Bytes(),
-			Space:     space,
-			Bucket:    "bk",
-			CreatedAt: time.Now().Add(-age),
-		}
-	}
-	fresh, stale := row(1, time.Minute), row(2, time.Hour)
-	for _, r := range []registry.BlobStream{fresh, stale} {
-		require.NoError(t, mem.PutStream(ctx, r))
-	}
-
-	n, err := b.SweepStaleStreams(ctx)
-	require.NoError(t, err)
-	require.Equal(t, 1, n)
-	require.Len(t, su.aborted, 1)
-	require.Equal(t, stale.AddTask, su.aborted[0].Bytes(), "only the stale upload is aborted, by its add task")
-	require.Len(t, staleStreams(t, mem), 1, "the live upload's row stays")
-
-	t.Run("an accepted upload's row is dropped", func(t *testing.T) {
-		su.abortErr = uploader.ErrBlobAccepted
-		require.NoError(t, mem.PutStream(ctx, row(3, time.Hour)))
-		n, err := b.SweepStaleStreams(ctx)
-		require.NoError(t, err)
-		require.Equal(t, 1, n)
-	})
-
-	t.Run("a failed abort is retried", func(t *testing.T) {
-		su.abortErr = errors.New("upload service unreachable")
-		require.NoError(t, mem.PutStream(ctx, row(4, time.Hour)))
-		n, err := b.SweepStaleStreams(ctx)
-		require.NoError(t, err)
-		require.Zero(t, n)
-		require.Len(t, staleStreams(t, mem), 2)
-	})
-
-	t.Run("a row past the provider's expiry is dropped", func(t *testing.T) {
-		require.NoError(t, mem.PutStream(ctx, row(5, 25*time.Hour)))
-		n, err := b.SweepStaleStreams(ctx)
-		require.NoError(t, err)
-		require.Equal(t, 1, n)
-	})
-}
-
-// A stale row whose blob was parked belongs to a multipart session that still
-// needs the blob: its row is dropped, and the blob is not aborted.
-func TestSweepStaleStreamsKeepsParkedBlob(t *testing.T) {
-	su := newStreamingUploader()
-	b, mem := newStreamingBackend(t, su)
-	ctx := context.Background()
-	addTask := cid.NewCidV1(cid.Raw, mustSum([]byte("parked"))).Bytes()
-	require.NoError(t, mem.PutStream(ctx, registry.BlobStream{
-		AddTask: addTask, Bucket: "bk", CreatedAt: time.Now().Add(-time.Hour),
-	}))
-	_, err := mem.PutPark(ctx, registry.BlobPark{
-		Space: did.Undef, Digest: mustSum([]byte("parked blob")), AddTask: addTask,
-		AcceptTask: addTask, PutInvocation: []byte("put"), Size: 1,
-	})
-	require.NoError(t, err)
-
-	n, err := b.SweepStaleStreams(ctx)
-	require.NoError(t, err)
-	require.Equal(t, 1, n, "the row is dropped")
-	require.Empty(t, su.aborted, "the parked blob is not aborted")
-}
-
-// A request renews the lease on its rows while it runs, so an old row of a
-// live request is not stale; once the lease ends, the row goes stale.
-func TestStreamLease(t *testing.T) {
-	prev := streamLeaseInterval
-	streamLeaseInterval = 10 * time.Millisecond
-	t.Cleanup(func() { streamLeaseInterval = prev })
-	su := newStreamingUploader()
-	b, mem := newStreamingBackend(t, su)
-	ctx := context.Background()
-	addTask := cid.NewCidV1(cid.Raw, mustSum([]byte("leased"))).Bytes()
-	require.NoError(t, mem.PutStream(ctx, registry.BlobStream{
-		AddTask: addTask, Bucket: "bk", CreatedAt: time.Now().Add(-time.Hour),
-	}))
-
-	lease := newStreamLease(mem, zap.NewNop())
-	lease.add(addTask)
-	require.Eventually(t, func() bool {
-		rows, err := mem.ListStaleStreams(ctx, time.Now().Add(-streamStaleAge), 10)
-		require.NoError(t, err)
-		return len(rows) == 0
-	}, time.Second, 5*time.Millisecond, "the lease renews the row")
-	n, err := b.SweepStaleStreams(ctx)
-	require.NoError(t, err)
-	require.Zero(t, n, "a live request's row is not swept")
-
-	lease.end()
-	lease.end()
-	require.Len(t, staleStreams(t, mem), 1, "the row stays for the sweeper once the lease ends")
 }
 
 // A conclude that fails after its accept ran still records the acceptance it
@@ -493,30 +441,6 @@ func TestStreamedPutObjectConcludeErrorRecordsAcceptance(t *testing.T) {
 	in, err := mem.IntentByDigest(ctx, su.concluded[0].Digest)
 	require.NoError(t, err)
 	require.Equal(t, registry.IntentAccepted, in.State, "the returned acceptance is recorded")
-	require.Empty(t, staleStreams(t, mem), "the accepted blob's row is dropped")
-}
-
-// failingStreams refuses every stream row, as an unavailable registry would.
-type failingStreams struct{ *inmem.MemStore }
-
-func (failingStreams) PutStream(context.Context, registry.BlobStream) error {
-	return errors.New("registry unavailable")
-}
-
-// An allocation whose stream row cannot be recorded is aborted at once:
-// without the row, the sweeper would never find it.
-func TestStreamedPutObjectUnrecordedStreamIsAborted(t *testing.T) {
-	su := newStreamingUploader()
-	b, _ := newDeferredBackend(t, su, func(d *Deps) {
-		d.Streaming = su
-		d.Streams = failingStreams{d.Parks.(*inmem.MemStore)}
-		d.MaxBlobSize = streamBlobCeiling
-	})
-	data := testBody(100 << 10)
-
-	require.Error(t, putSized(t, b, "k", data, int64(len(data))))
-	require.Len(t, su.started, 1)
-	require.Equal(t, []cid.Cid{su.started[0].AddTask}, su.aborted, "the allocation is aborted")
 }
 
 func ptrInt32(v int32) *int32 { return &v }
@@ -524,11 +448,11 @@ func ptrInt32(v int32) *int32 { return &v }
 // TestStreamedPutObjectRepeatedPlaintextChunk: a body stored as received can
 // hold the same bytes twice, so two streamed blobs share a digest. The
 // provider needs the bytes once: the first stream is concluded, the second
-// is given up at once rather than left for the stale-stream sweeper, and
-// the object reads back whole.
+// is given up at once rather than left for the provider to expire, and the
+// object reads back whole.
 func TestStreamedPutObjectRepeatedPlaintextChunk(t *testing.T) {
 	su := newStreamingUploader()
-	b, mem := newStreamingBackend(t, su)
+	b, _ := newStreamingBackend(t, su)
 	setNone(t, b)
 	chunk := testBody(streamBlobCeiling)
 	data := append(append([]byte{}, chunk...), chunk...)
@@ -542,6 +466,5 @@ func TestStreamedPutObjectRepeatedPlaintextChunk(t *testing.T) {
 	require.Len(t, su.concluded, 1, "the provider was asked to accept the bytes once")
 	require.Len(t, su.aborted, 1, "the second allocation was given up")
 	require.Equal(t, su.started[1].AddTask, su.aborted[0], "the later allocation is the one given up")
-	require.Empty(t, staleStreams(t, mem), "no upload is left for the sweeper")
 	require.Equal(t, data, getRange(t, b, "k", ""))
 }

@@ -3,7 +3,6 @@ package s3frontend
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3err"
@@ -76,15 +75,8 @@ func (b *Backend) DeleteBucketCors(ctx context.Context, bucket string) error {
 	return b.setCORSConfig(ctx, bucket, nil)
 }
 
-// setCORSConfig stores doc as the bucket's own CORS document. The registry
-// reports a missing row itself, so both writers reach the S3 sentinel
-// without a separate existence check.
+// setCORSConfig stores doc as the bucket's own CORS document
+// (queue-bucket.set-cors).
 func (b *Backend) setCORSConfig(ctx context.Context, bucket string, doc []byte) error {
-	if err := b.reg.SetCORSConfig(ctx, bucket, doc); err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
-		return fmt.Errorf("s3frontend: set bucket cors %q: %w", bucket, err)
-	}
-	return nil
+	return b.setBucketConfig(ctx, bucket, registry.BucketSetCORSAction, doc)
 }

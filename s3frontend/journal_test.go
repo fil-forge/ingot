@@ -5,6 +5,7 @@ import (
 	"context"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 )
@@ -23,16 +24,16 @@ import (
 // newJournalingBackend is a backend whose log ships: a segment seals once it
 // is 200ms old, and its ship waits until the test calls the returned release
 // func, so the test can read the journal before the ship and after it.
-func newJournalingBackend(t *testing.T) (*Backend, *inmem.MemStore, *logstore.Store, func()) {
+func newJournalingBackend(t *testing.T) (*Backend, *testStore, *logstore.Store, func()) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	mem := inmem.NewMemStore()
+	mem := newTestStore(t)
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
 	require.NoError(t, err)
-	spool, err := blockstore.NewSpool(filepath.Join(dir, "spool"))
-	require.NoError(t, err)
 	gate := make(chan struct{})
+	// The log's seals queue ships on the backend, built after it.
+	var backend atomic.Pointer[Backend]
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:    filepath.Join(dir, "segments"),
 		Bucket: "bk",
@@ -47,6 +48,11 @@ func newJournalingBackend(t *testing.T) (*Backend, *inmem.MemStore, *logstore.St
 					return nil, ctx.Err()
 				}
 			},
+			OnSealed: func() {
+				if b := backend.Load(); b != nil {
+					b.QueueShip("bk")
+				}
+			},
 		},
 		Logger: zaptest.NewLogger(t),
 	})
@@ -58,28 +64,29 @@ func newJournalingBackend(t *testing.T) (*Backend, *inmem.MemStore, *logstore.St
 		_ = log.Close(ctx)
 	})
 
-	b := New(Deps{
-		Authority:       mem,
-		Registry:        mem,
-		Intents:         mem,
-		Locations:       mem,
-		GC:              mem,
-		Multipart:       mem,
-		Parks:           mem,
-		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, inmem.NopBaseReader{}),
-		Log:             log,
-		Spool:           spool,
-		Cache:           cache,
-		Uploader:        inmem.NopUploader{},
-		Deferred:        inmem.NopUploader{},
-		Remover:         &recordingRemover{},
-		Registrar:       &recordingRegistrar{},
-		UploadRegs:      mem,
-		EncParams:       mem,
-		RegionKeys:      testRegionKeys(t),
-		TenantKeys:      testTenantKeys(),
-		PendingReleases: mem,
-	})
+	deps := Deps{
+		Authority:  mem,
+		Registry:   mem,
+		Intents:    mem,
+		Locations:  mem,
+		GC:         mem,
+		Multipart:  mem,
+		Parks:      mem,
+		Reads:      blockstore.NewLayered(cache, log, testfakes.NopBaseReader{}),
+		Log:        log,
+		Cache:      cache,
+		Deferred:   testfakes.NopUploader{},
+		Remover:    &recordingRemover{},
+		Registrar:  &recordingRegistrar{},
+		EncParams:  mem,
+		RegionKeys: testRegionKeys(t),
+		TenantKeys: testTenantKeys(),
+		Claims:     mem,
+	}
+	withStreaming(t, &deps, dir)
+	b := New(deps)
+	mem.start(t, b)
+	backend.Store(b)
 	require.NoError(t, mem.Create(ctx, "bk", did.Undef, registry.CreateState{}))
 	return b, mem, log, release
 }

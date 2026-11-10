@@ -2,14 +2,34 @@ package s3frontend
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/multiformats/go-multihash"
 
-	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
 )
+
+// failOnceMarkAccepted is an intent store whose next transition to accepted
+// fails, after the location for that blob has already been recorded.
+type failOnceMarkAccepted struct {
+	registry.IntentStore
+	armed   bool
+	refused multihash.Multihash
+}
+
+func (f *failOnceMarkAccepted) SetIntentState(ctx context.Context, space did.DID, digest multihash.Multihash, state string) error {
+	if f.armed && state == registry.IntentAccepted {
+		f.armed = false
+		f.refused = digest
+		return errors.New("intents table unavailable")
+	}
+	return f.IntentStore.SetIntentState(ctx, space, digest, state)
+}
 
 // TestUploadBlobRecordsLocationBeforeAccepted: a by-digest upload that the
 // provider accepts records the location before marking the intent accepted.
@@ -21,21 +41,21 @@ func TestUploadBlobRecordsLocationBeforeAccepted(t *testing.T) {
 		t.Helper()
 		bucket, key := sweepBucket, "obj"
 		body := bytes.Repeat([]byte{'a'}, 1000)
-		if _, err := b.PutObject(t.Context(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body)}); err == nil {
+		if _, err := b.PutObject(t.Context(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body), ContentLength: byteLen(body)}); err == nil {
 			t.Fatal("PutObject succeeded although recording the acceptance failed")
 		}
 	}
 	// stalledUploading checks that the intent is uploading and counted as a
 	// stalled upload, and returns it.
-	stalledUploading := func(t *testing.T, mem *inmem.MemStore, digest []byte) *registry.UploadIntent {
+	stalledUploading := func(t *testing.T, mem *testStore, digest []byte) *registry.UploadIntent {
 		t.Helper()
 		in, err := mem.IntentByDigest(t.Context(), digest)
 		if err != nil || in.State != registry.IntentUploading {
 			t.Fatalf("intent = %+v/%v, want uploading", in, err)
 		}
-		sizes, err := mem.StalledBytes(t.Context(), time.Now().Add(time.Hour))
-		if err != nil || sizes.Uploading != in.Size {
-			t.Fatalf("stalled = %+v/%v, want %d uploading", sizes, err, in.Size)
+		stalled, err := mem.StalledBytes(t.Context(), time.Now().Add(time.Hour))
+		if err != nil || stalled != in.Size {
+			t.Fatalf("stalled = %d/%v, want %d uploading", stalled, err, in.Size)
 		}
 		return in
 	}

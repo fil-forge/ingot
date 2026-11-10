@@ -1,20 +1,14 @@
-// Package bucketop provides the per-bucket write-transaction
-// primitive for ingot. Each Tx snapshots the bucket's published Root
-// from the registry, exposes a per-op staging buffer that
-// write-throughs to the LSM log, and on Commit fsyncs the buffer
-// into one log.AppendBatch and CAS-advances the bucket Root from
-// the snapshotted value to the caller-supplied newRoot — atomically
-// from the caller's perspective.
+// Package bucketop provides the per-bucket write-transaction primitive for
+// ingot. A Tx snapshots the bucket's published Root from the registry and
+// exposes a per-op staging buffer that writes through to the LSM log. A
+// queue-bucket.commit applies its changes to one Tx in turn, each advancing
+// the working root, and then appends the staged blocks to the log in one
+// fsynced batch (Append); the root's advance and the rows the commit owes are
+// written with the task. The bucket's subject on the queue serializes its
+// commits, so a Tx needs no lock of its own.
 //
-// The package owns the four-way wiring (registry, log, layered read
-// tier, MST CBOR view) that S3 verb implementations would otherwise
-// compose by hand for every PUT/DELETE. It also owns the per-bucket
-// lock map so concurrent transactions against the same bucket
-// serialize within a single process and the CAS in Commit always
-// sees a fresh snapshot.
-//
-// Read paths bypass bucketop. They only need the read-side
-// blockstore directly; tx-style ceremony would be pure overhead.
+// Read paths bypass bucketop. They only need the read-side blockstore
+// directly; tx-style ceremony would be pure overhead.
 package bucketop
 
 import (
@@ -34,7 +28,6 @@ import (
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/libforge/syncutil"
 )
 
 // ErrBucketNotFound is returned by Begin when the bucket doesn't
@@ -43,14 +36,13 @@ import (
 var ErrBucketNotFound = errors.New("bucketop: bucket not found")
 
 // Deps wires the Coordinator to its three dependencies. Every field
-// is an interface so tests can supply in-memory equivalents without
-// standing up Postgres, an on-disk log, or a network blockstore.
+// is an interface so tests can supply fakes without standing up an on-disk
+// log or a network blockstore.
 type Deps struct {
-	// Reg tracks per-bucket Root. Begin reads State; Commit
-	// CAS-advances Root from the snapshot to newRoot.
+	// Reg tracks per-bucket Root. Begin reads State.
 	Reg registry.Registry
 
-	// Log is the durability boundary. Tx.Commit calls
+	// Log is the durability boundary. Tx.Append calls
 	// log.AppendBatch with the per-tx blocks plus an op-root
 	// record of (bucket, newRoot). In production this is the
 	// per-bucket *logstore.Manager: the op-root's bucket routes
@@ -76,15 +68,10 @@ type ShipAuthority interface {
 	CaptureShipAuthority(ctx context.Context, space did.DID)
 }
 
-// Coordinator manages per-bucket transactions. One per ingot backend.
-// Its job is to hand out Tx instances that share the same Deps,
-// serialize concurrent transactions per bucket, and own the log's
-// shutdown.
+// Coordinator hands out Tx instances that share the same Deps, and owns the
+// log's shutdown. One per ingot backend.
 type Coordinator struct {
 	deps Deps
-
-	// locks serialises transactions per bucket, within this process.
-	locks syncutil.KeyedMutex
 }
 
 // NewCoordinator returns a Coordinator wired to the given deps.
@@ -92,141 +79,41 @@ func NewCoordinator(deps Deps) *Coordinator {
 	return &Coordinator{deps: deps}
 }
 
-// Begin starts a write transaction against bucket. Steps:
-//  1. Acquire the per-bucket lock.
-//  2. Snapshot the bucket's State from the registry. If the bucket
-//     doesn't exist, release the lock and return ErrBucketNotFound.
-//  3. Allocate a per-op staging buffer plus a CBOR view over it.
-//
-// Caller MUST defer tx.Discard() and call tx.Commit on success.
-// Both Commit and Discard are idempotent against the lock — either
-// one releases it; calling the other afterwards is a no-op.
+// Begin starts a write transaction against bucket: it snapshots the
+// bucket's State from the registry and allocates a per-op staging buffer
+// plus a CBOR view over it. It returns ErrBucketNotFound when the bucket
+// doesn't exist. The caller runs under the bucket's subject on the bucket
+// queue, and MUST defer tx.Discard().
 //
 // The bucket name is cloned defensively: protocol layers like
 // versitygw/fiber return string headers that alias the request
 // buffer (valid only inside the handler), and we persist the
 // bucket name in Tx.bucket → OpRoot.Bucket → segment.opRoots,
-// which the async flush path reads after the handler returns.
+// which the bucket's ship reads after the handler returns.
 func (c *Coordinator) Begin(ctx context.Context, bucket string) (*Tx, error) {
 	bucket = strings.Clone(bucket)
-	release := c.lockTraced(ctx, bucket)
-
 	state, err := c.deps.Reg.Get(ctx, bucket)
 	if err != nil {
-		release()
 		if errors.Is(err, registry.ErrNotFound) {
 			return nil, ErrBucketNotFound
 		}
 		return nil, fmt.Errorf("bucketop: get bucket %q: %w", bucket, err)
 	}
-
 	staging := blockstore.NewOpStaging(c.deps.Reads, c.deps.Log, bucket, state.Space)
 	return &Tx{
 		deps:    c.deps,
 		bucket:  bucket,
 		state:   state,
+		start:   state.Root,
 		staging: staging,
 		cst:     blockstore.CborStore(staging),
-		release: release,
 	}, nil
 }
 
-// Lock acquires the per-bucket lock without starting a transaction
-// and returns a release func the caller MUST defer. Used by
-// non-write operations that still need to serialize against
-// concurrent writes — DeleteBucket, for example, walks the MST to
-// confirm the bucket is empty and then deletes the registry row;
-// without serialization a concurrent PUT could squeeze in between.
-//
-// Most callers should prefer WithLock, which removes the
-// defer-or-leak hazard.
-func (c *Coordinator) Lock(bucket string) func() {
-	return c.locks.Lock(bucket)
-}
-
-// lockTraced is Lock with the wait recorded as a bucket.lock span: time spent
-// here is time queued behind other writes to the same bucket.
-func (c *Coordinator) lockTraced(ctx context.Context, bucket string) func() {
-	_, span := tracing.Start(ctx, "bucket.lock")
-	defer span.End()
-	return c.Lock(bucket)
-}
-
-// MutateFn is the closure passed to WithTx. It receives the
-// transaction's bucket-state snapshot and the per-op staging
-// view, and returns the MST root the transaction should advance
-// to.
-//
-//   - Returning (newRoot, nil) with newRoot.Defined() commits the
-//     transaction: log.AppendBatch fsyncs the staging buffer and
-//     reg.CommitRoot advances the bucket Root, with the rows the
-//     commit carries (claims, drops, registrations).
-//   - Returning (cid.Undef, nil) signals "no-op success": the
-//     staging buffer is discarded with no log append and no Root
-//     advance. Used by S3 DELETE-on-missing-key, which is
-//     idempotent: the protocol wants a 200 even though the tree
-//     didn't change.
-//   - Returning (_, non-nil err) discards and propagates err.
-type MutateFn func(ctx context.Context, tx *Tx) (newRoot cid.Cid, err error)
-
-// WithTx runs fn against a fresh transaction. Begin/Commit/Discard
-// happen automatically based on what fn returns; the caller can
-// neither leak the bucket lock by forgetting Discard nor leak
-// in-flight bytes by forgetting Commit.
-//
-// Errors mapped to the caller:
-//   - ErrBucketNotFound from Begin propagates verbatim (fn is not
-//     invoked).
-//   - registry.ErrConflict from the inner CommitRoot propagates
-//     wrapped (only reachable in cross-process races; the
-//     in-process bucket lock prevents it within one Coordinator).
-//   - Any error fn returns propagates verbatim.
-func (c *Coordinator) WithTx(ctx context.Context, bucket string, fn MutateFn) (err error) {
-	ctx, span := tracing.Start(ctx, "bucket.tx")
-	defer func() { tracing.End(span, err) }()
-
-	tx, err := c.Begin(ctx, bucket)
-	if err != nil {
-		return err
-	}
-
-	newRoot, fnErr := fn(ctx, tx)
-	if fnErr != nil {
-		tx.Discard()
-		return fnErr
-	}
-	if !newRoot.Defined() {
-		// NB(forrest): at present, this case only happens on delete for a
-		// bucket object that doesn't exist, since delete is idempotent
-		// meaning there isn't a new root derived.
-		tx.Discard()
-		return nil
-	}
-	return tx.Commit(ctx, newRoot)
-}
-
-// LockFn is the closure passed to WithLock. It runs while the
-// per-bucket lock is held; the lock is released as soon as fn
-// returns, regardless of whether fn errored.
-type LockFn func(ctx context.Context) error
-
-// WithLock runs fn while holding the per-bucket lock. Counterpart
-// to WithTx for non-mutating bucket-level operations
-// (DeleteBucket's empty-check + delete; future bucket-policy
-// updates).
-func (c *Coordinator) WithLock(ctx context.Context, bucket string, fn LockFn) error {
-	release := c.lockTraced(ctx, bucket)
-	defer release()
-	return fn(ctx)
-}
-
 // Close shuts down the underlying log — with the per-bucket
-// manager, every bucket's log: each seals its open segment,
-// drains its flush queue, and updates its bucket's forge_root_cid
-// for every op_root contained in flushed segments. After Close
-// returns cleanly, every acked write is durable in Forge or
-// scheduled to ship. Close is one-shot at process shutdown;
-// subsequent Begin/Lock calls are not safe.
+// manager, every bucket's log: each seals its open segment and stops
+// its seal ticker. Close is one-shot at process shutdown; subsequent
+// Begin calls are not safe.
 func (c *Coordinator) Close(ctx context.Context) error {
 	return c.deps.Log.Close(ctx)
 }
@@ -240,54 +127,74 @@ type Tx struct {
 	deps    Deps
 	bucket  string
 	state   *registry.State
+	start   cid.Cid
 	staging *blockstore.OpStaging
 	cst     cbor.IpldStore
 
-	// commit is what the root swap carries besides the root: the
-	// upload-registration outbox rows this commit owes and the reference
-	// index rows of the versions it publishes and discards. They are
-	// written in the same transaction as the root CAS, so none can describe
-	// a version that did not commit, nor miss one that did.
+	// commit is what the root's advance carries besides the root: the upload
+	// registrations this commit queues and the reference index rows of the
+	// versions it publishes and discards. They are written with the root,
+	// so none can describe a version that did not commit, nor miss one that
+	// did.
 	commit registry.RootCommit
-
-	// release is the bucket-lock release closure. Set by Begin;
-	// nil-ed by finalize() so Commit and Discard mutually agree
-	// that the lock has been released exactly once.
-	release func()
+	// gc are the catalog blocks the commit's changes made garbage.
+	gc []cid.Cid
 }
 
+// Mark is a point in a Tx to return to: the working root and what the
+// commit carries at that point.
+type Mark struct {
+	root                    cid.Cid
+	regs, claims, drops, gc int
+}
+
+// Mark returns the transaction's current point, for Restore.
+func (tx *Tx) Mark() Mark {
+	return Mark{tx.state.Root, len(tx.commit.Registrations), len(tx.commit.Claims), len(tx.commit.Drops), len(tx.gc)}
+}
+
+// Restore returns the transaction to m, dropping what the commit gained
+// since: a change that failed on its own terms leaves nothing behind but the
+// blocks it staged, which nothing references.
+func (tx *Tx) Restore(m Mark) {
+	tx.state.Root = m.root
+	tx.commit.Registrations = tx.commit.Registrations[:m.regs]
+	tx.commit.Claims = tx.commit.Claims[:m.claims]
+	tx.commit.Drops = tx.commit.Drops[:m.drops]
+	tx.gc = tx.gc[:m.gc]
+}
+
+// Advance makes root the working root, which the next change's LoadTree
+// starts from.
+func (tx *Tx) Advance(root cid.Cid) { tx.state.Root = root }
+
+// AddGCCandidate records a catalog block the commit made garbage, for the
+// commit to record as a GC candidate.
+func (tx *Tx) AddGCCandidate(c cid.Cid) { tx.gc = append(tx.gc, c) }
+
 // EnqueueUploadRegistration records a change to the space's content-entry
-// list for this commit to carry. Called under the bucket lock, so the rows of
-// one bucket are numbered in the order its commits took the lock — which is
-// the order the sweeper has to replay a key's changes in.
+// list for this commit to carry. Commits run one at a time on the bucket's
+// subject, so a bucket's registrations are queued in commit order, the order
+// a key's changes have to replay in.
 func (tx *Tx) EnqueueUploadRegistration(reg registry.UploadRegistration) {
 	tx.commit.Registrations = append(tx.commit.Registrations, reg)
 }
 
 // ClaimBlobs records the new generation's claims on its body digests for
-// this commit to carry. A claim refused at the swap (a started release holds
-// the digest, or the space has no location for it) fails the commit with
-// registry.ErrReleaseInProgress, and nothing is written.
+// this commit to carry. A claim whose write's pending reference has expired
+// fails the commit with registry.ErrReferenceExpired, and nothing is written.
 func (tx *Tx) ClaimBlobs(claims []registry.BlobClaim) {
 	tx.commit.Claims = append(tx.commit.Claims, claims...)
 }
 
-// PinBlobs records claims borrowed from another object of the space (a
-// same-space copy) for this commit to carry. Each is written only while the
-// space still holds a claim on its digest; otherwise the commit fails with
-// registry.ErrClaimGone, and nothing is written.
-func (tx *Tx) PinBlobs(claims []registry.BlobClaim) {
-	tx.commit.Pins = append(tx.commit.Pins, claims...)
-}
-
 // DropClaims records the claims of a discarded generation for this commit
-// to remove. A drop of the space's last claim on a digest records the
-// blob's release in the same transaction, due grace after the commit: the
-// grace is measured when the swap commits, not here, so the fsync and any
-// lock wait between do not eat into it.
-func (tx *Tx) DropClaims(drops []registry.ClaimDrop, grace time.Duration) {
+// to remove. A drop of the space's last claim on a digest queues the blob's
+// release with the commit, due grace after it and carrying release's
+// authority: the grace is measured once the catalog is fsynced, not here.
+func (tx *Tx) DropClaims(drops []registry.ClaimDrop, grace time.Duration, release registry.ReleaseTask) {
 	tx.commit.Drops = append(tx.commit.Drops, drops...)
 	tx.commit.ReleaseGrace = grace
+	tx.commit.Release = release
 }
 
 // Compile-time assertions: Tx is the canonical handle through which
@@ -300,8 +207,8 @@ var (
 	_ blockstore.BlockWriter = (*Tx)(nil) // PutBlock     → PutBody
 )
 
-// State returns the bucket's State as snapshotted at Begin. The
-// reported Root is the value Commit will CAS against.
+// State returns the bucket's State as snapshotted at Begin, with Root the
+// working root.
 func (tx *Tx) State() *registry.State { return tx.state }
 
 // Get fetches a CBOR-encoded value at c into out. Tx satisfies
@@ -349,70 +256,45 @@ func (tx *Tx) LoadTree() *mst.MerkleSearchTree {
 	return mst.NewEmptyMST(tx, tx.state.Space)
 }
 
-// Commit finalizes the transaction:
-//  1. log.AppendBatch fsyncs the staging buffer into the open log
-//     segment with an op-root of (bucket, newRoot).
-//  2. registry.CommitRoot advances the bucket Root from State().Root
-//     to newRoot and, in the same transaction, writes the rows the
-//     commit carries: its upload registrations, blob claims and claim
-//     drops, and its catalog blocks, journaled under the segment step 1
-//     appended them to until that segment ships.
-//  3. The bucket lock is released.
-//
-// Returns registry.ErrConflict if another writer raced ahead of us
-// (only possible across processes — within a single process the
-// per-bucket lock prevents it). On any error the lock is still
-// released; defer-Discard becomes a no-op.
-//
-// Failure mode worth knowing: if step 1 succeeds but step 2 fails
-// (transient Postgres error, context cancellation between the two
-// calls), the op_root is durable in the log even though the bucket
-// Root never advanced. The flusher will eventually see this op_root
-// and — today — blindly advance forge_root_cid to it, leaving
-// forge_root_cid pointing at an orphan Root the bucket never
-// published. See the TODO in pkg/ingot/registry/segments.go's
-// MarkSegmentFlushed for the planned conditional-update fix.
-func (tx *Tx) Commit(ctx context.Context, newRoot cid.Cid) (err error) {
-	if tx.release == nil {
-		return errors.New("bucketop: tx already finalized")
-	}
-	defer tx.finalize()
-	ctx, span := tracing.Start(ctx, "bucket.commit")
-	defer func() { tracing.End(span, err) }()
+// Appended is what Append made durable, for the commit's writes
+// (registry.Postgres.RootCommitWrites): the root the transaction began from,
+// the root it advances to, and what the advance carries.
+type Appended struct {
+	Expect, Next cid.Cid
+	Commit       registry.RootCommit
+	GC           []cid.Cid
+}
 
-	// The append below is what the segment will ship, whatever the root
-	// swap does, so its authority is captured first: an append that fills
-	// the segment can seal it and start its ship at once. A write with no
-	// body (a delete, a tag change) captures none anywhere else.
+// Append appends the staged blocks and an op-root of (bucket, root) to the
+// log in one fsynced batch and returns what the commit writes, or false
+// when no change moved the root. The append is what the segment will ship
+// whatever becomes of the commit, so the ship's authority is captured first:
+// an append that fills the segment can seal it at once. A write with no body
+// (a delete, a tag change) captures none anywhere else.
+//
+// An append whose commit then fails leaves its op-root in the log with a
+// root the bucket never published; a ship advances forge_root_cid through
+// it, as MarkSegmentShipped's TODO describes.
+func (tx *Tx) Append(ctx context.Context) (_ Appended, ok bool, err error) {
+	if tx.state.Root == tx.start {
+		return Appended{}, false, nil
+	}
+	ctx, span := tracing.Start(ctx, "bucket.append")
+	defer func() { tracing.End(span, err) }()
 	if tx.deps.Ships != nil {
 		tx.deps.Ships.CaptureShipAuthority(ctx, tx.state.Space)
 	}
-	appended, err := tx.staging.Commit(ctx, newRoot)
+	appended, err := tx.staging.Commit(ctx, tx.state.Root)
 	if err != nil {
-		return fmt.Errorf("bucketop: append: %w", err)
+		return Appended{}, false, fmt.Errorf("bucketop: append: %w", err)
 	}
-	tx.commit.Journal = appended
-	if err := tx.deps.Reg.CommitRoot(ctx, tx.bucket, tx.state.Root, newRoot, tx.commit); err != nil {
-		return fmt.Errorf("bucketop: advance root: %w", err)
-	}
-	return nil
+	c := tx.commit
+	c.Journal = appended
+	return Appended{Expect: tx.start, Next: tx.state.Root, Commit: c, GC: tx.gc}, true, nil
 }
 
-// Discard rolls back the staging buffer (drops staged blocks
-// without writing) and releases the bucket lock. Idempotent — safe
-// to defer at the top of every operation regardless of whether
-// Commit eventually runs.
+// Discard drops the staged blocks without writing them. Idempotent, and a
+// no-op after Append.
 func (tx *Tx) Discard() {
-	if tx.release == nil {
-		return
-	}
 	tx.staging.Discard()
-	tx.finalize()
-}
-
-func (tx *Tx) finalize() {
-	if tx.release != nil {
-		tx.release()
-		tx.release = nil
-	}
 }

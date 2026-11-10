@@ -15,7 +15,7 @@ func TestLayered_CountBlobReadsByTier(t *testing.T) {
 	meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
 	digest := mustDigest(t, []byte("blob"))
 
-	hit := NewLayered(fakeBlobTier{data: []byte("from-spool")}, nil, fakeBlobTier{data: []byte("from-base")})
+	hit := NewLayered(fakeBlobTier{data: []byte("from-cache")}, nil, fakeBlobTier{data: []byte("from-base")})
 	miss := NewLayered(fakeBlobTier{data: nil}, nil, fakeBlobTier{data: []byte("from-base")})
 	for _, l := range []*Layered{hit, miss} {
 		if err := l.CountBlobReads(meter); err != nil {

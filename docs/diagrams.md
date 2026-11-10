@@ -18,12 +18,12 @@ change to the diagrams to re-check. The maintenance rule lives in
 | `context` | [System context](#system-context-services-and-contracts) | every service ingot talks to, and the contract on each edge | here |
 | `packages` | [Package map](#package-map-and-interface-seams) | internal packages and the interface seams between them | here |
 | `block-routes` | [Two block routes](#two-block-routes-body-blobs-and-catalog-blocks) | how body blobs and catalog blocks travel to Forge by different paths | here |
-| `put` | [PutObject](#putobject-spool-and-upload-off-the-lock-commit-under-it) | the write path: off-lock ingest and upload, locked commit | here |
+| `put` | [PutObject](#putobject-stream-and-upload-in-the-request-commit-on-the-bucket-queue) | the write path: ingest and upload in the request, commit on the bucket queue | here |
 | `get` | [GetObject](#getobject-version-resolution-local-tiers-network-retrieval) | version resolution, tier fallthrough, network retrieval | here |
 | `multipart` | [Multipart upload](#multipart-upload-park-on-write-accept-in-the-background) | park at UploadPart, accept in the background, Complete's wait, abort unwind | here |
-| `part-states` | [Part states](#part-states-the-acceptance-queue) | the part rows as the acceptor's queue | here |
-| `multipart-states` | [Session states](#session-states-and-the-completeabort-latch) | the session state machine and the single-winner latch | here |
-| `blob-lifecycle` | [Blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released) | intent states and the claim ledger gating deletion | here |
+| `part-states` | [Part states](#part-states-the-acceptance-queue) | the part rows as the upload's accept queue | here |
+| `multipart-states` | [Session states](#session-states-open-and-completed) | the session state machine, one change per upload at a time | here |
+| `blob-lifecycle` | [Blob lifecycle](#blob-lifecycle-uploading-parked-accepted-released) | intent states and the claim ledger gating deletion | here |
 | `version-tree` | [Per-key version storage](#per-key-version-storage-manifest-arm-leaf-arm-prev-tree) | the value union, the leaf, the prev tree | here |
 | `gc-candidates` | [Catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal) | every path that records a superseded catalog block for removal | here |
 | `principals` | [Principals and proof stores](#principals-and-proof-stores) | every DID in play and which store proves what | here |
@@ -106,13 +106,14 @@ flowchart TB
     end
 
     subgraph store["local storage"]
-        bs["blockstore<br/>Spool, BlobCache, OpStaging, Layered, Cached, Forge"]
+        bs["blockstore<br/>BlobCache, OpStaging, Layered, Cached, Forge"]
         ls["logstore<br/>Manager, Store, PlaneLog, Segment"]
         cars["cars"]
     end
 
     subgraph meta["metadata"]
         reg["registry<br/>Postgres, LocalLocator"]
+        tr["taskrunner<br/>Runner, Exec"]
         mig["migrations"]
     end
 
@@ -134,17 +135,18 @@ flowchart TB
     s3f --> reg
     s3f --> up
     s3f --> ba
+    s3f --> tr
     bop -->|"blockstore.Log"| ls
     bop -.->|"bucketop.ShipAuthority<br/>(uploader.Forge injected)"| up
     bop --> mst
     mst --> bs
     bkt --> bs
     ls --> cars
-    ls -->|"logstore.Meta"| reg
+    reg -->|"logstore.Meta"| ls
     bs -.->|"locator.Locator<br/>(LocalLocator injected)"| reg
     up --> fc
     iam --> reg
-    reg --> mig
+    reg --> tr
     cmd --> root
     cmd -->|"catalog usage"| ls
     cmd --> reg
@@ -152,16 +154,23 @@ flowchart TB
     cmd --> bs
     cmd --> cars
     root --> vgw
+    root --> tr
+    root --> mig
     root -->|"BlockReader =<br/>Cached(Forge)"| bs
 ```
 
 - `registry.Postgres` is one struct satisfying the registry seams
   (`Registry` plus the intent, location, inclusion, blob-ref, GC, multipart,
   park, and catalog usage stores) and `logstore.Meta`.
-- `uploader.Forge` is one struct behind `Uploader`, `BodyUploader`,
-  `DeferredBodyUploader`, and `BlobRemover`.
-- `inmem` (test-only fakes) and `tokenstore` (empty; only the dormant login
-  paths would read it) are omitted. `blockstore/locator`'s indexer-backed
+- `taskrunner` imports nothing else from ingot. `New` registers
+  `s3frontend`'s handlers for every queue on the one runner
+  `provideTaskRunner` builds, and `registry` returns the statements and task
+  specs a handler commits with.
+- `uploader.Forge` is one struct behind `Uploader`,
+  `StreamingBodyUploader`, `DeferredBodyUploader`, and `BlobRemover`.
+- `internal/testfakes` (test-only fakes), `tokenstore` (empty; only the
+  dormant login paths would read it), `regionkey`, `tenantkey`, `revocation`,
+  `blake3tree` and the `internal/` helpers are omitted. `blockstore/locator`'s indexer-backed
   locator compiles but is never injected.
 - `cmd`'s `catalog usage` builds its own logstore walk, registry, Hilt
   authorization and Forge reader rather than going through the server.
@@ -186,17 +195,17 @@ flowchart TB
 
     subgraph bodyr["the body route (raw blobs, synchronous)"]
         split["SplitSizedBody at the declared length:<br/>coarse split at max_blob_size,<br/>BLAKE3 tree + md5 in one streaming pass"]
-        spool["Spool (DataDir/spool)<br/>+ upload_intents row<br/>(each blob streams its PUT<br/>to the provider while it is spooled)"]
-        upload["per-blob upload before the commit:<br/>conclude, accept (streamed), or<br/>/blob/add, HTTP PUT, conclude, accept<br/>(a blob_locations hit skips it: dedup)"]
+        stream["each blob streams to its provider as it arrives:<br/>/blob/add by size and digest code, HTTP PUT,<br/>sha256 on the way<br/>(an object's blob is teed into a .tmp-* file<br/>in the cache)"]
+        upload["per-blob queue-space-shard.add before the commit:<br/>/ucan/conclude, accept, upload_intents row<br/>(a blob_locations hit reuses it: dedup)"]
         bloc["blob_locations row: the whole blob,<br/>(space, digest) to provider URL"]
-        cache["BlobCache (DataDir/cache):<br/>the blob's file moves here by rename"]
-        split --> spool --> upload --> bloc --> cache
+        cache["BlobCache (DataDir/cache):<br/>the temporary file is adopted<br/>under the blob's digest"]
+        split --> stream --> upload --> bloc --> cache
     end
 
     subgraph catr["the catalog route (dag-cbor blocks, asynchronous ship)"]
-        commit["commit: manifest + MST splice into OpStaging,<br/>one fsynced AppendBatch into the bucket's log,<br/>guarded root swap journaling the new blocks<br/>in Postgres (catalog_journal), 200 to the client"]
+        commit["queue-bucket.commit: manifest + MST splice into OpStaging,<br/>one fsynced AppendBatch into the bucket's log,<br/>guarded root advance journaling the new blocks<br/>in Postgres (catalog_journal), 200 to the client"]
         seal["open segment seals at SealBytes / SealAge<br/>(CAR + .idx + .ops)"]
-        ship["background ship: /blob/add the sealed CAR,<br/>PUT, conclude, accept"]
+        ship["queue-bucket.ship: /blob/add the sealed CAR,<br/>PUT, conclude, accept"]
         incl["blob_locations (the CAR) + shard_inclusions<br/>(inner byte ranges), then the guarded<br/>forge_root_cid advance, the segment's journal<br/>rows deleted, and retention"]
         commit --> seal --> ship --> incl
     end
@@ -205,6 +214,7 @@ flowchart TB
 
     put --> split
     bloc -->|"every body blob durable and accepted"| commit
+    stream --> piri
     upload --> piri
     ship --> piri
 
@@ -224,21 +234,23 @@ flowchart TB
 - The network unit differs: a body blob is retrieved whole by its own digest
   (a `blob_locations` hit); catalog blocks share a CAR, so a network read
   resolves `shard_inclusions` to a byte range inside the shard.
-- Reads mirror the split: `OpenBlob` (bodies) checks local disk (cache,
-  then spool) then network, skipping the log; `GetBlock` (catalog) checks
+- Reads mirror the split: `OpenBlob` (bodies) checks local disk (the
+  cache) then network, skipping the log; `GetBlock` (catalog) checks
   local disk, log, then network
   (the [GetObject diagram](#getobject-version-resolution-local-tiers-network-retrieval)).
 - Removal mirrors it too: bodies are reference-counted
-  ([blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released));
+  ([blob lifecycle](#blob-lifecycle-uploading-parked-accepted-released));
   superseded catalog blocks queue for a future collector
   ([catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)).
 - A body streams: each blob is allocated by size
   and hash function (`/blob/add` with a digest code) and its envelope goes to
-  the provider while the spool writes it, so the upload overlaps the body's
-  arrival instead of following it. The spool copy still supplies the digest,
-  which the put receipt reports and the node checks at accept.
+  the provider as it arrives, so the upload overlaps the body's arrival
+  instead of following it. The digest is computed on the way; the put
+  receipt reports it and the node checks it at accept. An upload service
+  that cannot add by digest code fails the write.
 - Multipart parts ride the body route with the conclude deferred (parked);
-  the upload's acceptor finishes it
+  each blob's `queue-space-shard.accept`, queued by the upload's
+  `queue-multipart-upload.accept`, finishes it
   (the [multipart diagram](#multipart-upload-park-on-write-accept-in-the-background)).
 
 Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer),
@@ -246,15 +258,19 @@ Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer)
 [`logstore/README.md`](../logstore/README.md).
 
 Sources: `s3frontend/object.go` (ingestBody), `s3frontend/stream.go`,
-`bucket/sized.go`, `blockstore/spool.go`, `blockstore/blobcache.go`,
+`s3frontend/shardref.go` (runAdd), `s3frontend/bucketqueue.go` (runCommit),
+`s3frontend/bucketship.go` (runShip),
+`bucket/sized.go`, `blockstore/blobcache.go`,
 `blockstore/staging.go`, `logstore/`, `uploader/forge.go`, `uploader/blob.go`,
 `server.go` (newBucketFlushFunc). Review when these change.
 
-## PutObject: spool and upload off the lock, commit under it
+## PutObject: stream and upload in the request, commit on the bucket queue
 
-All network I/O runs outside the per-bucket lock; the critical section is a
-manifest write, an MST splice, one fsynced `AppendBatch`, and a guarded root
-swap. A `200` means the body is durable and accepted on the network, not
+All network I/O runs in the request, before the commit. The commit is a
+`queue-bucket.commit` task on the bucket's subject, run sync for the request,
+so one change to a bucket runs at a time. It is a manifest write, an MST
+splice, one fsynced `AppendBatch`, and a guarded root advance written with
+the task. A `200` means the body is durable and accepted on the network, not
 merely buffered.
 
 ```mermaid
@@ -262,14 +278,15 @@ sequenceDiagram
     autonumber
     actor C as S3 client
     participant B as s3frontend.Backend
-    participant SP as blockstore.Spool
+    participant BC as blockstore.BlobCache
     participant R as registry<br/>(Postgres)
     participant U as sprue
     participant P as piri
+    participant Q as queue-bucket.commit<br/>(the bucket's subject)
     participant TX as bucketop.Tx
     participant L as logstore.Manager
 
-    Note over C,L: off the lock: ingest, hash, encrypt, upload (an upload service that cannot<br/>add by digest code gets every blob spooled first, then uploaded by digest)
+    Note over C,L: in the request: ingest, hash, encrypt, stream each blob to its provider
     C->>B: PutObject(bucket, key, body)
     B->>R: reg.Get(bucket), precondition pre-check
     B->>B: tenant recipient: resolve the tenant's #35;wrap key<br/>(tenant DID from the request, did:plc doc via the cached PLC resolver)#59;<br/>no recipient → the write fails
@@ -277,54 +294,47 @@ sequenceDiagram
         B->>B: fresh CEK → FEE envelope (COSE_Encrypt, AES-256-GCM STREAM,<br/>one recipient: ECDH-ES+A256KW to the tenant wrap key)#59;<br/>its length is known from the header + plaintext length
         B->>U: /blob/add (digestCode sha2-256, envelope size, random nonce)
         U-->>B: allocation address, put and accept tasks
-        B->>R: PutStream(add task): the upload's name until parked or accepted
         par
-            B->>SP: spool under the CIPHERTEXT digest<br/>(BLAKE3 tree + md5 of the plaintext in the same pass)
+            B->>P: HTTP PUT the envelope bytes as they arrive<br/>(sha256 of the envelope, BLAKE3 tree + md5 of the plaintext in the same pass)
         and
-            B->>P: HTTP PUT the same envelope bytes as they are spooled
+            B->>BC: CreateTemp: tee the same bytes into a .tmp-* file<br/>(none with cache_writes: false#59; a failed copy is dropped, the PUT goes on)
         end
-        Note over B,P: a failed PUT detaches: the spool finishes, the allocation is<br/>aborted and the blob uploads by digest#59; UnsupportedDigestCode<br/>switches the rest of the body to spool-first
+        Note over B,P: a failed PUT fails the request: the allocation is aborted<br/>(within 10 s) and the client retries#59; so does UnsupportedDigestCode
     end
-    B->>R: PutIntent(digest, stored size, uploading) +<br/>PutEncryptionParams(region-wrapped CEK, FEE geometry) per blob
-    loop each streamed blob (uploadBlobs → concludeStreamed)
-        B->>U: /ucan/conclude the put receipt, reporting the spooled digest
-        U-->>B: accept receipt + /assert/location commitment
-        B->>R: PutLocation, then SetIntentState(accepted)#59; DeleteStream
-        B->>B: BlobCache.Take: the file moves from the spool to the cache
-    end
-    loop each spooled-first blob (uploadBlobs)
+    B->>R: PutEncryptionParams(region-wrapped CEK, FEE geometry) per blob
+    loop each blob (concludeBody → addBlob)
+        Note over B,R: a sync queue-space-shard.add on the blob's release subject (space/hex digest),<br/>after any release ahead of it, within 30 s (else SlowDown)
         alt blob_locations already has (space, digest)
-            B->>R: SetIntentState(accepted), skip upload, BlobCache.Take<br/>(never hits for fresh writes — every envelope digest is new)
-        else upload
-            B->>U: /blob/add (digest, size)
-            U-->>B: allocation address (none on provider-side dedup)
-            B->>P: HTTP PUT bytes
-            B->>U: /ucan/conclude the put receipt, then poll /blob/accept receipt
-            U-->>B: /assert/location commitment
+            B->>R: PutIntent(accepted)<br/>(only a plaintext bucket's repeated bytes hit: every envelope digest is new)
+        else conclude
+            B->>R: PutIntent(stored size, uploading)
+            B->>U: /ucan/conclude the put receipt, reporting the digest
+            U-->>B: accept receipt + /assert/location commitment
             B->>R: PutLocation, then SetIntentState(accepted)
-            B->>B: BlobCache.Take: the file moves from the spool to the cache
         end
+        B->>R: in the add's commit: the write's pending reference (blob_pending_refs)<br/>+ a queue-space-shard.expire due in 24 h
+        opt the space held the blob already
+            B->>U: /blob/abort the surplus allocation
+        end
+        B->>BC: Adopt: the .tmp-* file goes under the digest, before the 200#59;<br/>queue-shard.cache dates it and schedules its queue-shard.evict
     end
-    Note over B,U: UploadBlob also captures the request proof store, if borrowable,<br/>as the space's ship authority (captureShipProofs, 1h TTL)
-    Note over B,L: under the per-bucket lock: commitVersion via Coordinator.WithTx
-    B->>TX: Begin (lock, snapshot root)
-    TX->>R: AllocVersionSeq (a multipart Complete in an Enabled bucket<br/>reserved its seq before the lock: see the multipart diagram)
-    TX->>TX: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match under the lock,<br/>MST splice (new nodes into staging)
-    Note over TX: uploader.CaptureShipAuthority: every commit captures the request<br/>proof store, if borrowable and it holds a /blob/add chain, as the<br/>space's ship authority, so a write with no body (a delete, a tag<br/>change) leaves one for its segment's ship
-    TX->>L: AppendBatch(catalog blocks, OpRoot) with fsync
-    TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>the batch's catalog blocks journaled under its segment (catalog_journal,<br/>skipped once the segment has shipped), blob_refs gains this version,<br/>superseded version rows removed, a release record per digest whose<br/>claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (upload_registrations)
-    TX-->>B: committed, lock released
+    Note over B,U: StartBlob also captures the request proof store, if borrowable,<br/>as the space's ship authority (captureShipProofs, 1h TTL)
+    B->>Q: run sync: Put(key, manifest, blobs, pending references, If-Match/If-None-Match)<br/>+ the captured release and /upload/add, /upload/remove proofs
+    Q->>TX: Begin (snapshot root)
+    TX->>R: AllocVersionSeq (a multipart Complete in an Enabled bucket<br/>reserved its seq before the commit: see the multipart diagram)
+    TX->>TX: applyPut: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match against the current version,<br/>MST splice (new nodes into staging), advance the working root
+    Note over TX: uploader.CaptureShipAuthority: every append captures the request<br/>proof store, if borrowable and it holds a /blob/add chain, as the<br/>space's ship authority, so a write with no body<br/>(a delete, a tag change) leaves one for its segment's ship
+    TX->>L: Tx.Append: AppendBatch(catalog blocks, OpRoot) with fsync
+    Q->>R: RootCommitWrites, written with the task's own commit:<br/>the batch's catalog blocks journaled under its segment (catalog_journal,<br/>skipped once the segment has shipped), the root's advance (guarded: it must<br/>find the root it started from), blob_refs gains this version, each claim<br/>taking over the write's pending reference (row deleted, expiry cancelled#59;<br/>an expired one fails the change: SlowDown), superseded version rows removed,<br/>a queue-space-shard.release task, due after the grace, per digest whose<br/>claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (queue-space-upload tasks)
+    Q-->>B: the change's result (version id, seq)
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
-    Note over B,U: the release sweeper runs each record once its grace passes:<br/>/blob/remove (+ crypto-shred: its blob_encryption_params row deleted)
+    Note over B,U: a task runner worker runs each queue-space-shard.release once its grace passes:<br/>crypto-shred (its blob_encryption_params row deleted), then /blob/remove
 ```
 
-- A request that dies after allocating a streamed blob leaves its
-  `blob_streams` row; the stream sweeper (on the release sweeper's tick)
-  aborts such an upload by its add task once the row's lease (`touched_at`,
-  renewed every 10 minutes by the request that owns it) has gone 30 minutes
-  unrenewed, unless its blob was parked, and
-  drops the row once the abort lands or the provider reports the blob
-  accepted.
+- A streamed blob whose body fails aborts its allocation at once. One a
+  dying request leaves behind is never concluded, and the provider expires
+  it within a day: an unaccepted blob counts toward no space's usage and is
+  never served.
 - Encryption makes the stored digest a ciphertext digest: **content dedup is
   gone for bodies** (fresh CEK per write ⇒ unique envelope), by design per
   the encryption RFC. Manifest spans, `Body.Size`, the BLAKE3 tree, md5 and ETag stay
@@ -339,9 +349,14 @@ sequenceDiagram
   discarded) is [`s3-versioning.md`](./s3-versioning.md) §5; the resulting
   storage shape is the [version tree](#per-key-version-storage-manifest-arm-leaf-arm-prev-tree).
 - The claim ledger and the zero-claims release are the
-  [blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released).
-- `CopyObject` runs the same `commitVersion`. Within one space its manifest
-  pins the source's digests: no spool, no upload, claims incremented. Across
+  [blob lifecycle](#blob-lifecycle-uploading-parked-accepted-released).
+- `CopyObject` commits the same Put change. Within one space its manifest
+  pins the source's digests: no stream, no upload, claims incremented. Each
+  source blob first takes a pending reference through a copy-mode
+  `queue-space-shard.add`, which fails the copy with NoSuchKey unless the
+  space has the blob located, and the copy's claims take them over; a source
+  deleted and released after the adds leaves the copy's blobs referenced,
+  and the copy commits. Across
   spaces (every bucket has its own) the CEK wrap bound to (space, digest)
   rules out sharing, so the source's plaintext streams through the decrypting
   read path into `ingestBody` and the copy gets its own blobs and claims. A
@@ -359,55 +374,51 @@ sequenceDiagram
   `NumberOfObjects`. Best-effort, as the index publication is: the object is
   durable and the response must say so, so a failure logs and the count
   under-reports rather than failing a write that succeeded.
-- The write does **not** call the upload service. It queues the change in
-  `ingot.upload_registrations` in the same transaction as the root CAS, and the
-  registration sweeper (`SweepUploadRegistrations`, every 30s) applies it. The
-  count is reporting data, so a Sprue round trip does not belong in a PUT, and
-  a Sprue outage delays the count instead of failing writes or losing it.
-- The row exists exactly when the version committed, and `seq` replays a key's
-  changes in commit order. A sweep spends **two round trips**, not one per
-  change: every queued addition in one batch of invocations, then every
-  retraction in another. (A batch in ucantone's sense — many invocations, a
-  receipt each. `/ucan/conclude` is the other shape, one invocation carrying
-  many receipts.)
-  Both halves are needed — a container sorts its tokens bytewise, so the
-  service may run a batch in any order, and a retraction sharing a batch with
-  the addition it retires could overtake it and leave the root counted for
-  good. Splitting by op is safe because a root is added by the commit that
-  creates the version and retracted by a later one, so an addition always
-  carries the lower `seq`.
-- A key with a refused change is held whole until it is due again, within the
-  sweep and across sweeps, so a later row can never overtake an earlier one.
-  Each row carries the delegation chain that authorizes it, captured from the
-  request that committed the version, because the sweeper has no request to
-  borrow authority from.
+- The write does **not** call the upload service. It queues the change as a
+  `queue-space-upload` task in the same transaction as the root's advance, and a
+  worker sends it. The count is reporting data, so a Sprue round trip does not
+  belong in a PUT, and a Sprue outage delays the count instead of failing
+  writes or losing it.
+- The task exists exactly when the version committed. The queue's subject is
+  the space, so a space's changes run in commit order, and a batch takes only
+  consecutive changes of one kind: up to 256 additions in one round trip, then
+  the retractions after them in another. (A batch in ucantone's sense — many
+  invocations, a receipt each.) Splitting by kind is needed because a container
+  sorts its tokens bytewise, so the service may run a batch in any order, and a
+  retraction sharing a batch with the addition it retires could overtake it and
+  leave the root counted for good.
+- A refused change is retried with backoff and holds its space, so a later
+  change can never overtake it. Each change carries the delegation chain that
+  authorizes it, captured from the request that committed the version, because
+  the task has no request to borrow authority from.
 - That chain has room to spare — hilt expires its delegation to the gateway at
   the next UTC midnight plus an async overhang, so even a change queued at
-  23:59 has hours to be drained in. For the queue that outlasts that, the
-  sweeper renews from the space's live authority, which a recent body upload
-  with a borrowable store leaves behind, less any delegation a revocation has
-  since named. A space that has gone quiet has none, and after
-  `uploadRegistrationDeadLetterAfter` attempts the row is **dead-lettered**:
-  out of the sweep, and out of the way of its key's later rows. (Nothing to do
-  with a parked blob, which is durable and awaiting its accept.) The count is then short by
-  that one change rather than frozen for that key, and `dead_letter_reason` records
-  why.
+  23:59 has hours to be sent in. For a queue that outlasts that, the handler
+  renews from the space's live authority, which a recent body upload with a
+  borrowable store leaves behind, less any delegation a revocation has since
+  named. A space that has gone quiet has none, and after
+  `uploadRegistrationDeadLetterAfter` attempts the change fails for good: it
+  stays in the queue as a failed task, out of the way of the space's later
+  changes. The count is then short (or high) by that one change rather than
+  frozen for the space. A bucket delete resends the space's failed retractions
+  with its own authority before the space goes.
 
 Cross-references: [`architecture.md` §7.1](./architecture.md#71-write-single-shot-putobject).
 
-Sources: `s3frontend/object.go` (PutObject, ingestBody, uploadBlobs,
-concludeStreamed), `s3frontend/stream.go` (WriteSizedBlob,
-SweepStaleStreams), `bucket/sized.go`, `uploader/stream.go`,
+Sources: `s3frontend/object.go` (PutObject, ingestBody, concludeBody),
+`s3frontend/shardref.go` (addBlob, runAdd, runExpire), `s3frontend/stream.go` (WriteSizedBlob), `s3frontend/localblobs.go`
+(cacheWritten), `blockstore/blobcache.go`, `bucket/sized.go`, `uploader/stream.go`,
 `s3frontend/copy.go` (CopyObject, copySourceBucket),
-`s3frontend/version.go` (commitVersion, enqueueRegistration),
-`s3frontend/uploadsweep.go` (SweepUploadRegistrations), `bucketop/bucketop.go`,
+`s3frontend/version.go` (applyPut), `s3frontend/bucketqueue.go` (commit, runCommit, register),
+`registry/bucketcommit.go` (RootCommitWrites),
+`s3frontend/uploadqueue.go` (the queue-space-upload handlers), `bucketop/bucketop.go`,
 `blockstore/staging.go`, `uploader/blob.go`, `uploader/forge.go`,
 `uploader/upload.go`. Review when these change.
 
 ## GetObject: version resolution, local tiers, network retrieval
 
 A read resolves the version through the MST, then serves each covering blob
-from the first tier that has it: local disk (the cache, then the spool), the
+from the first tier that has it: local disk (the cache), the
 catalog log (catalog blocks only), then the network. Network resolution goes through the local locator
 tables, never the indexing-service.
 
@@ -439,8 +450,8 @@ sequenceDiagram
             Note over B: aesstream.CiphertextRange maps the plaintext range to<br/>one contiguous ciphertext span past the envelope header
         end
         B->>LY: read (whole blob, or only the ciphertext span via OpenBlobRange)
-        alt local hit (blockstore.LocalBlobs)
-            LY-->>B: bytes from the cache, else the spool<br/>(then the cache again: a blob can move between the two)
+        alt local hit (blockstore.BlobCache)
+            LY-->>B: bytes from the cache
         else catalog log hit (GetBlock only)
             LY->>LG: Get: linear scan of open bucket stores
             LG-->>B: block from an open or sealed segment
@@ -482,7 +493,7 @@ Cross-references: [`architecture.md` §7.4](./architecture.md#74-read-getobject)
 Sources: `s3frontend/object.go` (GetObject, HeadObject, selectBytes),
 `s3frontend/version.go` (resolveVersion), `s3frontend/decrypt.go`
 (bodyOpener, decryptingOpener), `bucket/chunker.go` (BlobRangeOpener),
-`blockstore/layered.go`, `blockstore/blobcache.go` (LocalBlobs),
+`blockstore/layered.go`, `blockstore/blobcache.go`,
 `blockstore/forge.go` (doRetrieve), `blockstore/cache.go`,
 `registry/locallocator.go`, `logstore/manager.go` (Get). Review when these
 change.
@@ -490,123 +501,134 @@ change.
 ## Multipart upload: park on write, accept in the background
 
 Parts upload to the provider at `UploadPart` and park there (durable,
-unaccepted). Each upload's acceptor concludes its parked parts in batches
-while the client is still uploading, so `Complete` waits only for the last
-few and its cost stays flat as the part count grows.
+unaccepted). Each upload's `queue-multipart-upload.accept` task
+queues a `queue-space-shard.accept` for each blob of its parked parts, which
+concludes the blob under the blob's own subject while the client is still
+uploading, so `Complete` has only the last few left to accept.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor C as S3 client
     participant B as s3frontend.Backend
-    participant A as the upload's acceptor<br/>(goroutine)
+    participant M as queue-multipart-upload<br/>(task, subject = uploadId)
+    participant A as queue-multipart-upload.accept<br/>(task, the upload's subject)
+    participant S as queue-space-shard.accept<br/>(task, subject = space/digest)
     participant R as registry<br/>(sessions, parts, parks, intents)
     participant U as sprue
     participant P as piri
-    participant TX as bucketop.Tx
+    participant Q as queue-bucket<br/>(the bucket's subject)
 
     C->>B: CreateMultipartUpload
-    B->>R: CreateSession(open) with headers + checksum algorithm
+    B->>M: run sync: queue-multipart-upload.create
+    M->>Q: run sync as a child: queue-bucket.admit-upload<br/>(a closing bucket: OperationAborted)
+    M->>R: with the task's commit: the session row (open) with headers + checksum algorithm#59;<br/>the auto-abort, queue-multipart-upload.abort, due one session TTL out (default 7 d)
     B-->>C: uploadId
     C->>B: UploadPart(n) / UploadPartCopy(n)
     B->>B: openSession (non-open: NoSuchUpload)
     opt UploadPartCopy
         B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412)#59;<br/>the body is the source's plaintext range through the decrypting reader
     end
-    B->>B: ingestPart: splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
-    B->>R: PutPart(spooled, span_lengths): open sessions only, the row held FOR SHARE<br/>against a concurrent latch#59; writes of one part number serialised on an advisory lock#59;<br/>a release record, due now, for each blob the replaced row named and this part<br/>does not, in the same transaction, returned to run#59; a refused part records its blobs' releases
-    loop each part blob (parkBlobs)
-        alt streamed while spooled
-            B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked,<br/>DeleteStream: the PUT already went to piri in splitSpool
-            B->>B: removeLocal (the part's local copy#59; the acceptor concludes from the park)
-        else blob_locations already has the digest
+    B->>B: ingestPart: splitBody<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope streamed to piri under its ciphertext<br/>digest + params row, as in the PutObject diagram#59; no local copy)
+    loop each part blob (parkBlobs → addBlob: a sync queue-space-shard.add on the blob's release subject)
+        alt blob_locations already has the digest
             B->>R: intent accepted (dedup, no park)
         else already parked (GetPark hit)
-            B->>R: reuse the park
+            B->>R: reuse the park, intent parked
         else park
-            B->>U: /blob/add with WithConclude(false)
-            B->>P: HTTP PUT bytes
-            B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked
-            B->>B: removeLocal (the part's local copy)
+            B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked:<br/>the PUT already went to piri in splitBody
+        end
+        B->>R: in the add's commit: the write's pending reference + a queue-space-shard.expire due in 24 h
+        opt the space held the blob already
+            B->>U: /blob/abort the surplus allocation
         end
     end
-    B->>R: MoveParts(spooled to parked), guarded by the part's digests
-    opt no row moved: a later upload of the part number replaced it,<br/>or a teardown took the session, while the blobs were parking
-        B->>R: EnqueueReleases of this part's blobs: a no-op beside the replacer's record,<br/>which the park left standing (awaitRelease)#59; they run below rather than on the next sweep
-    end
-    B->>A: nudge (start the acceptor, or ask for another pass)
-    B->>U: releaseNow: the records above, due at once (/blob/abort of the parks#59;<br/>a blob another part or the session still names waits on that reference)
+    B->>M: run sync: queue-multipart-upload.add-part, behind the upload's other changes<br/>(waiting past 30 s: SlowDown)
+    M->>R: PartWrites, with the task's commit: the part row (parked, span_lengths), open sessions<br/>only (otherwise NoSuchUpload)#59; the adds' references taken over (rows deleted, expiries<br/>cancelled)#59; a queue-space-shard.release task, due now, for each blob the replaced row<br/>named and this part does not, returned to run#59; a refused part expires its references at once (dropRefsNow)
+    M->>A: in the same commit: queue the upload's accept,<br/>a replacement due now (at most one pending per upload)
+    B->>U: releaseNow: wait for the workers to run the tasks above, due at once (/blob/abort of the parks#59;<br/>a blob another part or the session still names is stale for that reference)
     B-->>C: part ETag (part md5#59; for a copy, of the copied bytes)
-    loop while a pass finds parked parts
-        A->>R: GetSession (stop unless open or completing)#59; ListParkedParts
-        A->>U: acceptParked: up to 1000 blobs' put receipts in one /ucan/conclude,<br/>accept receipts read from the response (poll only as fallback)
-        A->>R: per blob, under its write lock: ConcludePark (park swapped for the<br/>location, only while the concluded park, by AddTask, stands) + intent accepted
-        A->>R: MoveParts(parked to accepted)
+    A->>R: GetSession (nothing to do unless open)#59; ListParkedParts, a page at a time
+    A->>S: with the task's commit: a queue-space-shard.accept per blob of the parked parts,<br/>a replacement due now (at most one pending per blob)#59; a part with no blobs accepted
+    Note over S: runs under the blob's subject, so never beside the blob's release<br/>or a write's add of it
+    alt located (a dedup)
+        S->>S: nothing to conclude
+    else parked, and a part or write in the space still references it
+        S->>U: ConcludeBlobs: the blob's put receipt in one /ucan/conclude (2 min timeout),<br/>its accept receipt read from the response (poll only as fallback)
+    else neither, or nothing references it
+        S->>S: nothing to do: its release aborts the allocation
     end
-    Note over A,R: a failed pass backs off (1 s to 30 s) and retries#59; the accept sweeper<br/>nudges every live upload with parked parts at start and every 30 s
+    S->>R: with the task's commit: park swapped for the location while the concluded park<br/>(by AddTask) stands#59; intent accepted (published stays)#59; a park beside a standing<br/>location dropped#59; the blob taken off its parts' lists of blobs still to accept, while it is located, and a part left with none accepted
+    Note over S,R: a failed conclude fails the task and records nothing#59; the retry concludes again<br/>(a repeat to sprue)#59; 5 attempts from 5 s, doubling, up to 1 min
     C->>B: CompleteMultipartUpload(parts)
-    B->>B: validate parts (ascending, ETags, checksums, MinPartSize)#59;<br/>an error here is answered with its own status
-    alt session already completed
+    B->>M: run sync: queue-multipart-upload.complete, to start within replayWaitBudget (10 s)<br/>behind the upload's other changes, another Complete included
+    alt it did not start in time
+        B-->>C: 409 OperationAborted
+    else session already completed
+        M->>M: validate parts (the conditional-write precheck is skipped)
         B-->>C: report the version id recorded on the session (none for a null version),<br/>then its ETag (idempotent re-Complete)
-    else another Complete holds the latch
-        B-->>C: report no version id (the winner's isn't known yet), then wait (bounded):<br/>replay its result, or take the latch if it failed
-    else latch won
-        B->>R: LatchSession(open to completing), single winner
-        B->>R: ListPartTrees#59; re-hash over budget: 400 InvalidPartLayout,<br/>the deferred revert reopens the session
-        alt versioning Enabled, nothing reported yet
-            B->>R: reserveVersion: AllocVersionSeq off the lock, mint the versionId
+    else session open
+        M->>M: conditional-write precheck#59; validate parts (ascending, ETags, checksums,<br/>MinPartSize)#59; an error here is answered with its own status
+        M->>R: ListPartTrees#59; re-hash over budget: 400 InvalidPartLayout, the upload stays open
+        alt versioning Enabled
+            M->>R: reserveVersion: AllocVersionSeq before the commit, mint the versionId
             B-->>C: report it: versitygw commits the 200 with x-amz-version-id<br/>and x-amz-server-side-encryption
         else
             B-->>C: report no version id: the 200 commits with x-amz-server-side-encryption only
         end
         Note over B,C: from here the body is padded with a newline every<br/>complete_multipart_keepalive (5 s), and any error goes in the 200's body
-        B->>R: manifest spans from each part's span_lengths<br/>(rows without them: intent size + FEE geometry)
-        B->>A: awaitPass until no named part is parked, up to acceptWaitBudget (30 s)
-        B->>R: ListParts: the named parts' states
-        alt a named part still parked
-            B-->>C: OperationAborted in the 200's body#59; the deferred revert reopens the session
-        else every part accepted, or spooled
-            B->>U: spooled parts only: concludeBlobs (conclude, or upload a never-parked blob)
-            B->>TX: commitVersionAt under what was reported (see the PutObject diagram)#59;<br/>refused (errReservationSuperseded) if the key gained a later seq,<br/>or the versioning no longer fits the report#59; the claims land<br/>in the root swap's transaction, set-based
-            B->>R: LatchSession(completing to completed), best-effort
+        M->>R: manifest spans from each part's span_lengths<br/>(rows without them: intent size + FEE geometry)
+        M->>S: queue the accept of each blob of the named parts still parked, committed at once,<br/>then bring them forward and wait for them, within acceptWaitBudget (30 s) in all#59;<br/>their writes commit before Complete reads the parts and assembles the tree
+        alt the accepts did not finish in time
+            B-->>C: OperationAborted in the 200's body#59; the upload stays open
+        else a named part still parked (its blob's accept failed)
+            B-->>C: an error in the 200's body, for the client to retry#59; the upload stays open
+        else a named part not accepted with the blobs the request validated
+            B-->>C: InvalidPart in the 200's body#59; the upload stays open<br/>for the client to upload the part again
+        else every named part accepted
+            M->>Q: run sync as a child: queue-bucket.commit, a Put under what was reported<br/>(see the PutObject diagram), with its reserved version and If-Match/If-None-Match#59;<br/>refused (errReservationSuperseded) if the key gained a later seq,<br/>or the versioning no longer fits the report#59; the claims land<br/>with the root's advance, set-based
+            M->>R: in the same commit: the session moves open to completed (guarded), the part trees<br/>are deleted, a release due now of each unlisted part's blob, and<br/>queue-multipart-upload.reap due one session TTL out
+            B->>U: releaseNow: the unlisted parts' releases, within 10 s
             B-->>C: the result ends the body: ETag = md5-of-part-md5s + "-N"
         end
     end
     C->>B: AbortMultipartUpload
-    B->>R: LatchSession(open to aborting)#59; EnqueueReleases for every<br/>unreferenced part blob#59; then DeleteSession (parts cascade)
-    B->>U: releaseNow, per record: crypto-shred, then /blob/abort a parked blob<br/>(cause = AddTask) or /blob/remove an accepted one#59; local rows dropped<br/>once the network step succeeds#59; the release sweeper retries the rest
-    Note over B,R: a background sweeper tears down sessions whose state has not<br/>changed for MultipartSessionTTL (default 7d)#59; a Complete's latch restarts the clock
+    B->>M: run sync: queue-multipart-upload.abort (completed or gone: NoSuchUpload)
+    M->>R: with the task's commit: a queue-space-shard.release, due now, for each part blob still<br/>there to release (published or missing intents skipped)#59; the session deleted (parts cascade)
+    B->>U: releaseNow, within 10 s in all: per blob, crypto-shred, then /blob/abort a parked blob<br/>(cause = AddTask) or /blob/remove an accepted one#59; local rows deleted<br/>in the task's commit#59; the task runner retries the rest
+    Note over M,R: the auto-abort runs the same task, async, one session TTL after the create: an<br/>open upload only, nothing otherwise, retried without limit (1 s to 5 min)#59; the reap,<br/>one session TTL after a Complete, deletes the completed session and its parts and releases nothing
 ```
 
-- A part re-upload and an abort record a release for every blob of theirs
-  that is not still live in the session; the release itself decides whether
-  the blob is free to go — a claimed digest drops the record (`CountClaims`),
-  and one a part of an in-flight session references waits
-  (`CountLivePartRefs`, checked first: a Complete claims before it leaves
-  'completing'). A commit's claim publishes the blob's upload intent, so
-  the reap of a retained session releases only what was never committed.
-- A release can take a blob while the acceptor concludes it. The provider
-  refuses whichever of accept and abort comes second, and the release drops
-  the park row before anything else, so `ConcludePark` finds no park and the
-  acceptor records nothing for a blob a release took. `ConcludePark`
-  matches the park's `/blob/add` task, so a later park of the same bytes
-  stays for its own conclude.
-- The acceptor never cancels a release record (`ReleasingDigests`, read
-  only); a part holding such a blob goes back to `spooled` for Complete.
-  Each pass runs under `acceptPassTimeout`.
-- No release runs while its blob's conclude is in flight: sprue registers
-  an accepted blob only when it answers, so an earlier remove would miss it.
-  A teardown waits for the acceptor's pass in flight (`quiesceAcceptor`)
-  before it records releases; any other release defers while the blob is
-  marked (`markConcluding`, held 2 min past a failed conclude) and runs from
-  the release sweeper.
+- A part re-upload and an abort queue a `queue-space-shard.release` task for
+  every blob of theirs that is not still live in the session; the release
+  itself decides whether the blob is free to go. Any reference in the space
+  (a claim, a write's pending reference, a part of an in-flight session,
+  counted in one statement by `CountReferences`) makes it stale and it does
+  nothing; the session's teardown queues it again. A commit's claim
+  publishes the blob's upload intent, so an abort releases only what was
+  never committed, and the reap of a completed session releases nothing.
+- A blob's accept and its releases run under the same subject, so a part
+  replaced or dropped, or an upload torn down, never releases a blob while
+  it is being concluded. A release that runs first deletes the park and
+  location rows in its commit, so the accept finds no park and records
+  nothing; one that runs after removes the accepted blob. The swap matches
+  the park's `/blob/add` task, so a later park of the same bytes stays for
+  its own conclude. A part lists the blobs still to be accepted, and each
+  blob's accept takes itself off the list while it is located, so the last
+  of a part's blobs to be accepted marks it.
+- Ingot treats a `/blob/remove` receipt as final. If sprue registers an
+  accepted blob only after a remove that arrived earlier, as it may when a
+  conclude Ingot gave up on is still running there, that window is sprue's
+  to fix, and Ingot does not guard it.
 - A part is written only while its session is open, in the statement that
-  checks the state; a teardown that took the session refuses it, and the
-  upload records releases for the blobs it had spooled.
-- A never-parked blob at Complete falls back to a full synchronous
-  `UploadBlob`, after rechecking for a park under the blob's lock: an
-  UploadPart still parking the blob when Complete classified it holds that
-  lock, and its park is concluded rather than allocated beside.
+  checks the state. The add-part runs on the upload's subject, so no
+  Complete or Abort runs beside it. One that ran first leaves the upload not
+  open, the add-part answers NoSuchUpload, and the upload expires its pending
+  references at once, which releases the blobs nothing else references
+  (`dropRefsNow`).
+- A blob with neither a park nor a location when its accept reaches it has
+  gone from its provider. The accept leaves its part `parked`, and Complete
+  answers `InvalidPart`; nothing keeps a part's bytes to upload them again.
 - Complete reports its response headers through versitygw's
   `CompleteMultipartUploadReportingHeaders` before it accepts the parts,
   and the response commits to 200 at the report, as S3's does. A reserved
@@ -615,92 +637,92 @@ sequenceDiagram
   ([`s3-versioning.md`](./s3-versioning.md) §5.1).
 
 Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
-[§7.3](./architecture.md#73-the-session-latch-the-abortcomplete-race).
+[§7.3](./architecture.md#73-one-change-per-upload-the-abortcomplete-race).
 
 Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
-recordStreamedPark, acceptRequested, acceptParked, recordConcluded,
-concludeBlobs, enqueuePartReleases, SweepStaleMultipartSessions),
-`s3frontend/version.go` (reserveVersion, commitVersionAt),
-`s3frontend/acceptor.go`, `s3frontend/stream.go`,
-`s3frontend/object.go` (runRelease, executeRelease),
-`s3frontend/uploadpartcopy.go`, `registry/stores.go`,
-`server.go` (startMultipartSweeper, startAcceptSweeper). Review when these change.
+acceptRequested, sessionReleases), `s3frontend/multipartqueue.go`
+(runCreateUpload, runAddPart, runAbort, runReap), `registry/multipartqueue.go`
+(PartWrites, CompletedSession),
+`s3frontend/version.go` (reserveVersion, applyPut), `s3frontend/bucketqueue.go` (putPreCheck),
+`s3frontend/acceptor.go` (runAccept, runBlobAccept), `registry/accept.go`,
+`s3frontend/stream.go`,
+`s3frontend/shardref.go` (addBlob, runAdd, dropRefsNow),
+`s3frontend/releasequeue.go` (runRelease, releaseNow),
+`s3frontend/uploadpartcopy.go`, `registry/stores.go`. Review when these change.
 
 ## Part states: the acceptance queue
 
-A part row's `state` is the upload's acceptance queue. Every move is a
-guarded update that also matches the part's `blob_digests`, so a request
-never moves a row a later upload of the same part number replaced.
+A part row's `state` is the upload's acceptance queue. A blob's accept
+marks `accepted` the parked parts that name it once all their blobs are
+located, so a row a later upload of the same part number replaced, which
+names other blobs, waits for those blobs' accepts.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> spooled : PutPart (UploadPart, before its blobs park)
-    spooled --> parked : every blob parked or located (MoveParts, then nudge)
-    parked --> accepted : acceptor pass concludes and records the blobs
-    parked --> spooled : acceptor finds a blob with a release record, or neither park nor location
-    spooled --> accepted : Complete finishes it (conclude, or upload from the spool)
-    parked --> accepted : Complete, when no acceptors run
-    spooled --> [*] : a later UploadPart of the same number replaces the row#59;<br/>the blobs it drops get release records in the same transaction
-    parked --> [*] : replaced (releases recorded with the replacement),<br/>or the session's teardown cascades
-    accepted --> [*] : replaced (releases recorded with the replacement),<br/>or the session's teardown cascades
+    [*] --> parked : queue-multipart-upload.add-part (UploadPart, once its blobs are parked)#59;<br/>queues the upload's accept in the same transaction
+    parked --> accepted : the queue-space-shard.accept of its last blob to be located#59;<br/>a part with no blobs, by the upload's accept
+    parked --> [*] : replaced (releases queued with the replacement),<br/>or the session's teardown cascades
+    accepted --> [*] : replaced (releases queued with the replacement),<br/>or the session's teardown cascades
 ```
 
-- `spooled` is the state of a part whose request is still parking its
-  blobs, or died doing so. The acceptor never takes it; Complete does.
-- A request whose `spooled` row is replaced while it parks moves no row to
-  `parked`. The releases the replacement recorded stand: a part's park
-  leaves a pending release of its digest to the part row, which defers it
-  while the row stands and lets it run once the row is replaced, so the
-  blobs go even if the request dies there. The request runs them itself
-  when it can, rather than leave them to the next sweep.
-- Complete requires every part it names to be `accepted` before the commit:
-  it waits until none of them is queued (parts it omits are not waited
-  for), finishes `spooled` parts itself, and answers a part still `parked`
-  with a 409 that botocore clients treat as final. A failed pass accepts
-  every part of its batch but those holding a failed blob.
+- A part with a blob that has neither a park nor a location stays `parked`:
+  its blob has gone from its provider, and Complete refuses the part
+  (`InvalidPart`), since nothing keeps a part's bytes to upload them again.
+- A replacement queues releases for the blobs the replaced row named and the
+  new one does not, in the same transaction. Each is stale while a part, a
+  claim or a pending reference in the space still names its blob. The
+  request runs them itself when it can, rather than leave them to the
+  runner's workers.
+- Complete requires every part it names to be `accepted` before the commit.
+  It queues the accept of each blob of those parts still parked (parts it
+  omits cannot fail it) and waits for them, answers accepts that do not
+  finish within 30 s with a 409 that botocore clients treat as final, and
+  fails for a retry when a blob's accept failed. A failed conclude fails
+  only its blob's accept, which records nothing.
 - Rows from before migration 00030 are `parked` or `accepted` and have no
   `span_lengths`; Complete derives their lengths per blob.
 
-Sources: `registry/stores.go` (Part* consts, MoveParts, ListParkedParts,
-ListUploadsWithParkedParts), `registry/stores_postgres.go`,
-`s3frontend/acceptor.go`, `s3frontend/multipart.go` (ingestPart,
-acceptRequested), `migrations/sql/00030_part_accept_queue.sql`. Review when
-these change.
+Sources: `registry/stores.go` (Part* consts), `registry/stores_postgres.go`
+(ListParkedParts, OldestParkedPart), `registry/multipartqueue.go` (PartWrites),
+`registry/accept.go`, `s3frontend/acceptor.go`, `s3frontend/multipart.go`
+(ingestPart, acceptRequested), `migrations/sql/00030_part_accept_queue.sql`,
+`migrations/sql/00033_task_runner.sql`. Review when these change.
 
-## Session states and the Complete/Abort latch
+## Session states: open and completed
 
-The latch is one guarded update: `UPDATE multipart_sessions SET state = $3
-WHERE upload_id = $1 AND state = $2`; exactly one caller sees
-`RowsAffected == 1`.
+Every change to an upload runs as a task on `queue-multipart-upload`, with
+the upload ID as its subject, so a Complete and an Abort never overlap and
+no part lands beside either.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> open : CreateSession
-    open --> completing : Complete wins the latch
-    completing --> open : pre-commit failure (deferred revert)
-    completing --> completed : commit ok (best-effort stamp)
-    open --> aborting : Abort, DeleteBucket implicit abort, or sweeper
-    aborting --> [*] : EnqueueReleases, then DeleteSession (parts cascade)
-    completed --> [*] : sweeper past TTL
+    [*] --> open : queue-multipart-upload.create
+    open --> completed : queue-multipart-upload.complete, in the version's commit (guarded)
+    open --> [*] : queue-multipart-upload.abort (a client, DeleteBucket or the auto-abort)#59;<br/>releases queued, session deleted (parts cascade)
+    completed --> [*] : queue-multipart-upload.reap (one session TTL out, or DeleteBucket)#59;<br/>releases nothing
 ```
 
-- A Complete that loses the latch reports no version id, then waits
-  (bounded) for the winner's terminal state: `completed` replays the ETag
-  and version id the winner recorded on the session; `aborting` or a
-  vanished row is `NoSuchUpload`; a winner still running past the wait
-  budget is `OperationAborted`, inside the 200's body since the headers
-  have gone out. A winner that fails reopens the session, and the waiting
-  Complete may then take the latch; in an Enabled bucket its commit is
-  refused, since it reported no id, and the client's retry reports one.
+- A Complete waits up to 10 s (`replayWaitBudget`) for the upload's other
+  changes, another Complete included, before it reports anything; past
+  that it answers `OperationAborted`, a 409. A Complete that runs after
+  another one committed replays the ETag and version id recorded on the
+  session, and skips the conditional-write precheck. A Complete after an
+  Abort finds no session and answers `NoSuchUpload`.
+- A Complete that fails before its commit leaves the upload open for a
+  retry.
+- The Complete's commit moves the session from `open` to `completed` in the
+  same transaction as the version, guarded on it still being open.
 - `ListParts` and `Abort` reject any non-`open` session as `NoSuchUpload`;
-  `Complete` alone accepts `completed`, for idempotency.
-- The sweeper also reaps rows stuck in `completing` or `aborting` past the
-  TTL.
+  `Complete` alone accepts `completed`, for idempotency. The auto-abort
+  leaves a completed or missing upload alone.
+- DeleteBucket aborts each open upload and reaps each completed one from
+  the request, after `queue-bucket.close`.
 
-Sources: `s3frontend/multipart.go`, `registry/stores_postgres.go`
-(LatchSession). Review when these change.
+Sources: `s3frontend/multipart.go`, `s3frontend/multipartqueue.go`,
+`s3frontend/bucketqueue.go` (putPreCheck), `registry/multipartqueue.go`
+(CompletedSession, DeletedSession, ReapedSession). Review when these change.
 
-## Blob lifecycle: spooled, parked, accepted, released
+## Blob lifecycle: uploading, parked, accepted, released
 
 Dedup stores bytes once; the claim ledger lets them be deleted once. Intents
 track the disk-and-network state of each digest; `blob_refs` counts which
@@ -708,88 +730,96 @@ versions still reference it.
 
 ```mermaid
 flowchart TB
-    W["spool write<br/>(PutObject ingest, UploadPart)"] --> spooled
-    W -->|"streamed: the PUT ran alongside the spool write"| uploading
+    W["streamed write<br/>(PutObject ingest, UploadPart)"] -->|"the PUT runs as the body arrives"| uploading
 
     subgraph intents["upload_intents, per digest"]
-        spooled([spooled])
         uploading([uploading])
         parked([parked])
         accepted([accepted])
         published([published])
     end
 
-    spooled -->|"dedup: blob_locations hit;<br/>file moves to the cache"| accepted
-    spooled -->|"first network call begins<br/>(uploadBlobs, parkBlobs, concludeBlobs fallback)"| uploading
-    uploading -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept;<br/>file moves to the cache (BlobCache.Take)"| accepted
-    uploading -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT (or already streamed); blob_parks row written;<br/>local copy removed (removeLocal)"| parked
-    parked -->|"acceptParked (the upload's acceptor, or Complete for a spooled part):<br/>/ucan/conclude; ConcludePark swaps the blob_parks row for blob_locations"| accepted
-    spooled -->|"release record; executeRelease, local only<br/>(the blob never left this node):<br/>DeleteIntent + removeLocal"| gone([deleted])
-    uploading -->|"release record; executeRelease: /blob/remove<br/>(idempotent: the accept may have landed, its location not);<br/>DeleteIntent + removeLocal"| gone
-    parked -->|"release record; executeRelease: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>DeleteIntent + removeLocal"| gone
-    accepted -->|"release record (never committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + removeLocal"| gone
-    published -->|"release record (committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + removeLocal"| gone
+    uploading -->|"single-shot write's queue-space-shard.add: conclude, accept,<br/>or a blob_locations hit (dedup, the stream aborted);<br/>an object's local copy is adopted into the cache"| accepted
+    uploading -->|"part's queue-space-shard.add (parkBlobs):<br/>the part streamed to its provider;<br/>blob_parks row written"| parked
+    parked -->|"queue-space-shard.accept (queued by the upload's accept, in the background<br/>or run by Complete): /ucan/conclude; its commit swaps the blob_parks row for blob_locations"| accepted
+    uploading -->|"queue-space-shard.release: /blob/remove<br/>(idempotent: the accept may have landed, its location not);<br/>rows deleted in the task's commit"| gone([deleted])
+    parked -->|"queue-space-shard.release: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>rows deleted in the task's commit"| gone
+    accepted -->|"queue-space-shard.release (never committed):<br/>/blob/remove;<br/>rows deleted in the task's commit;<br/>cached copy evicted"| gone
+    published -->|"queue-space-shard.release (committed):<br/>/blob/remove;<br/>rows deleted in the task's commit;<br/>cached copy evicted"| gone
 
-    accepted -->|"commit: the claim, in the root swap's transaction"| published
+    accepted -->|"queue-bucket.commit: the claim, with the root's advance"| published
 
-    parked -.->|"SweepLocalBlobs over budget (blob_parks row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted[["local file evicted<br/>(evicted_at set)"]]
-    accepted -.->|"cache_writes false: at accept,<br/>once the location is recorded;<br/>removeLocal + MarkEvicted"| evicted
-    accepted -.->|"SweepLocalBlobs over budget (blob_locations row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted
-    published -.->|"SweepLocalBlobs over budget (blob_locations row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted
-    published -->|"commit: the root swap's transaction adds this version's claim"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
-    refs -->|"version delete or overwrite removes its row"| zero{"CountClaims == 0<br/>for (space, digest)?"}
-    zero -->|yes| rel["release record enqueued, due after release_grace<br/>(the published → deleted edge runs it)"]
+    accepted -.->|"queue-shard.evict at the TTL,<br/>or SweepLocalBlobs over budget;<br/>state unchanged"| evicted[["cached file evicted"]]
+    published -.->|"queue-shard.evict at the TTL,<br/>or SweepLocalBlobs over budget;<br/>state unchanged"| evicted
+    W -->|"each blob's queue-space-shard.add"| pend["blob_pending_refs row<br/>(the write's pending reference, 24 h)"]
+    pend -->|"queue-bucket.commit: the claim takes it over<br/>(row deleted, expiry cancelled)"| refs
+    pend -->|"queue-space-shard.expire at the deadline:<br/>row dropped; nothing else referencing<br/>the blob queues its release, due at once"| gone
+    published -->|"queue-bucket.commit: the root's advance adds this version's claim"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
+    refs -->|"version delete or overwrite removes its row"| zero{"no claim left<br/>for (space, digest)?"}
+    zero -->|yes| rel["queue-space-shard.release queued in the same transaction,<br/>due after release_grace<br/>(the published → deleted edge runs it,<br/>stale if CountReferences finds any reference)"]
     zero -->|no| keep["blob retained<br/>(still referenced)"]
 ```
 
 - `published` is written with the blob's first reference claim and never
-  changes until the blob's release, which removes the local copy and the
-  intent as it does for a never-committed blob. `blob_parks` is a
+  changes until the blob's release, which evicts the cached copy and removes
+  the intent as it does for a never-committed blob. `blob_parks` is a
   presence machine (a row exists while a conclude is owed), not a state
   column.
-- A blob's file lives in the spool until the provider holds it, then moves
-  to the cache: once its location and `accepted` state are both recorded,
-  by rename (`BlobCache.Take`). A failed move leaves it in the spool. With
-  `cache_writes: false` the copy is removed at that point instead, and the
-  intent gains `evicted_at`.
-- Eviction (the dotted edges) is orthogonal to the state: `SweepLocalBlobs`
-  runs every 30s and, when the spool and cache together are over
-  `local_blob_max_bytes`, removes the local files of blobs the provider
-  already holds (a location row for `accepted` and `published`, a park row
-  for `parked`), oldest state change first, down to 90% of the budget,
-  passing over blobs inside `cache_min_residency` or `cache_read_retention`
-  unless usage stays over budget without them (then evicting inside the
-  windows only down to the budget): from
-  the cache, or from the spool for a blob whose move never happened. The
-  intent keeps its row and state and gains `evicted_at`; reads fall through
-  to the network tier. `spooled` and `uploading` files are never evicted.
-  The parked-part drop at UploadPart marks `evicted_at` the same way. A
-  committed blob's release removes its local copy with the intent; once at
-  startup, the released pass does the same for `published` intents nothing
-  names any more (no location, claim, pending release or live part), left
-  by versions whose releases kept the copy.
+- An object's blob is teed into a `.tmp-*` file in the cache as it streams
+  (`BlobCache.CreateTemp`). Once its location and `accepted` state are both
+  recorded, the write adopts the file under its digest (`BlobCache.Adopt`)
+  before the PUT answers, and queues a `queue-shard.cache` task that dates
+  the file and schedules a `queue-shard.evict` for `cache_ttl` later. A copy
+  that could not be written or adopted is not cached. With
+  `cache_writes: false` no copy is kept, and a multipart part never keeps
+  one.
+- Eviction (the dotted edges) is orthogonal to the state and touches only
+  the cache. A read from the cache with less than half its `cache_ttl` left
+  runs `queue-shard.cache` again, which replaces the pending eviction with a
+  later one. `SweepLocalBlobs` runs every 30s and, when the cache, writes in
+  progress included, is over `local_blob_max_bytes`, evicts cached files through sync
+  `queue-shard.evict` tasks, oldest
+  modification time (last renewal) first, down to 90% of the budget. The
+  intent keeps its row and state; reads fall through to the network tier.
+  Writes in progress are never evicted. A blob's release queues the
+  eviction of its cached copy unless another space holds an intent for the
+  digest.
 - Digests present in both the old and new version sets never churn: the new
   generation's claim lands before the old one's drops in the same
   transaction, so the digest keeps a claim throughout and no release is
-  recorded.
+  queued.
 - Parked-blob reclamation is guarded: a digest live in another session, part,
-  or committed object is left alone.
-- A same-space copy pins the source's body: its claims are pins
-  (`registry.RootCommit.Pins`), each written only while the space still
-  holds a claim on the digest, under its lock, so a copy racing the source's
-  delete and release fails with NoSuchKey instead of claiming a blob about
-  to go.
+  committed object or write's pending reference is left alone.
+- A write's pending reference is taken by its `queue-space-shard.add` on the
+  blob's release subject, which never overlaps a release of the blob. A
+  release that fails retries holding the subject, so an add behind it waits
+  and then finds the blob unlocated and concludes its own stream. A write of
+  a deleted object's bytes (plaintext bucket) while that object's release is
+  within its reader grace keeps the blob: the release finds the reference
+  and is stale.
+- A same-space copy takes a pending reference to each source blob through a
+  copy-mode `queue-space-shard.add`, which fails the copy with NoSuchKey
+  unless the space has the blob located; its claims take the references
+  over, so a source deleted and released after the adds leaves the copy's
+  blobs referenced.
 
 Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 [`s3-versioning.md`](./s3-versioning.md) §8.
 
-Sources: `registry/stores.go` (state consts, ListEvictable, ListReleasedPublished), `s3frontend/object.go`
+Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
 (ingestBody, addClaims, dropClaims), `s3frontend/localblob_sweep.go` (SweepLocalBlobs),
-`s3frontend/localblobs.go` (cacheHeld, removeLocal),
+`s3frontend/stream.go` (WriteSizedBlob), `s3frontend/localblobs.go` (cacheWritten),
+`blockstore/blobcache.go` (CreateTemp, Adopt), `s3frontend/shardqueue.go`
+(queue-shard.cache, queue-shard.evict),
 `s3frontend/multipart.go`
-(parkBlobs, acceptParked, recordConcluded, concludeBlobs, enqueuePartReleases),
-`s3frontend/acceptor.go`, `s3frontend/object.go`
-(runRelease, executeRelease), `uploader/blob.go` (UploadBlob,
+(parkBlobs, sessionReleases),
+`s3frontend/acceptor.go`, `registry/accept.go`, `s3frontend/releasequeue.go`
+(runRelease), `s3frontend/shardref.go` (runAdd, runExpire),
+`registry/stores_postgres.go` (CountReferences, PendingRefByExpiry),
+`registry/bucketcommit.go` (claimWrites, dropWrites), `registry/multipartqueue.go`
+(refWrites),
+`registry/release.go` (ReleasedRows, ReleasedIntent, PendingRef),
+`uploader/blob.go` (ConcludeBlobs,
 AbortBlob, RemoveBlob). Review when these change.
 
 ## Per-key version storage: manifest arm, leaf arm, prev tree
@@ -833,9 +863,10 @@ flowchart TB
 - Deleting the current version promotes the prev-tree head into a new leaf
   (clearing `NullSeq` when the promoted seq was the null); deleting the last
   version deletes the key.
-- The bucket versioning state itself is three values with one guarded SQL
-  update: `unversioned` moves to `enabled` or `suspended`, which then toggle;
-  there is no path back to `unversioned`.
+- The bucket versioning state itself is three values, set by
+  `queue-bucket.set-versioning` on the bucket's subject: `unversioned` moves
+  to `enabled` or `suspended`, which then toggle; there is no path back to
+  `unversioned`.
 - Blocks this tree sheds (replaced leaf blocks, discarded manifests) are
   recorded for future removal; the entry paths are the
   [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
@@ -847,21 +878,24 @@ value union §2.1, prev tree §2.2, token §3, write rule §5, deletes §7);
 manifest figure this complements.
 
 Sources: `bucket/leaf.go`, `bucket/manifest.go`, `s3frontend/version.go`
-(mintVersionID, revSeqKey, commitVersion, deleteVersionScoped). Review when
+(mintVersionID, revSeqKey, applyPut, applyDeleteVersion),
+`s3frontend/bucketadmin.go` (runSetVersioning). Review when
 `bucket/` types change (and re-run `make gen`).
 
 ## Catalog GC candidates: what gets remembered for removal
 
 `gc_candidates` is the memory of the catalog collector to come: every write
-that supersedes a catalog block records that block's CID here, inside the
-commit critical section, so nothing the tree sheds is ever forgotten. Nothing
+that supersedes a catalog block records that block's CID here, with the
+`queue-bucket.commit` that sheds it, so nothing the tree sheds is ever
+forgotten. Nothing
 consumes the table yet.
 
 ```mermaid
 flowchart TB
-    cv["commitVersion<br/>every version-creating write: PutObject, CopyObject,<br/>CompleteMultipartUpload, delete-marker insertion"]
-    dok["deleteObjectKey<br/>DELETE without versionId, unversioned bucket"]
-    dvs["deleteVersionScoped<br/>DELETE with versionId"]
+    cv["applyPut (a Put change)<br/>every version-creating write: PutObject, CopyObject,<br/>CompleteMultipartUpload, delete-marker insertion"]
+    dok["applyDeleteKey (a Delete change)<br/>DELETE without versionId, unversioned bucket"]
+    dvs["applyDeleteVersion (a Delete change)<br/>DELETE with versionId"]
+    sa["applySetAttributes (a SetAttributes change)<br/>retention, legal hold, tags"]
 
     gc[("gc_candidates<br/>(cid, bucket, created_at)")]
 
@@ -870,6 +904,8 @@ flowchart TB
     cv -->|"key already held a leaf:<br/>the replaced leaf block"| gc
     dok -->|"the key's value block, plus the current<br/>manifest when the key held a leaf"| gc
     dvs -->|"the removed version's manifest,<br/>plus the replaced leaf or value block"| gc
+    dvs -->|"the removed version's<br/>version-state block"| gc
+    sa -->|"the replaced version-state block,<br/>plus the replaced leaf block"| gc
 
     gc -.->|"no reader exists yet"| sweep["catalog GC collector (future):<br/>removes superseded blocks from Forge"]
 
@@ -877,27 +913,32 @@ flowchart TB
     class sweep external
 ```
 
-- Recording is mandatory, never best-effort: the inserts run inside the
-  per-bucket commit closure, so a failed insert fails the whole write before
-  the root swap.
+- Recording is mandatory, never best-effort: the inserts are written with the
+  root's advance in the task's commit, so a failed insert fails the whole
+  commit and the root does not move. A change that fails on its own terms
+  drops the candidates it recorded along with the rest of its work.
 - A retained supersession queues only the replaced **leaf block**; the old
   manifest is not queued because it lives on as a prev-tree entry. Only
   blocks nothing references anymore land here.
 - As built, the table holds superseded **value blocks** (manifests and leaf
-  blocks). Interior MST path nodes rewritten by a splice are not recorded;
+  blocks) and version-state blocks (a version's lock and tags). Interior MST
+  path nodes rewritten by a splice are not recorded;
   [`architecture.md` §4](./architecture.md#4-the-catalog-layer) scopes the
   eventual collector to those as well.
 - The body bytes a removed version referenced are handled separately, by the
   claim ledger in the
-  [blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released):
+  [blob lifecycle](#blob-lifecycle-uploading-parked-accepted-released):
   `gc_candidates` remembers catalog blocks, `blob_refs` counts body blobs.
 
 Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer),
 [`s3-versioning.md`](./s3-versioning.md) §7.
 
-Sources: `s3frontend/version.go` (commitVersion supersession,
-deleteVersionScoped), `s3frontend/object.go` (deleteObjectKey),
-`registry/stores_postgres.go` (AddGCCandidate). Review when these change.
+Sources: `s3frontend/version.go` (applyPut supersession,
+applyDeleteVersion), `s3frontend/object.go` (applyDeleteKey),
+`s3frontend/objectlock.go` (applySetAttributes), `bucketop/bucketop.go`
+(AddGCCandidate, Mark, Restore), `s3frontend/version.go` (pruneVersionState),
+`registry/bucketcommit.go`
+(RootCommitWrites). Review when these change.
 
 ## Principals and proof stores
 
@@ -931,11 +972,13 @@ flowchart TB
     kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add<br/>/upload/add, /upload/remove"]
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
     walk -->|"reqscope.ProofStore<br/>on the walk's ctx"| reads
-    kp -->|"captureShipProofs<br/>at UploadBlob and StartBlob,<br/>borrowable stores only"| ship
-    kp -->|"CaptureShipAuthority<br/>at every bucketop commit,<br/>borrowable stores only"| commit
-    commit --> catship["async catalog ship"]
+    kp -->|"captureShipProofs<br/>at StartBlob,<br/>borrowable stores only"| ship
+    kp -->|"CaptureShipAuthority<br/>at every queue-bucket.commit append,<br/>borrowable stores only"| commit
+    commit --> catship["queue-bucket.ship"]
     ship -->|"no commit capture<br/>holding a chain"| catship
-    ship --> async["sweepers' releases, aborts and<br/>registration renewals; DeleteBucket aborts"]
+    kp -->|"CaptureAuthority when a write<br/>queues a release"| relargs["queue-space-shard.release args:<br/>/blob/remove and /blob/abort chains"]
+    ship --> async["releases, aborts and<br/>registration renewals"]
+    relargs -->|"read first"| async
     static --> hc["hilt client:<br/>every /s3/* invocation"]
 
     classDef external stroke-dasharray: 5 5
@@ -996,8 +1039,9 @@ Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contrac
 
 Sources: `iam/service.go`, `iam/keyproofs.go`, `iam/proofcache.go`,
 `internal/reqscope/reqscope.go`, `cmd/catalog.go` (forgeSegments),
-`uploader/forge.go` (shipProofs,
-captureShipProofs, CaptureShipAuthority), `bucketop/bucketop.go` (Tx.Commit),
+`uploader/forge.go` (shipProofs, captureShipProofs, CaptureShipAuthority),
+`uploader/stream.go` (StartBlob), `bucketop/bucketop.go` (Tx.Append),
+`s3frontend/releasequeue.go` (releaseAuthority, withReleaseAuthority),
 `module.go`, `config/config.go` (auth_service fields).
 Review when these change.
 
@@ -1078,7 +1122,9 @@ Everything relational lives in the `ingot` schema; manifests and MST nodes
 are content-addressed blocks in the catalog log, not rows, apart from the
 catalog journal's copy of those not yet shipped. Attributes here
 are trimmed to keys, states, and the columns other diagrams reference; the
-full DDL is `migrations/sql/`.
+full DDL is `migrations/sql/`, annotated in
+[`architecture.md` Appendix C](./architecture.md#appendix-c--postgres-schema-the-ingot-schema),
+which also covers the task runner's per-queue tables (left out here).
 
 ```mermaid
 erDiagram
@@ -1086,11 +1132,12 @@ erDiagram
         text name PK
         bytea root_cid "committed MST root"
         bytea forge_root_cid "root durable on Forge"
-        text space "Forge space DID"
+        text space UK "Forge space DID, one per bucket"
         text tenant "owning tenant DID"
         text versioning "unversioned, enabled, suspended"
         text encryption "AES256, none; NULL = unconfigured, encrypts"
         bigint next_version_seq
+        boolean closing "set by DeleteBucket's queue-bucket.close"
     }
     segments {
         bigint seq PK "from segment_seq"
@@ -1123,15 +1170,20 @@ erDiagram
         text version_id PK
         text space "claim index (space, digest)"
     }
+    blob_pending_refs {
+        uuid add_task PK "the queue-space-shard.add that took it"
+        uuid expire_task UK "the queue-space-shard.expire due at the deadline"
+        text space
+        bytea digest
+        timestamptz deadline "24 h after the add"
+    }
     upload_intents {
-        text space PK "the upload's space: one file, an intent per space"
+        text space PK "the upload's space: one cached file, an intent per space"
         bytea digest PK
-        text local_path
         bigint size
-        text state "spooled, uploading, parked, accepted, published (claimed by a commit)"
+        text state "uploading, parked, accepted, published (claimed by a commit)"
         text bucket
-        timestamptz updated_at "last state change: the budget pass evicts oldest first"
-        timestamptz evicted_at "set once the local copy is removed (sweeper or parked-part drop)"
+        timestamptz updated_at "last state change: dates a stalled upload"
     }
     blob_locations {
         text space PK
@@ -1163,21 +1215,13 @@ erDiagram
         bytea put_invocation
         bigint size
     }
-    blob_streams {
-        bytea add_task PK "an upload allocated by digest code"
-        text space
-        text bucket
-        bigint size
-        timestamptz created_at "when the sweeper stops retrying the abort"
-        timestamptz touched_at "the owning request's lease, renewed while it runs; the stream sweeper's clock"
-    }
     multipart_sessions {
         text upload_id PK
         text bucket
         text space "the bucket's space, required: the subject of every release of the session's blobs, never resolved from the bucket name"
         text object_key
-        text state "open, completing, aborting, completed"
-        timestamptz state_changed_at "the sweeper's clock"
+        text state "open, completed"
+        timestamptz state_changed_at "set at create and by Complete"
         boolean plaintext "store parts as received; decided at create"
         text checksum_algorithm
     }
@@ -1188,7 +1232,7 @@ erDiagram
         bytea blob_digests "ordered array"
         bigint span_lengths "each blob's span in the object, bytes before encryption (digests are of the stored blob); NULL before 00030"
         text checksum
-        text state "spooled, parked, accepted: the acceptor's queue"
+        text state "parked, accepted: the upload's accept queue"
     }
     multipart_part_trees {
         text upload_id PK, FK
@@ -1201,25 +1245,9 @@ erDiagram
         bytea tail "bytes after its last chunk boundary (< 1 KiB)"
         bytea root "the part's own BLAKE3 hash, when hashed at offset 0"
     }
-    blob_release_intents {
-        text space PK
-        bytea digest PK
-        timestamptz not_before "earliest execution: claim drop + grace, or at once for a part blob"
-        timestamptz started_at "set under the claim-key lock once the release owns the blob; a reusing write cancels an unstarted record or waits out a started one"
-    }
     gc_candidates {
         bytea cid PK "superseded MST node"
         text bucket
-    }
-    upload_registrations {
-        bigint seq PK "commit order"
-        text bucket FK
-        text object_key
-        text space
-        bytea root "the version's manifest CID"
-        text op "add, remove"
-        timestamptz next_at "the sweeper's clock"
-        timestamptz dead_lettered_at "set once retrying stops"
     }
     revocation_cursor {
         boolean id PK "single-row latch"
@@ -1230,7 +1258,6 @@ erDiagram
     segments ||--o{ segment_op_roots : "ON DELETE CASCADE"
     multipart_sessions ||--o{ multipart_parts : "ON DELETE CASCADE"
     multipart_parts ||--o| multipart_part_trees : "ON DELETE CASCADE; deleted by Complete once the object commits"
-    buckets ||--o{ upload_registrations : "ON DELETE CASCADE"
     buckets ||--o{ catalog_journal : "ON DELETE CASCADE"
     segments ||..o{ catalog_journal : "by seq, deliberately no FK"
     buckets ||..o{ segments : "by bucket name, no FK"
@@ -1238,12 +1265,13 @@ erDiagram
     blob_locations ||..o{ shard_inclusions : "by shard_digest"
     blob_locations ||..o| blob_encryption_params : "by (space, digest), deliberately no FK"
     multipart_parts ||..o{ blob_parks : "digests in blob_digests"
-    multipart_parts ||..o{ blob_release_intents : "teardown and supersede records, by digest"
 ```
 
-- The five solid relationships are the schema's only real foreign keys;
+- The four solid relationships are the schema's only real foreign keys;
   dashed ones are soft joins the code performs. `revocation_cursor` stands
-  alone.
+  alone. `blob_pending_refs` joins nothing: a release counts its rows with
+  the `blob_refs` claims and the open sessions' parts by (space,
+  digest).
 - `catalog_journal` has no foreign key to `segments` on purpose: when a
   segment's CAR is missing from disk, recovery rebuilds its journaled blocks
   into new segments and moves the rows onto them, then deletes the lost row if
@@ -1251,8 +1279,7 @@ erDiagram
 - `gc_candidates` is write-only (no reader exists yet; its entry paths are the
   [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram); `segments.plane`
-  still CHECK-allows the deleted `data` arm; `multipart_parts.accepted` is a
-  CHECK arm no code writes.
+  still CHECK-allows the deleted `data` arm.
 - Session rows also carry the passthrough HTTP headers and checksum columns
   Complete writes into the manifest; intent and location rows carry
   timestamps. See the DDL for the full column lists.
@@ -1264,44 +1291,55 @@ Sources: `migrations/sql/*.sql`. Review whenever a migration is added.
 
 ## DeleteBucket teardown order
 
-Teardown crosses every seam in order: prove the bucket empty, commit its
-root empty, unwind in-flight multipart, quiesce the log, release every
-network registration, then delete at hilt and locally.
+Teardown crosses every seam in order: close the bucket, unwind in-flight
+multipart, prove the bucket empty again, commit its root empty, quiesce the
+log, release every network registration, then delete at hilt and locally.
+The request runs `queue-bucket.close`, then each upload's abort or reap,
+then a `queue-bucket.delete` task, all sync on the bucket's subject except
+the multipart tasks, so no commit or ship of the bucket runs beside the
+delete. The multipart tasks run from the request because
+`queue-multipart-upload` is above `queue-bucket` in the runner's order.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor C as S3 client
     participant B as s3frontend.Backend
+    participant Q as queue-bucket<br/>(the bucket's subject)
+    participant M as queue-multipart-upload<br/>(subject = uploadId)
     participant R as registry<br/>(Postgres)
     participant L as logstore.Manager
     participant U as sprue
     participant H as hilt
 
     C->>B: DeleteBucket
-    Note over B,R: the whole operation runs under the per-bucket lock
     B->>R: reg.Get
-    B->>B: MST emptiness walk<br/>(ErrBucketNotEmpty, or the versioned variant)
-    B->>R: EmptyRoot (one tx: root → empty, forge root cleared,<br/>the bucket's catalog_journal rows dropped)
-    Note over B,R: nothing the bucket reads is released below
-    loop each open multipart session
-        B->>U: abortOpenSession: /blob/abort parked blobs
+    B->>Q: run sync: queue-bucket.close
+    Q->>R: MST emptiness walk (ErrBucketNotEmpty, or the versioned variant)#59;<br/>mark the bucket closing: from then on queue-bucket.commit and<br/>queue-bucket.admit-upload refuse it with OperationAborted
+    loop each multipart session (in-flight uploads do not block the delete, as on AWS)
+        B->>M: open: run sync queue-multipart-upload.abort, then releaseNow<br/>(/blob/abort parked blobs)#59; completed: run sync queue-multipart-upload.reap
         Note over B,U: the request's own proofs sign the release legs<br/>(s3:DeleteBucket delegates blob.Abort + blob.Remove)
     end
-    B->>L: QuiesceBucketLog (stop flushes, wait for in-flight ship)
+    B->>Q: run sync: queue-bucket.delete, the signed S3 request in the caller's context (never stored)
+    Note over Q,H: the steps below run in the task#59; a delete resumed without<br/>its caller fails without acting
+    Q->>R: reg.Get#59; MST emptiness walk again#59; no multipart session may remain
+    Q->>R: EmptyRoot (one tx, ahead of the task's own commit: root → empty,<br/>forge root cleared, the bucket's catalog_journal rows dropped)
+    Note over Q,R: nothing the bucket reads is released below
+    Q->>L: QuiesceBucketLog (seal the open segment, close the store)#59;<br/>no ship is in flight, since ships share the subject
     loop ReleaseRetiredSegments: each retired segment
         L->>U: /blob/remove its CAR + index blob
         L->>R: DeleteSegment (its row, once both are released)
     end
-    B->>L: ShippedSegmentDigests (each unretired CAR + its index blob,<br/>sealed-but-unshipped over-listed, release is idempotent)
+    Q->>L: ShippedSegmentDigests (each unretired CAR + its index blob,<br/>sealed-but-unshipped over-listed, release is idempotent)
     loop each digest
-        B->>U: /blob/remove (release the space's registration)
+        Q->>U: /blob/remove (release the space's registration)
     end
-    B->>U: drainSpaceReleases: /blob/remove each deleted<br/>object's blob still behind the reader grace
-    B->>U: DrainSpaceRegistrations: send the space's queued<br/>/upload/add and /upload/remove changes
-    B->>H: /s3/bucket/delete (hilt refuses while registrations remain)
-    B->>R: reg.Delete (the local row, its catalog_journal rows cascading)
-    B->>L: RemoveBucketLog, best-effort<br/>(directory + segment rows)
+    Q->>R: drainSpaceReleases: lend the request's authority for the space, Expedite its pending<br/>queue-space-shard.release tasks (subject space/*) and wait for the workers to run them (/blob/remove each)#59;<br/>a release still waiting fails the delete for the client to retry
+    Q->>U: DrainSpaceRegistrations: send the space's pending queue-space-upload changes,<br/>then resend its failed retractions with the request's authority
+    Q->>H: /s3/bucket/delete with the signed S3 request (hilt refuses while registrations remain)#59;<br/>a refusal clears the closing mark, not found finishes the delete,<br/>a failed call leaves the bucket closing for a retry
+    Q->>L: RemoveBucketLog, best-effort (directory + segment rows), while the row holds the name:<br/>the log is the name's, and a bucket created under it later runs under its own space
+    Q->>R: reg.Delete (the local row, its catalog_journal rows cascading)
+    Q-->>B: done
     B-->>C: 204
 ```
 
@@ -1315,10 +1353,13 @@ sequenceDiagram
   The quiesce leaves the last segment sealed and unshipped until that next
   write; its journal rows went with the root.
 
-Sources: `s3frontend/bucket.go` (DeleteBucket), `s3frontend/multipart.go`
-(abortOpenSession), `s3frontend/object.go` (drainSpaceReleases),
-`s3frontend/uploadsweep.go` (DrainSpaceRegistrations), `logstore/manager.go`.
-Review when these change.
+Sources: `s3frontend/bucket.go` (DeleteBucket, runDeleteBucket),
+`s3frontend/bucketadmin.go` (runCloseBucket, runAdmitUpload),
+`s3frontend/bucketqueue.go` (bucketSpec), `s3frontend/multipartqueue.go`
+(abortUpload, runAbort, reapNow, runReap),
+`s3frontend/releasequeue.go` (drainSpaceReleases),
+`s3frontend/uploadqueue.go` (DrainSpaceRegistrations),
+`logstore/manager.go`. Review when these change.
 
 ## Package-to-diagram map
 
@@ -1329,12 +1370,17 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 |---|---|
 | `s3frontend/object.go` | put, get, blob-lifecycle, version-tree, gc-candidates, delete-bucket |
 | `s3frontend/version.go` | put, get, multipart, blob-lifecycle, version-tree, gc-candidates |
-| `s3frontend/multipart.go` | multipart, part-states, multipart-states, blob-lifecycle |
-| `s3frontend/acceptor.go` | multipart, part-states, blob-lifecycle |
+| `s3frontend/multipart.go`, `multipartqueue.go`, `registry/multipartqueue.go` | multipart, part-states, multipart-states, blob-lifecycle, delete-bucket |
+| `s3frontend/acceptor.go`, `registry/accept.go` | multipart, part-states, blob-lifecycle |
+| `s3frontend/releasequeue.go` | put, multipart, part-states, blob-lifecycle, delete-bucket |
+| `s3frontend/shardref.go` | put, multipart, blob-lifecycle |
+| `s3frontend/uploadqueue.go` | put, delete-bucket |
+| `s3frontend/shardqueue.go`, `localblobs.go`, `localblob_sweep.go` | put, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |
-| `s3frontend/uploadsweep.go` | put, delete-bucket |
+| `s3frontend/bucketqueue.go`, `bucketchanges.go`, `bucketadmin.go`, `bucketship.go` | put, multipart, gc-candidates, delete-bucket, logstore-pipeline |
 | `bucketop/` | put, get, delete-bucket, packages, principals |
+| `taskrunner/` | packages, put, multipart, multipart-states, delete-bucket |
 | `blockstore/` | get, packages, block-routes; `forge.go` also context, principals |
 | `registry/` | schema, get, blob-lifecycle, logstore-pipeline |
 | `logstore/` | logstore-pipeline, segment-states, get, block-routes, delete-bucket |

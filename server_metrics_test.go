@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
+	"go.uber.org/zap/zaptest"
 	"testing"
 	"time"
 
@@ -18,21 +19,23 @@ import (
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/iam"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/pgtest"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/tenantkey"
 )
 
-// TestServerReportsLocalBlobGauges: New registers the local blob and catalog
-// journal gauges on the global meter provider, and Stop unregisters them.
+// TestServerReportsLocalBlobGauges: New registers the local blob, catalog
+// journal and multipart gauges on the global meter provider, and Stop
+// unregisters them.
 func TestServerReportsLocalBlobGauges(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	prev := otel.GetMeterProvider()
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
 	t.Cleanup(func() { otel.SetMeterProvider(prev) })
 
-	s := newInmemServer(t, config.ServerConfig{LocalBlobMaxBytes: 1 << 20})
+	s := newTestServer(t, config.ServerConfig{LocalBlobMaxBytes: 1 << 20})
 
 	require.Equal(t, map[string]bool{
 		"ingot.local_blobs.usage":          true,
@@ -40,6 +43,7 @@ func TestServerReportsLocalBlobGauges(t *testing.T) {
 		"ingot.catalog_journal.blocks":     true,
 		"ingot.catalog_journal.bytes":      true,
 		"ingot.catalog_journal.oldest_age": true,
+		"ingot.multipart.parked_age":       true,
 	}, metricNames(t, reader), "metrics reported after New")
 
 	require.NoError(t, s.Stop(context.Background()))
@@ -57,10 +61,10 @@ func TestServerReportsCatalogUsageGauges(t *testing.T) {
 	t.Cleanup(func() { otel.SetMeterProvider(prev) })
 
 	ctx := t.Context()
-	mem := inmem.NewMemStore()
+	mem := registry.NewPostgres(pgtest.New(t))
 	space, err := did.Parse("did:web:catalog-usage.example")
 	require.NoError(t, err)
-	require.NoError(t, mem.Create(ctx, "bk", space, registry.CreateState{}))
+	require.NoError(t, mem.Create(ctx, "bk", space, registry.CreateState{Tenant: space}))
 	index := multihash.Multihash("index-digest")
 	// segment records a shipped segment of bk, and retires it if asked.
 	segment := func(size, dead int64, index multihash.Multihash, retire bool) {
@@ -79,7 +83,7 @@ func TestServerReportsCatalogUsageGauges(t *testing.T) {
 	segment(2000, 900, index, true)
 	segment(59, 0, nil, false) // shipped without registering anything: not on Forge
 
-	s := newInmemServer(t, config.ServerConfig{}, func(d *ServerDeps) { d.CatalogUsage = mem })
+	s := newTestServer(t, config.ServerConfig{}, func(d *ServerDeps) { d.CatalogUsage = mem })
 	require.Empty(t, gaugeValues(t, reader, "ingot.catalog.forge_bytes"), "reported before the first refresh")
 
 	require.NoError(t, s.Start(ctx))
@@ -146,10 +150,10 @@ func metricNames(t *testing.T, reader *sdkmetric.ManualReader) map[string]bool {
 	return names
 }
 
-// newInmemServer builds a Server over the in-memory fakes. cfg's address,
-// data directory, region and connection limits are filled in; each of opts
-// may adjust the dependencies before New.
-func newInmemServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerDeps)) *Server {
+// newTestServer builds a Server over a Postgres registry and fakes of the
+// network. cfg's address, data directory, region and connection limits are
+// filled in; each of opts may adjust the dependencies before New.
+func newTestServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerDeps)) *Server {
 	t.Helper()
 	id, err := identity.New("", "did:web:ingot.test")
 	require.NoError(t, err)
@@ -161,34 +165,38 @@ func newInmemServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerD
 	require.NoError(t, err)
 	tenantPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	require.NoError(t, err)
-	mem := inmem.NewMemStore()
+	pool := pgtest.New(t)
+	tasks, err := provideTaskRunner(pool, id, zaptest.NewLogger(t))
+	require.NoError(t, err)
+	require.NoError(t, tasks.Migrate(t.Context()))
+	mem := registry.NewPostgres(pool, registry.WithTasks(tasks))
 	cfg.Addr = freeAddr(t)
 	cfg.DataDir = t.TempDir()
 	cfg.Region = "us-east-1"
 	cfg.MaxConnections = 16
 	cfg.MaxRequests = 16
 	deps := ServerDeps{
-		BaseBlockReader: inmem.NopBaseReader{},
-		Uploader:        inmem.NopUploader{},
-		BodyUploader:    inmem.NopUploader{},
-		Deferred:        inmem.NopUploader{},
-		Remover:         inmem.NopUploader{},
-		Registrar:       inmem.NopUploader{},
+		BaseBlockReader: testfakes.NopBaseReader{},
+		Uploader:        testfakes.NopUploader{},
+		Streaming:       testfakes.NopUploader{},
+		Deferred:        testfakes.NopUploader{},
+		Remover:         testfakes.NopUploader{},
+		Registrar:       testfakes.NopUploader{},
 		Registry:        mem,
-		UploadRegs:      mem,
 		Intents:         mem,
 		Locations:       mem,
 		Inclusions:      mem,
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
-		PendingReleases: mem,
+		Claims:          mem,
 		EncParams:       mem,
 		RegionKeys:      regionKeys,
 		TenantKeys:      tenantkey.NewStatic(tenantPriv.PublicKey()),
 		Meta:            mem,
 		Identity:        id,
 		IAM:             svc,
+		Tasks:           tasks,
 	}
 	for _, opt := range opts {
 		opt(&deps)

@@ -67,8 +67,8 @@ func WithoutMD5() SplitOption { return func(c *splitConfig) { c.md5 = false } }
 // already holds the value. A zero-byte body yields a Body with no blobs (and
 // the well-known empty digests).
 //
-// w is the local spool in production (blockstore.Spool): the blobs land on disk
-// before being uploaded to Forge by digest. SplitBody itself is storage-agnostic.
+// SplitBody itself is storage-agnostic. The write path, which knows each
+// body's length, uses SplitSizedBody.
 func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlobSize int64, opts ...SplitOption) (Body, BlobRefs, error) {
 	max := maxBlobSize
 	if max <= 0 {
