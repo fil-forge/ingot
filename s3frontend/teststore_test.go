@@ -55,6 +55,16 @@ const testNode = "did:web:ingot.test"
 
 func newTestStore(t testing.TB) *testStore {
 	t.Helper()
+	return newTestStoreWithLease(t, time.Second)
+}
+
+// newTestStoreWithLease is newTestStore with the task runner's leases lasting
+// ttl. Renewal runs every third of the TTL, and a lease it finds expired is
+// lost, so a test that holds one through minutes of work under the race
+// detector needs longer than the default to survive a late renewal. Tests
+// that wait out a lease left to expire need it short.
+func newTestStoreWithLease(t testing.TB, ttl time.Duration) *testStore {
+	t.Helper()
 	pool := pgtest.New(t)
 	r, err := taskrunner.New(pool, taskrunner.Options{
 		Schema: "ingot",
@@ -73,7 +83,7 @@ func newTestStore(t testing.TB) *testStore {
 			{Name: registry.ReleaseQueue, Workers: 2},
 			{Name: ShardQueue, Workers: 2},
 		},
-		LeaseTTL:     time.Second,
+		LeaseTTL:     ttl,
 		PollInterval: 10 * time.Millisecond,
 		Node:         testNode,
 		Logger:       zaptest.NewLogger(t),
