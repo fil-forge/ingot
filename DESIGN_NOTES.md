@@ -149,7 +149,7 @@ full lifecycle):
   bucket's unshipped sealed segments oldest first, stops at the first
   failure and fails the task, which retries with no attempt limit (1 s
   doubling to 5 minutes). A ship and the bucket's commits share the subject,
-  so the journal rows of a segment need no lock between them.
+  so no commit journals blocks under a segment while that segment ships.
 - **The catalog is location-free**: manifests and MST nodes reference
   content by CID only; byte location resolves at read time through the
   locator, never embedded in the DAG.
@@ -281,8 +281,9 @@ re-hash budget, reserves and reports the version id, and runs the upload's
 accept limited to the part numbers it lists, so a part it drops cannot fail
 it. The accept runs as a task of its own, not a child, so its writes commit
 before Complete reads the parts again and assembles the object's tree,
-which reads the accepted blobs back through their locations. It waits for
-an accept already running and runs after any pending. If it cannot start
+which reads the accepted blobs back through their locations. It cancels an
+accept the upload queued that has not started, since its own concludes
+every part it names, and waits for one already running. If it cannot start
 within 30 s (`acceptWaitBudget`), Complete answers OperationAborted, a 409,
 and the upload stays open. The AWS CLI and other botocore-based
 clients treat that 409 as final and abort the upload, so the 30 s budget is
@@ -332,9 +333,9 @@ session, so the queued tasks are what make the teardown recoverable: an
 abort that fails commits nothing and runs again, and the releases it
 committed are tasks the runner retries. Both retry with no attempt limit and
 a backoff from 1 s doubling to 5 min. Once the session row is gone, the
-teardown runs those releases inline, within 10 s (`releaseNow`), so an Abort
-has released its parked blobs on their providers before it answers;
-whatever is left runs on the runner's workers. Each release carries its
+teardown waits, within 10 s (`releaseNow`), for the runner's workers to run
+those releases, so an Abort has released its parked blobs on their
+providers before it answers; whatever is left runs later. Each release carries its
 own authority: the `/blob/remove` and `/blob/abort` proof chains captured
 from the request that queued it, since it runs after that request has gone. The release reads the blob's
 state from its rows rather than its intent. A location row means accepted
@@ -607,8 +608,9 @@ draws the chains and the stores.
 - **The MST is the data**: immutable, content-addressed, self-verifying,
   shipped to Forge as-is.
 - A bucket is single-writer: every change to it (`queue-bucket.commit`,
-  `.create`, `.set-versioning`, `.set-object-lock-config`, `.delete`,
-  `.ship`) runs as a task on its `queue-bucket` subject, one at a time, and
+  `.create`, `.set-versioning`, `.set-object-lock-config`, `.close`,
+  `.admit-upload`, `.delete`, `.ship`) runs as a task on its `queue-bucket`
+  subject, one at a time, and
   the root's advance is guarded on the root the commit started from. The
   versioning state and the lock configuration change on the same subject, so
   set-versioning's refusal of Suspended under a lock configuration and

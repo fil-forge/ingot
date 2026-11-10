@@ -50,9 +50,9 @@ the same row as everything else `registry.Get` returns, so the per-request
 read costs nothing extra. `registry.State.CORSConfig` carries it, nil when
 the bucket has none of its own, and `SetCORSConfig` writes it, nil clearing.
 
-The gateway-wide document is still marshalled once at construction
-(`Deps.CORS`); `cors_allowed_origins` in the config is now the default for
-buckets without a document of their own, and its comment says so.
+The gateway-wide document is marshalled once at construction
+(`Deps.CORS`); `cors_allowed_origins` in the config is the default for
+buckets without a document of their own.
 
 ## 4. Authorization
 
@@ -67,8 +67,9 @@ registry.
 ## 5. Tests
 
 - `s3frontend/bucketcors_test.go`: the default, the replacement for one
-  bucket alone, the delete round-trip, the size cap, and the missing
-  bucket outranking everything. `s3frontend/cors_test.go` keeps the round
+  bucket alone, the delete round-trip, the rule limit, the size cap, the
+  missing bucket outranking everything, and a document not surviving its
+  bucket's deletion and re-creation. `s3frontend/cors_test.go` keeps the round
   trip of the gateway-wide document through versitygw's parser.
 - `itest`: `TestForgeScenarios/CORS/per_bucket` sets a document on one
   bucket and checks the preflights on it and on a sibling, then deletes it
