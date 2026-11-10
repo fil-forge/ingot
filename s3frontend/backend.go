@@ -153,7 +153,7 @@ type Backend struct {
 	// registration of the usage and budget gauges (nil when not registered).
 	localBlobMetrics localBlobMetrics
 	localBlobGauges  metric.Registration
-	// multipartMetrics counts accept batches and deferred Completes;
+	// multipartMetrics counts part blobs' concludes and deferred Completes;
 	// multipartGauges is the registration of the parked-age gauge (nil when
 	// not registered).
 	multipartMetrics multipartMetrics

@@ -223,14 +223,15 @@ every one it finds.
 | `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `expired` (its `cache_ttl` ran out), `budget`, `orphan` (an unfinished write's temporary file) |
 | `ingot.local_blobs.reads` | Body-blob reads, by `tier`: `local` or `network` (the local hit ratio) |
 
-Multipart uploads' parts are accepted by a `queue-multipart-upload-shard.accept`
-task while the client uploads them (see DESIGN_NOTES), and report:
+Multipart uploads' parts are accepted while the client uploads them, each
+blob by a `queue-space-shard.accept` task the upload's
+`queue-multipart-upload-shard.accept` queues (see DESIGN_NOTES), and report:
 
 | Metric | Meaning |
 | -- | -- |
 | `ingot.multipart.parked_age` | Seconds the oldest parked part of an open upload has waited for acceptance, read from the part rows when collected; 0 when none waits. Parts are accepted within seconds, so growth means the acceptance queue is stuck |
-| `ingot.multipart.accept_passes` | Accept batches that concluded parts, by `outcome`: `accepted` or `failed` (the accept retries; a timed-out batch included) |
-| `ingot.multipart.complete_deferred` | CompleteMultipartUpload requests answered OperationAborted because the upload's accept did not start in time. Botocore clients (the AWS CLI) treat that as a failed upload |
+| `ingot.multipart.accept_passes` | Part blobs concluded, by `outcome`: `accepted` or `failed` (the blob's accept retries; a timed-out conclude included) |
+| `ingot.multipart.complete_deferred` | CompleteMultipartUpload requests answered OperationAborted because the parts' accepts did not finish in time. Botocore clients (the AWS CLI) treat that as a failed upload |
 
 Each commit also journals its catalog blocks in Postgres until their segment
 ships (see `logstore/README.md`), so a copy of the database holds the

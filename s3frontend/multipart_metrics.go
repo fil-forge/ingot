@@ -10,14 +10,14 @@ import (
 	"go.uber.org/zap"
 )
 
-// The outcome of an accept batch: the outcome attribute on the pass counter.
+// The outcome of a blob's conclude: the outcome attribute on the pass counter.
 var (
 	passAccepted = metric.WithAttributes(attribute.String("outcome", "accepted"))
 	passFailed   = metric.WithAttributes(attribute.String("outcome", "failed"))
 )
 
-// multipartMetrics counts the accept batches and the Completes answered
-// OperationAborted because the upload's accept did not start in time. The age of the
+// multipartMetrics counts the multipart blobs' concludes and the Completes
+// answered OperationAborted because the parts' accepts did not finish in time. The age of the
 // oldest queued part is a gauge observed by a callback
 // (registerMultipartGauges).
 type multipartMetrics struct {
@@ -32,13 +32,13 @@ func newMultipartMetrics(mp metric.MeterProvider, b *Backend, logger *zap.Logger
 	meter := mp.Meter(meterName)
 	m := multipartMetrics{acceptPasses: noop.Int64Counter{}, completeDeferred: noop.Int64Counter{}}
 	if c, err := meter.Int64Counter("ingot.multipart.accept_passes", metric.WithUnit("{pass}"),
-		metric.WithDescription("Multipart accept batches that concluded parts, by outcome: accepted, or failed (the accept retries; a timed-out batch included)")); err == nil {
+		metric.WithDescription("Multipart part blobs concluded, by outcome: accepted, or failed (the blob's accept retries; a timed-out conclude included)")); err == nil {
 		m.acceptPasses = c
 	} else {
 		logger.Warn("multipart metrics: create accept_passes counter", zap.Error(err))
 	}
 	if c, err := meter.Int64Counter("ingot.multipart.complete_deferred", metric.WithUnit("{request}"),
-		metric.WithDescription("CompleteMultipartUpload requests answered OperationAborted because the upload's accept did not start in time; botocore clients treat it as final")); err == nil {
+		metric.WithDescription("CompleteMultipartUpload requests answered OperationAborted because the parts' accepts did not finish in time; botocore clients treat it as final")); err == nil {
 		m.completeDeferred = c
 	} else {
 		logger.Warn("multipart metrics: create complete_deferred counter", zap.Error(err))
@@ -83,7 +83,7 @@ func registerMultipartGauges(meter metric.Meter, b *Backend) (metric.Registratio
 	}, age)
 }
 
-// pass records the outcome of an accept batch.
+// pass records the outcome of a blob's conclude.
 func (m multipartMetrics) pass(ctx context.Context, err error) {
 	if err != nil {
 		m.acceptPasses.Add(ctx, 1, passFailed)

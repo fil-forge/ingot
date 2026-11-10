@@ -575,23 +575,44 @@ func (r *Runner) SubmitAllTx(ctx context.Context, tx pgx.Tx, specs []Spec) ([]Ta
 	if len(specs) == 0 {
 		return nil, nil
 	}
+	q, err := r.checkSpec(specs[0])
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range specs[1:] {
+		sq, err := r.checkSpec(s)
+		if err != nil {
+			return nil, err
+		}
+		if sq != q {
+			return nil, fmt.Errorf("task runner: SubmitAllTx: tasks of %s and %s", q.name, sq.name)
+		}
+	}
+	ids, sql, args, err := insertSpecs(q, specs)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, sql, args...); err != nil {
+		return nil, fmt.Errorf("submit %d %s tasks: %w", len(specs), q.name, err)
+	}
+	return ids, nil
+}
+
+// insertSpecs returns the IDs of specs, async tasks of queue q, in their
+// order, and the one statement that adds them. Of two replacements in specs
+// with the same subject and action, the one with the later NotBefore is
+// added, and both are given its ID: one statement cannot replace a row it
+// inserted.
+func insertSpecs(q *queue, specs []Spec) ([]TaskID, string, []any, error) {
 	ids := make([]TaskID, len(specs))
 	// kept is, for each replacement's (subject, action), the index of the
 	// spec that stands for it.
 	type key struct{ subject, action string }
 	kept := map[key]int{}
-	var q *queue
 	for i, s := range specs {
-		sq, err := r.checkSpec(s)
-		if err != nil {
-			return nil, err
-		}
-		if q != nil && sq != q {
-			return nil, fmt.Errorf("task runner: SubmitAllTx: tasks of %s and %s", q.name, sq.name)
-		}
-		q = sq
+		var err error
 		if ids[i], err = uuid.NewV7(); err != nil {
-			return nil, err
+			return nil, "", nil, err
 		}
 		if !s.Replace {
 			continue
@@ -626,7 +647,7 @@ func (r *Runner) SubmitAllTx(ctx context.Context, tx pgx.Tx, specs []Spec) ([]Ta
 		cols.nodes = append(cols.nodes, s.Node)
 		cols.replaceable = append(cols.replaceable, s.Replace)
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO `+q.tasks+` AS t (id, subject, action, not_before, expires, args, sync, node, replaceable)
+	return ids, `INSERT INTO ` + q.tasks + ` AS t (id, subject, action, not_before, expires, args, sync, node, replaceable)
 	SELECT u.id, u.subject, u.action, u.not_before, u.expires, u.args, false, u.node, u.replaceable
 	FROM unnest($1::uuid[], $2::text[], $3::text[], $4::timestamptz[], $5::timestamptz[], $6::bytea[], $7::text[], $8::boolean[])
 		WITH ORDINALITY AS u(id, subject, action, not_before, expires, args, node, replaceable, i)
@@ -636,10 +657,7 @@ func (r *Runner) SubmitAllTx(ctx context.Context, tx pgx.Tx, specs []Spec) ([]Ta
 		not_before = EXCLUDED.not_before, expires = EXCLUDED.expires, args = EXCLUDED.args,
 		node = EXCLUDED.node
 	WHERE t.not_before < EXCLUDED.not_before`,
-		cols.ids, cols.subjects, cols.actions, cols.notBefore, cols.expires, cols.args, cols.nodes, cols.replaceable); err != nil {
-		return nil, fmt.Errorf("submit %d %s tasks: %w", len(cols.ids), q.name, err)
-	}
-	return ids, nil
+		[]any{cols.ids, cols.subjects, cols.actions, cols.notBefore, cols.expires, cols.args, cols.nodes, cols.replaceable}, nil
 }
 
 type execer interface {

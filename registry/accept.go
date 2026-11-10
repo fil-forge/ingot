@@ -12,13 +12,19 @@ import (
 )
 
 // AcceptQueue is the task queue a multipart upload's parked parts are
-// accepted on. Its subject is the upload ID, so an upload has one accept
-// running at a time, apart from the upload's other work: a pass makes network
-// calls and can run for minutes.
+// scheduled for acceptance on. Its subject is the upload ID, so an upload has
+// one accept running at a time, apart from the upload's other work.
 const AcceptQueue = "queue-multipart-upload-shard"
 
-// AcceptAction concludes an upload's parked parts and marks them accepted.
+// AcceptAction queues the acceptance of each blob of an upload's parked
+// parts: a queue-space-shard.accept on the blob's subject (BlobAcceptSpec).
 const AcceptAction = "accept"
+
+// BlobAcceptAction concludes a parked blob on the upload service and marks
+// accepted the parts it completes. It runs on queue-space-shard, under the
+// blob's subject (ReleaseSubject), so it never overlaps the blob's release
+// or a write's add of it.
+const BlobAcceptAction = "accept"
 
 // AcceptTask is a queue-multipart-upload-shard.accept task's arguments.
 type AcceptTask struct {
@@ -36,6 +42,20 @@ func AcceptSpec(uploadID string) taskrunner.Spec {
 		Queue:     AcceptQueue,
 		Subject:   uploadID,
 		Action:    AcceptAction,
+		NotBefore: &now,
+		Replace:   true,
+	}
+}
+
+// BlobAcceptSpec returns the accept of digest in space an upload's accept
+// queues: a replacement due now, so a blob has at most one pending, however
+// many parts or uploads name it.
+func BlobAcceptSpec(space did.DID, digest multihash.Multihash) taskrunner.Spec {
+	now := DueNow()
+	return taskrunner.Spec{
+		Queue:     ReleaseQueue,
+		Subject:   ReleaseSubject(space, digest),
+		Action:    BlobAcceptAction,
 		NotBefore: &now,
 		Replace:   true,
 	}
@@ -108,17 +128,36 @@ func LocatedBlob(space did.DID, digest multihash.Multihash) []Statement {
 	}
 }
 
-// AcceptedPart is the write that marks p, a part of a session in space,
-// accepted once every one of its blobs is located there, and while its row
-// still names the blobs it was read with: a part replaced or dropped
-// meanwhile is left, as is one whose conclude found its park taken.
-func AcceptedPart(space did.DID, p MultipartPart) Statement {
+// AcceptedParts is the write that takes digest off the list of blobs still
+// to be accepted of every parked part of an open session in space that names
+// it, and marks accepted each part it leaves with none. It follows the writes
+// that locate digest in the same commit, and applies only while digest is
+// located: a conclude whose park was taken, or a location gone before the
+// commit, leaves the parts as they are. Each part's row is locked by the
+// update, so two accepts of one part's blobs, which run under different
+// subjects, take turns on it, and the second sees the first's removal. A part
+// written since it was listed lists every one of its own blobs, each with an
+// accept of its own to come, and a part replaced or dropped meanwhile is not
+// there to mark.
+func AcceptedParts(space did.DID, digest multihash.Multihash) []Statement {
+	return []Statement{{
+		`UPDATE ingot.multipart_parts p
+		    SET unaccepted = array_remove(p.unaccepted, $2::bytea),
+		        state = CASE WHEN cardinality(array_remove(p.unaccepted, $2::bytea)) = 0 THEN 'accepted' ELSE p.state END
+		   FROM ingot.multipart_sessions s
+		  WHERE s.upload_id = p.upload_id AND s.space = $1 AND s.state = $3
+		    AND p.blob_digests @> ARRAY[$2::bytea] AND p.unaccepted @> ARRAY[$2::bytea] AND p.state = 'parked'
+		    AND EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.space = $1 AND l.digest = $2)`,
+		[]any{space, []byte(digest), SessionOpen},
+	}}
+}
+
+// AcceptedEmptyPart is the write that marks p, a parked part with no blobs,
+// accepted: it has nothing to conclude.
+func AcceptedEmptyPart(p MultipartPart) Statement {
 	return Statement{
-		`UPDATE ingot.multipart_parts p SET state = 'accepted'
-		  WHERE p.upload_id = $1 AND p.part_number = $2 AND p.blob_digests = $3 AND p.state = 'parked'
-		    AND NOT EXISTS (
-		      SELECT 1 FROM unnest(p.blob_digests) AS b(digest)
-		       WHERE NOT EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.space = $4 AND l.digest = b.digest))`,
-		[]any{p.UploadID, p.PartNumber, p.BlobDigests, space},
+		`UPDATE ingot.multipart_parts SET state = 'accepted'
+		  WHERE upload_id = $1 AND part_number = $2 AND state = 'parked' AND cardinality(blob_digests) = 0`,
+		[]any{p.UploadID, p.PartNumber},
 	}
 }

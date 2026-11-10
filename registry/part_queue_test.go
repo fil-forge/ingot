@@ -205,29 +205,23 @@ func runPartQueueSuite(t *testing.T, pool *pgxpool.Pool, st partQueueStore) {
 		_ = st.DeleteLocation(ctx, space, digest)
 	})
 
-	t.Run("a part is accepted once every blob is located and its row is unchanged", func(t *testing.T) {
+	t.Run("a blob's accept marks accepted the parts it completes", func(t *testing.T) {
 		a, b := multihash.Multihash{0xf3, 0x0a}, multihash.Multihash{0xf3, 0x0b}
-		first := part(id, 5, a, b)
+		part(id, 5, a, b)
+		part(id, 6, b)
 		if err := st.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: a, Provider: "did:web:piri", URL: "https://piri/a", Size: 1}); err != nil {
 			t.Fatalf("PutLocation: %v", err)
 		}
-		exec(registry.AcceptedPart(space, first))
-		if got := states(id)[5]; got != registry.PartParked {
-			t.Fatalf("part 5 with one blob located = %q, want parked", got)
+		exec(registry.AcceptedParts(space, a)...)
+		if got := states(id); got[5] != registry.PartParked || got[6] != registry.PartParked {
+			t.Fatalf("parts with b unlocated = %v, want 5 and 6 parked", got)
 		}
 		if err := st.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: b, Provider: "did:web:piri", URL: "https://piri/b", Size: 2}); err != nil {
 			t.Fatalf("PutLocation: %v", err)
 		}
-		// Replaced since it was read: the old row's digests no longer match.
-		part(id, 5, a)
-		exec(registry.AcceptedPart(space, first))
-		if got := states(id)[5]; got != registry.PartParked {
-			t.Fatalf("replaced part 5 = %q, want parked", got)
-		}
-		second := part(id, 5, a, b)
-		exec(registry.AcceptedPart(space, second))
-		if got := states(id)[5]; got != registry.PartAccepted {
-			t.Fatalf("part 5 = %q, want accepted", got)
+		exec(registry.AcceptedParts(space, b)...)
+		if got := states(id); got[5] != registry.PartAccepted || got[6] != registry.PartAccepted {
+			t.Fatalf("parts once every blob is located = %v, want 5 and 6 accepted", got)
 		}
 		_ = st.DeleteLocation(ctx, space, a)
 		_ = st.DeleteLocation(ctx, space, b)

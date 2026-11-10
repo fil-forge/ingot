@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/versitygw/s3response"
@@ -156,6 +157,10 @@ func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 // TestExtents_MultipartPartNumberAcrossExtents: a multipart object whose
 // parts span several extents serves ?partNumber and ranges from them.
 func TestExtents_MultipartPartNumberAcrossExtents(t *testing.T) {
+	// Complete accepts each of the parts' thousands of tiny blobs on its own.
+	saved := acceptWaitBudget
+	acceptWaitBudget = 5 * time.Minute
+	t.Cleanup(func() { acceptWaitBudget = saved })
 	b, _, _ := newRefTestBackend(t, extentBlobSize)
 	part1 := testBody(5 << 20) // 5,120 blobs
 	part2 := bytes.Repeat([]byte("second part "), 30000)

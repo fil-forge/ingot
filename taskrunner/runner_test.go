@@ -436,6 +436,67 @@ func TestAsyncSubmitCommitsWithItsParent(t *testing.T) {
 	}
 }
 
+// TestSubmitAllCommitsWithItsParent: a handler's SubmitAll adds tasks on
+// several queues with the tree's commit, returns their IDs in order, keeps
+// one of two replacements for a subject and action, and adds nothing when
+// the parent fails. A task cannot submit its own action.
+func TestSubmitAllCommitsWithItsParent(t *testing.T) {
+	f := newFixture(t, 2)
+	f.handle(t, qMiddle, "put", f.put())
+	f.handle(t, qBottom, "put", f.put())
+	now := time.Now()
+	later := now.Add(time.Millisecond)
+	var ids []taskrunner.TaskID
+	f.handle(t, qTop, "spawn", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		var err error
+		ids, err = ex.SubmitAll(ctx, []taskrunner.Spec{
+			{Queue: qBottom, Subject: "a", Action: "put", Args: []byte("1")},
+			{Queue: qMiddle, Subject: "b", Action: "put", Args: []byte("2"), NotBefore: &now, Replace: true},
+			{Queue: qBottom, Subject: "c", Action: "put", Args: []byte("3")},
+			{Queue: qMiddle, Subject: "b", Action: "put", Args: []byte("4"), NotBefore: &later, Replace: true},
+		})
+		if err != nil {
+			return nil, err
+		}
+		if string(task.Args) == "fail" {
+			return nil, errors.New("parent failed")
+		}
+		return nil, nil
+	})
+	f.handle(t, qTop, "again", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		_, err := ex.SubmitAll(ctx, []taskrunner.Spec{{Queue: qTop, Subject: "x", Action: "again"}})
+		return nil, err
+	})
+	f.start(t)
+	ctx := waitCtx(t)
+
+	if _, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "t", Action: "spawn", Args: []byte("fail")}); err == nil {
+		t.Fatal("parent succeeded")
+	}
+	if _, err := f.r.Wait(ctx, qBottom, ids[0]); !errors.Is(err, taskrunner.ErrNotFound) {
+		t.Errorf("a failed parent's spawn exists: Wait error %v", err)
+	}
+	if _, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "t", Action: "spawn"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 4 || ids[1] != ids[3] {
+		t.Fatalf("ids = %v, want four, the two replacements of b sharing one", ids)
+	}
+	for i, q := range []string{qBottom, qMiddle, qBottom} {
+		if _, err := f.r.Wait(ctx, q, ids[i]); err != nil {
+			t.Fatalf("spawn %d: %v", i, err)
+		}
+	}
+	for k, want := range map[string]int{"a": 1, "b": 4, "c": 3} {
+		if v, _ := f.item(t, k); v != want {
+			t.Errorf("item %s = %d, want %d", k, v, want)
+		}
+	}
+	if _, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "t", Action: "again"}); !errors.Is(err, taskrunner.ErrRecursion) {
+		t.Errorf("a task submitting its own action: err = %v, want ErrRecursion", err)
+	}
+}
+
 // claimFixture has a qTop.claim handler whose conditional write misses until
 // item ref exists, and counts its runs.
 func claimFixture(t *testing.T, workers int) (*fixture, *atomic.Int32) {

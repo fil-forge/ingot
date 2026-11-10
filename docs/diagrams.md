@@ -249,7 +249,8 @@ flowchart TB
   receipt reports it and the node checks it at accept. An upload service
   that cannot add by digest code fails the write.
 - Multipart parts ride the body route with the conclude deferred (parked);
-  the upload's `queue-multipart-upload-shard.accept` finishes it
+  each blob's `queue-space-shard.accept`, queued by the upload's
+  `queue-multipart-upload-shard.accept`, finishes it
   (the [multipart diagram](#multipart-upload-park-on-write-accept-in-the-background)).
 
 Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer),
@@ -501,9 +502,9 @@ change.
 
 Parts upload to the provider at `UploadPart` and park there (durable,
 unaccepted). Each upload's `queue-multipart-upload-shard.accept` task
-concludes its parked parts in batches while the client is still uploading,
-so `Complete` has only the last few left to accept and its cost stays flat
-as the part count grows.
+queues a `queue-space-shard.accept` for each blob of its parked parts, which
+concludes the blob under the blob's own subject while the client is still
+uploading, so `Complete` has only the last few left to accept.
 
 ```mermaid
 sequenceDiagram
@@ -512,6 +513,7 @@ sequenceDiagram
     participant B as s3frontend.Backend
     participant M as queue-multipart-upload<br/>(task, subject = uploadId)
     participant A as queue-multipart-upload-shard.accept<br/>(task, subject = uploadId)
+    participant S as queue-space-shard.accept<br/>(task, subject = space/digest)
     participant R as registry<br/>(sessions, parts, parks, intents)
     participant U as sprue
     participant P as piri
@@ -546,14 +548,18 @@ sequenceDiagram
     M->>A: in the same commit: queue the upload's accept,<br/>a replacement due now (at most one pending per upload)
     B->>U: releaseNow: wait for the workers to run the tasks above, due at once (/blob/abort of the parks#59;<br/>a blob another part or the session still names is stale for that reference)
     B-->>C: part ETag (part md5#59; for a copy, of the copied bytes)
-    A->>R: GetSession (nothing to do unless open)
-    loop while a parked part is left after the part-number cursor
-        A->>R: ListParkedParts after the cursor: a batch of up to 1000 blobs, a part never split
-        A->>U: ConcludeBlobs: the batch's put receipts in one /ucan/conclude (2 min timeout),<br/>accept receipts read from the response (poll only as fallback)
-        A->>A: writes for the task's commit: park swapped for the location while the concluded<br/>park (by AddTask) stands#59; intent accepted (published stays)#59; a park beside a standing<br/>location dropped#59; part accepted while its row names the same blobs, all located
+    A->>R: GetSession (nothing to do unless open)#59; ListParkedParts, a page at a time
+    A->>S: with the task's commit: a queue-space-shard.accept per blob of the parked parts,<br/>a replacement due now (at most one pending per blob)#59; a part with no blobs accepted
+    Note over S: runs under the blob's subject, so never beside the blob's release<br/>or a write's add of it
+    alt located (a dedup)
+        S->>S: nothing to conclude
+    else parked, and a part or write in the space still references it
+        S->>U: ConcludeBlobs: the blob's put receipt in one /ucan/conclude (2 min timeout),<br/>its accept receipt read from the response (poll only as fallback)
+    else neither, or nothing references it
+        S->>S: nothing to do: its release aborts the allocation
     end
-    A->>R: commit every batch's writes with the task
-    Note over A,R: a failed batch fails the task and records nothing#59; the retry concludes again<br/>(a repeat to sprue)#59; 5 attempts from 5 s, doubling, up to 1 min
+    S->>R: with the task's commit: park swapped for the location while the concluded park<br/>(by AddTask) stands#59; intent accepted (published stays)#59; a park beside a standing<br/>location dropped#59; the blob taken off its parts' lists of blobs still to accept, while it is located, and a part left with none accepted
+    Note over S,R: a failed conclude fails the task and records nothing#59; the retry concludes again<br/>(a repeat to sprue)#59; 5 attempts from 5 s, doubling, up to 1 min
     C->>B: CompleteMultipartUpload(parts)
     B->>M: run sync: queue-multipart-upload.complete, to start within replayWaitBudget (10 s)<br/>behind the upload's other changes, another Complete included
     alt it did not start in time
@@ -572,11 +578,12 @@ sequenceDiagram
         end
         Note over B,C: from here the body is padded with a newline every<br/>complete_multipart_keepalive (5 s), and any error goes in the 200's body
         M->>R: manifest spans from each part's span_lengths<br/>(rows without them: intent size + FEE geometry)
-        M->>A: run the accept as a task of its own, not a child, limited to the named parts:<br/>after any running or pending accept, to start within acceptWaitBudget (30 s)#59;<br/>its writes commit before Complete reads the parts and assembles the tree
-        alt the accept did not start in time
+        M->>A: run the accept as a task of its own, not a child, limited to the named parts,<br/>after any running or pending accept
+        M->>S: bring the named blobs' accepts forward and wait for them, within acceptWaitBudget<br/>(30 s) in all#59; their writes commit before Complete reads the parts and assembles the tree
+        alt the accepts did not finish in time
             B-->>C: OperationAborted in the 200's body#59; the upload stays open
-        else the accept failed
-            B-->>C: its error in the 200's body#59; the upload stays open
+        else a named part still parked (its blob's accept failed)
+            B-->>C: an error in the 200's body, for the client to retry#59; the upload stays open
         else a named part not accepted with the blobs the request validated
             B-->>C: InvalidPart in the 200's body#59; the upload stays open<br/>for the client to upload the part again
         else every named part accepted
@@ -601,25 +608,26 @@ sequenceDiagram
   nothing; the session's teardown queues it again. A commit's claim
   publishes the blob's upload intent, so an abort releases only what was
   never committed, and the reap of a completed session releases nothing.
-- A release can take a blob while an accept concludes it, when a part is
-  replaced or dropped mid-conclude. Sprue decides the order: a released
-  allocation refuses the accept, and an accepted blob refuses `/blob/abort`,
-  which the release then follows with `/blob/remove`. The release deletes
-  the park and location rows in its commit, so the accept's swap finds no
-  park and records nothing for a blob a release took. The swap matches the
-  park's `/blob/add` task, so a later park of the same bytes stays for its
-  own conclude, and a part is marked accepted only while its row names the
-  blobs the accept read, all located.
+- A blob's accept and its releases run under the same subject, so a part
+  replaced or dropped, or an upload torn down, never releases a blob while
+  it is being concluded. A release that runs first deletes the park and
+  location rows in its commit, so the accept finds no park and records
+  nothing; one that runs after removes the accepted blob. The swap matches
+  the park's `/blob/add` task, so a later park of the same bytes stays for
+  its own conclude. A part lists the blobs still to be accepted, and each
+  blob's accept takes itself off the list while it is located, so the last
+  of a part's blobs to be accepted marks it.
 - Ingot treats a `/blob/remove` receipt as final. If sprue registers an
-  accepted blob only after a remove that arrived earlier, that window is
-  sprue's to fix, and Ingot does not guard it.
+  accepted blob only after a remove that arrived earlier, as it may when a
+  conclude Ingot gave up on is still running there, that window is sprue's
+  to fix, and Ingot does not guard it.
 - A part is written only while its session is open, in the statement that
   checks the state. The add-part runs on the upload's subject, so no
   Complete or Abort runs beside it. One that ran first leaves the upload not
   open, the add-part answers NoSuchUpload, and the upload expires its pending
   references at once, which releases the blobs nothing else references
   (`dropRefsNow`).
-- A blob with neither a park nor a location when the accept reaches it has
+- A blob with neither a park nor a location when its accept reaches it has
   gone from its provider. The accept leaves its part `parked`, and Complete
   answers `InvalidPart`; nothing keeps a part's bytes to upload them again.
 - Complete reports its response headers through versitygw's
@@ -637,7 +645,7 @@ acceptRequested, sessionReleases), `s3frontend/multipartqueue.go`
 (runCreateUpload, runAddPart, runAbort, runReap), `registry/multipartqueue.go`
 (PartWrites, CompletedSession),
 `s3frontend/version.go` (reserveVersion, applyPut), `s3frontend/bucketqueue.go` (putPreCheck),
-`s3frontend/acceptor.go` (runAccept, acceptBatch), `registry/accept.go`,
+`s3frontend/acceptor.go` (runAccept, runBlobAccept), `registry/accept.go`,
 `s3frontend/stream.go`,
 `s3frontend/shardref.go` (addBlob, runAdd, dropRefsNow),
 `s3frontend/releasequeue.go` (runRelease, releaseNow),
@@ -645,14 +653,15 @@ acceptRequested, sessionReleases), `s3frontend/multipartqueue.go`
 
 ## Part states: the acceptance queue
 
-A part row's `state` is the upload's acceptance queue. The accept marks a
-part `accepted` only while its row still names the blobs the accept read, so
-it never moves a row a later upload of the same part number replaced.
+A part row's `state` is the upload's acceptance queue. A blob's accept
+marks `accepted` the parked parts that name it once all their blobs are
+located, so a row a later upload of the same part number replaced, which
+names other blobs, waits for those blobs' accepts.
 
 ```mermaid
 stateDiagram-v2
     [*] --> parked : queue-multipart-upload.add-part (UploadPart, once its blobs are parked)#59;<br/>queues the upload's accept in the same transaction
-    parked --> accepted : queue-multipart-upload-shard.accept concludes the blobs,<br/>while the row names the same blobs and all are located
+    parked --> accepted : the queue-space-shard.accept of its last blob to be located#59;<br/>a part with no blobs, by the upload's accept
     parked --> [*] : replaced (releases queued with the replacement),<br/>or the session's teardown cascades
     accepted --> [*] : replaced (releases queued with the replacement),<br/>or the session's teardown cascades
 ```
@@ -733,7 +742,7 @@ flowchart TB
 
     uploading -->|"single-shot write's queue-space-shard.add: conclude, accept,<br/>or a blob_locations hit (dedup, the stream aborted);<br/>an object's local copy is adopted into the cache"| accepted
     uploading -->|"part's queue-space-shard.add (parkBlobs):<br/>the part streamed to its provider;<br/>blob_parks row written"| parked
-    parked -->|"queue-multipart-upload-shard.accept (in the background, or run by Complete):<br/>/ucan/conclude; its commit swaps the blob_parks row for blob_locations"| accepted
+    parked -->|"queue-space-shard.accept (queued by the upload's accept, in the background<br/>or run by Complete): /ucan/conclude; its commit swaps the blob_parks row for blob_locations"| accepted
     uploading -->|"queue-space-shard.release: /blob/remove<br/>(idempotent: the accept may have landed, its location not);<br/>rows deleted in the task's commit"| gone([deleted])
     parked -->|"queue-space-shard.release: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>rows deleted in the task's commit"| gone
     accepted -->|"queue-space-shard.release (never committed):<br/>/blob/remove;<br/>rows deleted in the task's commit;<br/>cached copy evicted"| gone
@@ -1328,8 +1337,8 @@ sequenceDiagram
     Q->>R: drainSpaceReleases: lend the request's authority for the space, Expedite its pending<br/>queue-space-shard.release tasks (subject space/*) and wait for the workers to run them (/blob/remove each)#59;<br/>a release still waiting fails the delete for the client to retry
     Q->>U: DrainSpaceRegistrations: send the space's pending queue-space-upload changes,<br/>then resend its failed retractions with the request's authority
     Q->>H: /s3/bucket/delete with the signed S3 request (hilt refuses while registrations remain)#59;<br/>a refusal clears the closing mark, not found finishes the delete,<br/>a failed call leaves the bucket closing for a retry
+    Q->>L: RemoveBucketLog, best-effort (directory + segment rows), while the row holds the name:<br/>the log is the name's, and a bucket created under it later runs under its own space
     Q->>R: reg.Delete (the local row, its catalog_journal rows cascading)
-    Q->>L: RemoveBucketLog, best-effort<br/>(directory + segment rows)
     Q-->>B: done
     B-->>C: 204
 ```

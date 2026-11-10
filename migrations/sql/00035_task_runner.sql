@@ -35,6 +35,13 @@ ALTER TABLE ingot.multipart_parts
         CHECK (state IN ('parked','accepted')),
     ALTER COLUMN state SET DEFAULT 'parked';
 
+-- A parked part lists the blobs still to be accepted. Each blob's accept takes
+-- its digest off the list, and the part is accepted once the list is empty, so
+-- marking a part costs each accept one update of the part's row rather than a
+-- check of every blob the part names.
+ALTER TABLE ingot.multipart_parts ADD COLUMN unaccepted bytea[] NOT NULL DEFAULT '{}';
+UPDATE ingot.multipart_parts SET unaccepted = blob_digests WHERE state = 'parked';
+
 -- Every body blob streams to its provider as the body arrives, so an intent
 -- starts 'uploading', none is 'spooled', and there is no local path for it to
 -- record. A stalled upload is one left 'uploading'.
@@ -108,6 +115,7 @@ ALTER TABLE ingot.upload_intents ALTER COLUMN local_path DROP DEFAULT;
 CREATE INDEX upload_intents_stalled_idx
     ON ingot.upload_intents (updated_at) INCLUDE (size, state)
     WHERE state IN ('spooled', 'uploading');
+ALTER TABLE ingot.multipart_parts DROP COLUMN unaccepted;
 ALTER TABLE ingot.multipart_parts DROP CONSTRAINT multipart_parts_state_check;
 ALTER TABLE ingot.multipart_parts
     ADD CONSTRAINT multipart_parts_state_check

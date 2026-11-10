@@ -7,12 +7,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/fil-forge/ucantone/did"
+	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
 	"go.opentelemetry.io/otel/attribute"
 
-	"github.com/fil-forge/ingot/forgeclient"
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
@@ -23,86 +22,43 @@ import (
 // uploading, so Complete has only the last few parts left to accept. The part
 // rows are the queue: UploadPart records a part 'parked', its blobs parked
 // before the row, and queues the upload's queue-multipart-upload-shard.accept
-// in the same transaction. The accept concludes the upload's parked parts in
-// batches and marks them 'accepted'. It runs on the upload's own subject, apart
-// from the upload's other work, and stays consistent with it through the part
-// rows: a part is marked accepted only while its row is unchanged. A release
-// of a blob a dropped part named can race the conclude of that blob; the
-// upload service decides which wins, since a released allocation refuses the
-// accept and an accepted blob refuses the abort, which the release then
-// removes instead.
+// in the same transaction. That accept queues a queue-space-shard.accept for
+// each blob of the upload's parked parts, which concludes the blob and marks
+// accepted the parts it completes. The blob's accept runs under the blob's
+// own subject, the one its releases and a write's adds run under, so it never
+// overlaps them: a release of the blob runs before the conclude, and the
+// accept finds the park gone, or after it, and removes the accepted blob.
 
-// acceptBatchBlobs caps the blobs one batch concludes: one /ucan/conclude's
-// worth. A part is never split across batches, so a batch takes at least one
-// part however many blobs it has.
-var acceptBatchBlobs = forgeclient.MaxConcludeReceipts
+// acceptListPage is how many parked parts an upload's accept reads at a time.
+var acceptListPage = 1000
 
-// acceptBatchTimeout bounds one batch's conclude. The Forge client sets no
+// acceptConcludeTimeout bounds one blob's conclude. The Forge client sets no
 // timeout of its own, so without it a conclude whose answer never came would
-// hold the upload's accept for good. A batch that runs out fails the task;
-// accepts the upload service ran before the timeout are concluded again on
-// the retry, which it treats as a repeat. Package-level so tests can shrink
-// it.
-var acceptBatchTimeout = 2 * time.Minute
+// hold the blob's subject for good. A conclude that runs out fails the task,
+// and the retry concludes it again, which the upload service treats as a
+// repeat. Package-level so tests can shrink it.
+var acceptConcludeTimeout = 2 * time.Minute
 
-// acceptRetry retries a failed background accept a few times. A later part's
-// accept, or the one Complete runs, concludes whatever is left.
+// acceptRetry retries a failed accept a few times. A later part's accept, or
+// the one Complete runs, queues whatever is left again.
 var acceptRetry = taskrunner.RetryPolicy{First: 5 * time.Second, Max: time.Minute, Multiplier: 2, Attempts: 5}
 
-// acceptFlush is the queue's sync no-op: running it on an upload's subject
-// waits for the upload's running accept to finish, and leaves a pending one
-// standing.
-const acceptFlush = "flush"
-
-// RegisterAcceptTasks registers the queue-multipart-upload-shard handlers
-// with r. Call it before r starts.
+// RegisterAcceptTasks registers queue-multipart-upload-shard.accept and
+// queue-space-shard.accept with r. Call it before r starts.
 func (b *Backend) RegisterAcceptTasks(r *taskrunner.Runner) error {
 	b.accepts = r
 	if err := r.Handle(registry.AcceptQueue, registry.AcceptAction, b.runAccept, taskrunner.WithRetry(acceptRetry)); err != nil {
 		return err
 	}
-	return r.Handle(registry.AcceptQueue, acceptFlush, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
-		return nil, nil
-	})
+	return r.Handle(registry.ReleaseQueue, registry.BlobAcceptAction, b.runBlobAccept, taskrunner.WithRetry(acceptRetry))
 }
 
-// awaitRunningAccept waits for uploadID's running accept, if any, to finish.
-// queue-multipart-upload.abort calls it before it queues any release. The
-// upload's queued accepts, and the flushes of earlier aborts that gave up, are
-// cancelled first: the flush would otherwise wait for a worker to run each,
-// and no accept is queued meanwhile, since only the upload's parts and its
-// Complete queue one, on the subject the abort holds. The accept running may
-// have concluded a blob the upload service is still accepting, and the
-// service registers the blob before it answers: a release run sooner could
-// remove the blob before that registration lands, and leave the blob
-// registered and stored with nothing left to remove it. The wait is bounded
-// by acceptWaitBudget; past it the abort fails, for its caller to retry.
-func (b *Backend) awaitRunningAccept(ctx context.Context, uploadID string) error {
-	for _, action := range []string{registry.AcceptAction, acceptFlush} {
-		queued, err := b.accepts.Pending(ctx, registry.AcceptQueue, []string{uploadID}, action)
-		if err != nil {
-			return fmt.Errorf("find the upload's queued %s: %w", action, err)
-		}
-		// Cancel leaves one that has started, which the flush waits for.
-		if err := b.accepts.Cancel(ctx, registry.AcceptQueue, queued[uploadID]...); err != nil {
-			return fmt.Errorf("cancel the upload's queued %s: %w", action, err)
-		}
-	}
-	expires := time.Now().Add(acceptWaitBudget)
-	_, err := b.accepts.Run(ctx, taskrunner.Spec{Queue: registry.AcceptQueue, Subject: uploadID, Action: acceptFlush, Expires: &expires})
-	if errors.Is(err, taskrunner.ErrExpired) {
-		return fmt.Errorf("the upload's running accept did not finish in time; retry")
-	}
-	return err
-}
-
-// runAccept is queue-multipart-upload-shard.accept: it concludes the upload's
-// parked parts, or those of them the task names, in part order and in
-// batches, including parts parked while it runs that sort after the batch it
-// is on, and records them accepted with its commit. A session that is gone
-// or completed has nothing to accept: an abort released its parts, and a
-// Complete accepted them all. A failed batch fails the task, which records
-// nothing. Its result is the number of parts it marked accepted.
+// runAccept is queue-multipart-upload-shard.accept: it queues, with its
+// commit, a queue-space-shard.accept for each blob of the upload's parked
+// parts, or of those of them the task names, and marks a part with no blobs
+// accepted. A session that is gone or
+// completed has nothing to accept: an abort released its parts, and a
+// Complete accepted them all. Its result is the number of blobs it queued.
 func (b *Backend) runAccept(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
 	uploadID := t.Subject
 	args, err := registry.AcceptTaskFrom(t)
@@ -127,138 +83,107 @@ func (b *Backend) runAccept(ctx context.Context, ex *taskrunner.Exec, t taskrunn
 		return nil, nil
 	}
 
-	// Each digest once across the task: parts can share a blob, and the
-	// first batch's writes are not committed when a later one runs.
-	done := map[string]bool{}
-	var accepted []int
+	// Each digest once: parts can share a blob.
+	queued := map[string]bool{}
+	var specs []taskrunner.Spec
 	after := 0
 	for {
-		queued, err := b.multipart.ListParkedParts(ctx, uploadID, after, acceptBatchBlobs)
+		parts, err := b.multipart.ListParkedParts(ctx, uploadID, after, acceptListPage)
 		if err != nil {
 			return nil, fmt.Errorf("list parked parts: %w", err)
 		}
-		if len(queued) == 0 {
+		if len(parts) == 0 {
 			break
 		}
-		var batch []registry.MultipartPart
-		blobs := 0
-		for _, p := range queued {
-			if len(batch) > 0 && blobs+len(p.BlobDigests) > acceptBatchBlobs {
-				break
-			}
+		for _, p := range parts {
 			after = p.PartNumber
 			if only != nil && !only[p.PartNumber] {
 				continue
 			}
-			batch = append(batch, p)
-			blobs += len(p.BlobDigests)
+			if len(p.BlobDigests) == 0 {
+				st := registry.AcceptedEmptyPart(p)
+				if err := ex.Write(ctx, st.SQL, st.Args...); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			for _, d := range p.BlobDigests {
+				if queued[string(d)] {
+					continue
+				}
+				queued[string(d)] = true
+				specs = append(specs, registry.BlobAcceptSpec(sess.Space, d))
+			}
 		}
-		if len(batch) == 0 {
-			continue
-		}
-		marked, err := b.acceptBatch(ctx, ex, sess.Space, batch, done)
-		b.multipartMetrics.pass(ctx, err)
-		if err != nil {
-			return nil, err
-		}
-		accepted = append(accepted, marked...)
 	}
-	return []byte(strconv.Itoa(len(accepted))), nil
+	if _, err := ex.SubmitAll(ctx, specs); err != nil {
+		return nil, err
+	}
+	return []byte(strconv.Itoa(len(specs))), nil
 }
 
-// acceptBatch concludes the parked blobs of batch, adds the writes that
-// record them and mark the parts accepted, and returns the numbers of the
-// parts it marks. A blob already located needs nothing concluded (a dedup); a parked
-// one concludes its deferred /http/put receipt, firing /blob/accept. A blob
-// with neither has been released, which only a part replaced or dropped
-// since the listing allows, and its part is left. done holds the digests
-// earlier batches recorded, and gains this batch's.
-func (b *Backend) acceptBatch(ctx context.Context, ex *taskrunner.Exec, space did.DID, batch []registry.MultipartPart, done map[string]bool) (_ []int, err error) {
-	total := 0
-	for _, p := range batch {
-		total += len(p.BlobDigests)
+// runBlobAccept is queue-space-shard.accept: it concludes the blob its
+// subject names, if it is still parked, and marks accepted, with its commit,
+// the parts of the space's open sessions it completes. A blob already located
+// needs nothing concluded (a dedup); a parked one concludes its deferred
+// /http/put receipt, firing /blob/accept. A blob with neither has been
+// released, and its parts are left parked. So is a parked blob nothing in the
+// space references any more, as a dropped part's is: its release aborts the
+// allocation instead.
+func (b *Backend) runBlobAccept(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) (_ []byte, err error) {
+	space, digest, err := registry.ParseReleaseSubject(t.Subject)
+	if err != nil {
+		return nil, taskrunner.Permanent(err)
 	}
-	ctx, span := tracing.Start(ctx, "blobs.conclude",
-		attribute.Int("ingot.parts", len(batch)),
-		attribute.Int("ingot.blobs.total", total),
-	)
+	ctx, span := tracing.Start(ctx, "blobs.conclude", attribute.Int("ingot.blobs.total", 1))
 	defer func() { tracing.End(span, err) }()
 
 	var writes []registry.Statement
-	var toConclude []uploader.UploadedBlob
-	gone := map[string]bool{}
-	for _, p := range batch {
-		for _, digest := range p.BlobDigests {
-			k := string(digest)
-			if done[k] || gone[k] {
-				continue
-			}
-			if loc, err := b.locations.GetLocation(ctx, space, digest); err == nil && loc != nil {
-				done[k] = true
-				writes = append(writes, registry.LocatedBlob(space, digest)...)
-				continue
-			} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
-				return nil, fmt.Errorf("lookup location: %w", err)
-			}
-			park, err := b.parks.GetPark(ctx, space, digest)
-			if errors.Is(err, registry.ErrNotFound) {
-				gone[k] = true
-				continue
-			}
-			if err != nil {
-				return nil, fmt.Errorf("lookup park: %w", err)
-			}
-			blob, err := parkedBlob(digest, park)
-			if err != nil {
-				return nil, err
-			}
-			done[k] = true
-			toConclude = append(toConclude, blob)
+	if loc, err := b.locations.GetLocation(ctx, space, digest); err == nil && loc != nil {
+		writes = registry.LocatedBlob(space, digest)
+	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		return nil, fmt.Errorf("lookup location: %w", err)
+	} else {
+		park, err := b.parks.GetPark(ctx, space, digest)
+		if errors.Is(err, registry.ErrNotFound) {
+			return nil, nil
 		}
-	}
-	span.SetAttributes(
-		attribute.Int("ingot.blobs.concluded", len(toConclude)),
-		attribute.Int("ingot.blobs.unparked", len(gone)),
-	)
-
-	if len(toConclude) > 0 {
-		cctx, cancel := context.WithTimeout(ctx, acceptBatchTimeout)
-		// Every parked blob goes to the upload service in one exchange (the
-		// client splits only past its batch cap), so thousands of parts cost
-		// a couple of round trips rather than one per part.
-		locations, err := b.deferred.ConcludeBlobs(cctx, space, toConclude)
-		cancel()
 		if err != nil {
-			return nil, fmt.Errorf("conclude blobs: %w", err)
+			return nil, fmt.Errorf("lookup park: %w", err)
 		}
-		for i, blob := range toConclude {
-			if i >= len(locations) || locations[i] == nil {
-				return nil, fmt.Errorf("conclude blobs: blob %x returned no location", blob.Digest)
-			}
-			loc := locations[i]
-			writes = append(writes, registry.ConcludedBlob(space, blob.Digest, blob.AddTask.Bytes(), registry.BlobLocation{
-				Provider: loc.Provider,
-				URL:      loc.URL,
-				Size:     loc.Size,
-			})...)
+		if n, err := b.claims.CountReferences(ctx, space, digest, uuid.Nil); err != nil {
+			return nil, fmt.Errorf("count references: %w", err)
+		} else if n == 0 {
+			return nil, nil
 		}
+		blob, err := parkedBlob(digest, park)
+		if err != nil {
+			return nil, err
+		}
+		cctx, cancel := context.WithTimeout(ctx, acceptConcludeTimeout)
+		locations, err := b.deferred.ConcludeBlobs(cctx, space, []uploader.UploadedBlob{blob})
+		cancel()
+		b.multipartMetrics.pass(ctx, err)
+		if err != nil {
+			return nil, fmt.Errorf("conclude blob: %w", err)
+		}
+		if len(locations) == 0 || locations[0] == nil {
+			return nil, fmt.Errorf("conclude blob %x: no location returned", digest)
+		}
+		span.SetAttributes(attribute.Int("ingot.blobs.concluded", 1))
+		writes = registry.ConcludedBlob(space, digest, blob.AddTask.Bytes(), registry.BlobLocation{
+			Provider: locations[0].Provider,
+			URL:      locations[0].URL,
+			Size:     locations[0].Size,
+		})
 	}
-
-	// The writes mark a part accepted only once its blobs are located, so a
-	// part whose park was taken while it concluded stays parked.
-	var marked []int
-	for _, p := range batch {
-		if !anyIn(p.BlobDigests, gone) {
-			writes = append(writes, registry.AcceptedPart(space, p))
-			marked = append(marked, p.PartNumber)
-		}
-	}
+	writes = append(writes, registry.AcceptedParts(space, digest)...)
 	for _, st := range writes {
 		if err := ex.Write(ctx, st.SQL, st.Args...); err != nil {
 			return nil, err
 		}
 	}
-	return marked, nil
+	return nil, nil
 }
 
 // parkedBlob is the blob a park left on its provider, ready to conclude.
@@ -278,14 +203,4 @@ func parkedBlob(digest mh.Multihash, park *registry.BlobPark) (uploader.Uploaded
 		AcceptTask:    acceptTask,
 		PutInvocation: park.PutInvocation,
 	}, nil
-}
-
-// anyIn reports whether any of digests is in set.
-func anyIn(digests []mh.Multihash, set map[string]bool) bool {
-	for _, d := range digests {
-		if set[string(d)] {
-			return true
-		}
-	}
-	return false
 }

@@ -116,7 +116,8 @@ Internal:
   (`queue-bucket.ship`, queued on each seal), `multipart.go`,
   `multipartqueue.go` (`queue-multipart-upload`: every change to an upload,
   on the upload ID's subject), `acceptor.go`
-  (`queue-multipart-upload-shard.accept`: parked parts concluded while the
+  (`queue-multipart-upload-shard.accept`, queueing a
+  `queue-space-shard.accept` per parked blob, which concludes it while the
   client uploads), `bucket.go` (`queue-bucket.delete`), `listversions.go`,
   `backend.go`, `stream.go` (each body blob streams to its
   provider as the body arrives, teeing an object's bytes into the cache; a
@@ -173,7 +174,9 @@ Internal:
   `queue-space-upload`, `queue-space-shard`, `queue-shard`.
   `queue-multipart-upload` (`s3frontend/multipartqueue.go`), subject the
   upload ID: an upload's create, add-part, complete, abort and reap, one at
-  a time;
+  a time; `queue-multipart-upload-shard` (`s3frontend/acceptor.go`), subject
+  the upload ID: the upload's accept, which queues a `queue-space-shard.accept`
+  for each blob of its parked parts;
   `queue-bucket` (`s3frontend/bucketqueue.go`), subject the bucket's space
   DID: every change to a bucket, placed on the instance holding its catalog
   log; `queue-space-upload` (`s3frontend/uploadqueue.go`), the
@@ -183,7 +186,8 @@ Internal:
   `queue-shard.evict` at `CacheTTL`, run again by reads with under half
   left, and the budget pass's evictions as sync `queue-shard.evict`s;
   `queue-space-shard` (`s3frontend/releasequeue.go`,
-  `shardref.go`), subject space/hex digest: a blob's release, a write's sync
+  `shardref.go`, `acceptor.go`), subject space/hex digest: a blob's release,
+  a parked blob's `queue-space-shard.accept` (its conclude), a write's sync
   `queue-space-shard.add` (its pending reference, in `blob_pending_refs`)
   and the reference's `queue-space-shard.expire` at 24 h. Its own tests each use a schema of their own
   (`taskrunnertest`), so the runner tests need no Ingot tables.
@@ -256,7 +260,7 @@ Internal:
   the same `OTEL_EXPORTER_OTLP_*` variables, metrics). Local blob storage's
   instruments (`ingot.local_blobs.*`: usage by directory, budget and
   stalled-upload gauges, removals by reason, reads by tier), the multipart
-  accept's (`ingot.multipart.*`: parked-part age, batches by outcome,
+  accept's (`ingot.multipart.*`: parked-part age, blob concludes by outcome,
   deferred Completes) and the catalog journal's (`ingot.catalog_journal.*`:
   blocks, bytes, oldest age) are created on the global meter provider,
   through `s3frontend.Deps.MeterProvider` and `Layered.CountBlobReads`, and

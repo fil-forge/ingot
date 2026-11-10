@@ -46,16 +46,32 @@ func cancelQueuedAccepts(t *testing.T, b *Backend, uploadID string) {
 }
 
 // runAccepts runs one accept of uploadID's parked parts, as the queue's
-// worker would, in place of the one UploadPart queued.
+// worker would, in place of the one UploadPart queued, and waits for the
+// blobs' accepts it queues, as Complete does. A blob's accept that fails
+// leaves its part parked.
 func runAccepts(t *testing.T, b *Backend, uploadID string) error {
 	t.Helper()
 	cancelQueuedAccepts(t, b, uploadID)
-	_, err := b.accepts.Run(context.Background(), taskrunner.Spec{
+	ctx := context.Background()
+	if _, err := b.accepts.Run(ctx, taskrunner.Spec{
 		Queue:   registry.AcceptQueue,
 		Subject: uploadID,
 		Action:  registry.AcceptAction,
-	})
-	return err
+	}); err != nil {
+		return err
+	}
+	sess, err := b.multipart.GetSession(ctx, uploadID)
+	if errors.Is(err, registry.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	parts, err := b.multipart.ListParts(ctx, uploadID)
+	if err != nil {
+		return err
+	}
+	return b.awaitBlobAccepts(ctx, sess.Space, parts, time.Now().Add(10*time.Second))
 }
 
 // countingConcluder is a parking uploader that records what each conclude
@@ -195,24 +211,20 @@ func TestUploadPartQueuesOneAccept(t *testing.T) {
 	}
 }
 
-// TestAcceptBatchesByBlobCount: a batch concludes at most acceptBatchBlobs
-// blobs, and the accept makes batches until no parked part is left.
-func TestAcceptBatchesByBlobCount(t *testing.T) {
-	saved := acceptBatchBlobs
-	acceptBatchBlobs = 2
-	t.Cleanup(func() { acceptBatchBlobs = saved })
-
+// TestAcceptConcludesEachBlobOnItsOwn: the upload's accept queues an accept
+// for each blob, under the blob's subject, which concludes that blob alone.
+func TestAcceptConcludesEachBlobOnItsOwn(t *testing.T) {
 	cc := &countingConcluder{}
 	b, mem := newDeferredBackend(t, cc)
-	key := "accept-batches"
+	key := "accept-per-blob"
 	uploadID := mpCreate(t, b, key, "", "")
 	uploadDistinctParts(t, b, key, uploadID, 3)
 
 	if err := runAccepts(t, b, uploadID); err != nil {
 		t.Fatalf("accept: %v", err)
 	}
-	if got := cc.concluded(); len(got) != 2 || got[0] != 2 || got[1] != 1 {
-		t.Fatalf("conclude calls = %v, want [2 1]", got)
+	if got := cc.concluded(); !slices.Equal(got, []int{1, 1, 1}) {
+		t.Fatalf("conclude calls = %v, want one per blob", got)
 	}
 	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartAccepted) {
 		t.Fatalf("part states = %v, want all accepted", states)
@@ -277,34 +289,29 @@ func (s *selectiveConcluder) ConcludeBlobs(ctx context.Context, space did.DID, p
 	return locations, errors.Join(errs...)
 }
 
-// TestAFailedAcceptRecordsNothing: the second batch's conclude fails, so the
-// accept fails and records nothing, the first batch's acceptances included.
-// Its retry concludes both batches again, which the upload service treats as
-// a repeat, and records them.
-func TestAFailedAcceptRecordsNothing(t *testing.T) {
-	saved := acceptBatchBlobs
-	acceptBatchBlobs = 1
-	t.Cleanup(func() { acceptBatchBlobs = saved })
-
+// TestAFailedBlobAcceptLeavesItsPart: the upload service refuses part 2's
+// blob, so that blob's accept fails and records nothing, while part 1's blob
+// is accepted. The retry accepts part 2.
+func TestAFailedBlobAcceptLeavesItsPart(t *testing.T) {
 	sc := &selectiveConcluder{}
 	b, mem := newDeferredBackend(t, sc)
 	ctx := context.Background()
 	key := "accept-fails"
 	uploadID := mpCreate(t, b, key, "", "")
 	uploadDistinctParts(t, b, key, uploadID, 2)
-	first := hygienePartDigests(t, mem, uploadID, 1)[0]
+	second := hygienePartDigests(t, mem, uploadID, 2)[0]
 	sc.mu.Lock()
-	sc.failing = map[string]bool{string(hygienePartDigests(t, mem, uploadID, 2)[0]): true}
+	sc.failing = map[string]bool{string(second): true}
 	sc.mu.Unlock()
 
-	if err := runAccepts(t, b, uploadID); err == nil {
-		t.Fatal("the accept did not fail")
+	if err := runAccepts(t, b, uploadID); err != nil {
+		t.Fatalf("accept: %v", err)
 	}
-	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartParked) {
-		t.Fatalf("part states after a failed accept = %v, want parked", states)
+	if got := partStates(t, mem, uploadID); got[1] != registry.PartAccepted || got[2] != registry.PartParked {
+		t.Fatalf("part states = %v, want part 1 accepted and part 2 parked", got)
 	}
-	if _, err := mem.GetLocation(ctx, mem.bk(), first); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("the first batch's blob is located after a failed accept (err=%v)", err)
+	if _, err := mem.GetLocation(ctx, mem.bk(), second); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("the refused blob is located (err=%v)", err)
 	}
 
 	sc.mu.Lock()
@@ -457,9 +464,8 @@ func TestCompleteOverTheWaitBudgetLeavesTheUploadOpen(t *testing.T) {
 	}
 }
 
-// TestCompleteFailsWhileTheConcludeFails: Complete's own accept failing
-// fails the request with the conclude's error, which clients retry, and the
-// retry commits.
+// TestCompleteFailsWhileTheConcludeFails: a part whose blob's accept fails
+// fails the request, which clients retry, and the retry commits.
 func TestCompleteFailsWhileTheConcludeFails(t *testing.T) {
 	cc := &countingConcluder{fails: 1}
 	b, _ := newDeferredBackend(t, cc)
@@ -493,26 +499,26 @@ func (s *stallingConcluder) ConcludeBlobs(ctx context.Context, space did.DID, pa
 	return s.parkingUploader.ConcludeBlobs(ctx, space, parked)
 }
 
-// TestAcceptBatchTimesOut: a conclude that never answers ends its batch at
-// acceptBatchTimeout, failing the accept so its retry can run, rather than
-// holding the upload's accept for good.
-func TestAcceptBatchTimesOut(t *testing.T) {
-	saved := acceptBatchTimeout
-	acceptBatchTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { acceptBatchTimeout = saved })
+// TestAcceptConcludeTimesOut: a conclude that never answers ends at
+// acceptConcludeTimeout, failing the blob's accept so its retry can run,
+// rather than holding the blob's subject for good.
+func TestAcceptConcludeTimesOut(t *testing.T) {
+	saved := acceptConcludeTimeout
+	acceptConcludeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { acceptConcludeTimeout = saved })
 
 	sc := &stallingConcluder{}
 	sc.stalled.Store(true)
 	b, mem := newDeferredBackend(t, sc)
-	key := "accept-batch-timeout"
+	key := "accept-conclude-timeout"
 	uploadID := mpCreate(t, b, key, "", "")
 	uploadDistinctParts(t, b, key, uploadID, 1)
 
-	if err := runAccepts(t, b, uploadID); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("accept against a stalled conclude = %v, want the batch deadline", err)
+	if err := runAccepts(t, b, uploadID); err != nil {
+		t.Fatalf("accept: %v", err)
 	}
 	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartParked) {
-		t.Fatalf("part states after a timed-out batch = %v, want parked", states)
+		t.Fatalf("part states after a timed-out conclude = %v, want parked", states)
 	}
 	sc.stalled.Store(false)
 	if err := runAccepts(t, b, uploadID); err != nil {
@@ -524,7 +530,7 @@ func TestAcceptBatchTimesOut(t *testing.T) {
 }
 
 // TestCompleteAcceptsOnlyItsParts: Complete names part 1 and omits part 2,
-// whose blob the upload service refuses. Complete's accept concludes part 1
+// whose blob the upload service refuses. Complete waits for part 1's blob
 // alone, so the dropped part cannot fail it.
 func TestCompleteAcceptsOnlyItsParts(t *testing.T) {
 	sc := &selectiveConcluder{}
@@ -537,8 +543,11 @@ func TestCompleteAcceptsOnlyItsParts(t *testing.T) {
 	sc.mu.Unlock()
 	// The accept UploadPart queued fails on part 2, before Complete runs
 	// its own.
-	if err := runAccepts(t, b, uploadID); err == nil {
-		t.Fatal("the upload's accept did not fail")
+	if err := runAccepts(t, b, uploadID); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if got := partStates(t, mem, uploadID); got[2] != registry.PartParked {
+		t.Fatalf("part 2 = %q, want parked", got[2])
 	}
 
 	if _, err := mpComplete(t, b, key, uploadID, parts[:1], nil); err != nil {
@@ -688,11 +697,11 @@ func assertGone(t *testing.T, mem *testStore, d multihash.Multihash) {
 	}
 }
 
-// TestAcceptRacesATeardown: an abort or a session expiry arrives while the
-// accept concludes a part's blob, before the provider accepts it or after,
+// TestAcceptRacesATeardown: an abort or a session expiry arrives while a
+// part's blob is being concluded, before the provider accepts it or after,
 // and the provider registers the blob only just before it answers. The
-// teardown waits for the accept, so its release removes the registered blob
-// rather than race the registration: nothing is left registered or recorded.
+// teardown's release runs under the blob's subject, after the accept: it
+// removes the registered blob, and nothing is left registered or recorded.
 func TestAcceptRacesATeardown(t *testing.T) {
 	teardowns := map[string]func(t *testing.T, b *Backend, key, uploadID string){
 		"abort": func(t *testing.T, b *Backend, key, uploadID string) {
@@ -725,10 +734,11 @@ func TestAcceptRacesATeardown(t *testing.T) {
 						teardown(t, b, key, uploadID)
 						close(done)
 					}()
-					select {
-					case <-done:
-						t.Error("the teardown finished while the accept was concluding")
-					case <-time.After(100 * time.Millisecond):
+					time.Sleep(100 * time.Millisecond)
+					pc.mu.Lock()
+					defer pc.mu.Unlock()
+					if pc.removed > 0 || slices.Contains(pc.aborted, string(d)) {
+						t.Error("the teardown's release ran while the blob was being concluded")
 					}
 				}
 				if when == "before accept" {
@@ -750,60 +760,14 @@ func TestAcceptRacesATeardown(t *testing.T) {
 	}
 }
 
-// TestAbortOverTheAcceptWaitFailsAndARetryFinishes: an Abort whose wait for
-// the upload's running accept runs out fails, leaving the upload open and
-// releasing nothing. Once the accept is done, the retried Abort releases the
-// blob.
-func TestAbortOverTheAcceptWaitFailsAndARetryFinishes(t *testing.T) {
-	saved := acceptWaitBudget
-	acceptWaitBudget = 20 * time.Millisecond
-	t.Cleanup(func() { acceptWaitBudget = saved })
-
-	g := newGatedConcluder()
-	b, mem := newDeferredBackend(t, g)
-	openGate := sync.OnceFunc(func() { close(g.open) })
-	t.Cleanup(openGate) // runs before the backend's, on an early failure
-	ctx := context.Background()
-	key := "abort-over-budget"
-	uploadID := mpCreate(t, b, key, "", "")
-	uploadDistinctParts(t, b, key, uploadID, 1)
-	d := hygienePartDigests(t, mem, uploadID, 1)[0]
-	background := acceptInBackground(t, b, uploadID)
-	<-g.entered
-
-	bucket := "bk"
-	abort := func() error {
-		return b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID})
-	}
-	if err := abort(); err == nil {
-		t.Fatal("Abort over the accept wait succeeded")
-	}
-	if sess, err := mem.GetSession(ctx, uploadID); err != nil || sess.State != registry.SessionOpen {
-		t.Fatalf("session after the failed Abort = %+v, %v; want open", sess, err)
-	}
-	if pending, _ := mem.ReleasingDigests(ctx, mem.bk(), []multihash.Multihash{d}); pending[string(d)] {
-		t.Fatalf("the failed Abort queued a release of %s", d)
-	}
-
-	openGate()
-	if err := <-background; err != nil {
-		t.Fatalf("background accept: %v", err)
-	}
-	acceptWaitBudget = saved
-	if err := abort(); err != nil {
-		t.Fatalf("retry Abort: %v", err)
-	}
-	drainReleases(t, b)
-	assertGone(t, mem, d)
-}
-
-// TestAcceptRacesASupersede: a part is uploaded again while the accept
-// concludes the first upload of it, after the provider has accepted it. The
-// first upload's release runs at once and removes the accepted blob; the
-// accept's records find the park gone and the row replaced, and write
-// nothing. The next accept accepts the replacement, and Complete commits it.
+// TestAcceptRacesASupersede: a part is uploaded again while the first
+// upload's blob is being concluded, after the provider has accepted it and
+// before it registers it. The first blob's release runs under its subject,
+// after the accept, and removes the registered blob; the accept's records
+// find the row replaced and mark nothing. The next accept accepts the
+// replacement, and Complete commits it.
 func TestAcceptRacesASupersede(t *testing.T) {
-	pc := &providerConcluder{}
+	pc := &providerConcluder{registerLate: true}
 	b, mem := newDeferredBackend(t, pc, func(d *Deps) { d.Remover = pc })
 	key := "race-supersede"
 	uploadID := mpCreate(t, b, key, "", "")
@@ -813,17 +777,30 @@ func TestAcceptRacesASupersede(t *testing.T) {
 	replacement := testBody(int(backend.MinPartSize))
 	replacement[0] = 0xff
 	var etag *string
+	superseded := make(chan struct{})
 	pc.after = func() {
-		out, err := mpUploadPart(t, b, key, uploadID, 1, replacement, nil)
-		if err != nil {
-			t.Errorf("superseding UploadPart: %v", err)
-			return
+		// The UploadPart waits for the release it queues, which waits for
+		// this accept, so it runs beside it.
+		go func() {
+			defer close(superseded)
+			out, err := mpUploadPart(t, b, key, uploadID, 1, replacement, nil)
+			if err != nil {
+				t.Errorf("superseding UploadPart: %v", err)
+				return
+			}
+			etag = out.ETag
+		}()
+		time.Sleep(100 * time.Millisecond)
+		pc.mu.Lock()
+		defer pc.mu.Unlock()
+		if pc.removed > 0 || slices.Contains(pc.aborted, string(first)) {
+			t.Error("the superseded blob's release ran while it was being concluded")
 		}
-		etag = out.ETag
 	}
 	if err := runAccepts(t, b, uploadID); err != nil {
 		t.Fatalf("accept: %v", err)
 	}
+	<-superseded
 	drainReleases(t, b)
 
 	assertGone(t, mem, first)
@@ -895,30 +872,13 @@ func TestAcceptRacesASupersedesRelease(t *testing.T) {
 	}
 }
 
-// meetingConcluder holds each conclude until `parties` of them are in
-// flight, so two accepts conclude the same park at once.
-type meetingConcluder struct {
-	parkingUploader
-	met sync.WaitGroup
-}
-
-func (c *meetingConcluder) ConcludeBlobs(ctx context.Context, space did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
-	c.met.Done()
-	c.met.Wait()
-	return c.parkingUploader.ConcludeBlobs(ctx, space, parked)
-}
-
-// TestAcceptsShareAPark: two open uploads of the space hold the same bytes,
-// so their parts share one park, and both accepts conclude it at once. A
-// repeated conclude is harmless upstream; here the first commit swaps the
-// park for the location, and the second finds no park to swap and the
-// location in place, so both parts are accepted and the blob is recorded
-// once.
-func TestAcceptsShareAPark(t *testing.T) {
-	mc := &meetingConcluder{}
-	mc.met.Add(2)
+// TestAcceptsShareABlob: two open uploads of the space hold the same bytes,
+// so their parts share one park, and the blob has one accept, which
+// concludes it once and marks both parts accepted.
+func TestAcceptsShareABlob(t *testing.T) {
+	cc := &countingConcluder{}
 	rm := &recordingRemover{}
-	b, mem := newDeferredBackend(t, mc, func(d *Deps) { d.Remover = rm })
+	b, mem := newDeferredBackend(t, cc, func(d *Deps) { d.Remover = rm })
 	ctx := context.Background()
 	key := "shared-park"
 	uploadID := mpCreate(t, b, key, "", "")
@@ -933,16 +893,18 @@ func TestAcceptsShareAPark(t *testing.T) {
 		t.Fatalf("PutPart: %v", err)
 	}
 
-	first, second := acceptInBackground(t, b, uploadID), acceptInBackground(t, b, other)
-	for _, done := range []<-chan error{first, second} {
-		if err := <-done; err != nil {
-			t.Fatalf("accept: %v", err)
+	for _, id := range []string{uploadID, other} {
+		if err := runAccepts(t, b, id); err != nil {
+			t.Fatalf("accept of %s: %v", id, err)
 		}
 	}
 	for _, id := range []string{uploadID, other} {
 		if states := partStates(t, mem, id); states[1] != registry.PartAccepted {
 			t.Fatalf("upload %s part state = %q, want accepted", id, states[1])
 		}
+	}
+	if got := cc.concluded(); !slices.Equal(got, []int{1}) {
+		t.Fatalf("conclude calls = %v, want the shared blob concluded once", got)
 	}
 	assertAcceptedAndUnparked(t, mem, d)
 	if n := rm.removedDigests()[string(d)]; n != 0 {
