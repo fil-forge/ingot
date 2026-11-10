@@ -184,12 +184,12 @@ func (c *Consumer) Run(ctx context.Context) {
 	bo.MaxInterval = c.maxBackoff
 
 	var latest atomic.Pointer[registry.RevocationCursor]
-	position, ok := c.startPosition(ctx, bo, &latest)
+	position, headUnsaved, ok := c.startPosition(ctx, bo, &latest)
 	if !ok {
 		return
 	}
 	saved := make(chan struct{})
-	go c.saveCursor(ctx, &latest, saved)
+	go c.saveCursor(ctx, &latest, headUnsaved, saved)
 	defer func() { <-saved }()
 
 	bo.Reset()
@@ -260,37 +260,44 @@ func (c *Consumer) Run(ctx context.Context) {
 // or, with none stored, at the firehose's head, which it saves first (see the
 // package doc). It reads the cursor, and then the head, with backoff until
 // each answers; a cursor it can't read is never replaced by the head. A head
-// it fails to save goes to latest, for the saver to retry. It reports false
-// only when ctx is canceled first.
-func (c *Consumer) startPosition(ctx context.Context, bo *backoff.ExponentialBackOff, latest *atomic.Pointer[registry.RevocationCursor]) (registry.RevocationCursor, bool) {
+// it fails to save goes to latest, for the saver to retry, and unsaved
+// reports the failure, logged as the start of a run of failed saves unless a
+// stop cut the save short. It reports ok false only when ctx is canceled
+// first.
+func (c *Consumer) startPosition(ctx context.Context, bo *backoff.ExponentialBackOff, latest *atomic.Pointer[registry.RevocationCursor]) (position registry.RevocationCursor, unsaved, ok bool) {
 	for {
 		stored, err := c.cursor.GetRevocationCursor(ctx)
 		if err == nil {
-			return *stored, true
+			return *stored, false, true
 		}
 		if errors.Is(err, registry.ErrNotFound) {
 			break
 		}
 		if ctx.Err() != nil {
-			return registry.RevocationCursor{}, false
+			return registry.RevocationCursor{}, false, false
 		}
 		// No revocation is applied until it can be read, so this is an error.
 		c.logger.Error("revocation: load cursor", zap.Error(err))
 		if !sleepCtx(ctx, bo.NextBackOff()) {
-			return registry.RevocationCursor{}, false
+			return registry.RevocationCursor{}, false, false
 		}
 	}
 	head, ok := c.readHead(ctx, bo)
 	if !ok {
-		return registry.RevocationCursor{}, false
+		return registry.RevocationCursor{}, false, false
 	}
-	position := registry.RevocationCursor{Token: string(head)}
+	position = registry.RevocationCursor{Token: string(head)}
 	if err := c.cursor.PutRevocationCursor(ctx, position); err != nil {
-		c.logger.Warn("revocation: persist cursor", zap.Error(err))
 		saveLater := position
 		latest.Store(&saveLater)
+		// A save cut short by a stop is no failure: the final save settles it.
+		if ctx.Err() != nil {
+			return position, false, true
+		}
+		c.logger.Warn("revocation: persist cursor failed; retrying each interval", zap.Error(err))
+		return position, true, true
 	}
-	return position, true
+	return position, false, true
 }
 
 // readHead reads the firehose's head with backoff until the service answers,
@@ -318,8 +325,9 @@ func (c *Consumer) readHead(ctx context.Context, bo *backoff.ExponentialBackOff)
 // on slow disks, one commit per record bounded how fast the loop could apply
 // records. A failed save is retried at the next interval; until one succeeds,
 // a restart re-delivers from the previous saved cursor. A run of failed
-// interval saves is logged once when it starts and once when it ends.
-func (c *Consumer) saveCursor(ctx context.Context, latest *atomic.Pointer[registry.RevocationCursor], done chan<- struct{}) {
+// interval saves is logged once when it starts and once when it ends;
+// failing says the run started before the saver did, with the head's save.
+func (c *Consumer) saveCursor(ctx context.Context, latest *atomic.Pointer[registry.RevocationCursor], failing bool, done chan<- struct{}) {
 	defer close(done)
 	var last *registry.RevocationCursor
 	save := func(ctx context.Context) error {
@@ -334,7 +342,6 @@ func (c *Consumer) saveCursor(ctx context.Context, latest *atomic.Pointer[regist
 		return nil
 	}
 
-	failing := false
 	ticker := time.NewTicker(c.saveInterval)
 	defer ticker.Stop()
 	for {

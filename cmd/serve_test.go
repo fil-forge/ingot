@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -124,6 +125,13 @@ func TestApp_StopSavesRevocationCursor(t *testing.T) {
 	}
 	if err := app.Stop(ctx); err != nil {
 		t.Fatalf("stop app: %v", err)
+	}
+	// Nothing that stops before the pool, the consumer included, may find it
+	// closed.
+	for _, e := range logs.All() {
+		if msg, _ := e.ContextMap()["error"].(string); strings.Contains(msg, "closed pool") {
+			t.Errorf("%q logged against the closed pool: %s", e.Message, msg)
+		}
 	}
 
 	cur, err := registry.NewPostgres(pool).GetRevocationCursor(ctx)

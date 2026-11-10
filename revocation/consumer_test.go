@@ -496,12 +496,16 @@ func TestConsumerSavesOnlyTheLastPositionWhenStoppedBeforeTheInterval(t *testing
 	require.Equal(t, []registry.RevocationCursor{{Token: string(last.Cursor)}}, store.calls())
 }
 
-// The tests below run the consumer from a stored cursor, so the only saves
-// are the saver's: with none stored, the consumer would save the head first.
-//
 // A synctest.Test bubble's clock advances only once every goroutine in it is
 // blocked, so after synctest.Wait a consumer run in one has done everything
 // the elapsed intervals call for.
+
+// storedCursorStore returns a recordingCursorStore holding a cursor, so a
+// consumer on it streams without saving the head first, and the only saves
+// it records are the saver's.
+func storedCursorStore() *recordingCursorStore {
+	return &recordingCursorStore{stored: &registry.RevocationCursor{Token: "cursor-stored"}}
+}
 
 // errUnavailable is a save failure the tests inject.
 var errUnavailable = errors.New("database unavailable")
@@ -518,7 +522,7 @@ func failing(n int) []error {
 func TestConsumerSavesNothingMoreWhileTheFeedIsIdle(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		recs := records(t, 1)
-		store := &recordingCursorStore{stored: &registry.RevocationCursor{Token: "cursor-stored"}}
+		store := storedCursorStore()
 		src := &fakeSource{scripts: []streamScript{{records: recs}}}
 		c := revocation.NewConsumer(src, store, &fakeInvalidator{},
 			revocation.WithSaveInterval(time.Second))
@@ -535,7 +539,8 @@ func TestConsumerSavesNothingMoreWhileTheFeedIsIdle(t *testing.T) {
 func TestConsumerRetriesAFailedSaveUntilItLands(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		recs := records(t, 1)
-		store := &recordingCursorStore{stored: &registry.RevocationCursor{Token: "cursor-stored"}, putErrs: failing(3)}
+		store := storedCursorStore()
+		store.putErrs = failing(3)
 		core, logs := observer.New(zap.InfoLevel)
 		src := &fakeSource{scripts: []streamScript{{records: recs}}}
 		c := revocation.NewConsumer(src, store, &fakeInvalidator{},
@@ -558,7 +563,8 @@ func TestConsumerRetriesAFailedSaveUntilItLands(t *testing.T) {
 func TestConsumerLogsARecoveryAtStop(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		recs := records(t, 1)
-		store := &recordingCursorStore{stored: &registry.RevocationCursor{Token: "cursor-stored"}, putErrs: failing(1)}
+		store := storedCursorStore()
+		store.putErrs = failing(1)
 		core, logs := observer.New(zap.InfoLevel)
 		src := &fakeSource{scripts: []streamScript{{records: recs}}}
 		c := revocation.NewConsumer(src, store, &fakeInvalidator{},
@@ -579,7 +585,8 @@ func TestConsumerLogsARecoveryAtStop(t *testing.T) {
 func TestConsumerLogsNoFailureForASaveCutShortByStop(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		recs := records(t, 1)
-		store := &recordingCursorStore{stored: &registry.RevocationCursor{Token: "cursor-stored"}, release: make(chan struct{})}
+		store := storedCursorStore()
+		store.release = make(chan struct{})
 		core, logs := observer.New(zap.InfoLevel)
 		src := &fakeSource{scripts: []streamScript{{records: recs}}}
 		c := revocation.NewConsumer(src, store, &fakeInvalidator{},
@@ -607,7 +614,7 @@ func TestConsumerIgnoresANonPositiveSaveInterval(t *testing.T) {
 		t.Run(d.String(), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				recs := records(t, 1)
-				store := &recordingCursorStore{stored: &registry.RevocationCursor{Token: "cursor-stored"}}
+				store := storedCursorStore()
 				src := &fakeSource{scripts: []streamScript{{records: recs}}}
 				c := revocation.NewConsumer(src, store, &fakeInvalidator{},
 					revocation.WithSaveInterval(d))
@@ -619,6 +626,49 @@ func TestConsumerIgnoresANonPositiveSaveInterval(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestConsumerLogsAFailedHeadSaveAsTheStartOfAFailingRun(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &recordingCursorStore{putErrs: failing(1)}
+		core, logs := observer.New(zap.InfoLevel)
+		c := revocation.NewConsumer(&fakeSource{}, store, &fakeInvalidator{},
+			revocation.WithSaveInterval(time.Second),
+			revocation.WithLogger(zap.New(core)))
+		stop := run(c)
+		defer stop()
+
+		// The head's save fails; the first interval's save lands it.
+		time.Sleep(time.Second)
+		synctest.Wait()
+		require.Equal(t, []registry.RevocationCursor{{Token: string(testHead)}}, store.calls())
+		require.Equal(t, 1, logs.FilterMessage("revocation: persist cursor failed; retrying each interval").Len())
+		require.Equal(t, 1, logs.FilterMessage("revocation: persist cursor recovered").Len())
+	})
+}
+
+func TestConsumerLogsNoFailureForAHeadSaveCutShortByStop(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &recordingCursorStore{release: make(chan struct{})}
+		core, logs := observer.New(zap.InfoLevel)
+		c := revocation.NewConsumer(&fakeSource{}, store, &fakeInvalidator{},
+			revocation.WithSaveInterval(time.Second),
+			revocation.WithLogger(zap.New(core)))
+		stop := run(c)
+
+		// The head's save waits on release, so the stop cuts it short; the
+		// final save then waits on release too.
+		synctest.Wait()
+		stopped := make(chan struct{})
+		go func() { defer close(stopped); stop() }()
+		synctest.Wait()
+		close(store.release)
+		<-stopped
+
+		require.Equal(t, []registry.RevocationCursor{{Token: string(testHead)}}, store.calls(), "the final save lands the head")
+		require.Zero(t, logs.FilterLevelExact(zap.WarnLevel).Len(), "a save cut short by the stop is no failure")
+		require.Zero(t, logs.FilterMessage("revocation: persist cursor recovered").Len(), "nothing failed to recover from")
+	})
 }
 
 // cancelingInvalidator cancels the consumer's context from inside the
