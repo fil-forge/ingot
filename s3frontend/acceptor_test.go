@@ -580,16 +580,20 @@ func TestAcceptTakesABlobWithAReleasePending(t *testing.T) {
 
 // providerConcluder concludes as the upload service and provider do: a blob
 // whose allocation was aborted is refused, any other is accepted and
-// registered in the space at once, and an abort of an accepted blob is then
-// refused as already accepted (parkingUploader.AbortBlob). It is the
-// backend's BlobRemover too, removing a registered blob. The before hook runs
-// once ahead of the next conclude, the after hook once between its accepts
-// and its reply.
+// registered in the space, and an abort of an accepted blob is then refused
+// as already accepted (parkingUploader.AbortBlob). It is the backend's
+// BlobRemover too, removing a registered blob. The before hook runs once
+// ahead of the next conclude, the after hook once between its accepts and its
+// reply.
 type providerConcluder struct {
 	parkingUploader
 	before, after func()
-	registered    map[string]bool
-	removed       int
+	// registerLate registers an accepted blob after the after hook, just
+	// before the reply, as the upload service does; otherwise it is
+	// registered with the accept.
+	registerLate bool
+	registered   map[string]bool
+	removed      int
 	// concluded is the /blob/add task of every blob a conclude accepted.
 	concluded []cid.Cid
 }
@@ -598,6 +602,7 @@ func (c *providerConcluder) ConcludeBlobs(_ context.Context, _ did.DID, parked [
 	c.runOnce(&c.before)
 	locations := make([]*uploader.BlobLocation, len(parked))
 	var refused []error
+	var accepted []string
 	c.mu.Lock()
 	aborted := map[string]bool{}
 	for _, d := range c.aborted {
@@ -615,12 +620,22 @@ func (c *providerConcluder) ConcludeBlobs(_ context.Context, _ did.DID, parked [
 			c.registered = map[string]bool{}
 		}
 		c.acceptedOnProvider[string(p.Digest)] = true
-		c.registered[string(p.Digest)] = true
+		if !c.registerLate {
+			c.registered[string(p.Digest)] = true
+		}
+		accepted = append(accepted, string(p.Digest))
 		c.concluded = append(c.concluded, p.AddTask)
 		locations[i] = &uploader.BlobLocation{Provider: "did:key:zNode", URL: "https://node.example/blob", Size: p.Size}
 	}
 	c.mu.Unlock()
 	c.runOnce(&c.after)
+	if c.registerLate {
+		c.mu.Lock()
+		for _, d := range accepted {
+			c.registered[d] = true
+		}
+		c.mu.Unlock()
+	}
 	return locations, errors.Join(refused...)
 }
 
@@ -673,12 +688,11 @@ func assertGone(t *testing.T, mem *testStore, d multihash.Multihash) {
 	}
 }
 
-// TestAcceptRacesATeardown: an abort or a session expiry runs while the
-// accept concludes a part's blob, before the provider accepts it or after.
-// Before, the release aborts the allocation and the provider refuses the
-// accept; after, the abort is refused and the release removes the accepted
-// blob. Either way nothing is left registered or recorded, and the accept
-// records nothing over the release.
+// TestAcceptRacesATeardown: an abort or a session expiry arrives while the
+// accept concludes a part's blob, before the provider accepts it or after,
+// and the provider registers the blob only just before it answers. The
+// teardown waits for the accept, so its release removes the registered blob
+// rather than race the registration: nothing is left registered or recorded.
 func TestAcceptRacesATeardown(t *testing.T) {
 	teardowns := map[string]func(t *testing.T, b *Backend, key, uploadID string){
 		"abort": func(t *testing.T, b *Backend, key, uploadID string) {
@@ -696,32 +710,88 @@ func TestAcceptRacesATeardown(t *testing.T) {
 	for name, teardown := range teardowns {
 		for _, when := range []string{"before accept", "after accept"} {
 			t.Run(name+"/"+when, func(t *testing.T) {
-				pc := &providerConcluder{}
+				pc := &providerConcluder{registerLate: true}
 				b, mem := newDeferredBackend(t, pc, func(d *Deps) { d.Remover = pc })
 				key := "race-" + name
 				uploadID := mpCreate(t, b, key, "", "")
 				uploadDistinctParts(t, b, key, uploadID, 1)
 				d := hygienePartDigests(t, mem, uploadID, 1)[0]
 
-				hook := func() { teardown(t, b, key, uploadID) }
-				wantRemoved := 1
+				// The teardown starts mid-conclude and is given time to
+				// overtake it.
+				done := make(chan struct{})
+				hook := func() {
+					go func() {
+						teardown(t, b, key, uploadID)
+						close(done)
+					}()
+					select {
+					case <-done:
+						t.Error("the teardown finished while the accept was concluding")
+					case <-time.After(100 * time.Millisecond):
+					}
+				}
 				if when == "before accept" {
 					pc.before = hook
-					wantRemoved = 0
 				} else {
 					pc.after = hook
 				}
 				_ = runAccepts(t, b, uploadID)
+				<-done
 				drainReleases(t, b)
 
 				assertGone(t, mem, d)
 				pc.assertNoneLeft(t)
-				if pc.removed != wantRemoved {
-					t.Fatalf("blob %s removed %d times, want %d", d, pc.removed, wantRemoved)
+				if pc.removed != 1 {
+					t.Fatalf("blob %s removed %d times, want once", d, pc.removed)
 				}
 			})
 		}
 	}
+}
+
+// TestAbortOverTheAcceptWaitFailsAndTheSweepFinishes: an Abort whose wait
+// for the upload's running accept runs out fails and leaves the session
+// latched 'aborting', releasing nothing. Once the accept is done, the sweep
+// finishes the teardown and the blob goes.
+func TestAbortOverTheAcceptWaitFailsAndTheSweepFinishes(t *testing.T) {
+	saved := acceptWaitBudget
+	acceptWaitBudget = 20 * time.Millisecond
+	t.Cleanup(func() { acceptWaitBudget = saved })
+
+	g := newGatedConcluder()
+	b, mem := newDeferredBackend(t, g)
+	openGate := sync.OnceFunc(func() { close(g.open) })
+	t.Cleanup(openGate) // runs before the backend's, on an early failure
+	ctx := context.Background()
+	key := "abort-over-budget"
+	uploadID := mpCreate(t, b, key, "", "")
+	uploadDistinctParts(t, b, key, uploadID, 1)
+	d := hygienePartDigests(t, mem, uploadID, 1)[0]
+	background := acceptInBackground(t, b, uploadID)
+	<-g.entered
+
+	bucket := "bk"
+	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err == nil {
+		t.Fatal("Abort over the accept wait succeeded")
+	}
+	if sess, err := mem.GetSession(ctx, uploadID); err != nil || sess.State != registry.SessionAborting {
+		t.Fatalf("session after the failed Abort = %+v, %v; want aborting", sess, err)
+	}
+	if pending, _ := mem.ReleasingDigests(ctx, mem.bk(), []multihash.Multihash{d}); pending[string(d)] {
+		t.Fatalf("the failed Abort queued a release of %s", d)
+	}
+
+	openGate()
+	if err := <-background; err != nil {
+		t.Fatalf("background accept: %v", err)
+	}
+	acceptWaitBudget = saved
+	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n != 1 {
+		t.Fatalf("sweep: cleaned=%d err=%v, want the aborting session", n, err)
+	}
+	drainReleases(t, b)
+	assertGone(t, mem, d)
 }
 
 // TestAcceptRacesASupersede: a part is uploaded again while the accept

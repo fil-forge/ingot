@@ -1139,8 +1139,12 @@ func (b *Backend) abortOpenSession(ctx context.Context, sess registry.MultipartS
 // this before DeleteSession and only deletes the session once it has
 // succeeded. Returns the blobs, for releaseNow. The caller has latched the
 // session out of 'open' and 'completing', so the upload's next accept
-// concludes nothing.
+// concludes nothing; the one running is waited out first
+// (awaitRunningAccept).
 func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uploadID string, inFlight bool) ([]mh.Multihash, error) {
+	if err := b.awaitRunningAccept(ctx, uploadID); err != nil {
+		return nil, fmt.Errorf("wait for the upload's accept: %w", err)
+	}
 	parts, err := b.multipart.ListParts(ctx, uploadID)
 	if err != nil {
 		return nil, fmt.Errorf("list parts: %w", err)

@@ -49,11 +49,52 @@ var acceptBatchTimeout = 2 * time.Minute
 // accept, or the one Complete runs, concludes whatever is left.
 var acceptRetry = taskrunner.RetryPolicy{First: 5 * time.Second, Max: time.Minute, Multiplier: 2, Attempts: 5}
 
-// RegisterAcceptTasks registers the queue-multipart-upload-shard handler with
-// r. Call it before r starts.
+// acceptFlush is the queue's sync no-op: running it on an upload's subject
+// waits for the upload's running accept to finish, and leaves a pending one
+// standing.
+const acceptFlush = "flush"
+
+// RegisterAcceptTasks registers the queue-multipart-upload-shard handlers
+// with r. Call it before r starts.
 func (b *Backend) RegisterAcceptTasks(r *taskrunner.Runner) error {
 	b.accepts = r
-	return r.Handle(registry.AcceptQueue, registry.AcceptAction, b.runAccept, taskrunner.WithRetry(acceptRetry))
+	if err := r.Handle(registry.AcceptQueue, registry.AcceptAction, b.runAccept, taskrunner.WithRetry(acceptRetry)); err != nil {
+		return err
+	}
+	return r.Handle(registry.AcceptQueue, acceptFlush, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, nil
+	})
+}
+
+// awaitRunningAccept waits for uploadID's running accept, if any, to finish.
+// A session teardown calls it once it has latched the session out of 'open'
+// and 'completing', and before it records any release: an accept that starts
+// after the latch concludes nothing, so only one already running matters. It
+// may have concluded a blob the upload service is still accepting, and the
+// service registers the blob before it answers: a release run sooner could
+// remove the blob before that registration lands, and leave the blob
+// registered and stored with nothing left to remove it. The upload's queued
+// accepts, and the flushes of earlier teardowns that gave up, are cancelled
+// first: the flush would otherwise wait for a worker to run each. The wait is
+// bounded by acceptWaitBudget; past it the teardown fails, for its caller to
+// retry.
+func (b *Backend) awaitRunningAccept(ctx context.Context, uploadID string) error {
+	for _, action := range []string{registry.AcceptAction, acceptFlush} {
+		queued, err := b.accepts.Pending(ctx, registry.AcceptQueue, []string{uploadID}, action)
+		if err != nil {
+			return fmt.Errorf("find the upload's queued %s: %w", action, err)
+		}
+		// Cancel leaves one that has started, which the flush waits for.
+		if err := b.accepts.Cancel(ctx, registry.AcceptQueue, queued[uploadID]...); err != nil {
+			return fmt.Errorf("cancel the upload's queued %s: %w", action, err)
+		}
+	}
+	expires := time.Now().Add(acceptWaitBudget)
+	_, err := b.accepts.Run(ctx, taskrunner.Spec{Queue: registry.AcceptQueue, Subject: uploadID, Action: acceptFlush, Expires: &expires})
+	if errors.Is(err, taskrunner.ErrExpired) {
+		return fmt.Errorf("the upload's running accept did not finish in time; retry")
+	}
+	return err
 }
 
 // runAccept is queue-multipart-upload-shard.accept: it concludes the upload's
