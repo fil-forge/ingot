@@ -1,4 +1,4 @@
-package s3frontend
+package spaceuploadqueue
 
 import (
 	"context"
@@ -16,16 +16,14 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/internal/authority"
-	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 	"github.com/fil-forge/ingot/uploader"
 )
 
-// queueFixture runs the queue-space-upload handlers over a fresh schema, with
-// a backend holding only what they need.
+// queueFixture runs the queue over a fresh schema.
 type queueFixture struct {
-	b     *Backend
+	q     *Queue
 	r     *taskrunner.Runner
 	space did.DID
 }
@@ -33,7 +31,7 @@ type queueFixture struct {
 // newQueueFixture starts the upload queue with the given registrar and number
 // of workers. Zero workers leaves the queued changes to a bucket delete's
 // drain.
-func newQueueFixture(t *testing.T, registrar uploader.UploadRegistrar, workers int, tweak ...func(*Backend)) *queueFixture {
+func newQueueFixture(t *testing.T, registrar uploader.UploadRegistrar, workers int, tweak ...func(*Deps)) *queueFixture {
 	t.Helper()
 	f := newStoppedQueueFixture(t, registrar, workers, tweak...)
 	f.start(t)
@@ -42,30 +40,31 @@ func newQueueFixture(t *testing.T, registrar uploader.UploadRegistrar, workers i
 
 // newStoppedQueueFixture is newQueueFixture with its runner not yet started,
 // so a test can queue changes before any worker takes one (start).
-func newStoppedQueueFixture(t *testing.T, registrar uploader.UploadRegistrar, workers int, tweak ...func(*Backend)) *queueFixture {
+func newStoppedQueueFixture(t *testing.T, registrar uploader.UploadRegistrar, workers int, tweak ...func(*Deps)) *queueFixture {
 	t.Helper()
 	env := taskrunnertest.NewEnv(t)
 	r, err := taskrunner.New(env.DB, taskrunner.Options{
 		Schema:       env.Schema,
-		Queues:       []taskrunner.QueueOptions{{Name: registry.UploadQueue, Workers: workers}},
+		Queues:       []taskrunner.QueueOptions{{Name: Name, Workers: workers}},
 		LeaseTTL:     time.Second,
 		PollInterval: 20 * time.Millisecond,
 		Logger:       zaptest.NewLogger(t),
 	})
 	require.NoError(t, err)
-	b := &Backend{
-		registrar:    registrar,
-		proofs:       authority.New(registrar),
-		logger:       zaptest.NewLogger(t),
-		uploadRetry:  taskrunner.RetryPolicy{First: 5 * time.Millisecond, Max: 20 * time.Millisecond, Multiplier: 2, HoldsSubject: true},
+	d := Deps{
+		Registrar:    registrar,
+		Authority:    authority.New(registrar),
+		Logger:       zaptest.NewLogger(t),
+		retry:        taskrunner.RetryPolicy{First: 5 * time.Millisecond, Max: 20 * time.Millisecond, Multiplier: 2, HoldsSubject: true},
 		drainTimeout: 500 * time.Millisecond,
 	}
 	for _, f := range tweak {
-		f(b)
+		f(&d)
 	}
-	require.NoError(t, b.registerUploadTasks(r))
+	q, err := New(r, d)
+	require.NoError(t, err)
 	require.NoError(t, r.Migrate(context.Background()))
-	return &queueFixture{b: b, r: r, space: testutil.RandomDID(t)}
+	return &queueFixture{q: q, r: r, space: testutil.RandomDID(t)}
 }
 
 // start starts the fixture's runner.
@@ -76,9 +75,9 @@ func (f *queueFixture) start(t *testing.T) {
 }
 
 // queue submits a change for root on the fixture's space, as a commit would.
-func (f *queueFixture) queue(t *testing.T, op registry.UploadRegistrationOp, root cid.Cid) taskrunner.TaskID {
+func (f *queueFixture) queue(t *testing.T, op Op, root cid.Cid) taskrunner.TaskID {
 	t.Helper()
-	spec, err := registry.UploadRegistration{Bucket: "bk", ObjectKey: root.String(), Space: f.space, Root: root, Op: op, Proofs: []byte("proofs")}.Spec()
+	spec, err := Registration{Bucket: "bk", ObjectKey: root.String(), Space: f.space, Root: root, Op: op, Proofs: []byte("proofs")}.Spec()
 	require.NoError(t, err)
 	id, err := f.r.Submit(context.Background(), spec)
 	require.NoError(t, err)
@@ -96,8 +95,8 @@ func TestQueuedRegistrationLands(t *testing.T) {
 	reg := &recordingRegistrar{}
 	f := newQueueFixture(t, reg, 1)
 	root := liveRoot(t, "a")
-	id := f.queue(t, registry.UploadRegistrationAdd, root)
-	_, err := f.r.Wait(context.Background(), registry.UploadQueue, id)
+	id := f.queue(t, Add, root)
+	_, err := f.r.Wait(context.Background(), Name, id)
 	require.NoError(t, err)
 	added, _ := reg.snapshot()
 	require.Equal(t, []cid.Cid{root}, added)
@@ -110,15 +109,15 @@ func TestRefusedAddIsRetriedAndHoldsBackTheRemove(t *testing.T) {
 	reg.refuse("add", true)
 	f := newQueueFixture(t, reg, 1)
 	root := liveRoot(t, "a")
-	f.queue(t, registry.UploadRegistrationAdd, root)
-	remove := f.queue(t, registry.UploadRegistrationRemove, root)
+	f.queue(t, Add, root)
+	remove := f.queue(t, Remove, root)
 
 	time.Sleep(200 * time.Millisecond)
 	_, retracted := reg.snapshot()
 	require.Empty(t, retracted, "the retraction must wait behind the refused addition")
 
 	reg.refuse("add", false)
-	_, err := f.r.Wait(context.Background(), registry.UploadQueue, remove)
+	_, err := f.r.Wait(context.Background(), Name, remove)
 	require.NoError(t, err)
 	added, retracted := reg.snapshot()
 	require.Equal(t, []cid.Cid{root}, added, "the addition lands once the service recovers")
@@ -131,14 +130,14 @@ func TestChangesBatchByOpInCommitOrder(t *testing.T) {
 	reg := &recordingRegistrar{}
 	f := newStoppedQueueFixture(t, reg, 1)
 	a, b, c := liveRoot(t, "a"), liveRoot(t, "b"), liveRoot(t, "c")
-	f.queue(t, registry.UploadRegistrationAdd, a)
-	f.queue(t, registry.UploadRegistrationAdd, b)
-	f.queue(t, registry.UploadRegistrationRemove, a)
-	f.queue(t, registry.UploadRegistrationRemove, b)
-	f.queue(t, registry.UploadRegistrationAdd, c)
+	f.queue(t, Add, a)
+	f.queue(t, Add, b)
+	f.queue(t, Remove, a)
+	f.queue(t, Remove, b)
+	f.queue(t, Add, c)
 	f.start(t)
 
-	require.NoError(t, f.b.DrainSpaceRegistrations(context.Background(), f.space))
+	require.NoError(t, f.q.Drain(context.Background(), f.space))
 	require.Equal(t, []int{2, 2, 1}, reg.roundTrips())
 	added, retracted := reg.snapshot()
 	require.Equal(t, []cid.Cid{a, b, c}, added)
@@ -152,23 +151,23 @@ func TestSpentAuthorityFailsAfterItsAttempts(t *testing.T) {
 	reg := &recordingRegistrar{}
 	reg.spendAuthority()
 	f := newQueueFixture(t, reg, 1)
-	stuck := f.queue(t, registry.UploadRegistrationAdd, liveRoot(t, "a"))
+	stuck := f.queue(t, Add, liveRoot(t, "a"))
 
-	_, err := f.r.Wait(context.Background(), registry.UploadQueue, stuck)
+	_, err := f.r.Wait(context.Background(), Name, stuck)
 	var failed *taskrunner.HandlerError
 	require.ErrorAs(t, err, &failed)
 	require.Contains(t, failed.Message, "authority expired")
-	list, err := f.r.ListFailed(context.Background(), registry.UploadQueue, f.space.String(), taskrunner.TaskID{}, 10)
+	list, err := f.r.ListFailed(context.Background(), Name, f.space.String(), taskrunner.TaskID{}, 10)
 	require.NoError(t, err)
 	require.Len(t, list, 1)
-	require.Equal(t, uploadRegistrationDeadLetterAfter-1, list[0].Task.Attempt, "failed on its last attempt")
+	require.Equal(t, deadLetterAfter-1, list[0].Task.Attempt, "failed on its last attempt")
 
 	reg.mu.Lock()
 	reg.spent = false
 	reg.mu.Unlock()
 	next := liveRoot(t, "b")
-	id := f.queue(t, registry.UploadRegistrationAdd, next)
-	_, err = f.r.Wait(context.Background(), registry.UploadQueue, id)
+	id := f.queue(t, Add, next)
+	_, err = f.r.Wait(context.Background(), Name, id)
 	require.NoError(t, err)
 	added, _ := reg.snapshot()
 	require.Equal(t, []cid.Cid{next}, added, "the failed change no longer holds the space")
@@ -180,11 +179,11 @@ func TestRenewedAuthorityRescuesAQueuedChange(t *testing.T) {
 	reg := &renewingRegistrar{}
 	reg.spent = true
 	// Slow enough that the change is still retrying when the space recovers.
-	f := newQueueFixture(t, reg, 1, func(b *Backend) {
-		b.uploadRetry = taskrunner.RetryPolicy{First: 50 * time.Millisecond, Max: 50 * time.Millisecond, HoldsSubject: true}
+	f := newQueueFixture(t, reg, 1, func(d *Deps) {
+		d.retry = taskrunner.RetryPolicy{First: 50 * time.Millisecond, Max: 50 * time.Millisecond, HoldsSubject: true}
 	})
 	root := liveRoot(t, "a")
-	id := f.queue(t, registry.UploadRegistrationAdd, root)
+	id := f.queue(t, Add, root)
 
 	time.Sleep(120 * time.Millisecond)
 	added, _ := reg.snapshot()
@@ -193,7 +192,7 @@ func TestRenewedAuthorityRescuesAQueuedChange(t *testing.T) {
 	reg.spent = false
 	reg.mu.Unlock()
 
-	_, err := f.r.Wait(context.Background(), registry.UploadQueue, id)
+	_, err := f.r.Wait(context.Background(), Name, id)
 	require.NoError(t, err)
 	added, _ = reg.snapshot()
 	require.Equal(t, []cid.Cid{root}, added)
@@ -205,9 +204,9 @@ func TestDrainSendsTheSpacesQueuedChanges(t *testing.T) {
 	reg := &recordingRegistrar{}
 	f := newQueueFixture(t, reg, 1)
 	root := liveRoot(t, "a")
-	f.queue(t, registry.UploadRegistrationRemove, root)
+	f.queue(t, Remove, root)
 
-	require.NoError(t, f.b.DrainSpaceRegistrations(context.Background(), f.space))
+	require.NoError(t, f.q.Drain(context.Background(), f.space))
 	_, retracted := reg.snapshot()
 	require.Equal(t, []cid.Cid{root}, retracted)
 }
@@ -218,9 +217,9 @@ func TestDrainFailsWhenTheServiceRefuses(t *testing.T) {
 	reg := &failingRegistrar{}
 	reg.refuse("remove", true)
 	f := newQueueFixture(t, reg, 1)
-	f.queue(t, registry.UploadRegistrationRemove, liveRoot(t, "a"))
+	f.queue(t, Remove, liveRoot(t, "a"))
 
-	err := f.b.DrainSpaceRegistrations(context.Background(), f.space)
+	err := f.q.Drain(context.Background(), f.space)
 	require.Error(t, err)
 	require.True(t, strings.Contains(err.Error(), "retry"), err.Error())
 }
@@ -232,18 +231,18 @@ func TestDrainResendsAFailedRetraction(t *testing.T) {
 	reg.spendAuthority()
 	f := newQueueFixture(t, reg, 1)
 	root := liveRoot(t, "a")
-	stuck := f.queue(t, registry.UploadRegistrationRemove, root)
-	_, err := f.r.Wait(context.Background(), registry.UploadQueue, stuck)
+	stuck := f.queue(t, Remove, root)
+	_, err := f.r.Wait(context.Background(), Name, stuck)
 	require.Error(t, err)
 
 	// The delete request carries /upload/remove in its own right.
 	reg.mu.Lock()
 	reg.spent = false
 	reg.mu.Unlock()
-	require.NoError(t, f.b.DrainSpaceRegistrations(context.Background(), f.space))
+	require.NoError(t, f.q.Drain(context.Background(), f.space))
 	_, retracted := reg.snapshot()
 	require.Equal(t, []cid.Cid{root}, retracted)
-	left, err := f.r.ListFailed(context.Background(), registry.UploadQueue, f.space.String(), taskrunner.TaskID{}, 10)
+	left, err := f.r.ListFailed(context.Background(), Name, f.space.String(), taskrunner.TaskID{}, 10)
 	require.NoError(t, err)
 	require.Empty(t, left)
 }
@@ -253,22 +252,22 @@ func TestDrainResendsAFailedRetraction(t *testing.T) {
 func TestDrainResendsARetractionBehindFailedAdditions(t *testing.T) {
 	reg := &recordingRegistrar{}
 	reg.spendAuthority()
-	f := newQueueFixture(t, reg, 1, func(b *Backend) { b.failedPage = 2 })
+	f := newQueueFixture(t, reg, 1, func(d *Deps) { d.failedPage = 2 })
 	var stuck []taskrunner.TaskID
 	for _, s := range []string{"a", "b", "c"} {
-		stuck = append(stuck, f.queue(t, registry.UploadRegistrationAdd, liveRoot(t, s)))
+		stuck = append(stuck, f.queue(t, Add, liveRoot(t, s)))
 	}
 	root := liveRoot(t, "removed")
-	stuck = append(stuck, f.queue(t, registry.UploadRegistrationRemove, root))
+	stuck = append(stuck, f.queue(t, Remove, root))
 	for _, id := range stuck {
-		_, err := f.r.Wait(context.Background(), registry.UploadQueue, id)
+		_, err := f.r.Wait(context.Background(), Name, id)
 		require.Error(t, err)
 	}
 
 	reg.mu.Lock()
 	reg.spent = false
 	reg.mu.Unlock()
-	require.NoError(t, f.b.DrainSpaceRegistrations(context.Background(), f.space))
+	require.NoError(t, f.q.Drain(context.Background(), f.space))
 	_, retracted := reg.snapshot()
 	require.Equal(t, []cid.Cid{root}, retracted, "the retraction on the second page was resent")
 }
@@ -314,8 +313,8 @@ func TestRenewedAuthorityIsKeptForTheRetry(t *testing.T) {
 		t.Run(map[bool]string{false: "refused", true: "unreachable"}[unreachable], func(t *testing.T) {
 			reg := &proofCheckingRegistrar{unreachable: unreachable}
 			f := newQueueFixture(t, reg, 1)
-			id := f.queue(t, registry.UploadRegistrationAdd, liveRoot(t, "a"))
-			_, err := f.r.Wait(context.Background(), registry.UploadQueue, id)
+			id := f.queue(t, Add, liveRoot(t, "a"))
+			_, err := f.r.Wait(context.Background(), Name, id)
 			require.NoError(t, err)
 			reg.mu.Lock()
 			defer reg.mu.Unlock()
@@ -332,20 +331,20 @@ func TestDrainFailsWhenAResentRetractionIsRefused(t *testing.T) {
 	reg.spendAuthority()
 	f := newQueueFixture(t, reg, 1)
 	root := liveRoot(t, "a")
-	stuck := f.queue(t, registry.UploadRegistrationRemove, root)
-	_, err := f.r.Wait(context.Background(), registry.UploadQueue, stuck)
+	stuck := f.queue(t, Remove, root)
+	_, err := f.r.Wait(context.Background(), Name, stuck)
 	require.Error(t, err)
 
 	reg.recordingRegistrar.mu.Lock()
 	reg.spent = false
 	reg.recordingRegistrar.mu.Unlock()
 	reg.refuse("remove", true)
-	err = f.b.DrainSpaceRegistrations(context.Background(), f.space)
+	err = f.q.Drain(context.Background(), f.space)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "retry")
 
 	reg.refuse("remove", false)
-	require.NoError(t, f.b.DrainSpaceRegistrations(context.Background(), f.space))
+	require.NoError(t, f.q.Drain(context.Background(), f.space))
 	_, retracted := reg.snapshot()
 	require.Equal(t, []cid.Cid{root}, retracted)
 }

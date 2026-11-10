@@ -3,7 +3,6 @@ package s3frontend
 import (
 	"bytes"
 	"context"
-	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -39,9 +38,6 @@ type recordingRegistrar struct {
 	// batches records the size of each round trip, so a test can assert the
 	// sweep spends one call on many changes rather than one per change.
 	batches []int
-	// spent makes PrepareAuthority fail, standing in for an expired chain the
-	// space cannot renew.
-	spent bool
 	// gate, when set, holds every RegisterUploads call until it is closed.
 	gate chan struct{}
 }
@@ -56,25 +52,9 @@ func (r *recordingRegistrar) CaptureAuthority(_ context.Context, _ did.DID, _ uc
 	return container.Encode(container.RawGzip, container.New())
 }
 
-// PrepareAuthority keeps whatever the row holds unless spent is set, which
-// stands in for a chain that has outlived hilt's delegation with no live
-// authority to renew from.
-func (r *recordingRegistrar) PrepareAuthority(_ context.Context, space did.DID, _ ucan.Command, stored []byte) ([]byte, bool, error) {
-	r.mu.Lock()
-	spent := r.spent
-	r.mu.Unlock()
-	if spent {
-		return nil, false, errors.New("no proof store for space " + space.String())
-	}
+// PrepareAuthority keeps whatever the row holds.
+func (r *recordingRegistrar) PrepareAuthority(_ context.Context, _ did.DID, _ ucan.Command, stored []byte) ([]byte, bool, error) {
 	return stored, false, nil
-}
-
-// spendAuthority makes every later PrepareAuthority fail, as it does for a
-// space whose stored chain has expired and which has seen no recent write.
-func (r *recordingRegistrar) spendAuthority() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.spent = true
 }
 
 func (r *recordingRegistrar) RegisterUploads(_ context.Context, changes []uploader.QueuedUpload) ([]error, error) {
@@ -332,53 +312,6 @@ func currentManifestCID(t *testing.T, b *Backend, key string) cid.Cid {
 	return rv.node.Manifest
 }
 
-// failingRegistrar refuses the ops named in fail, so a test can watch a queued
-// row survive a refusal and land on a later sweep.
-type failingRegistrar struct {
-	recordingRegistrar
-	mu   sync.Mutex
-	fail map[string]bool
-}
-
-func (r *failingRegistrar) refuse(op string, yes bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.fail == nil {
-		r.fail = map[string]bool{}
-	}
-	r.fail[op] = yes
-}
-
-func (r *failingRegistrar) refuses(op string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.fail[op]
-}
-
-func (r *failingRegistrar) RegisterUploads(ctx context.Context, changes []uploader.QueuedUpload) ([]error, error) {
-	if r.refuses("add") {
-		return refusals(len(changes)), nil
-	}
-	return r.recordingRegistrar.RegisterUploads(ctx, changes)
-}
-
-func (r *failingRegistrar) RetractUploads(ctx context.Context, changes []uploader.QueuedUpload) ([]error, error) {
-	if r.refuses("remove") {
-		return refusals(len(changes)), nil
-	}
-	return r.recordingRegistrar.RetractUploads(ctx, changes)
-}
-
-// refusals reports every change in a batch as refused, the way the upload
-// service answers a batch it accepted but could not act on.
-func refusals(n int) []error {
-	out := make([]error, n)
-	for i := range out {
-		out[i] = errors.New("upload service unavailable")
-	}
-	return out
-}
-
 // TestWriteDoesNotCallTheUploadService: the count is reporting data, so a PUT
 // commits without waiting on Sprue. The change is queued and applied later.
 func TestWriteDoesNotCallTheUploadService(t *testing.T) {
@@ -403,30 +336,4 @@ func TestWriteDoesNotCallTheUploadService(t *testing.T) {
 	drainRegistrations(t, b)
 	added, _ := reg.snapshot()
 	require.Len(t, added, 1, "draining applies what the write queued")
-}
-
-// renewingRegistrar starts with spent authority and recovers once renew is
-// called, standing in for a space that is written again while its queued
-// changes are waiting.
-type renewingRegistrar struct {
-	recordingRegistrar
-	renewals int
-}
-
-func (r *renewingRegistrar) PrepareAuthority(ctx context.Context, space did.DID, cmd ucan.Command, stored []byte) ([]byte, bool, error) {
-	r.mu.Lock()
-	spent := r.spent
-	if !spent {
-		r.renewals++
-	}
-	r.mu.Unlock()
-	if spent {
-		return nil, false, errors.New("no proof store for space " + space.String())
-	}
-	// Renewed: a different chain from the one the row holds.
-	fresh, err := container.Encode(container.RawGzip, container.New())
-	if err != nil {
-		return nil, false, err
-	}
-	return fresh, true, nil
 }

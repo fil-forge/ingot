@@ -152,7 +152,8 @@ Internal:
 - **`queue/`** — one package per task queue, each built over the runner
   with what its handlers need, registering them in its `New`, with typed
   calls for its sync tasks and specs for the async ones other queues spawn:
-  `shardqueue` (`queue-shard`, the cache's copies). The other queues'
+  `shardqueue` (`queue-shard`, the cache's copies), `spaceuploadqueue`
+  (`queue-space-upload`, the object-count changes). The other queues'
   handlers are in `s3frontend`.
 - **`taskrunner/`** — durable task queues in Postgres (one tasks table and
   one leases table per queue), serialized per (queue, subject) by a lease
@@ -182,7 +183,7 @@ Internal:
   `queue-space-shard.accept` for each blob of the upload's parked parts;
   `queue-bucket` (`s3frontend/bucketqueue.go`), subject the bucket's space
   DID: every change to a bucket, placed on the instance holding its catalog
-  log; `queue-space-upload` (`s3frontend/uploadqueue.go`), the
+  log; `queue-space-upload` (`queue/spaceuploadqueue`), the
   object-count changes a `queue-bucket.commit` spawns with its own
   commit; `queue-shard` (`queue/shardqueue`), subject the hex
   digest: a cached blob's time to live, `queue-shard.cache` scheduling its

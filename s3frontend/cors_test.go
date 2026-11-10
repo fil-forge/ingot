@@ -12,6 +12,7 @@ import (
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/internal/cors"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -36,7 +37,7 @@ func TestGetBucketCors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cache: %v", err)
 		}
-		b, err := New(Deps{Tasks: mem.tasks, Registry: mem, Cache: cache, CORS: corsCfg})
+		b, err := New(Deps{Tasks: mem.tasks, Registrar: testfakes.NopUploader{}, Registry: mem, Cache: cache, CORS: corsCfg})
 		if err != nil {
 			t.Fatalf("backend: %v", err)
 		}

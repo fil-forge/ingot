@@ -9,6 +9,7 @@ package main
 import (
 	"github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/queue/shardqueue"
+	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
 	cbg "github.com/whyrusleeping/cbor-gen"
@@ -33,7 +34,6 @@ func main() {
 		panic(err)
 	}
 	if err := cfg.WriteMapEncodersToFile("../registry/cbor_gen.go", "registry",
-		registry.UploadTask{},
 		registry.ReleaseTask{},
 	); err != nil {
 		panic(err)
@@ -41,6 +41,11 @@ func main() {
 	if err := cfg.WriteMapEncodersToFile("../queue/shardqueue/cbor_gen.go", "shardqueue",
 		shardqueue.CacheTask{},
 		shardqueue.EvictTask{},
+	); err != nil {
+		panic(err)
+	}
+	if err := cfg.WriteMapEncodersToFile("../queue/spaceuploadqueue/cbor_gen.go", "spaceuploadqueue",
+		spaceuploadqueue.Task{},
 	); err != nil {
 		panic(err)
 	}

@@ -21,6 +21,7 @@ import (
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/queue/shardqueue"
+	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
@@ -78,7 +79,7 @@ func newTestStoreWithLease(t testing.TB, ttl time.Duration) *testStore {
 			{Name: registry.MultipartQueue, Workers: 2},
 			// Commits run sync, in the request; the workers run ships.
 			{Name: registry.BucketQueue, Workers: 2},
-			{Name: registry.UploadQueue, Workers: 2},
+			{Name: spaceuploadqueue.Name, Workers: 2},
 			{Name: registry.ReleaseQueue, Workers: 2},
 			{Name: shardqueue.Name, Workers: 2},
 		},
@@ -175,7 +176,7 @@ func (s *testStore) drainUploads(t testing.TB) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		tasks, err := s.queued(context.Background(), registry.UploadQueue)
+		tasks, err := s.queued(context.Background(), spaceuploadqueue.Name)
 		if err != nil {
 			t.Fatalf("list queued uploads: %v", err)
 		}

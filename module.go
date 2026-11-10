@@ -69,6 +69,7 @@ import (
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/queue/shardqueue"
+	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/revocation"
@@ -554,7 +555,7 @@ func provideTaskRunner(pool *pgxpool.Pool, id identity.Identity, logger *zap.Log
 		Queues: []taskrunner.QueueOptions{
 			{Name: registry.MultipartQueue, Workers: multipartWorkers},
 			{Name: registry.BucketQueue, Workers: bucketWorkers},
-			{Name: registry.UploadQueue, Workers: uploadRegistrationWorkers},
+			{Name: spaceuploadqueue.Name, Workers: uploadRegistrationWorkers},
 			{Name: registry.ReleaseQueue, Workers: releaseWorkers},
 			{Name: shardqueue.Name, Workers: shardWorkers},
 		},

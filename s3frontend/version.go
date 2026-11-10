@@ -17,6 +17,7 @@ import (
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
+	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 )
@@ -641,9 +642,9 @@ func (b *Backend) applyPut(ctx context.Context, sc *commitScope, key string, p *
 		// in commit order. Every write rule runs through here, so a PUT, a
 		// multipart Complete, a CopyObject destination and a delete marker all
 		// count as one object — which is what AWS reports for NumberOfObjects.
-		b.register(sc, st, key, mfCid, registry.UploadRegistrationAdd)
+		b.register(sc, st, key, mfCid, spaceuploadqueue.Add)
 		for _, d := range discards {
-			b.register(sc, st, key, d.manifest, registry.UploadRegistrationRemove)
+			b.register(sc, st, key, d.manifest, spaceuploadqueue.Remove)
 		}
 		return t2.GetPointer(ctx, tx)
 	}()
@@ -714,7 +715,7 @@ func (b *Backend) applyDeleteVersion(ctx context.Context, sc *commitScope, key, 
 			b.dropClaims(sc, st, key, claimVersionID(targetVersionID(kind, mf), mf.Seq), digests)
 			res.Found, res.DeleteMarker = true, mf.DeleteMarker
 			// The version is gone for good, so the space stops counting it.
-			b.register(sc, st, key, valCid, registry.UploadRegistrationRemove)
+			b.register(sc, st, key, valCid, spaceuploadqueue.Remove)
 			// The value block is the manifest — one GC candidate covers it.
 			tx.AddGCCandidate(valCid)
 			t2, err := t.Delete(ctx, key)
@@ -791,7 +792,7 @@ func (b *Backend) applyDeleteVersion(ctx context.Context, sc *commitScope, key, 
 		b.dropClaims(sc, st, key, claimVersionID(targetVersionID(kind, targetMf), targetMf.Seq), digests)
 		res.Found, res.DeleteMarker = true, targetMf.DeleteMarker
 		// The version is gone for good, so the space stops counting it.
-		b.register(sc, st, key, targetCid, registry.UploadRegistrationRemove)
+		b.register(sc, st, key, targetCid, spaceuploadqueue.Remove)
 		tx.AddGCCandidate(targetCid)
 		tx.AddGCCandidate(valCid)
 

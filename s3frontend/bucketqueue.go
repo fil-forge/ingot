@@ -17,6 +17,7 @@ import (
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
+	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	uploadcmds "github.com/fil-forge/libforge/commands/upload"
@@ -261,12 +262,12 @@ func (b *Backend) applyDelete(ctx context.Context, sc *commitScope, key string, 
 // failing the write over the object count would fail a write that otherwise
 // succeeded: the registration is skipped and logged, and the count
 // under-reports until something registers that root again.
-func (b *Backend) register(sc *commitScope, st *registry.State, key string, root cid.Cid, op registry.UploadRegistrationOp) {
+func (b *Backend) register(sc *commitScope, st *registry.State, key string, root cid.Cid, op spaceuploadqueue.Op) {
 	if !root.Defined() {
 		return
 	}
 	proofs := sc.args.RegisterAdd
-	if op == registry.UploadRegistrationRemove {
+	if op == spaceuploadqueue.Remove {
 		proofs = sc.args.RegisterRemove
 	}
 	if len(proofs) == 0 {
@@ -278,14 +279,20 @@ func (b *Backend) register(sc *commitScope, st *registry.State, key string, root
 		)
 		return
 	}
-	sc.tx.EnqueueUploadRegistration(registry.UploadRegistration{
+	spec, err := spaceuploadqueue.Registration{
 		Bucket:    st.Name,
 		ObjectKey: key,
 		Space:     st.Space,
 		Root:      root,
 		Op:        op,
 		Proofs:    proofs,
-	})
+	}.Spec()
+	if err != nil {
+		b.logger.Warn("commit: could not encode an upload registration; object count will drift",
+			zap.String("bucket", st.Name), zap.Stringer("root", root), zap.Error(err))
+		return
+	}
+	sc.tx.EnqueueUploadRegistration(spec)
 }
 
 // putPreCheck returns the check a put runs against the version it would

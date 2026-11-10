@@ -28,6 +28,7 @@ import (
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // ErrBucketNotFound is returned by Begin when the bucket doesn't
@@ -176,7 +177,7 @@ func (tx *Tx) AddGCCandidate(c cid.Cid) { tx.gc = append(tx.gc, c) }
 // list for this commit to carry. Commits run one at a time on the bucket's
 // subject, so a bucket's registrations are queued in commit order, the order
 // a key's changes have to replay in.
-func (tx *Tx) EnqueueUploadRegistration(reg registry.UploadRegistration) {
+func (tx *Tx) EnqueueUploadRegistration(reg taskrunner.Spec) {
 	tx.commit.Registrations = append(tx.commit.Registrations, reg)
 }
 

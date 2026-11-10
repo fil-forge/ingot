@@ -47,6 +47,7 @@ import (
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/authority"
 	"github.com/fil-forge/ingot/queue/shardqueue"
+	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
@@ -75,23 +76,15 @@ type Backend struct {
 	parks     registry.ParkStore
 	remover   uploader.BlobRemover
 	registrar uploader.UploadRegistrar
-	// tasks runs the queue-space-upload tasks.
-	tasks *taskrunner.Runner
+	// counts keeps each version's place in its space's object count.
+	counts *spaceuploadqueue.Queue
 	// shards keeps the cache's copies.
 	shards *shardqueue.Queue
 	// proofs finds the authority queued tasks make their network calls
 	// with, and holds what requests lend for their spaces while they wait on
 	// them.
-	proofs *authority.Resolver
-	// uploadRetry is the queue-space-upload retry policy, and drainTimeout
-	// how long a bucket delete waits for its space's changes; tests shorten
-	// both.
-	uploadRetry  taskrunner.RetryPolicy
-	drainTimeout time.Duration
-	// failedPage overrides how many failed tasks a bucket delete's drain
-	// lists per query, for tests; zero takes uploadRegistrationBatch.
-	failedPage int
-	encParams  registry.EncryptionParamsStore
+	proofs    *authority.Resolver
+	encParams registry.EncryptionParamsStore
 	// streaming sends each body blob to its provider as the body arrives.
 	streaming uploader.StreamingBodyUploader
 	// claims counts a blob's claims for a release's recheck; releases runs
@@ -361,8 +354,6 @@ func New(d Deps) (*Backend, error) {
 		streaming:    d.Streaming,
 		registrar:    d.Registrar,
 		proofs:       authority.New(d.Registrar),
-		uploadRetry:  uploadRegistrationRetry,
-		drainTimeout: uploadDrainTimeout,
 		encParams:    d.EncParams,
 		regionKeys:   d.RegionKeys,
 		tenantKeys:   d.TenantKeys,
@@ -392,6 +383,9 @@ func New(d Deps) (*Backend, error) {
 	b.catalogGauges = newCatalogUsageGauges(mp, b, logger)
 	var err error
 	if b.shards, err = shardqueue.New(d.Tasks, shardqueue.Deps{Cache: d.Cache, TTL: d.CacheTTL, Removed: b.cacheRemoved, Logger: logger}); err == nil {
+		b.counts, err = spaceuploadqueue.New(d.Tasks, spaceuploadqueue.Deps{Registrar: d.Registrar, Authority: b.proofs, Logger: logger})
+	}
+	if err == nil {
 		err = b.registerTasks(d.Tasks)
 	}
 	if err != nil {
@@ -404,7 +398,6 @@ func New(d Deps) (*Backend, error) {
 // registerTasks registers every queue's handlers with r.
 func (b *Backend) registerTasks(r *taskrunner.Runner) error {
 	for _, register := range []func(*taskrunner.Runner) error{
-		b.registerUploadTasks,
 		b.registerMultipartTasks,
 		b.registerBucketTasks,
 		b.registerReleaseTasks,

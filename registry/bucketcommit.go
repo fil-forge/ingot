@@ -96,13 +96,7 @@ func (r *Postgres) RootCommitWrites(ctx context.Context, name string, expect, ne
 		SQL:  `UPDATE ingot.buckets SET root_cid = $1 WHERE name = $2 AND root_cid IS NOT DISTINCT FROM $3`,
 		Args: []any{next.Bytes(), name, expectBytes},
 	})
-	for _, reg := range c.Registrations {
-		spec, err := reg.Spec()
-		if err != nil {
-			return CommitWrites{}, err
-		}
-		w.Spawns = append(w.Spawns, spec)
-	}
+	w.Spawns = append(w.Spawns, c.Registrations...)
 	if err := r.claimWrites(ctx, &w, c.Claims); err != nil {
 		return CommitWrites{}, err
 	}
