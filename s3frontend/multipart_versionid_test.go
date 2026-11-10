@@ -258,48 +258,6 @@ func TestReCompleteReplaysTheVersionID(t *testing.T) {
 	}
 }
 
-// A Complete that finds another Complete of its upload in progress reports
-// "" before it waits, since the winner's id isn't known yet. When the winner
-// fails and this caller then wins the latch, its commit would create a
-// numbered version it never reported, so it is refused retryably, and the
-// retry reports the id it commits.
-func TestCompleteThatWaitsOnTheWinnerReportsNoVersion(t *testing.T) {
-	b, mp := newHookedCompleteBackend(t)
-	setVersioning(t, b, types.BucketVersioningStatusEnabled)
-	key := "loser"
-	uploadID, parts := completeTwoParts(t, b, key)
-	ctx := context.Background()
-	if won, err := mp.multipart.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
-		t.Fatalf("latch as another Complete: won=%v err=%v", won, err)
-	}
-	// The other Complete fails once this one has reported, reopening the
-	// upload as its revert does.
-	reopen := func(string) {
-		if won, err := mp.multipart.LatchSession(ctx, uploadID, registry.SessionCompleting, registry.SessionOpen); err != nil || !won {
-			t.Errorf("reopen as the failed Complete: won=%v err=%v", won, err)
-		}
-	}
-
-	reported, _, err := completeReporting(t, b, key, uploadID, parts, reopen)
-	if !errors.Is(err, errReservationSuperseded) {
-		t.Fatalf("Complete: err = %v, want errReservationSuperseded", err)
-	}
-	if !slices.Equal(reported, []string{""}) {
-		t.Fatalf("reported %q, want one empty report", reported)
-	}
-	if st := sessionState(t, mp.multipart, uploadID); st != registry.SessionOpen {
-		t.Fatalf("session state %q after the refusal, want open", st)
-	}
-
-	retried, versionID, err := completeAnnounced(t, b, key, uploadID, parts)
-	if err != nil {
-		t.Fatalf("retried Complete: %v", err)
-	}
-	if len(retried) != 1 || retried[0] == "" || retried[0] != versionID || currentVersionID(t, b, key) != versionID {
-		t.Fatalf("retry reported %q and returned %q, current is %q; want the same non-empty id", retried, versionID, currentVersionID(t, b, key))
-	}
-}
-
 // Enabling versioning while a Complete in an unversioned bucket accepts its
 // parts would have it create a numbered version after reporting none, so the
 // commit is refused retryably, and the retry reports the id it commits.
@@ -327,5 +285,55 @@ func TestCompleteRefusedWhenVersioningIsEnabledDuringIt(t *testing.T) {
 	}
 	if len(retried) != 1 || retried[0] == "" || retried[0] != versionID {
 		t.Fatalf("retry reported %q and returned %q, want the same non-empty id", retried, versionID)
+	}
+}
+
+// TestCompleteRunAgainKeepsItsReportedVersion: a Complete whose commit fails
+// its guard runs again from scratch, after it has reported its version id.
+// The run again installs that id, which the client already has, rather than
+// reserving another one.
+func TestCompleteRunAgainKeepsItsReportedVersion(t *testing.T) {
+	b, mem := newDeferredBackend(t, &parkingUploader{})
+	setVersioning(t, b, types.BucketVersioningStatusEnabled)
+	key := "rerun"
+	uploadID, parts := completeTwoParts(t, b, key)
+
+	// The first move of the session to completed affects no row, so the
+	// Complete's guard fails its first commit. The sequence is not
+	// transactional, so the rolled-back commit still counts.
+	ctx := context.Background()
+	for _, sql := range []string{
+		`CREATE SEQUENCE ingot.test_skip_complete`,
+		`CREATE FUNCTION ingot.test_skip_complete() RETURNS trigger LANGUAGE plpgsql AS $$
+		 BEGIN
+		   IF NEW.state = 'completed' AND nextval('ingot.test_skip_complete') = 1 THEN
+		     RETURN NULL;
+		   END IF;
+		   RETURN NEW;
+		 END $$`,
+		`CREATE TRIGGER test_skip_complete BEFORE UPDATE ON ingot.multipart_sessions
+		 FOR EACH ROW EXECUTE FUNCTION ingot.test_skip_complete()`,
+	} {
+		if _, err := mem.pool.Exec(ctx, sql); err != nil {
+			t.Fatalf("install the skip: %v", err)
+		}
+	}
+
+	announced, versionID, err := completeAnnounced(t, b, key, uploadID, parts)
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	var n int64
+	if err := mem.pool.QueryRow(ctx, `SELECT last_value FROM ingot.test_skip_complete`).Scan(&n); err != nil || n < 2 {
+		t.Fatalf("the Complete's commit ran %d times (%v), want a run again", n, err)
+	}
+	if len(announced) != 1 || announced[0] == "" {
+		t.Fatalf("reported %q, want one version id", announced)
+	}
+	if versionID != announced[0] {
+		t.Fatalf("Complete returned version %q, reported %q", versionID, announced[0])
+	}
+	if got := currentVersionID(t, b, key); got != announced[0] {
+		t.Fatalf("current version %q, reported %q", got, announced[0])
 	}
 }

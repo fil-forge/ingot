@@ -31,6 +31,13 @@ func TestABucketTaskForAnotherSpaceIsNoSuchBucket(t *testing.T) {
 		t.Fatal("a task for another space set the bucket's versioning")
 	}
 
+	for _, action := range []string{registry.BucketCloseAction, registry.BucketAdmitUploadAction} {
+		wantNoSuchBucket(t, action, b.runBucket(ctx, old, action, &BucketTask{Name: "bk"}))
+	}
+	if st, _ := mem.Get(ctx, "bk"); st.Closing {
+		t.Fatal("a close for another space closed the bucket")
+	}
+
 	args, err := encodeBucketTask(&BucketTask{Name: "bk"})
 	if err != nil {
 		t.Fatal(err)

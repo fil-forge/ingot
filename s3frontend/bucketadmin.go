@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/s3err"
@@ -75,6 +76,8 @@ func (b *Backend) registerBucketAdmin(r *taskrunner.Runner) error {
 		registry.BucketCreateAction:        b.runCreateBucket,
 		registry.BucketSetVersioningAction: b.runSetVersioning,
 		registry.BucketSetLockConfigAction: b.runSetLockConfig,
+		registry.BucketCloseAction:         b.runCloseBucket,
+		registry.BucketAdmitUploadAction:   b.runAdmitUpload,
 		registry.BucketDeleteAction:        b.runDeleteBucket,
 	} {
 		if err := r.Handle(registry.BucketQueue, action, h); err != nil {
@@ -204,4 +207,54 @@ func (b *Backend) runSetLockConfig(ctx context.Context, ex *taskrunner.Exec, t t
 	st2 := registry.LockConfigSet(args.Name, args.Config)
 	// Written with the task's commit, as the versioning state is.
 	return nil, ex.WriteConditional(ctx, st2.SQL, st2.Args...)
+}
+
+// errBucketClosing refuses a write to a bucket a DeleteBucket has closed.
+var errBucketClosing = s3err.APIError{
+	Code:           "OperationAborted",
+	Description:    "A conflicting conditional operation is currently in progress against this resource. Please try again.",
+	HTTPStatusCode: http.StatusConflict,
+}
+
+// runCloseBucket is queue-bucket.close, the first step of DeleteBucket: it
+// refuses a bucket that holds objects and otherwise marks it closing, so it
+// stays empty (queue-bucket.commit refuses it) and gains no multipart upload
+// (queue-bucket.admit-upload refuses it) while the request aborts the ones in
+// flight. A bucket already closing, by a delete that stopped, closes again.
+func (b *Backend) runCloseBucket(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
+	var args BucketTask
+	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
+		return nil, taskrunner.Permanent(fmt.Errorf("decode close: %w", err))
+	}
+	st, err := b.bucketOn(ctx, args.Name, t.Subject)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.refuseNonEmpty(ctx, st); err != nil {
+		return nil, err
+	}
+	// Written with the task's commit, under its lease, as the bucket's
+	// settings are.
+	st2 := registry.ClosingSet(args.Name)
+	return nil, ex.WriteConditional(ctx, st2.SQL, st2.Args...)
+}
+
+// runAdmitUpload is queue-bucket.admit-upload, which
+// queue-multipart-upload.create runs as a child: it refuses a closing
+// bucket. The create holds this subject until it commits, so its upload
+// either exists before a queue-bucket.close, and the bucket's delete aborts
+// it, or is refused here.
+func (b *Backend) runAdmitUpload(ctx context.Context, _ *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
+	var args BucketTask
+	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
+		return nil, taskrunner.Permanent(fmt.Errorf("decode admit-upload: %w", err))
+	}
+	st, err := b.bucketOn(ctx, args.Name, t.Subject)
+	if err != nil {
+		return nil, err
+	}
+	if st.Closing {
+		return nil, errBucketClosing
+	}
+	return nil, nil
 }

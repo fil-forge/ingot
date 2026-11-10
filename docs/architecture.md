@@ -443,33 +443,46 @@ Each upload's `queue-multipart-upload-shard.accept` task concludes its parked pa
 `Complete` has only the last few parts left to accept before it commits.
 
 ```
-CreateMultipartUpload → uploadId, session (state=open)
+create, add-part, complete, abort and reap run on queue-multipart-upload (subject = uploadId; one at a time)
+CreateMultipartUpload → queue-multipart-upload.create: queue-bucket.admit-upload (a closing
+                        bucket refuses it); session (state=open); auto-abort scheduled one
+                        session TTL out (multipart_session_ttl, default 7 days)
 UploadPart(n)         → ingest + split; blob/add + PUT as the body arrives
                         queue-space-shard.add per blob → PARKED (park row + pending reference)
-                        record part (parked), taking the references over, and queue the
-                        upload's queue-multipart-upload-shard.accept in the same transaction
+                        queue-multipart-upload.add-part: record part (parked), taking the
+                        references over, and queue the upload's
+                        queue-multipart-upload-shard.accept in the same transaction;
+                        waiting > 30 s → SlowDown; upload not open → NoSuchUpload
                         ETag = hex(part MD5); a part keeps no local copy
 queue-multipart-upload-shard.accept (subject = uploadId; one runs per upload at a time)
-     session not open or completing → nothing to do
+     session not open → nothing to do
      each batch: parked parts after a part-number cursor, up to 1000 blobs, a part never split
      conclude them (one /ucan/conclude); writes commit with the task:
         park → location while the concluded park stands; intent → accepted;
         part → accepted while its row names the same blobs, all located
      continues until no parked part is left after the cursor
      a failed batch fails the task, which records nothing; retried 5 times from 5 s, up to 1 min
-CompleteMultipartUpload([parts])
-     validate parts (S3 rules); latch session open→completing (§7.3)
-     run the accept as a sync task, limited to the named parts (omitted parts cannot fail it)
-     accept not started within 30 s → 409 OperationAborted, session reopened
+CompleteMultipartUpload([parts]) → queue-multipart-upload.complete
+     waiting > 10 s behind the upload's other changes → 409 OperationAborted
+     upload already completed → replay its ETag and version id
+     validate parts (S3 rules); check the re-hash budget; reserve and report the version id
+     run the accept as a task of its own, limited to the named parts (omitted parts cannot
+        fail it); its writes commit before Complete reads the parts and assembles the tree
+     accept not started within 30 s → 409 OperationAborted, the upload stays open
      accept failed → Complete fails with its error
      a named part not accepted with the same blobs → InvalidPart, and the client uploads it again
-     COMMIT (queue-bucket.commit, a Put change): manifest pins ordered [blobs..]+ranges;
-        object ETag = hex(md5(concat part MD5s)) + "-N";
+     COMMIT (queue-bucket.commit as a sync child, a Put change): manifest pins ordered
+        [blobs..]+ranges; object ETag = hex(md5(concat part MD5s)) + "-N";
         splice; blob_refs += version per digest; guarded root advance;
-        session completing→completed in the same transaction (guarded)
-AbortMultipartUpload
-     latch session open→aborting
+        in the same transaction: session open→completed (guarded), part trees deleted,
+        releases of the unlisted parts' blobs queued, queue-multipart-upload.reap
+        scheduled one session TTL out
+AbortMultipartUpload (or the auto-abort) → queue-multipart-upload.abort
+     open uploads only; delete the session (parts cascade) and queue a release, due now,
+        of each part blob still there to release
      parked blobs → abort;  accepted blobs → remove (§6)
+queue-multipart-upload.reap
+     delete the completed session and its parts; releases nothing
 ```
 
 The part rows are the accept's queue (`multipart_parts.state`: `parked`, `accepted`), and the accept
@@ -478,7 +491,7 @@ process that stops mid-upload leaves the accept pending, and it runs again once 
 Each UploadPart queues the accept as a replacement due now, so an upload has at most one pending.
 
 Accepting during the upload has a cost when an upload is abandoned. Its parts are already
-accepted, so abort and session expiry remove them (`/blob/remove`) instead of aborting an
+accepted, so an abort or auto-abort removes them (`/blob/remove`) instead of aborting an
 allocation, and the storage node has already computed their piece commitments and queued them
 for aggregation. The node releases the space's claim and deletes the bytes once their aggregate
 retires, as for any deleted object.
@@ -489,19 +502,32 @@ the byte ranges from the part rows alone. The commit also records each part's by
 (`Body.PartSizes`), so a later `GET`/`HEAD ?partNumber=N` can resolve part `N` to its byte span and
 report `x-amz-mp-parts-count` without re-deriving boundaries from the blob list.
 
-### 7.3 The session latch (the Abort/Complete race)
+### 7.3 One change per upload (the Abort/Complete race)
 
 `Complete` and `Abort` can arrive concurrently for one `uploadId`. Without coordination one would
-commit an object over parts the other is releasing. A **single-winner latch** prevents it: an atomic
-state transition on the session row (`UPDATE … SET state=? WHERE state='open'`). Exactly one of
-`Complete`→`completing` or `Abort`→`aborting` wins; the loser observes the moved row and returns an
-error. The Complete's `queue-bucket.commit` records the session completed in the same transaction
-as the version, and only while it is still `completing`. A teardown (DeleteBucket, the stale-session
-sweeper) that latched the session away first makes the commit fail with `NoSuchUpload`.
+commit an object over parts the other is releasing. Every change to an upload runs as a task on
+`queue-multipart-upload` with the upload ID as its subject, so they run one at a time: a Complete
+and an Abort never overlap, and no part lands beside either. The queue is first in the runner's
+order, so a Complete can run its accept and its `queue-bucket.commit` from inside its task. Whichever runs second
+sees what the first left: an Abort after a Complete finds the upload completed and answers
+`NoSuchUpload`, and a Complete after an Abort finds no session. The Complete's commit moves the
+session from `open` to `completed` in the same transaction as the version, guarded on it still
+being open.
 
-The accept is not behind the latch: an abort, a session expiry or a part re-upload can release a
-blob while an accept is concluding it. The upload service decides the order. A released allocation
-refuses the later accept, and an accepted blob refuses the later `/blob/abort`, so the release
+DeleteBucket first runs `queue-bucket.close`, which refuses a bucket that holds objects and marks
+it closing (`buckets.closing`); from then on `queue-bucket.commit` and `queue-bucket.admit-upload`
+refuse it with `OperationAborted`. The request then runs `queue-multipart-upload.abort` for each
+open upload and `queue-multipart-upload.reap` for each completed one, from the request because the
+multipart queue is above the bucket queue, and last runs `queue-bucket.delete`. A create holds the
+bucket's subject through `queue-bucket.admit-upload` until it commits, so an upload either exists
+before the close, and the delete aborts it, or is refused. In-flight uploads do not block the
+delete, as on AWS. Only Hilt refusing the delete reopens the bucket. Hilt not finding the space
+means an earlier delete removed it, so this one finishes, and a call that failed on its way leaves
+the bucket closing until a retry settles it.
+
+The accept runs on its own queue, apart from the upload's changes, so an abort, an auto-abort or a
+part re-upload can release a blob while an accept is concluding it. The upload service decides the
+order. A released allocation refuses the later accept, and an accepted blob refuses the later `/blob/abort`, so the release
 follows it with `/blob/remove`. Ingot records an acceptance only while the park row it concluded
 stands, matched by its `/blob/add` task, swapping the park for the location in the accept's commit;
 the release deletes the park and location rows together in its commit, so a location is never
@@ -542,8 +568,8 @@ or by the commit fails alone.
 | Guarded-root-advance mismatch | The commit task runs again from the current root and re-splices; blobs already durable, never re-uploaded. |
 | Concurrent PUT, same key | Distinct versionIds; the commits run one at a time on the bucket's subject. |
 | Concurrent PUT, same content | One blob; both versions reference it; `blob_refs` counts both. |
-| Abort vs racing Complete | Single-winner latch ([§7.3](#73-the-session-latch-the-abortcomplete-race)). |
-| Abort, expiry or part re-upload during an accept's conclude | The upload service refuses whichever of accept and abort comes second; Ingot records the location only while the park row stands ([§7.3](#73-the-session-latch-the-abortcomplete-race)). |
+| Abort vs racing Complete | One change per upload at a time on `queue-multipart-upload` ([§7.3](#73-one-change-per-upload-the-abortcomplete-race)). |
+| Abort, auto-abort or part re-upload during an accept's conclude | The upload service refuses whichever of accept and abort comes second; Ingot records the location only while the park row stands ([§7.3](#73-one-change-per-upload-the-abortcomplete-race)). |
 | Delete of a digest still referenced by any space | Claim non-empty → no physical delete; only the version/MST entry removed. |
 | 0-byte object | No blob; manifest-only, empty MD5 ETag. |
 | Conditional request | Backend-evaluated; re-checked at commit for mutations. |
@@ -662,7 +688,7 @@ The MVP this supersedes had six structural problems; each is resolved by a layer
 |-----------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | A per-bucket lock held across the whole write | Ingest and upload run in the request; only the MST splice, the append and the guarded root advance run in the bucket's serialized commit. [§7.1](#71-write-single-shot-putobject)                        |
 | The whole object buffered in memory           | Hash while streaming to Piri; nothing held whole in RAM. [§5](#5-the-data-layer), [§7.1](#71-write-single-shot-putobject)                                                                                           |
-| No multipart, no abort                        | Parked part-blobs accepted during the upload, single-winner latch; abort = `/blob/abort` (parked) / `remove` (deduped). [§7.2](#72-multipart)–7.3, [§9](#9-the-system-contract-piri--sprue--indexer)                        |
+| No multipart, no abort                        | Parked part-blobs accepted during the upload, one change per upload at a time; abort = `/blob/abort` (parked) / `remove` (deduped). [§7.2](#72-multipart)–7.3, [§9](#9-the-system-contract-piri--sprue--indexer)          |
 | Objects chunked into CARs to obtain a digest  | Object body = one blob (≤ `max`) or a coarse `≤ max` split; no fine chunking, no CAR. [§5](#5-the-data-layer), [§10](#10-deployment-topology--the-digest-before-upload-cost)                                        |
 | No delete of superseded data                  | Reference index + per-space `remove` + Piri's global claim gate + indexer delete; O(1) for ≥ `min` blobs. [§5](#5-the-data-layer), [§6](#6-the-forgechain-layer), [§9](#9-the-system-contract-piri--sprue--indexer) |
 | Aggregation blocked partial deletes           | A small `min` makes most blobs their own piece (O(1) delete); compaction handles only the sub-`min` tail. [§6](#6-the-forgechain-layer)                                                                             |
@@ -687,8 +713,8 @@ The MVP this supersedes had six structural problems; each is resolved by a layer
   read cache.
 - **Guarded root advance** — advancing the bucket MST root only if it still matches the root the
   `queue-bucket.commit` started from.
-- **Single-winner latch** — the atomic session-state transition that serializes multipart
-  Complete vs Abort.
+- **`queue-multipart-upload`** — the task queue every change to a multipart upload runs on, with
+  the upload ID as its subject, so a Complete and an Abort of one upload never overlap.
 - **Reference index (`blob_refs`)** — `(space, digest) → versions`, the reverse map that gates
   deletion.
 - **IPNI** — InterPlanetary Network Indexer; the indexer's durable, network-wide advertisement layer
@@ -733,8 +759,9 @@ CREATE TABLE ingot.buckets (
     object_lock_config bytea,                            -- auth.BucketLockConfig JSON; NULL = never configured
     bucket_tagging     bytea,                            -- tag set as a JSON object; NULL = no tag set
     cors_config        bytea,                            -- the bucket's own CORS XML; NULL = the gateway default (docs/s3-cors.md)
-    encryption         text CHECK (encryption IN ('AES256','none'))
+    encryption         text CHECK (encryption IN ('AES256','none')),
                                                          -- default encryption; NULL = unconfigured (encrypts)
+    closing            boolean NOT NULL DEFAULT false    -- set by DeleteBucket's queue-bucket.close (§7.3)
 );
 CREATE INDEX buckets_space_idx ON ingot.buckets (space);
 
@@ -876,10 +903,10 @@ CREATE TABLE ingot.shard_inclusions (
     PRIMARY KEY (space, digest)
 );
 
--- One row per in-flight multipart upload (§7.2). `state` is the single-winner
--- latch (§7.3): Complete and Abort race to move it off 'open'; 'completed' rows
--- are retained so a duplicate Complete is idempotent, then reaped by the TTL
--- sweeper, which measures staleness from state_changed_at. The header, lock and
+-- One row per in-flight multipart upload (§7.2). Every change to it runs on
+-- queue-multipart-upload (§7.3): Complete moves it from 'open' to 'completed',
+-- and Abort deletes it. 'completed' rows are retained so a duplicate Complete is
+-- idempotent, then deleted by queue-multipart-upload.reap. The header, lock and
 -- tagging columns carry CreateMultipartUpload's metadata into the Complete-time
 -- manifest; committed_* hold what Complete returned, for a duplicate Complete to
 -- replay. space is recorded so teardown never depends on the bucket row.
@@ -888,7 +915,7 @@ CREATE TABLE ingot.multipart_sessions (
     bucket                    text NOT NULL,
     object_key                text NOT NULL,
     state                     text NOT NULL DEFAULT 'open'
-        CHECK (state IN ('open','completing','aborting','completed')),
+        CHECK (state IN ('open','completed')),
     content_type              text,
     metadata                  jsonb,                     -- user metadata
     created_at                timestamptz NOT NULL DEFAULT now(),
@@ -993,7 +1020,7 @@ references a `segments.seq` by value, deliberately. `blob_refs`, `segments`,
 `shard_inclusions` joins `blob_locations` on `shard_digest`, and `blob_encryption_params` joins
 `blob_locations` on `(space, digest)` with deliberately no FK. `revocation_cursor` stands alone.
 A space's references to a blob are its `blob_refs` claims, its `blob_pending_refs` rows, and the
-parts of its open or completing multipart sessions, counted in one statement
+parts of its open multipart sessions, counted in one statement
 (`registry.CountReferences`). The drop of the last claim queues `remove(digest)`
 ([§6](#6-the-forgechain-layer)) as a `queue-space-shard.release` task on the task runner, subject
 `<space>/<hex digest>`, in the same transaction and due after the release grace; the release does
@@ -1029,7 +1056,7 @@ The storage / delete / retrieval core is built and tested:
   server-computed full-object `CRC64NVME` default when the client names none — S3's
   default-checksum-on-store), `DeleteObjects`,
   metadata-only `CopyObject`, multipart (`Create`/`UploadPart`/`Complete`/`Abort` with the
-  single-winner latch and the `-N` ETag), zero-byte objects. Ranged reads return `206`/`Content-Range`
+  one change per upload at a time and the `-N` ETag), zero-byte objects. Ranged reads return `206`/`Content-Range`
   on **both** `GetObject` and `HeadObject` (`416` on an unsatisfiable range); the system headers
   carried through PUT and replayed on GET/HEAD include `Content-Encoding`/`Disposition`/`Language`,
   `Cache-Control`, and the `Expires` caching header. GET/HEAD also accept `?partNumber=N`: a completed
@@ -1095,9 +1122,9 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   over the `blob_parks` table, and the `queue-multipart-upload-shard.accept` task in
   `s3frontend/acceptor.go` and `registry/accept.go`.) A part holds no local bytes: its blobs
   stream to their providers, and the accept concludes each from its park row. Complete runs the
-  accept for the parts it names, and answers an accept that cannot start within 30 s with a 409 that the AWS CLI treats as final. Abort and session
-  expiry unwind parked blobs with `/blob/abort` and accepted ones with `/blob/remove`
-  ([§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race)).
+  accept for the parts it names, and answers an accept that cannot start within 30 s with a 409 that the AWS CLI treats as final. Abort and the
+  auto-abort unwind parked blobs with `/blob/abort` and accepted ones with `/blob/remove`
+  ([§7.2](#72-multipart)–[7.3](#73-one-change-per-upload-the-abortcomplete-race)).
 - **Crash recovery is not built.** A write that dies after its `queue-space-shard.add` tasks commit
   leaves pending references, which expire after 24 h and release the blobs; one that dies inside an
   add, after the conclude and before the add's commit, leaves an accepted blob with no reference.
@@ -1113,11 +1140,13 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   releases inline, for up to 10 s, before answering. The release shreds the blob's key, unwinds it
   on the network as its state requires, then removes its intent; the task runner
   retries a release that fails, with no attempt limit, backing off from 1 s to 5 min, and the retry
-  holds the blob's subject, so a write's `queue-space-shard.add` of the same blob waits behind it. A background sweeper aborts
-  open sessions older than `multipart_session_ttl` (default 7d) and reaps terminal session rows. A
-  successful Complete retains its session in state `completed` so a duplicate Complete is idempotent
-  per S3. `DeleteBucket` implicitly aborts the bucket's in-flight sessions before the space delete
-  (upstream's conformance teardown never aborts them); `s3:DeleteBucket` delegates `blob.Abort` and
+  holds the blob's subject, so a write's `queue-space-shard.add` of the same blob waits behind it. Each
+  upload's create schedules its `queue-multipart-upload.abort` one `multipart_session_ttl` out
+  (default 7d), which aborts it if it is still open. A successful Complete retains its session in
+  state `completed` so a duplicate Complete is idempotent per S3, and schedules its
+  `queue-multipart-upload.reap` the same TTL out. `DeleteBucket` closes the bucket, aborts its open
+  uploads and reaps its completed ones before the space delete (upstream's conformance teardown
+  never aborts them); `s3:DeleteBucket` delegates `blob.Abort` and
   `blob.Remove`, so the abort and every other release leg signs with the request's own proofs; each
   release task carries the proof chains captured from the request that queued it. `DeleteBucket`
   also brings the space's pending releases forward, runs them inline, and fails for the client to

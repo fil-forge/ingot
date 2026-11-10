@@ -1056,29 +1056,6 @@ func (t *PutChange) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	// t.Session (string) (string)
-	if len("Session") > 1000000 {
-		return xerrors.Errorf("Value in field \"Session\" was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("Session"))); err != nil {
-		return err
-	}
-	if _, err := cw.WriteString(string("Session")); err != nil {
-		return err
-	}
-
-	if len(t.Session) > 1000000 {
-		return xerrors.Errorf("Value in field t.Session was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(t.Session))); err != nil {
-		return err
-	}
-	if _, err := cw.WriteString(string(t.Session)); err != nil {
-		return err
-	}
-
 	// t.HasBlobs (bool) (bool)
 	if len("HasBlobs") > 1000000 {
 		return xerrors.Errorf("Value in field \"HasBlobs\" was too long")
@@ -1124,6 +1101,22 @@ func (t *PutChange) MarshalCBOR(w io.Writer) error {
 	}
 
 	if err := t.Reserved.MarshalCBOR(cw); err != nil {
+		return err
+	}
+
+	// t.Completes (bool) (bool)
+	if len("Completes") > 1000000 {
+		return xerrors.Errorf("Value in field \"Completes\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("Completes"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("Completes")); err != nil {
+		return err
+	}
+
+	if err := cbg.WriteBool(w, t.Completes); err != nil {
 		return err
 	}
 
@@ -1346,17 +1339,6 @@ func (t *PutChange) UnmarshalCBOR(r io.Reader) (err error) {
 
 				t.IfMatch = string(sval)
 			}
-			// t.Session (string) (string)
-		case "Session":
-
-			{
-				sval, err := cbg.ReadStringWithMax(cr, 1000000)
-				if err != nil {
-					return err
-				}
-
-				t.Session = string(sval)
-			}
 			// t.HasBlobs (bool) (bool)
 		case "HasBlobs":
 
@@ -1414,6 +1396,24 @@ func (t *PutChange) UnmarshalCBOR(r io.Reader) (err error) {
 					}
 				}
 
+			}
+			// t.Completes (bool) (bool)
+		case "Completes":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+			if maj != cbg.MajOther {
+				return fmt.Errorf("booleans must be major type 7")
+			}
+			switch extra {
+			case 20:
+				t.Completes = false
+			case 21:
+				t.Completes = true
+			default:
+				return fmt.Errorf("booleans are either major type 7, value 20 or 21 (got %d)", extra)
 			}
 			// t.DeletePre (s3frontend.DeletePreconditions) (struct)
 		case "DeletePre":
@@ -4086,6 +4086,132 @@ func (t *BucketSetLockConfigTask) UnmarshalCBOR(r io.Reader) (err error) {
 
 			if _, err := io.ReadFull(cr, t.Config); err != nil {
 				return err
+			}
+
+		default:
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+func (t *MultipartAbortTask) MarshalCBOR(w io.Writer) error {
+	if t == nil {
+		_, err := w.Write(cbg.CborNull)
+		return err
+	}
+
+	cw := cbg.NewCborWriter(w)
+
+	if _, err := cw.Write([]byte{162}); err != nil {
+		return err
+	}
+
+	// t.Auto (bool) (bool)
+	if len("Auto") > 1000000 {
+		return xerrors.Errorf("Value in field \"Auto\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("Auto"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("Auto")); err != nil {
+		return err
+	}
+
+	if err := cbg.WriteBool(w, t.Auto); err != nil {
+		return err
+	}
+
+	// t.Release (registry.ReleaseTask) (struct)
+	if len("Release") > 1000000 {
+		return xerrors.Errorf("Value in field \"Release\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("Release"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("Release")); err != nil {
+		return err
+	}
+
+	if err := t.Release.MarshalCBOR(cw); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (t *MultipartAbortTask) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = MultipartAbortTask{}
+
+	cr := cbg.NewCborReader(r)
+
+	maj, extra, err := cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}()
+
+	if maj != cbg.MajMap {
+		return fmt.Errorf("cbor input should be of type map")
+	}
+
+	if extra > cbg.MaxLength {
+		return fmt.Errorf("MultipartAbortTask: map struct too large (%d)", extra)
+	}
+
+	n := extra
+
+	nameBuf := make([]byte, 7)
+	for i := uint64(0); i < n; i++ {
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
+		}
+
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
+		// t.Auto (bool) (bool)
+		case "Auto":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+			if maj != cbg.MajOther {
+				return fmt.Errorf("booleans must be major type 7")
+			}
+			switch extra {
+			case 20:
+				t.Auto = false
+			case 21:
+				t.Auto = true
+			default:
+				return fmt.Errorf("booleans are either major type 7, value 20 or 21 (got %d)", extra)
+			}
+			// t.Release (registry.ReleaseTask) (struct)
+		case "Release":
+
+			{
+
+				if err := t.Release.UnmarshalCBOR(cr); err != nil {
+					return xerrors.Errorf("unmarshaling t.Release: %w", err)
+				}
+
 			}
 
 		default:

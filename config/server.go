@@ -45,12 +45,11 @@ type ServerConfig struct {
 	MaxConnections int
 	MaxRequests    int
 
-	// MultipartSessionTTL bounds abandoned multipart uploads: a session whose
-	// state has not changed for this long is torn down by a background
-	// sweeper — open ones aborted (releasing their parked parts), completed
-	// rows retained for Complete idempotency reaped. A Complete's latch
-	// restarts the clock, so a live Complete on an old session is not swept
-	// from under it. Zero → default 7 days; negative → sweeper disabled.
+	// MultipartSessionTTL bounds multipart uploads: an upload still open this
+	// long after its creation is aborted (releasing its parked parts), and a
+	// completed one, kept so a repeated Complete gets the same answer, is
+	// reaped this long after its Complete. Zero → default 7 days; negative →
+	// neither.
 	MultipartSessionTTL time.Duration
 
 	// CompleteMultipartKeepalive is the interval between the newlines a

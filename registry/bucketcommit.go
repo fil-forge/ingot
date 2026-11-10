@@ -27,6 +27,8 @@ const (
 	BucketShipAction          = "ship"
 	BucketSetVersioningAction = "set-versioning"
 	BucketSetLockConfigAction = "set-object-lock-config"
+	BucketCloseAction         = "close"
+	BucketAdmitUploadAction   = "admit-upload"
 	BucketDeleteAction        = "delete"
 )
 
@@ -37,12 +39,13 @@ func BucketSubject(space did.DID) string { return space.String() }
 // commit with its outcome: its statements, the tasks it queues and the
 // queue-space-shard.expire tasks it cancels.
 type CommitWrites struct {
-	// Statements are the writes, in order.
-	Statements []Statement
 	// Guards are writes that must each affect a row, or the commit fails and
 	// runs again (taskrunner.Exec.WriteConditional): the root's advance from
-	// the root the commit read, and the take-over of its pending references.
+	// the root the commit read, a part's row, and the take-over of pending
+	// references. They run first, in order.
 	Guards []Statement
+	// Statements are the other writes, in order, after the guards.
+	Statements []Statement
 	// Spawns are the tasks the commit queues: upload registrations and
 	// releases.
 	Spawns []taskrunner.Spec
@@ -138,20 +141,8 @@ func (r *Postgres) claimWrites(ctx context.Context, w *CommitWrites, claims []Bl
 			refs = append(refs, c.Ref)
 		}
 	}
-	slices.SortFunc(refs, func(a, b taskrunner.TaskID) int { return bytes.Compare(a[:], b[:]) })
-	refs = slices.Compact(refs)
-	if len(refs) > 0 {
-		var expires []taskrunner.TaskID
-		if err := r.pool.QueryRow(ctx,
-			`SELECT coalesce(array_agg(expire_task), '{}') FROM ingot.blob_pending_refs WHERE add_task = ANY($1)`,
-			refs).Scan(&expires); err != nil {
-			return fmt.Errorf("registry: read pending references: %w", err)
-		}
-		if len(expires) != len(refs) {
-			return ErrReferenceExpired
-		}
-		w.Guards = append(w.Guards, takeoverGuard(refs))
-		w.Expiries = append(w.Expiries, expires...)
+	if err := r.refWrites(ctx, w, refs); err != nil {
+		return err
 	}
 	w.Statements = append(w.Statements,
 		Statement{
@@ -244,9 +235,7 @@ func (r *Postgres) dropWrites(ctx context.Context, w *CommitWrites, c RootCommit
 // PendingRefsHeld reports whether every one of refs, the IDs of the
 // queue-space-shard.add tasks that took them, is still a pending reference.
 func (r *Postgres) PendingRefsHeld(ctx context.Context, refs []taskrunner.TaskID) (bool, error) {
-	refs = slices.Clone(refs)
-	slices.SortFunc(refs, func(a, b taskrunner.TaskID) int { return bytes.Compare(a[:], b[:]) })
-	refs = slices.Compact(refs)
+	refs = sortedRefs(refs)
 	if len(refs) == 0 {
 		return true, nil
 	}
@@ -258,18 +247,11 @@ func (r *Postgres) PendingRefsHeld(ctx context.Context, refs []taskrunner.TaskID
 	return n == len(refs), nil
 }
 
-// CompletedSession is the write that records uploadID's Complete with the
-// commit that installs its object: it moves the session from completing to
-// completed with the object's etag and versionID ("" for none). It is a
-// guard: a session no longer completing, as a teardown leaves it, fails the
-// commit, which then runs again and refuses the Complete.
-func CompletedSession(uploadID, etag, versionID string) Statement {
-	return Statement{
-		`UPDATE ingot.multipart_sessions
-		    SET state = $2, committed_etag = $3, committed_version_id = $4, state_changed_at = now()
-		  WHERE upload_id = $1 AND state = $5`,
-		[]any{uploadID, SessionCompleted, etag, nullString(versionID), SessionCompleting},
-	}
+// sortedRefs returns refs sorted, each once.
+func sortedRefs(refs []taskrunner.TaskID) []taskrunner.TaskID {
+	refs = slices.Clone(refs)
+	slices.SortFunc(refs, func(a, b taskrunner.TaskID) int { return bytes.Compare(a[:], b[:]) })
+	return slices.Compact(refs)
 }
 
 // takeoverGuard is the guard that takes refs, pending references, over for
@@ -300,4 +282,11 @@ func VersioningSet(name string, v VersioningState) (Statement, error) {
 // configuration. It is a guard: a bucket gone fails the task's commit.
 func LockConfigSet(name string, cfg []byte) Statement {
 	return Statement{`UPDATE ingot.buckets SET object_lock_config = $1 WHERE name = $2`, []any{cfg, name}}
+}
+
+// ClosingSet is the write that marks bucket name closing, which
+// queue-bucket.close commits. It is a guard: a bucket gone fails the task's
+// commit.
+func ClosingSet(name string) Statement {
+	return Statement{`UPDATE ingot.buckets SET closing = true WHERE name = $1`, []any{name}}
 }

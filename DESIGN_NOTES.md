@@ -206,7 +206,7 @@ upload's `queue-multipart-upload-shard.accept` (`s3frontend/acceptor.go`,
 accept pending. The accept runs on its own queue (`registry.AcceptQueue`)
 with the upload ID as its subject, so one accept runs per upload at a time,
 apart from the upload's other work. It does nothing unless the session is
-`open` or `completing`. It lists the parked parts in part order behind a
+`open`. It lists the parked parts in part order behind a
 part-number cursor, in batches of up to `MaxConcludeReceipts` (1000) blobs,
 and never splits a part across batches. It concludes each batch and
 continues until no parked part is left after the cursor, so parts that land
@@ -243,7 +243,7 @@ or Complete's, concludes whatever is left. `ingot.multipart.parked_age`
 (accept batches, by outcome) and `ingot.multipart.complete_deferred` report
 the queue's health; the README lists them.
 
-An abort, a session expiry or a part re-upload can release a blob while an
+An abort, an auto-abort or a part re-upload can release a blob while an
 accept is concluding it, and the upload service decides the order: a
 released allocation refuses the accept, and an accepted blob refuses
 `/blob/abort`, so the release follows it with `/blob/remove`. The release
@@ -257,12 +257,34 @@ uploads in one space holding the same bytes share a park, and both accepts
 may conclude it: a repeated conclude is harmless upstream, the first record
 swaps the park, and the second finds the location.
 
-`CompleteMultipartUpload` latches the session to `completing`, which stops
-new parts, and runs the upload's accept as a sync task limited to the part
-numbers it lists, so a part it drops cannot fail it. The sync task waits for
+Every change to a multipart upload runs as a task on
+`queue-multipart-upload` (`s3frontend/multipartqueue.go`), with the upload
+ID as its subject, so one change to an upload runs at a time: a part never
+lands beside a Complete or an Abort, and a Complete and an Abort never
+overlap. The queue is first in the runner's order. CreateMultipartUpload
+runs `queue-multipart-upload.create`, which runs `queue-bucket.admit-upload`
+as a sync child (it refuses a bucket a DeleteBucket has closed), writes the
+session row, and schedules `queue-multipart-upload.abort`, the auto-abort,
+one session TTL out (`multipart_session_ttl`, 7 days by default, negative
+for never). UploadPart streams the part's blobs and takes their references
+in the request, then runs `queue-multipart-upload.add-part`, which records
+the part row. One that waits more than 30 s behind the upload's other
+changes answers SlowDown, and one for an upload that is not open answers
+NoSuchUpload.
+
+`CompleteMultipartUpload` runs `queue-multipart-upload.complete`. It waits
+up to 10 s (`replayWaitBudget`) for the upload's other changes, another
+Complete included, and past that answers OperationAborted. An upload
+already completed replays the result recorded on its session, the same
+ETag and version id. Otherwise Complete validates the parts, checks the
+re-hash budget, reserves and reports the version id, and runs the upload's
+accept limited to the part numbers it lists, so a part it drops cannot fail
+it. The accept runs as a task of its own, not a child, so its writes commit
+before Complete reads the parts again and assembles the object's tree,
+which reads the accepted blobs back through their locations. It waits for
 an accept already running and runs after any pending. If it cannot start
 within 30 s (`acceptWaitBudget`), Complete answers OperationAborted, a 409,
-and the latch reverts to `open`. The AWS CLI and other botocore-based
+and the upload stays open. The AWS CLI and other botocore-based
 clients treat that 409 as final and abort the upload, so the 30 s budget is
 the margin before a client sees a failed upload. An accept that fails fails
 Complete with its error. After the accept, every listed part must be
@@ -272,34 +294,43 @@ keeps a part's bytes to upload them again, so Complete answers `InvalidPart`
 and the client uploads the part again. Every part blob streams to its
 provider as the part arrives, and an UploadPart whose blob does not stream
 fails. Complete lays out the object's byte ranges from the part rows' blob
-lengths and claims every blob in the root advance's transaction, a few
-statements however many blobs there are (`registry.Postgres.RootCommitWrites`).
-The commit records the session completed in that same transaction, and only
-while it is still completing: a teardown (DeleteBucket, the stale-session
-sweeper) that latched it away first makes the commit fail with
-`NoSuchUpload`.
+lengths and runs `queue-bucket.commit` as a sync child, which claims every
+blob in the root advance's transaction, a few statements however many
+blobs there are (`registry.Postgres.RootCommitWrites`). The same
+transaction moves the session from open to completed (a guard), deletes
+the part trees, queues the releases of the unlisted parts' blobs, and
+schedules `queue-multipart-upload.reap` one session TTL out. The reap
+deletes the completed session and its parts and releases nothing: the
+object's claims hold the listed parts' blobs.
 
-Every session teardown (abort, expiry, the completed-session reap, a
-superseded part, the parts a Complete omitted) queues a
-`queue-space-shard.release` task, due at once, for each blob of the session
-that is not still live in it *before* it deletes the session row. Whether
+AbortMultipartUpload runs `queue-multipart-upload.abort`, as does the
+auto-abort. It acts only on an open upload: it deletes the session, whose
+parts and part trees cascade, and queues the releases of its parts' blobs.
+An upload completed or gone is NoSuchUpload for a client's abort and
+nothing for the auto-abort. DeleteBucket aborts the bucket's open uploads
+and reaps its completed ones from the request, after it has closed the
+bucket.
+
+Every session teardown (an abort or auto-abort, a superseded part, the
+parts a Complete omitted) queues a `queue-space-shard.release` task, due at
+once, for each blob of the session that is not still live in it, in the
+same commit as the change that drops the blob's part reference. Whether
 the blob is in fact free to go is decided when the release runs, never at
 teardown: a release of a digest the space still references (a committed
 object's claim, a write's pending reference, a part of an in-flight session)
 does nothing. Deciding at
 teardown would race another teardown sharing the blob. A committed blob is
 recognisable for good: its first reference claim marks its upload intent
-`published` in the same transaction, so the reap of a retained session,
-completed or stranded, leaves such blobs to the object path's own releases
-whatever has become of the object. A blob with no intent at all is one a
-release already took, intent and all: a reap that still holds its part rows
-leaves it alone rather than queueing it again, since the second release
+`published` in the same transaction, so an abort leaves such blobs to the
+object path's own releases whatever has become of the object. A blob with
+no intent at all is one a release already took, intent and all: an abort
+that still holds its part rows leaves it alone rather than queueing it again, since the second release
 would find neither rows nor intent and ask the network to remove a blob that
 may never have reached it.
 The part rows are the only index to the blobs and cascade away with the
-session, so the queued task is what makes the teardown recoverable: a
-failure before it leaves the session for the multipart sweeper, and a
-failure after it leaves tasks the runner retries, with no attempt limit and
+session, so the queued tasks are what make the teardown recoverable: an
+abort that fails commits nothing and runs again, and the releases it
+committed are tasks the runner retries. Both retry with no attempt limit and
 a backoff from 1 s doubling to 5 min. Once the session row is gone, the
 teardown runs those releases inline, within 10 s (`releaseNow`), so an Abort
 has released its parked blobs on their providers before it answers;
@@ -398,7 +429,7 @@ writes the source's blobs into another bucket's catalog, hands the commit
 the list rather than the source's extent links. One manifest holds at most
 8,389,632 blobs (`bucket.MaxBodyBlobs`, cbor-gen's 8,192-entry cap on the
 extent list); a Complete over it is refused with `EntityTooLarge` before
-the session latches. A PutObject or CopyObject is at most 5 GiB and accepts
+it reports a version id, and the upload stays open. A PutObject or CopyObject is at most 5 GiB and accepts
 its blobs before the commit, so it is kept under the limit by configuration
 instead: `max_blob_size` may not be below 1 KiB (`config.MinMaxBlobSize`). The 48.8 TiB S3 maximum fits whenever `max_blob_size`
 is at least 6.11 MiB. `PartSizes` and `PartChecksums` hold 10,000 entries,
@@ -486,9 +517,10 @@ CopyObject's commit claims each blob with the add's task ID
 deleted, its expiry cancelled, and the `blob_refs` claim inserted. A
 reference that has expired fails that change with
 `registry.ErrReferenceExpired`, and the client gets SlowDown. UploadPart
-runs its blobs' adds before it writes the part row, and `PutPart` takes
-their references over in its transaction (`MultipartPart.Refs`); a PutPart
-that fails expires the write's references at once and runs the releases they
+runs its blobs' adds before it writes the part row, and
+`queue-multipart-upload.add-part` takes their references over in its commit
+(`MultipartPart.Refs`, `registry.Postgres.PartWrites`); an add-part that
+fails expires the write's references at once and runs the releases they
 leave (`dropRefsNow`). Complete's claims carry no reference: the session's
 parts reference the blobs until its teardown. Any other write that fails
 before its commit leaves its references to expire. A
@@ -499,7 +531,7 @@ reader grace is owed. It retries without limit, backing off from 1 s to
 5 min.
 
 A space's references to a digest are its claims, its pending references and
-the parts of its open or completing multipart sessions, counted in one
+the parts of its open multipart sessions, counted in one
 statement (`registry.CountReferences`), so a row that takes another's
 reference over in one transaction is counted before or after the move, and
 never missed. A release that finds any reference is stale and does nothing.
@@ -510,8 +542,8 @@ queued behind it waits: a failed attempt may already have removed the blob,
 and the add then finds it unlocated and concludes its own stream (a space
 can take a digest again once `/blob/remove` has its receipt). Every reference enters
 through an add on the subject, so a release that may have acted never finds
-one afterwards. A release runs only as a task: Complete leaves an orphan
-whose release it failed to queue to the reap.
+one afterwards. A release runs only as a task: Complete queues its orphans'
+releases with its own commit.
 
 In a plaintext bucket, a write of a deleted object's bytes while that
 object's release is still within its reader grace keeps the blob: the

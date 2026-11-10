@@ -57,6 +57,7 @@ func main() {
 		s3frontend.BucketCreateTask{},
 		s3frontend.BucketSetVersioningTask{},
 		s3frontend.BucketSetLockConfigTask{},
+		s3frontend.MultipartAbortTask{},
 	); err != nil {
 		panic(err)
 	}

@@ -182,9 +182,8 @@ is a task in Postgres, so it survives a restart.
 A multipart part keeps no local copy, so Complete relies on the provider
 keeping each parked allocation until it runs; keep `multipart_session_ttl`
 (default `168h`) well under how long the provider keeps parked allocations.
-The TTL counts from the session's last state change, and a failed Complete
-returns the session to open, which restarts it, so a part can outlive the
-TTL. The budget is off by default (`local_blob_max_bytes: 0`): without it
+The TTL counts from the upload's creation, when its auto-abort is
+scheduled, so no parked part outlives it. The budget is off by default (`local_blob_max_bytes: 0`): without it
 the cache grows with every live object's bodies. A node that rarely reads
 back what it just wrote can keep no written bodies at all: with
 `cache_writes: false`, a write keeps no copy and every read goes to the
@@ -224,7 +223,7 @@ uploads them (see DESIGN_NOTES), and report:
 
 | Metric | Meaning |
 | -- | -- |
-| `ingot.multipart.parked_age` | Seconds the oldest parked part of an open or completing upload has waited for acceptance, read from the part rows when collected; 0 when none waits. Parts are accepted within seconds, so growth means the acceptance queue is stuck |
+| `ingot.multipart.parked_age` | Seconds the oldest parked part of an open upload has waited for acceptance, read from the part rows when collected; 0 when none waits. Parts are accepted within seconds, so growth means the acceptance queue is stuck |
 | `ingot.multipart.accept_passes` | Accept batches that concluded parts, by `outcome`: `accepted` or `failed` (the accept retries; a timed-out batch included) |
 | `ingot.multipart.complete_deferred` | CompleteMultipartUpload requests answered OperationAborted because the upload's accept did not start in time. Botocore clients (the AWS CLI) treat that as a failed upload |
 

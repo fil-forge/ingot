@@ -2,6 +2,8 @@ package s3frontend
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -209,5 +211,54 @@ func TestAnAbandonedDeleteNeverActs(t *testing.T) {
 	}
 	if _, err := mem.Get(ctx, "bk"); err != nil {
 		t.Fatalf("the bucket after the refused delete: %v", err)
+	}
+}
+
+// answeringAuthority answers DeleteBucket with err.
+type answeringAuthority struct {
+	bucketauthority.BucketAuthority
+	err error
+}
+
+func (a *answeringAuthority) DeleteBucket(context.Context, cmds3.Request) error { return a.err }
+
+// TestDeleteBucket_OnlyARefusalReopens: Hilt not finding the space means an
+// earlier delete removed it, so the delete finishes; a refusal reopens the
+// bucket; a call that failed on its way may have deleted the space, so the
+// bucket stays closing.
+func TestDeleteBucket_OnlyARefusalReopens(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err     error
+		gone    bool
+		closing bool
+	}{
+		"not found":   {err: bucketauthority.ErrNotFound, gone: true},
+		"refused":     {err: fmt.Errorf("%w: access denied", bucketauthority.ErrRefused)},
+		"not empty":   {err: bucketauthority.ErrNotEmpty},
+		"unreachable": {err: errors.New("connection reset"), closing: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
+				d.Authority = &answeringAuthority{BucketAuthority: d.Authority, err: tc.err}
+			})
+			ctx := context.WithValue(context.Background(), reqscope.RequestKey(), cmds3.Request{})
+			err := b.DeleteBucket(ctx, "bk")
+			if tc.gone != (err == nil) {
+				t.Fatalf("DeleteBucket: %v", err)
+			}
+			st, gerr := mem.Get(ctx, "bk")
+			if tc.gone {
+				if !errors.Is(gerr, registry.ErrNotFound) {
+					t.Fatalf("the bucket after the delete: %v, want gone", gerr)
+				}
+				return
+			}
+			if gerr != nil {
+				t.Fatal(gerr)
+			}
+			if st.Closing != tc.closing {
+				t.Fatalf("closing = %v, want %v", st.Closing, tc.closing)
+			}
+		})
 	}
 }

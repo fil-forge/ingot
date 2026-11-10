@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/ipfs/go-cid"
+	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/taskrunner"
 )
@@ -27,11 +28,6 @@ func (r *Postgres) CommitRoot(ctx context.Context, name string, expect, next cid
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	for _, st := range w.Statements {
-		if _, err := tx.Exec(ctx, st.SQL, st.Args...); err != nil {
-			return err
-		}
-	}
 	for i, st := range w.Guards {
 		tag, err := tx.Exec(ctx, st.SQL, st.Args...)
 		if err != nil {
@@ -51,6 +47,11 @@ func (r *Postgres) CommitRoot(ctx context.Context, name string, expect, next cid
 			return ErrNotFound
 		}
 		return ErrConflict
+	}
+	for _, st := range w.Statements {
+		if _, err := tx.Exec(ctx, st.SQL, st.Args...); err != nil {
+			return err
+		}
 	}
 	if len(w.Spawns) > 0 {
 		if _, err := r.tasks.SubmitAllTx(ctx, tx, w.Spawns); err != nil {
@@ -72,3 +73,47 @@ func (r *Postgres) CASRoot(ctx context.Context, name string, expect, next cid.Ci
 
 // TakeoverGuard exposes takeoverGuard to the package's tests.
 func TakeoverGuard(refs []taskrunner.TaskID) Statement { return takeoverGuard(refs) }
+
+// PutPart applies PartWrites as a queue-multipart-upload.add-part commits
+// them, in one transaction, for tests that drive the registry directly. A
+// guard that affects no row is ErrNotFound: the upload was no longer open,
+// or a reference had gone.
+func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree, release ReleaseTask) ([]multihash.Multihash, error) {
+	w, released, err := r.PartWrites(ctx, p, tree, release)
+	if err != nil {
+		return nil, err
+	}
+	if r.tasks == nil {
+		return nil, fmt.Errorf("registry: put part: the registry has no task runner")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, st := range w.Guards {
+		tag, err := tx.Exec(ctx, st.SQL, st.Args...)
+		if err != nil {
+			return nil, err
+		}
+		if tag.RowsAffected() == 0 {
+			return nil, ErrNotFound
+		}
+	}
+	for _, st := range w.Statements {
+		if _, err := tx.Exec(ctx, st.SQL, st.Args...); err != nil {
+			return nil, err
+		}
+	}
+	for _, spec := range w.Spawns {
+		if _, err := r.tasks.SubmitTx(ctx, tx, spec); err != nil {
+			return nil, err
+		}
+	}
+	if len(w.Expiries) > 0 {
+		if err := r.tasks.CancelTx(ctx, tx, ReleaseQueue, w.Expiries...); err != nil {
+			return nil, err
+		}
+	}
+	return released, tx.Commit(ctx)
+}

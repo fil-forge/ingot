@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
@@ -475,5 +477,54 @@ func TestChildDoesNotStartOnceTheRootLeaseIsLost(t *testing.T) {
 	}
 	if n := childRuns.Load(); n != 1 {
 		t.Errorf("the child ran %d times, want once: never under the lost root lease", n)
+	}
+}
+
+// A commit that runs long holds its lease row locked from start to end.
+// Renewal skips that row instead of waiting on it, so the other leases this
+// runner holds stay renewed, and the commit extended its own lease when it
+// locked it, so neither lapses. Here one task's commit runs three seconds and
+// another task holds its lease meanwhile; the lease TTL is one second, long
+// enough that a busy runner's late renewal does not lapse it.
+func TestALongCommitStopsNoRenewal(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	f := newFixture(t, 0, func(o *taskrunner.Options) {
+		o.LeaseTTL = time.Second
+		o.Logger = zap.New(core)
+	})
+	f.handle(t, qTop, "slow-commit", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		return nil, ex.Write(ctx, `SELECT pg_sleep(3)`)
+	})
+	started := make(chan struct{})
+	var runs atomic.Int32
+	f.handle(t, qBottom, "long-hold", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if runs.Add(1) == 1 {
+			close(started)
+		}
+		time.Sleep(4500 * time.Millisecond)
+		return nil, ex.Write(ctx, `SELECT 1`)
+	})
+	f.start(t)
+	ctx := waitCtx(t)
+
+	held := make(chan error, 1)
+	go func() {
+		_, err := f.r.Run(ctx, taskrunner.Spec{Queue: qBottom, Subject: "held", Action: "long-hold"})
+		held <- err
+	}()
+	<-started
+	if _, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "slow", Action: "slow-commit"}); err != nil {
+		t.Fatalf("slow commit: %v", err)
+	}
+	if err := <-held; err != nil {
+		t.Fatalf("the task holding its lease through the slow commit: %v", err)
+	}
+	if n := runs.Load(); n != 1 {
+		t.Fatalf("the task holding its lease ran %d times: its lease lapsed during the slow commit", n)
+	}
+	// Renewal skipped the slow commit's lease past the expiry it had before
+	// the commit extended it, and still counted it kept.
+	if n := logs.FilterMessage("lease lost to another consumer").Len(); n != 0 {
+		t.Fatalf("renewal took %d leases for lost during the slow commit", n)
 	}
 }

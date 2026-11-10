@@ -416,7 +416,7 @@ func (r *Runner) failOrRetry(ctx context.Context, h *hold, a *action, tasks []Ta
 		return fmt.Errorf("record failure of %s.%s: %w", tasks[0].Queue, tasks[0].Action, err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	if err := lockLease(ctx, tx, h); err != nil {
+	if err := lockLease(ctx, tx, h, r.opts.LeaseTTL); err != nil {
 		return err
 	}
 	errs := make([]error, len(tasks))
