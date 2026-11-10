@@ -73,7 +73,11 @@ func newTestStore(t testing.TB) *testStore {
 			{Name: registry.ReleaseQueue, Workers: 2},
 			{Name: ShardQueue, Workers: 2},
 		},
-		LeaseTTL:     time.Second,
+		// Renewal runs every third of the TTL, and a lease it finds expired
+		// is lost. Under the race detector on a loaded runner a renewal can
+		// run a second late, which lapsed a one-second lease held through a
+		// long Complete.
+		LeaseTTL:     10 * time.Second,
 		PollInterval: 10 * time.Millisecond,
 		Node:         testNode,
 		Logger:       zaptest.NewLogger(t),
