@@ -811,8 +811,10 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 	opts = append(opts, s3api.WithRoute(http.MethodGet, web.WellKnownDIDPath, didDocumentHandler(doc)))
 
 	// No s3api.WithRootUser: the gateway has no root account, so every access
-	// key resolves through iam.
-	api, err := s3api.New(backend,
+	// key resolves through iam. The backend gets each request's context
+	// detached from fasthttp's request value, which fasthttp reuses once the
+	// handler returns (detachedBackend).
+	api, err := s3api.New(detachedBackend{b: backend},
 		cfg.Region, iam, loggers.S3Logger, loggers.AdminLogger, evSender, mm,
 		opts...,
 	)
