@@ -214,11 +214,7 @@ func (c *Consumer) Run(ctx context.Context) {
 				zap.Stringer("cause", rec.Cause),
 				zap.String("cursor", string(event.Cursor)),
 				zap.Int("keys_invalidated", len(keys)))
-			cur := registry.RevocationCursor{
-				Token:      string(event.Cursor),
-				RecordedAt: rec.RecordedAt.Time(),
-				Revoke:     rec.Revoke,
-			}
+			cur := registry.RevocationCursor{Token: string(event.Cursor)}
 			position = cur
 			// Published only after Revoke returns, so the saver never saves
 			// past a record that has not been applied.

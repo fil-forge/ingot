@@ -725,7 +725,6 @@ func TestPostgresStores(t *testing.T) {
 		if _, err := r.GetRevocationCursor(ctx); err != registry.ErrNotFound {
 			t.Fatalf("GetRevocationCursor before put err = %v, want ErrNotFound", err)
 		}
-		// A head saved before the first record has no record to describe.
 		first := registry.RevocationCursor{Token: "1733"}
 		if err := r.PutRevocationCursor(ctx, first); err != nil {
 			t.Fatalf("PutRevocationCursor: %v", err)
@@ -734,15 +733,11 @@ func TestPostgresStores(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetRevocationCursor: %v", err)
 		}
-		if got.Token != first.Token || !got.RecordedAt.IsZero() || got.Revoke.Defined() {
+		if *got != first {
 			t.Fatalf("cursor = %+v, want %+v", got, first)
 		}
 		// The row is a single latch: a second put overwrites, never adds.
-		second := registry.RevocationCursor{
-			Token:      "1734",
-			RecordedAt: time.Now().UTC().Truncate(time.Microsecond), // timestamptz is µs-precision
-			Revoke:     liveCid(t, "revoked-2"),
-		}
+		second := registry.RevocationCursor{Token: "1734"}
 		if err := r.PutRevocationCursor(ctx, second); err != nil {
 			t.Fatalf("PutRevocationCursor (upsert): %v", err)
 		}
@@ -750,7 +745,7 @@ func TestPostgresStores(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetRevocationCursor after upsert: %v", err)
 		}
-		if got.Token != second.Token || !got.RecordedAt.Equal(second.RecordedAt) || !got.Revoke.Equals(second.Revoke) {
+		if *got != second {
 			t.Fatalf("cursor after upsert = %+v, want %+v", got, second)
 		}
 	})
