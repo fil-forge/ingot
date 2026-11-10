@@ -21,6 +21,7 @@ import (
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
 )
@@ -1123,10 +1124,12 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 		t.Fatalf("pool: %v", err)
 	}
 	defer pool.Close()
-	reg := registry.NewPostgres(pool)
+	tasks := liveUploadTasks(t, setupPool)
+	reg := registry.NewPostgres(pool, registry.WithTasks(tasks))
 	setup := registry.NewPostgres(setupPool)
 
 	space := testutil.RandomDID(t)
+	t.Cleanup(func() { clearQueuedUploads(t, setupPool, space) })
 	regs := []registry.UploadRegistration{{
 		Bucket: "cas-single-conn", ObjectKey: "k", Space: space,
 		Root: liveCid(t, "root"), Op: registry.UploadRegistrationAdd, Proofs: []byte("proofs"),
@@ -1155,8 +1158,6 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 	if err := setup.Create(ctx, "cas-single-conn", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	// Deleting the bucket cascades to its registrations, which matters here:
-	// this suite runs against a database that persists between runs.
 	t.Cleanup(func() { _ = setup.Delete(context.Background(), "cas-single-conn") })
 
 	// A root that does not match: the same path, reporting a conflict.
@@ -1175,74 +1176,137 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 	}
 	// Scoped to this run's space: the suite's database persists, so a global
 	// count would depend on what ran before.
-	queued, err := setup.ListUploadRegistrationsBySpace(ctx, space)
-	if err != nil {
-		t.Fatalf("list by space: %v", err)
-	}
-	if len(queued) != 1 {
+	if queued := queuedUploads(t, setupPool, space); len(queued) != 1 {
 		t.Fatalf("queued %d registrations for the space, want 1", len(queued))
 	}
 }
 
-// TestDeletingABucketCascadesItsUploadRegistrations: a queued object-count
-// change is only meaningful while its bucket exists, so the two share one
-// fate. The database enforces it, which is what keeps bucket teardown free of
-// a cleanup step to sequence, to fail on its own, or to leave behind.
-//
-//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run Cascades -v
-func TestDeletingABucketCascadesItsUploadRegistrations(t *testing.T) {
+// liveUploadTasks returns a migrated runner holding the upload queue, for the
+// registry to queue registrations through.
+func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
+	t.Helper()
+	r, err := taskrunner.New(pool, taskrunner.Options{Schema: "ingot", Queues: []taskrunner.QueueOptions{{Name: registry.UploadQueue}}})
+	if err != nil {
+		t.Fatalf("task runner: %v", err)
+	}
+	// Submitting a task needs its handler registered, though these tests
+	// never run one.
+	for _, op := range []registry.UploadRegistrationOp{registry.UploadRegistrationAdd, registry.UploadRegistrationRemove} {
+		if err := r.Handle(registry.UploadQueue, string(op), func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+			return nil, nil
+		}); err != nil {
+			t.Fatalf("register %s: %v", op, err)
+		}
+	}
+	if err := r.Migrate(context.Background()); err != nil {
+		t.Fatalf("task runner migrate: %v", err)
+	}
+	return r
+}
+
+// queuedUploads returns the space's pending registrations, in queue order.
+// Tasks outlive their bucket, so each test clears its space's afterwards.
+func queuedUploads(t *testing.T, pool *pgxpool.Pool, space did.DID) []registry.UploadRegistration {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), `SELECT subject, action, args FROM ingot.queue_space_upload_tasks
+		WHERE subject = $1 AND state = 'pending' ORDER BY seq`, space.String())
+	if err != nil {
+		t.Fatalf("list queued uploads: %v", err)
+	}
+	defer rows.Close()
+	var out []registry.UploadRegistration
+	for rows.Next() {
+		var task taskrunner.Task
+		if err := rows.Scan(&task.Subject, &task.Action, &task.Args); err != nil {
+			t.Fatalf("scan queued upload: %v", err)
+		}
+		reg, err := registry.UploadRegistrationFromTask(task)
+		if err != nil {
+			t.Fatalf("decode queued upload: %v", err)
+		}
+		out = append(out, reg)
+	}
+	return out
+}
+
+func clearQueuedUploads(t *testing.T, pool *pgxpool.Pool, space did.DID) {
+	t.Helper()
+	_, _ = pool.Exec(context.Background(), `DELETE FROM ingot.queue_space_upload_tasks WHERE subject = $1`, space.String())
+}
+
+// livePool returns a pool on the test database with ingot's migrations
+// applied, skipping the test without INGOT_TEST_DSN.
+func livePool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
 	dsn := os.Getenv("INGOT_TEST_DSN")
 	if dsn == "" {
 		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
 	}
-	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
+	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		t.Fatalf("pool: %v", err)
 	}
-	defer pool.Close()
-	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
+	t.Cleanup(pool.Close)
+	if err := migrations.Up(context.Background(), pool, zaptest.NewLogger(t)); err != nil {
 		t.Fatalf("migrations: %v", err)
 	}
-	r := registry.NewPostgres(pool)
+	return pool
+}
 
+// TestCommitRootQueuesUploadRegistrationsLive: a commit's registrations become
+// tasks in its own transaction, in commit order, carrying what the worker
+// needs; a commit that fails queues none.
+//
+//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run QueuesUploadRegistrations -v
+func TestCommitRootQueuesUploadRegistrationsLive(t *testing.T) {
+	pool := livePool(t)
+	ctx := context.Background()
+	r := registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool)))
 	space := testutil.RandomDID(t)
-	if err := r.Create(ctx, "cascade-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+	t.Cleanup(func() { clearQueuedUploads(t, pool, space) })
+	if err := r.Create(ctx, "queue-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	t.Cleanup(func() { _ = r.Delete(context.Background(), "cascade-bucket") })
+	t.Cleanup(func() { _ = r.Delete(context.Background(), "queue-bucket") })
 
-	if err := r.CommitRoot(ctx, "cascade-bucket", cid.Undef, liveCid(t, "root"),
-		registry.RootCommit{Registrations: []registry.UploadRegistration{{
-			Bucket: "cascade-bucket", ObjectKey: "k", Space: space,
-			Root: liveCid(t, "mf"), Op: registry.UploadRegistrationAdd, Proofs: []byte("proofs"),
-		}}}); err != nil {
+	regs := []registry.UploadRegistration{
+		{Bucket: "queue-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "new"), Op: registry.UploadRegistrationAdd, Proofs: []byte("add proofs")},
+		{Bucket: "queue-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "old"), Op: registry.UploadRegistrationRemove, Proofs: []byte("remove proofs")},
+	}
+	if err := r.CommitRoot(ctx, "queue-bucket", liveCid(t, "stale"), liveCid(t, "root"), registry.RootCommit{Registrations: regs}); !errors.Is(err, registry.ErrConflict) {
+		t.Fatalf("stale commit: %v, want ErrConflict", err)
+	}
+	if queued := queuedUploads(t, pool, space); len(queued) != 0 {
+		t.Fatalf("a failed commit queued %d registrations", len(queued))
+	}
+	if err := r.CommitRoot(ctx, "queue-bucket", cid.Undef, liveCid(t, "root"), registry.RootCommit{Registrations: regs}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
+	if queued := queuedUploads(t, pool, space); !reflect.DeepEqual(queued, regs) {
+		t.Fatalf("queued %+v, want %+v", queued, regs)
+	}
+}
 
-	// A dead-lettered row goes too: it is out of the sweep but still a row,
-	// and the bearer proofs on it have no reason to outlive the bucket.
-	queued, err := r.ListUploadRegistrationsBySpace(ctx, space)
-	if err != nil {
-		t.Fatalf("list by space: %v", err)
+// TestCommitRootWithoutTasksRefusesRegistrations: a registry with no runner
+// cannot queue a commit's registrations, so it refuses the commit rather than
+// dropping them.
+func TestCommitRootWithoutTasksRefusesRegistrationsLive(t *testing.T) {
+	pool := livePool(t)
+	ctx := context.Background()
+	r := registry.NewPostgres(pool)
+	space := testutil.RandomDID(t)
+	if err := r.Create(ctx, "no-tasks-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+		t.Fatalf("create bucket: %v", err)
 	}
-	if len(queued) != 1 {
-		t.Fatalf("queued %d, want 1", len(queued))
+	t.Cleanup(func() { _ = r.Delete(context.Background(), "no-tasks-bucket") })
+	err := r.CommitRoot(ctx, "no-tasks-bucket", cid.Undef, liveCid(t, "root"), registry.RootCommit{
+		Registrations: []registry.UploadRegistration{{Bucket: "no-tasks-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "mf"), Op: registry.UploadRegistrationAdd}},
+	})
+	if err == nil {
+		t.Fatal("a commit with registrations succeeded without a task runner")
 	}
-	if err := r.DeadLetterUploadRegistrations(ctx, []int64{queued[0].Seq}, "test"); err != nil {
-		t.Fatalf("dead-letter: %v", err)
-	}
-
-	if err := r.Delete(ctx, "cascade-bucket"); err != nil {
-		t.Fatalf("delete bucket: %v", err)
-	}
-
-	left, err := r.ListUploadRegistrationsBySpace(ctx, space)
-	if err != nil {
-		t.Fatalf("list by space after delete: %v", err)
-	}
-	if len(left) != 0 {
-		t.Fatalf("%d registrations outlived their bucket", len(left))
+	if st, _ := r.Get(ctx, "no-tasks-bucket"); st != nil && st.Root.Defined() {
+		t.Fatal("the refused commit moved the root")
 	}
 }
 

@@ -35,6 +35,7 @@ import (
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
+	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/uploader"
 )
@@ -78,8 +79,11 @@ type ServerDeps struct {
 	// catalog: one entry per committed object version, which is what the
 	// service counts to report the space's object count.
 	Registrar uploader.UploadRegistrar
-	// UploadRegs is the upload-registration outbox the sweeper drains.
-	UploadRegs registry.UploadRegistrationStore
+	// Tasks runs ingot's durable task queues: New registers the handlers,
+	// Start starts it and Stop stops it. It must be migrated, and be the
+	// runner the Postgres registry queues through (registry.WithTasks). nil
+	// with an in-memory registry, which queues no tasks.
+	Tasks *taskrunner.Runner
 
 	// Authority is the service that authorizes bucket creation and deletion.
 	Authority bucketauthority.BucketAuthority
@@ -155,6 +159,8 @@ type Server struct {
 	log     blockstore.Log
 	backend *s3frontend.Backend
 	api     *s3api.S3ApiServer
+	// tasks is ServerDeps.Tasks.
+	tasks *taskrunner.Runner
 	// sweepCtx is cancelled by Stop. Every background sweep derives its
 	// context from it, and sweeps counts the sweeper goroutines, so Stop
 	// can wait for them to exit before the registry closes.
@@ -240,7 +246,6 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Streaming:       deps.Streaming,
 		Streams:         deps.Streams,
 		Registrar:       deps.Registrar,
-		UploadRegs:      deps.UploadRegs,
 		EncParams:       deps.EncParams,
 		RegionKeys:      deps.RegionKeys,
 		TenantKeys:      deps.TenantKeys,
@@ -261,6 +266,14 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Logger:              logger,
 	})
 
+	if deps.Tasks != nil {
+		if err := backend.RegisterUploadTasks(deps.Tasks); err != nil {
+			_ = backend.CloseMetrics()
+			_ = log.Close(ctx)
+			return nil, fmt.Errorf("ingot: register upload tasks: %w", err)
+		}
+	}
+
 	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, logger)
 	if err != nil {
 		// Best-effort cleanup if we got past the log open: the caller
@@ -276,6 +289,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		log:     log,
 		backend: backend,
 		api:     api,
+		tasks:   deps.Tasks,
 	}, nil
 }
 
@@ -288,6 +302,12 @@ func (s *Server) Start(ctx context.Context) error {
 		// gauges go now; Stop calling CloseMetrics again is harmless.
 		_ = s.backend.CloseMetrics()
 		return fmt.Errorf("ingot: recover: %w", err)
+	}
+	if s.tasks != nil {
+		if err := s.tasks.Start(ctx); err != nil {
+			_ = s.backend.CloseMetrics()
+			return fmt.Errorf("ingot: start task runner: %w", err)
+		}
 	}
 	s.logger.Info("starting ingot S3 listener",
 		zap.String("addr", s.cfg.Addr),
@@ -305,7 +325,6 @@ func (s *Server) Start(ctx context.Context) error {
 	s.startReleaseSweeper()
 	s.startLocalBlobSweeper()
 	s.startReleasedPass()
-	s.startRegistrationSweeper()
 	s.startAcceptSweeper()
 	s.startCatalogUsageSweeper()
 	return nil
@@ -520,42 +539,6 @@ func (s *Server) startReleasedPass() {
 	})
 }
 
-// uploadRegistrationSweepInterval is how often the queue is drained. The count
-// is reporting data, not a read-your-writes surface, so a short lag is fine and
-// a steady cadence keeps the load on the upload service predictable.
-const uploadRegistrationSweepInterval = 30 * time.Second
-
-// startRegistrationSweeper spawns the upload-registration sweeper: the write
-// path queues one row per object version committed or retired, and this drains
-// them against the upload service, retrying with backoff until each is taken.
-//
-// It runs off the request path deliberately. The object count is a reporting
-// number, so a Sprue round trip does not belong in a PUT, and a Sprue outage
-// should delay the count rather than fail writes or lose it.
-func (s *Server) startRegistrationSweeper() {
-	s.goSweep(func() {
-		ticker := time.NewTicker(uploadRegistrationSweepInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-s.sweepCtx.Done():
-				return
-			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(s.sweepCtx, 5*time.Minute)
-				ctx, span := tracing.Start(ctx, "sweep.upload_registrations")
-				n, err := s.backend.SweepUploadRegistrations(ctx)
-				s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
-				cancel()
-				if err != nil && s.sweepCtx.Err() == nil {
-					s.logger.Warn("registration sweep", zap.Error(err))
-				} else if n > 0 {
-					s.logger.Info("registration sweep recorded object count changes", zap.Int("count", n))
-				}
-			}
-		}
-	})
-}
-
 // catalogUsageInterval is how often the catalog usage gauges' figures are
 // refreshed from the segment rows. Each refresh scans every segment row,
 // retired ones included, which accumulate until DeleteBucket (see
@@ -610,6 +593,14 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))
+	}
+	if s.tasks != nil {
+		// After the listener, whose requests run sync tasks, and before the
+		// backend drains: a task interrupted here stays queued and resumes
+		// on the next start.
+		if err := s.tasks.Stop(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("task runner stop: %w", err))
+		}
 	}
 	if err := s.backend.Drain(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("backend drain: %w", err))
@@ -910,9 +901,6 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.Registrar == nil {
 		return errors.New("ingot: ServerDeps.Registrar is required")
-	}
-	if deps.UploadRegs == nil {
-		return errors.New("ingot: ServerDeps.UploadRegs is required")
 	}
 	if deps.Meta == nil {
 		return errors.New("ingot: ServerDeps.Meta is required")
