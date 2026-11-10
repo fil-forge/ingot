@@ -27,6 +27,11 @@ func NewVerificationKeyCache() *VerificationKeyCache {
 	return &VerificationKeyCache{data: gocache.New(gocache.NoExpiration, cacheJanitorInterval)}
 }
 
+// Clear drops every cached key.
+func (k *VerificationKeyCache) Clear() {
+	k.data.Flush()
+}
+
 // Put caches each key under (access, key.Kind) for ttl. Keys with no data
 // are skipped.
 func (k *VerificationKeyCache) Put(access string, ttl time.Duration, keys ...s3.VerificationKey) {

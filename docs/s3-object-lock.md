@@ -37,7 +37,7 @@ reference index are untouched.
 
 ## 2. The backend contract
 
-The six methods (versitygw `backend/backend.go:94`):
+The six methods (versitygw `backend/backend.go:100`):
 
 ```go
 PutObjectLockConfiguration(ctx, bucket string, config []byte) error
@@ -100,7 +100,7 @@ reused.
 
 **This design stores lock state in a per-key version-state tree inside the catalog** (§4.1):
 a home for mutable per-version *service state* generally, with lock as its first tenant and
-object tagging (planned follow-up) as its second. The registry alternative is specified
+object tagging ([`s3-object-tagging.md`](./s3-object-tagging.md)) as its second. The registry alternative is specified
 alongside because the choice trades implementation surface against what the catalog alone can
 reconstruct, and that trade deserves review before it hardens. Appendix A holds the rejected
 shapes.
@@ -151,13 +151,13 @@ type VersionState struct {
     // Retention is the stored retention document (§2), verbatim; nil when
     // retention has never been set.
     Retention []byte `cborgen:"r"`
-    // LegalHold is tri-valued: 0 never set, 1 explicitly OFF, 2 ON. S3
-    // distinguishes never-set (a 400 from GetObjectLegalHold) from an
-    // explicit OFF (a 200).
+    // LegalHold is tri-valued: LegalHoldUnset (0, never set), LegalHoldOff
+    // (1, explicitly OFF), LegalHoldOn (2). S3 distinguishes never-set (a
+    // 400 from GetObjectLegalHold) from an explicit OFF (a 200).
     LegalHold uint8 `cborgen:"h"`
-    // Tags is reserved for object tagging (planned follow-up). Declared now
-    // so every rewrite round-trips it under the merge rule below; the
-    // tagging feature adds handlers, not format. Nil until it lands.
+    // Tags is the version's object tag set (s3-object-tagging.md); nil when
+    // the version has no tags. Every rewrite round-trips it under the merge
+    // rule below.
     Tags map[string]string `cborgen:"t"`
 }
 
@@ -170,12 +170,12 @@ State *cid.Cid `cborgen:"st"`
 ```
 
 The tree is the same forked `mst` package, the same space, the same
-`revSeqKey` rendering the prev tree uses (`s3frontend/version.go:78`); its nodes and the
+`revSeqKey` rendering the prev tree uses (`s3frontend/version.go`); its nodes and the
 state blocks are ordinary catalog-plane blocks. Point lookups are `state.Get(revSeqKey(seq))`.
 A bucket default retention materializes nothing here (§7), so the tree holds exactly the
 versions that received explicit state.
 
-`VersionState` is not where `x-amz-meta-*` user metadata lives, and tagging will not move
+`VersionState` is not where `x-amz-meta-*` user metadata lives, and tagging does not move
 it: S3 fixes user metadata at version creation (changing it requires writing a new version),
 so it is canonical state on the immutable manifest (`ObjectManifest.Metadata`), while tags
 mutate in place through their own API. The split is exactly the manifest/state-tree boundary.
@@ -223,15 +223,16 @@ ALTER TABLE ingot.multipart_sessions
 // registry.State gains the raw config document.
 ObjectLockConfig []byte // nil = never configured
 
-// Registry gains:
-// SetObjectLockConfig stores the bucket's lock configuration document verbatim.
-SetObjectLockConfig(ctx context.Context, name string, cfg []byte) error
+// The registry gains a statement queue-bucket.set-object-lock-config writes
+// with its commit: LockConfigSet stores the bucket's lock configuration
+// document verbatim.
+func LockConfigSet(name string, cfg []byte) Statement
 
-// Create gains an initial-state parameter so a bucket created with
-// x-amz-bucket-object-lock-enabled is versioned and locked atomically
-// (schema is dev-only; call sites are few).
+// Create takes an initial state so a bucket created with
+// x-amz-bucket-object-lock-enabled is versioned and locked atomically.
 Create(ctx context.Context, name string, space did.DID, init CreateState) error
 type CreateState struct {
+    Tenant           did.DID         // owning tenant; required by the Postgres registry
     Versioning       VersioningState // "" = unversioned
     ObjectLockConfig []byte          // nil = no lock
 }
@@ -242,27 +243,28 @@ type CreateState struct {
 ## 5. Bucket-level configuration
 
 **CreateBucket.** `input.ObjectLockEnabledForBucket` (the
-`x-amz-bucket-object-lock-enabled: true` header; currently ignored at `s3frontend/bucket.go:205`)
-makes the create call `registry.Create` with `CreateState{Versioning: VersioningEnabled,
+`x-amz-bucket-object-lock-enabled: true` header) makes the create call `registry.Create` with `CreateState{Versioning: VersioningEnabled,
 ObjectLockConfig: cfg}` where `cfg` is the JSON of
-`auth.BucketLockConfig{Enabled: true, CreatedAt: &now}`. The Hilt forwarding path is
-untouched: lock state is local bucket metadata, like versioning state.
+`auth.BucketLockConfig{Enabled: true, CreatedAt: &now}`. Hilt's bucket create runs in the
+request first, and `queue-bucket.create` then records the bucket with that initial state, so the
+bucket is born versioned and locked. Lock state is local bucket metadata, like versioning state.
 
 **GetObjectLockConfiguration** returns `State.ObjectLockConfig` verbatim, or
-`ErrObjectLockConfigurationNotFound` when nil. This replaces the stub at
-`s3frontend/bucket.go:115` whose entire job was returning that sentinel; the method stays on
-the per-request path (`CheckObjectAccess` calls it on every object PUT/DELETE) and costs the
-one `registry.Get` the stub already performs.
+`ErrObjectLockConfigurationNotFound` when nil. The method is on the per-request path
+(`CheckObjectAccess` calls it on every object PUT/DELETE) and costs one `registry.Get`.
 
-**PutObjectLockConfiguration** requires `State.Versioning == Enabled` and answers
+**PutObjectLockConfiguration** runs `queue-bucket.set-object-lock-config` on the bucket's subject,
+which requires `State.Versioning == Enabled` and answers
 `ErrObjectLockConfigurationNotAllowed` (409) otherwise, then stores the controller's document
-verbatim via `SetObjectLockConfig`. Enabling lock on an existing versioned bucket is allowed
+verbatim with the task's commit (`registry.LockConfigSet`). Enabling lock on an existing versioned bucket is allowed
 (pinned by `Versioning_Enable_object_lock`); the controller has already validated the document
 and rejects a non-Enabled status, so a stored config always has `Enabled: true`.
 
-**PutBucketVersioning** gains one guard: `Suspended` against a bucket whose
-`ObjectLockConfig` is set answers `ErrSuspendedVersioningNotAllowed` (pinned by
-`Versioning_status_switch_to_suspended_with_object_lock`). This is what makes "a lock bucket
+**PutBucketVersioning** runs `queue-bucket.set-versioning` on the same subject, with one guard:
+`Suspended` against a bucket whose `ObjectLockConfig` is set answers
+`ErrSuspendedVersioningNotAllowed` (pinned by
+`Versioning_status_switch_to_suspended_with_object_lock`). The two tasks run one at a time on
+the bucket's subject, so neither check can read a state the other is about to change. This is what makes "a lock bucket
 is always versioning-Enabled" an invariant rather than an initial condition, and it is why no
 other path needs to consider lock state on an unversioned or suspended bucket: lock state can
 only exist on buckets that were Enabled when it was written and can never leave Enabled.
@@ -287,7 +289,7 @@ All four run the same check order:
 6. The resolved version is a delete marker: `ErrMethodNotAllowed` (pinned by
    `Versioning_Put_GetObjectRetention_delete_marker` and the legal-hold twin).
 
-**Reads** run it lock-free over `resolveVersion` (`s3frontend/version.go:144`), which already
+**Reads** run it lock-free over `resolveVersion` (`s3frontend/version.go`), which already
 has the leaf in hand, then seek the state tree:
 
 - A manifest-arm key, a nil `State`, a tree miss at `revSeqKey(node.Seq)`, or a nil/zero
@@ -296,7 +298,8 @@ has the leaf in hand, then seek the state tree:
   returned as stored; expiry is the controller's judgment.
 - **GetObjectLegalHold** maps `LegalHold` 1/2 to `false`/`true`.
 
-**Writes** run the same order inside a `bucketop` commit (per-bucket lock held, so the
+**Writes** run the same order as a SetAttributes change inside a `queue-bucket.commit`
+(`applySetAttributes`; the bucket's subject runs one change at a time, so the
 read-modify-write below is serialized against every other mutation of the key):
 
 1. Load the key's value; a manifest-arm key upgrades to a leaf (§4.1 rule 1).
@@ -326,12 +329,13 @@ RFC3339, future-dated, known enum values). The backend's obligations:
   the wording). The controller populates the retain-until pointer unconditionally, so an
   absent header arrives as a pointer to the zero time and absence is judged on the zero
   value, never on nil.
-- **Stamping, inside the commit.** When lock headers are present, `commitVersion` writes the
+- **Stamping, inside the commit.** When lock headers are present, the Put change (`applyPut`)
+  writes the
   new version's `VersionState` (retention =
   `json.Marshal(types.ObjectLockRetention{Mode, RetainUntilDate})` when a mode was supplied;
   hold when the header named `ON` or `OFF`) into the state tree in the same commit that
   installs the version, forcing the leaf form for a new key. The version and its protections
-  land in one root swap: there is no state in which the version exists unprotected.
+  land in one root advance: there is no state in which the version exists unprotected.
 - **Multipart carry.** `CreateMultipartUpload` persists the three values on the session row
   (§4.2); `CompleteMultipartUpload` stamps them onto the version it commits, exactly as a
   single-shot PUT would have.
@@ -353,8 +357,9 @@ headers. After `resolveVersion`, when `State.ObjectLockConfig` is enabled and th
 value is a leaf with a non-nil `State`, one tree seek and one block fetch fill the three
 fields (mode and date from the stored retention JSON, `ON`/`OFF` from the hold; absent fields
 stay unset). Keys without state, and buckets without a lock configuration, skip the lookup
-entirely, so the common read path costs nothing new. The same fetch is where future
-state-block consumers (tagging's count header) read from. `ListObjectVersions` and the list
+entirely, so the common read path costs nothing extra. Tagging's count header reads from the
+same fetch, which it makes whenever the leaf carries state, lock-enabled or not
+([`s3-object-tagging.md`](./s3-object-tagging.md) §5). `ListObjectVersions` and the list
 walks carry no lock fields.
 
 ---
@@ -368,33 +373,32 @@ removes version `S` from a leaf with a state tree runs `state.Delete(revSeqKey(S
 is a no-op), queues the removed state block for GC, and drops `State` to nil when the tree
 empties. Promotion and noncurrent removal already rebuild the leaf through `spliceLeaf`; the
 state tree threads through it beside the prev tree. The rule also covers the write-rule
-discard paths (`commitVersion`'s null replacement and null eviction), though lock alone
+discard paths (`applyPut`'s null replacement and null eviction), though lock alone
 never exercises them: lock state requires a bucket that was Enabled when it was written and
 can never leave Enabled (§5), while discards happen only on unversioned or suspended
-buckets. State written by a future tenant without that guard (tags exist on unversioned
-buckets) is covered by the same rule with no redesign. `DeleteBucket` needs no state sweep
-for the same reason it needs no claim sweep: it refuses non-empty buckets, and an empty
+buckets. Tags, which exist on unversioned buckets, are covered by the same rule.
+`DeleteBucket` needs no state sweep for the same reason it needs no claim sweep: it refuses non-empty buckets, and an empty
 bucket has no leaves left to carry state trees.
 
 ---
 
-## 10. Governance bypass, deferred with bucket policies
+## 10. Governance bypass, deferred
 
 The `x-amz-bypass-governance-retention` header is resolved entirely in the controller and is
 authorized by the bucket policy: `CheckObjectAccess` fetches the policy document through
-`GetBucketPolicy` and requires a grant of `s3:BypassGovernanceRetention`. Ingot does not model
-bucket policies (`GetBucketPolicy` answers `ErrNoSuchBucketPolicy`, `s3frontend/bucket.go:130`),
-and the controller maps a missing policy to `ErrObjectLocked`. Until bucket policies land,
-bypass therefore always denies and `GOVERNANCE` retention is exactly as strict as
-`COMPLIANCE`. The failure direction is safe (protected versions stay protected), and an
-operator retains an escape hatch: the fork's `IsObjectLockRetentionPutAllowed` permits
-same-mode replacement, so a mistaken retention can be rewritten with a near-term
-retain-until date and waited out.
+`GetBucketPolicy` and requires a grant of `s3:BypassGovernanceRetention`. Bucket policies are
+kept by the bucket authority (Hilt): `PutBucketPolicy`, `DeleteBucketPolicy`, and a signed
+`GET /{bucket}?policy` forward to it (`s3frontend/policy.go`). Every other `GetBucketPolicy`
+caller, `CheckObjectAccess` included, gets `ErrNoSuchBucketPolicy`, and the controller maps a
+missing policy to `ErrObjectLocked`. Bypass therefore always denies and `GOVERNANCE` retention
+is exactly as strict as `COMPLIANCE`. The failure direction is safe (protected versions stay
+protected), and an operator retains an escape hatch: the fork's
+`IsObjectLockRetentionPutAllowed` permits same-mode replacement, so a mistaken retention can be
+rewritten with a near-term retain-until date and waited out.
 
-Bucket policies are planned follow-up work. When they land, bypass starts working with no
-change to any code this document specifies (`CheckObjectAccess` already contains the policy
-consult), and the conformance rows below that exercise bypass flip from XFail via the
-ratchet.
+Working bypass needs the controller's policy consult answered from the bucket's real policy,
+which changes `GetBucketPolicy`'s stub path, not the lock code this document specifies. The
+conformance rows below that exercise bypass are XFail until then and flip via the ratchet.
 
 ---
 
@@ -417,8 +421,8 @@ for `COMPLIANCE`), sleeps past expiry, and deletes.
   bucket with no versioning check (upstream's own comment calls it not S3 compatible);
   ingot answers the AWS 409 and the row is excluded, with
   `Versioning_object_lock_not_enabled_on_bucket_creation` pinning that behavior.
-  `PutObjectRetention_overwrite_governance_with_permission` installs a bucket policy: XFail
-  until bucket policies land.
+  `PutObjectRetention_overwrite_governance_with_permission` installs a bucket policy granting
+  bypass: XFail (§10).
 - Lock-enabled-bucket cases from the plain-conf groups (`PutObject_with_object_lock`,
   `PutObject_racey_success`, the CopyObject lock-header cases,
   `CreateMultipartUpload_with_object_lock`) run under a dedicated versioned-conf category:
@@ -429,12 +433,14 @@ for `COMPLIANCE`), sleeps past expiry, and deletes.
   against a locked object fails with `ErrObjectLocked`; a lock bucket in ingot is always
   versioning-Enabled, so those requests succeed by stacking a version or a marker (AWS
   semantics, §1). Those rows are excluded with this reason, the same treatment as the
-  `VersioningDisabled_*` pair (`itest/versity_versioning_test.go:26`). The group's
-  `*governance_bypass*` and `root_bypass` cases install bucket policies: XFail. Versioned
-  WORM behavior is covered by the `Versioning_WORM_*` rows instead.
+  `VersioningDisabled_*` pair (`itest/versity_versioning_test.go`). The group's
+  `*governance_bypass*` cases install bucket policies: XFail (§10).
+  `root_bypass_governance_retention_delete_object` is excluded with the
+  `checkWORMProtection` cases. Versioned WORM behavior is covered by the `Versioning_WORM_*`
+  rows instead.
 
-**Versioning-group additions.** The `Versioning_*` lock rows currently excluded by the
-header note of `versity_versioning_test.go` move into the pass table: the configuration trio
+**Versioning-group rows.** The `Versioning_*` lock rows in the pass table of
+`versity_versioning_test.go`: the configuration trio
 (`Versioning_object_lock_not_enabled_on_bucket_creation`, `Versioning_Enable_object_lock`,
 `Versioning_status_switch_to_suspended_with_object_lock`), the retention and legal-hold
 grammar cases (invalid versionId, non-existing version, delete marker, success), and the
@@ -443,14 +449,14 @@ insertion over locked objects, overwrite via PUT / copy / multipart, marker remo
 bucket default retention). None of them requires bucket policy (only the excluded
 `Versioning_AccessControl_*` cases do).
 
-**Promotions.** Existing XFail rows that flip once this lands, flagged by the ratchet:
+**Rows in other groups that depend on lock**, all in their pass tables:
 `PutObject_with_object_lock`, `PutObject_missing_bucket_lock`,
 `CopyObject_missing_bucket_lock`, `CopyObject_with_legal_hold`,
 `CopyObject_with_retention_lock`, `CreateMultipartUpload_with_object_lock`,
 `CreateMultipartUpload_with_object_lock_not_enabled`, `CreateBucket_default_object_lock`,
 and `Versioning_DeleteObject_non_existing_objects` (its bucket is created `withLock()`).
 
-**Unit tests** (inmem harness, `version_test.go` pattern): the §6 check order per method
+**Unit tests** (the Postgres-backed `s3frontend` test store, `version_test.go` pattern): the §6 check order per method
 (sentinel table tests: marker, unset state, disabled bucket, versionId grammar); the state
 tree itself (manifest-arm upgrade on first state write, the merge carrying unowned fields
 including the reserved `Tags`, tri-valued hold, cleanup through version-scoped delete and
@@ -467,9 +473,8 @@ missing-bucket-lock validation errors; Head/Get echo fields; a cborgen round-tri
 Each deferred feature has a landing path that leaves this design's format and invariants
 unchanged:
 
-- **Bucket policies** (and with them working governance bypass, §10): a per-bucket document
-  stored beside `object_lock_config`, registry-shaped like every bucket-level configuration.
-  The lock code needs no change when it lands (§10).
+- **Governance bypass** (§10): needs the controller's policy consult answered from the
+  bucket's policy in the bucket authority. The lock code needs no change for it.
 - **Object tagging**: its `Tags` field is reserved on `VersionState` (§4.1), so tagging adds
   handlers and conformance rows, not format. Specified in
   [`s3-object-tagging.md`](./s3-object-tagging.md).
@@ -477,8 +482,8 @@ unchanged:
   per-version document is the shape `VersionState` hosts by an additive field and an arm
   bump.
 - **S3 Batch Operations retention updates**: batch jobs drive the same per-object APIs this
-  document specifies; scale is a throughput question (many state commits, foldable into
-  shared root swaps), never a format one.
+  document specifies; scale is a throughput question (many SetAttributes changes, foldable into
+  one `queue-bucket.commit` per bucket), never a format one.
 - **Lifecycle expiration**: an expirer runs outside the controller, so it enforces lock
   itself by reading the same per-version state and bucket configuration the controller
   reads; both are readable off the request path.
@@ -487,8 +492,8 @@ unchanged:
   semantics, the §7 in-commit stamping mechanism absorbs it: stamp the default when the
   request carries no lock headers.
 
-The versioning design's own out-of-scope list (`s3-versioning.md` §10) drops object lock and
-now points here.
+The versioning design's own out-of-scope list (`s3-versioning.md` §10) points here for object
+lock.
 
 ---
 
@@ -497,12 +502,12 @@ now points here.
 | Where | Change |
 |---|---|
 | `bucket/leaf.go`, `gen/main.go`, `make gen` | `VersionState` + the `"/versionstate/0"` arm and `EnvelopedVersionState`; `ObjectLeaf.State` (§4.1) |
-| `migrations/sql/` (new) | `buckets.object_lock_config`, `multipart_sessions` lock columns (§4.2) |
-| `registry/registry.go`, `postgres.go`, `inmem/store.go` | `State.ObjectLockConfig`, `SetObjectLockConfig`, `Create` initial state (§4.2) |
+| `migrations/sql/00011_object_lock.sql` (new) | `buckets.object_lock_config`, `multipart_sessions` lock columns (§4.2) |
+| `registry/registry.go`, `postgres.go`, `bucketcommit.go` | `State.ObjectLockConfig`, `LockConfigSet`, `Create` initial state (§4.2) |
 | `s3frontend/objectlock.go` (new) | the four per-version methods: the §6 check order, the state-tree read and commit paths, the Head/Get echo helper (§8) |
-| `s3frontend/version.go` | `commitVersion` in-commit stamping incl. forced leaf (§7); `deleteVersionScoped` + `spliceLeaf` state-tree threading and cleanup (§9) |
-| `s3frontend/bucket.go` | `CreateBucket` lock header (§5), `PutObjectLockConfiguration` (new), `GetObjectLockConfiguration` (real config), `PutBucketVersioning` suspend guard |
-| `s3frontend/object.go`, `copy.go`, `multipart.go` | lock-header validation + stamping via `commitVersion` (§7), Head/Get echo (§8), session carry (§7) |
+| `s3frontend/version.go` | `applyPut` in-commit stamping incl. forced leaf (§7); `applyDeleteVersion` + `spliceLeaf` state-tree threading and cleanup (§9) |
+| `s3frontend/bucket.go`, `bucketadmin.go` | `CreateBucket` lock header (§5), `PutObjectLockConfiguration` and its versioning gate (`queue-bucket.set-object-lock-config`), `GetObjectLockConfiguration`, `PutBucketVersioning` suspend guard (`queue-bucket.set-versioning`) |
+| `s3frontend/object.go`, `copy.go`, `multipart.go` | lock-header validation + stamping via the Put change (`applyPut`, §7), Head/Get echo (§8), session carry (§7) |
 | `itest/versity_lock_test.go` (new), `versity_{object,bucket,multipart,versioning}_test.go` | new categories, promotions, exclusions (§11) |
 | `docs/s3-versioning.md` | §10 drops lock from out-of-scope, pointing here |
 
@@ -535,8 +540,8 @@ pointer on the leaf, one block per state-carrying version.
 `(key, seq)` to state blocks, isolating service state from the object tree entirely. Rejected
 on plumbing: the entire pipeline assumes one root per operation. `bucketop.Tx` commits one
 root, the segment `.ops` journal records `(bucket, newRoot)` pairs, recovery and
-`forge_root_cid` advance on that single lineage, and `CASRoot` guards it. A second root needs
-its own CAS, journal, and ship lineage, or a combined bucket-root record that changes what
+`forge_root_cid` advance on that single lineage, and the guarded root advance covers it. A second
+root needs its own guarded advance, journal, and ship lineage, or a combined bucket-root record that changes what
 `Root` means everywhere. A composite MST key also overflows `mst.MaxKeyBytes` for
 maximum-length object keys. The per-key version-state tree reaches the same isolation one
 level down, where the leaf already provides a single atomic attachment point.

@@ -14,14 +14,14 @@ import (
 	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/iam"
-	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/internal/cors"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
 	s3 "github.com/fil-forge/libforge/commands/s3"
 	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
 	"github.com/fil-forge/libforge/identity"
-	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/versitygw/auth"
 	v4 "github.com/fil-forge/versitygw/aws/signer/v4"
 	"github.com/gofiber/fiber/v3"
@@ -79,8 +79,8 @@ func TestBuildS3API_BucketPolicy(t *testing.T) {
 	const origin = "https://app.example"
 	corsCfg, err := cors.Build([]string{origin})
 	require.NoError(t, err)
-	mem := inmem.NewMemStore()
-	require.NoError(t, mem.Create(ctx, "photos", did.Undef, registry.CreateState{}))
+	mem := registry.NewPostgres(pgtest.New(t))
+	require.NoError(t, mem.Create(ctx, "photos", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}))
 	f := &fakeAuthority{}
 	backend := s3frontend.New(s3frontend.Deps{Registry: mem, CORS: corsCfg, Authority: f})
 	// New registers its gauges on the global meter provider; leaving them

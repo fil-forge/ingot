@@ -9,7 +9,6 @@ import (
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3err"
 
-	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/internal/cors"
 	"github.com/fil-forge/ingot/registry"
 )
@@ -27,7 +26,7 @@ func TestGetBucketCors(t *testing.T) {
 
 	newBackend := func(t *testing.T, corsCfg *auth.CORSConfiguration) *Backend {
 		t.Helper()
-		mem := inmem.NewMemStore()
+		mem := newTestStore(t)
 		if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 			t.Fatalf("create bucket: %v", err)
 		}

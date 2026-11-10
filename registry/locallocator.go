@@ -43,7 +43,7 @@ type InclusionReader interface {
 // what keeps retention-retired catalog blocks readable.
 //
 // LocationReader / InclusionReader are the read slices of LocationStore /
-// InclusionStore the LocalLocator needs. *Postgres (and *inmem.MemStore)
+// InclusionStore the LocalLocator needs. *Postgres
 // satisfies both.
 type LocalLocator struct {
 	locations  LocationReader

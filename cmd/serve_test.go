@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,7 +20,6 @@ import (
 	"github.com/fil-forge/ucantone/ucan/container"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/ipfs/go-cid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -29,6 +27,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/fil-forge/ingot/config"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -38,15 +37,11 @@ import (
 // binding a listener or running migrations. Guards cmd/serve.go's provider
 // list from drifting away from what ServerModule needs.
 //
-// buildApp dials and pings Postgres as it builds the graph, so this
-// runs only when INGOT_TEST_DSN names a reachable database (same gate as
-// registry's live test). The always-on, DB-free graph validation lives in the
-// root package's TestModuleValidate_* (fx.ValidateApp over ingot.Module).
+// buildApp dials and pings Postgres as it builds the graph, so it gets a
+// database of its own. The DB-free graph validation lives in the root
+// package's TestModuleValidate_* (fx.ValidateApp over ingot.Module).
 func TestApp_GraphValidates(t *testing.T) {
-	dsn := os.Getenv("INGOT_TEST_DSN")
-	if dsn == "" {
-		t.Skip("set INGOT_TEST_DSN to run the buildApp graph test (buildApp pings Postgres)")
-	}
+	_, dsn := pgtest.NewWithDSN(t)
 
 	app, err := buildApp(t.Context(), appConfig(t, dsn), zaptest.NewLogger(t))
 	if err != nil {
@@ -57,24 +52,18 @@ func TestApp_GraphValidates(t *testing.T) {
 	}
 }
 
-// TestApp_LiveStopSavesRevocationCursor starts the app with the revocation
+// TestApp_StopSavesRevocationCursor starts the app with the revocation
 // consumer reading a stub firehose, stops it as soon as the consumer has
 // applied a record, and checks that the record's cursor was saved. The
-// consumer saves at stop whatever its periodic save has not, which lands
-// only if the pool outlives the consumer: this pins buildApp closing the
-// pool after the consumer has stopped.
+// consumer saves the head before it streams, and at stop whatever its
+// periodic save has not, which lands only if the pool outlives the consumer:
+// this pins buildApp closing the pool after the consumer has stopped.
 //
 // The stop beats the consumer's first periodic save by a wide margin, so a
 // pool that closes first fails the test; a slow enough runner would let the
 // periodic save land first and hide that, but never fail a correct build.
-// The app runs in a scratch database: its background sweeps would otherwise
-// act on rows other packages' live tests write to the shared one.
-func TestApp_LiveStopSavesRevocationCursor(t *testing.T) {
-	dsn := os.Getenv("INGOT_TEST_DSN")
-	if dsn == "" {
-		t.Skip("set INGOT_TEST_DSN to run the app shutdown test")
-	}
-	dsn = scratchDatabase(t, dsn, "ingot_cmd_shutdown")
+func TestApp_StopSavesRevocationCursor(t *testing.T) {
+	pool, dsn := pgtest.NewWithDSN(t)
 
 	mh, err := multihash.Sum([]byte("revoked"), multihash.SHA2_256, -1)
 	if err != nil {
@@ -89,12 +78,21 @@ func TestApp_LiveStopSavesRevocationCursor(t *testing.T) {
 	if err := rec.MarshalDagJSON(&payload); err != nil {
 		t.Fatalf("encode record: %v", err)
 	}
-	// The stub sends the record, then holds the stream open as an idle feed.
+	// The stub answers the head, then streams the record after it and holds
+	// the stream open as an idle feed.
+	const head, recCursor = "41", "42"
 	firehose := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprintf(w, "event: revocation\ndata: %s\n\n", payload.String())
-		w.(http.Flusher).Flush()
-		<-r.Context().Done()
+		switch r.URL.Path {
+		case "/revocations/head":
+			_, _ = fmt.Fprintln(w, head)
+		case "/revocations/after/" + head:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "id: %s\nevent: revocation\ndata: %s\n\n", recCursor, payload.String())
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
 	}))
 	t.Cleanup(func() {
 		firehose.CloseClientConnections()
@@ -128,46 +126,13 @@ func TestApp_LiveStopSavesRevocationCursor(t *testing.T) {
 		t.Fatalf("stop app: %v", err)
 	}
 
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer pool.Close()
 	cur, err := registry.NewPostgres(pool).GetRevocationCursor(ctx)
 	if err != nil {
 		t.Fatalf("read the cursor saved at stop: %v", err)
 	}
-	if !cur.Revoke.Equals(rec.Revoke) {
-		t.Fatalf("saved cursor is at %s, want the applied record %s", cur.Revoke, rec.Revoke)
+	if cur.Token != recCursor {
+		t.Fatalf("saved cursor is %q, want the applied record's %q", cur.Token, recCursor)
 	}
-}
-
-// scratchDatabase creates a database named name on the server dsn names,
-// dropping it again at cleanup, and returns dsn pointed at it. dsn must be a
-// postgres:// URL.
-func scratchDatabase(t *testing.T, dsn, name string) string {
-	t.Helper()
-	u, err := url.Parse(dsn)
-	if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
-		t.Skip("INGOT_TEST_DSN is not a postgres:// URL; this test needs one to name a scratch database")
-	}
-	ctx := context.Background()
-	admin, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(admin.Close)
-	if _, err := admin.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)"); err != nil {
-		t.Fatalf("drop stale scratch database: %v", err)
-	}
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+name); err != nil {
-		t.Fatalf("create scratch database: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = admin.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
-	})
-	u.Path = "/" + name
-	return u.String()
 }
 
 // appConfig returns a daemon config for an app on dsn. The other services it

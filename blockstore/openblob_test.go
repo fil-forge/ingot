@@ -39,22 +39,22 @@ func readOpenBlob(t *testing.T, r BlobReader, digest mh.Multihash) (string, erro
 	return string(b), err
 }
 
-// TestLayered_OpenBlob_Tiering covers the body-blob read fallthrough: spool first
+// TestLayered_OpenBlob_Tiering covers the body-blob read fallthrough: cache first
 // (read-after-write), then the network base after eviction, then ErrNotFound. The
 // log is never consulted (it holds no body blobs).
 func TestLayered_OpenBlob_Tiering(t *testing.T) {
 	digest, _ := mh.Sum([]byte("digest"), mh.SHA2_256, -1)
 
-	// spool hit — base is not consulted.
-	l := NewLayered(fakeBlobTier{data: []byte("from-spool")}, nil, fakeBlobTier{data: []byte("from-base")})
-	if got, err := readOpenBlob(t, l, digest); err != nil || got != "from-spool" {
-		t.Fatalf("spool hit: got %q err %v, want from-spool", got, err)
+	// cache hit — base is not consulted.
+	l := NewLayered(fakeBlobTier{data: []byte("from-cache")}, nil, fakeBlobTier{data: []byte("from-base")})
+	if got, err := readOpenBlob(t, l, digest); err != nil || got != "from-cache" {
+		t.Fatalf("cache hit: got %q err %v, want from-cache", got, err)
 	}
 
-	// spool miss → base hit (the after-eviction path).
+	// cache miss → base hit (the after-eviction path).
 	l = NewLayered(fakeBlobTier{data: nil}, nil, fakeBlobTier{data: []byte("from-base")})
 	if got, err := readOpenBlob(t, l, digest); err != nil || got != "from-base" {
-		t.Fatalf("spool miss → base: got %q err %v, want from-base", got, err)
+		t.Fatalf("cache miss → base: got %q err %v, want from-base", got, err)
 	}
 
 	// both miss → ErrNotFound.
@@ -63,10 +63,10 @@ func TestLayered_OpenBlob_Tiering(t *testing.T) {
 		t.Fatalf("both miss: err = %v, want ErrNotFound", err)
 	}
 
-	// nil spool is skipped, not panicked.
+	// nil cache is skipped, not panicked.
 	l = NewLayered(nil, nil, fakeBlobTier{data: []byte("from-base")})
 	if got, err := readOpenBlob(t, l, digest); err != nil || got != "from-base" {
-		t.Fatalf("nil spool → base: got %q err %v, want from-base", got, err)
+		t.Fatalf("nil cache → base: got %q err %v, want from-base", got, err)
 	}
 }
 
@@ -80,20 +80,13 @@ func TestCached_OpenBlob_BypassesCache(t *testing.T) {
 	}
 }
 
-// TestSpool_OpenBlobRange: the section reader serves exactly the inclusive
-// [start, end] of the spooled file, and an end past the file's end yields a
-// shorter stream.
-func TestSpool_OpenBlobRange(t *testing.T) {
+// TestBlobCache_OpenBlobRange: the section reader serves exactly the
+// inclusive [start, end] of the cached file, and an end past the file's end
+// yields a shorter stream.
+func TestBlobCache_OpenBlobRange(t *testing.T) {
 	ctx := context.Background()
-	sp, err := NewSpool(t.TempDir())
-	if err != nil {
-		t.Fatalf("NewSpool: %v", err)
-	}
-	data := []byte("0123456789abcdef")
-	digest, _, err := sp.WriteBlob(ctx, bytes.NewReader(data))
-	if err != nil {
-		t.Fatalf("WriteBlob: %v", err)
-	}
+	sp := newTestCache(t)
+	digest := cacheTestBlob(t, sp, "0123456789abcdef")
 
 	cases := []struct {
 		name       string

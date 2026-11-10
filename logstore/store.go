@@ -16,8 +16,8 @@ var _ blockstore.Log = (*Store)(nil)
 
 // Store is the catalog log: a single LSM pipeline (its own seal trigger,
 // transport, and retention) over the dag-cbor MST nodes + ObjectManifests.
-// Object-body blobs are not journaled — they are spooled and uploaded per-blob
-// (see blockstore.Spool), so the data plane is gone. Store is a thin wrapper
+// Object-body blobs are not journaled — they stream to their providers
+// per-blob, so there is no data plane. Store is a thin wrapper
 // over one PlaneLog, kept as the blockstore.Log seam the write/read paths hold.
 type Store struct {
 	catalog *PlaneLog
@@ -51,13 +51,24 @@ func (s *Store) AppendBatch(ctx context.Context, catalogBlocks []block.Block, op
 
 // Get returns the catalog block holding c, or ErrNotFound. (Body blobs are
 // never in the log; a raw-codec lookup simply misses and the caller falls
-// through to the spool / network tier.)
+// through to the cache / network tier.)
 func (s *Store) Get(ctx context.Context, c cid.Cid) (block.Block, error) {
 	return s.catalog.Get(ctx, c)
 }
 
-// Close closes the catalog pipeline (sealing the open segment, draining the
-// flush queue). Safe to call once.
+// Ship ships the catalog's sealed segments still unshipped (PlaneLog.Ship).
+func (s *Store) Ship(ctx context.Context) error {
+	return s.catalog.Ship(ctx)
+}
+
+// ShipBucket is Ship, for a caller that ships by bucket: a Store holds one
+// bucket's log.
+func (s *Store) ShipBucket(ctx context.Context, _ string) error {
+	return s.Ship(ctx)
+}
+
+// Close closes the catalog pipeline (sealing the open segment and stopping
+// its seal ticker). Safe to call once.
 func (s *Store) Close(ctx context.Context) error {
 	return s.catalog.Close(ctx)
 }

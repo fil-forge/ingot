@@ -227,6 +227,7 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// The same store holds the key's action sets, which the backend consults
 	// for what the URL does not show (a DeleteObjects entry naming a version).
 	ctx.Locals(reqscope.ActionsKey(), reqscope.ActionSet(store))
+	ctx.Locals(reqscope.BorrowableKey(), true)
 
 	// Local fast path: with a cached verification key, a cached action set
 	// permitting the request's S3 action on every bucket it acts on, and
@@ -290,6 +291,10 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	if ctr != nil && !s.cacheProofs(spanCtx, store, ctr, req, accessKeyID) {
 		scoped := NewDelegationCache(nil)
 		ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(scoped))
+		// The scoped store holds a delegation known revoked, so nothing
+		// outside this request may borrow it (an upload registration this
+		// request queues still carries the chain it encodes from it).
+		ctx.Locals(reqscope.BorrowableKey(), false)
 		// Refetches bucket info already fetched above; rare (a failed Hilt commit).
 		s.cacheProofs(reqCtx, scoped, ctr, req, accessKeyID)
 		// The action set too, held for this request alone.
@@ -351,6 +356,44 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	return adminAccount(accessKeyStr, key), nil
 }
 
+// ErrBucketNotPermitted is AuthorizeSigned's refusal when Hilt answers that
+// the key may not act on the bucket the request addresses: the bucket is
+// unknown to it or another tenant's, or the key's permissions on it exclude
+// the request's action.
+var ErrBucketNotPermitted = errors.New("hilt/iam: the access key may not act on the bucket")
+
+// AuthorizeSigned authorizes req, an S3 request signed with the secret of
+// accessKey, by Hilt alone, and returns a proof store holding the
+// delegations Hilt issued for it, their chains completed as for a request
+// the gateway serves. It caches nothing. It is for a process other than the
+// serving daemon, such as a command reading a bucket's catalog from Forge
+// with a key its operator holds: the store goes on that work's context under
+// [reqscope.ProofStoreKey]. The store takes no part in the revocations a
+// serving daemon tracks, which such a process doesn't have.
+func (s *Service) AuthorizeSigned(ctx context.Context, req s3.Request, accessKey string) (*DelegationCache, error) {
+	keyDID, err := did.Parse(did.KeyPrefix + accessKey)
+	if err != nil {
+		return nil, fmt.Errorf("hilt/iam: access key is not a did:key identifier: %w", err)
+	}
+	_, ctr, err := s.authorizer.AuthorizeRequest(ctx, req)
+	if err != nil {
+		var named ucanerrors.Named
+		if ucanerrors.As(err, &named) {
+			switch named.Name() {
+			case hiltauth.UnknownBucketErrorName,
+				hiltauth.ForeignBucketErrorName,
+				hiltauth.BucketNotPermittedErrorName,
+				hiltauth.OperationNotPermittedErrorName:
+				return nil, fmt.Errorf("%w: %w", ErrBucketNotPermitted, err)
+			}
+		}
+		return nil, fmt.Errorf("hilt/iam: authorize request: %w", err)
+	}
+	store := NewDelegationCache(nil)
+	s.cacheProofs(ctx, store, ctr, req, keyDID)
+	return store, nil
+}
+
 // adminAccount is the gateway account an authorized request runs as. Admin so the
 // gateway's role/ACL layers defer entirely: authorization is per-request via
 // Hilt (or the local fast path), which enforces the key's permissions and
@@ -394,6 +437,22 @@ func mapAuthError(err error) (error, bool) {
 		return conflictingQuery(named.Error()), true
 	case hiltauth.UnknownBucketErrorName:
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket), true
+	case hiltauth.BucketRegionMismatchErrorName:
+		// The bucket is the caller's but is served by another region's gateway.
+		// S3 answers a request signed for the wrong region with
+		// AuthorizationHeaderMalformed naming the expected region, which the AWS
+		// SDKs follow to the right endpoint. hilt's failure carries both regions.
+		var mismatch *hiltauth.BucketRegionMismatchError
+		if ucanerrors.As(err, &mismatch) {
+			return s3err.MalformedAuth.IncorrectRegion(mismatch.Expected, mismatch.Actual), true
+		}
+		// The failure arrived without its regions (decoded by a reader that knows
+		// only the standard error model): still a wrong-region answer, unnamed.
+		return s3err.APIError{
+			Code:           "AuthorizationHeaderMalformed",
+			Description:    "The authorization header is malformed; the bucket is served by another region.",
+			HTTPStatusCode: http.StatusBadRequest,
+		}, true
 	case hiltauth.TenantDisabledErrorName,
 		hiltauth.IssuerForbiddenErrorName,
 		hiltauth.RegionNotServedErrorName,
@@ -448,6 +507,10 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 	if s.buckets == nil || !s.agent.Defined() {
 		return auth.Account{}, false, nil
 	}
+	keyDID, err := did.Parse(did.KeyPrefix + access)
+	if err != nil {
+		return auth.Account{}, false, nil
+	}
 
 	// 1. Parse the signature envelope. Only HMAC SigV4 is fast-pathed: the
 	// gateway re-verifies with the returned key and only speaks HMAC.
@@ -489,12 +552,14 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 	// bucket, or the answer expired, or the local registry's space disagrees
 	// with the bucket Hilt named — ask Hilt; a cached set that excludes the
 	// action is a refusal); and every command the action maps to must be
-	// covered by a chain to this instance's agent in THIS key's store.
-	// Because the store holds only keyDID's delegations, a resolving agent
-	// chain is necessarily space→…→keyDID→agent — it carries both keyDID's
-	// own grant (Hilt's bucket scoping) and the onward re-delegation.
-	// Cross-key mixing is structurally impossible, so one probe per command
-	// suffices.
+	// covered by a chain to this instance's agent in THIS key's store, ending
+	// in a delegation keyDID issued: space→…→keyDID→agent, which carries both
+	// keyDID's own grant (Hilt's bucket scoping) and the onward
+	// re-delegation. The store also holds the tenant's longer-lived
+	// delegations of the cleanup commands, which reach the agent without
+	// passing through keyDID and outlive it on purpose, so the probe is
+	// restricted to keyDID's. Cross-key mixing is structurally impossible,
+	// so one probe per command suffices.
 	for _, r := range reqs {
 		cmds := s3perm.CommandsFor(r.Permission)
 		if len(cmds) == 0 {
@@ -516,7 +581,7 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 			return auth.Account{}, false, s3err.GetAPIError(s3err.ErrAccessDenied)
 		}
 		for _, cmd := range cmds {
-			if chain, _, err := store.ProofChain(ctx, s.agent, cmd, st.Space); err != nil || len(chain) == 0 {
+			if chain, _, err := store.ProofChainVia(ctx, s.agent, cmd, st.Space, keyDID); err != nil || len(chain) == 0 {
 				return auth.Account{}, false, nil
 			}
 		}
@@ -562,8 +627,11 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 	}
 
 	// A leaf is complete when a chain from its audience (this instance)
-	// back to its subject's root exists in the cache. Powerline leaves
-	// (undefined subject) can't anchor a chain lookup; skip them here —
+	// back to its subject's root, through the leaf's own issuer, exists in
+	// the cache. Any chain is not enough: the tenant's longer-lived cleanup
+	// delegations arrive complete, and would leave the access key's chain
+	// for the same command, which the fast path needs, unfetched. Powerline
+	// leaves (undefined subject) can't anchor a chain lookup; skip them here —
 	// the retrieval path resolves them against a concrete space, and the
 	// bucket-info fetch below covers the missing intermediates either way.
 	incomplete := false
@@ -571,7 +639,7 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 		if !leaf.Subject().Defined() {
 			continue
 		}
-		chain, _, err := store.ProofChain(ctx, leaf.Audience(), leaf.Command(), leaf.Subject())
+		chain, _, err := store.ProofChainVia(ctx, leaf.Audience(), leaf.Command(), leaf.Subject(), leaf.Issuer())
 		if err != nil || len(chain) == 0 {
 			incomplete = true
 			break

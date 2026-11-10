@@ -47,7 +47,8 @@ import (
 
 // forgeRegion must match smelt's ingot config (systems/ingot/config/
 // config.yaml) and the provider region hilt's post_start hook registers
-// ingot under (INGOT_REGION) — tenants are provisioned per region.
+// ingot under (INGOT_REGION): S3 requests are signed for it and hilt resolves
+// the serving provider from it. Tenants themselves are region-free.
 const forgeRegion = "us-west-1"
 
 // TestMain sweeps containers/volumes leaked by prior crashed itest runs (same
@@ -182,8 +183,8 @@ func withMultipartTTLConfig() stack.Option {
 }
 
 // withLocalBlobBudgetConfig mounts testdata/config-localblobbudget.yaml — a
-// 4 MiB local_blob_max_bytes with the residency and read-retention windows
-// off, so the local blob sweeper evicts within a test's budget. Dedicated
+// 4 MiB local_blob_max_bytes, so the local blob sweeper evicts within a test's
+// budget. Dedicated
 // stacks only: other tests read envelopes back from local disk.
 func withLocalBlobBudgetConfig() stack.Option {
 	return stack.WithServiceConfig("ingot", "testdata/config-localblobbudget.yaml")
@@ -363,6 +364,10 @@ var hiltAllPermissions = []string{
 	"s3:PutObjectTagging",
 	"s3:DeleteObjectTagging",
 	"s3:GetObjectAttributes",
+	// A delete or retention write carrying x-amz-bypass-governance-retention
+	// is priced on its own permission; the conformance suite clears
+	// governance-locked versions when it tears a bucket down.
+	"s3:BypassGovernanceRetention",
 }
 
 // hiltPolicyPermissions are the bucket policy operations, held by service
@@ -414,8 +419,9 @@ func iamScenariosEnabled() bool {
 //
 // The Tenant API is reached with curl inside the hilt container (so no host
 // port mapping is needed), authenticated with smelt's local-dev partner key.
-// The tenant's region must match the provider region hilt's post_start hook
-// registered ingot under (forgeRegion).
+// A tenant carries no region; each bucket binds to the region it is created
+// in, which here is the provider region hilt's post_start hook registers
+// ingot under (forgeRegion).
 func hiltProvisionTenant(t *testing.T, ctx context.Context, s *stack.Stack, tenantID string) (accessKey, secretKey string) {
 	t.Helper()
 	accessKey, secretKey, err := hiltProvisionTenantErr(ctx, s, tenantID)
@@ -435,10 +441,11 @@ func hiltProvisionTenant(t *testing.T, ctx context.Context, s *stack.Stack, tena
 func hiltProvisionTenantErr(ctx context.Context, s *stack.Stack, tenantID string) (accessKey, secretKey string, err error) {
 	const partnerAuth = "Authorization: Bearer dev-partner-key"
 
+	// PUT /tenants/{id} takes no body: a tenant is region-free, each bucket
+	// binds to the region it is created in.
 	if out, errOut, err := s.Exec(ctx, "hilt", "curl", "-sS", "-f", "-X", "PUT",
 		"http://localhost:80/tenants/"+tenantID,
-		"-H", partnerAuth, "-H", "Content-Type: application/json",
-		"-d", fmt.Sprintf(`{"region":%q}`, forgeRegion)); err != nil {
+		"-H", partnerAuth); err != nil {
 		return "", "", fmt.Errorf("hilt provision tenant %q: %w (stdout=%s stderr=%s)", tenantID, err, out, errOut)
 	}
 
@@ -480,7 +487,7 @@ func hiltProvisionTenantErr(ctx context.Context, s *stack.Stack, tenantID string
 // hex digest to stored (envelope) byte count, from upload_intents. Diffing two
 // listings around a write identifies the envelope(s) that write stored — the
 // digest names the ciphertext, so it cannot be computed from the plaintext —
-// whether or not their spool copies are still on disk.
+// whether or not their cached copies are still on disk.
 func uploadIntentSizes(t *testing.T, ctx context.Context, s *stack.Stack) map[string]int64 {
 	t.Helper()
 	out := ingotSQL(t, ctx, s, `SELECT encode(digest,'hex') || ' ' || size FROM ingot.upload_intents`)
@@ -510,53 +517,53 @@ func newIntentDigests(before, after map[string]int64) []string {
 	return added
 }
 
-// localBlobCount counts the body blobs in the ingot container's spool and
-// cache, ignoring in-progress temp files. Used to prove object bodies are spooled by
+// localBlobCount counts the body blobs in the ingot container's cache,
+// ignoring in-progress temp files. Used to prove object bodies are cached by
 // digest (the data-plane inversion), not journaled into the log.
 func localBlobCount(t *testing.T, ctx context.Context, s *stack.Stack) int {
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
-		`find /data/spool /data/cache -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null | wc -l`)
+		`find /data/cache -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null | wc -l`)
 	if err != nil {
-		t.Fatalf("count spool blobs: %v (stderr=%s)", err, errOut)
+		t.Fatalf("count cached blobs: %v (stderr=%s)", err, errOut)
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(out))
 	if err != nil {
-		t.Fatalf("parse spool count %q: %v", out, err)
+		t.Fatalf("parse cached blob count %q: %v", out, err)
 	}
 	return n
 }
 
 // localBlobBytes sums the sizes of the body blobs in the ingot container's
-// spool and cache, ignoring in-progress temp files.
+// cache, ignoring in-progress temp files.
 func localBlobBytes(t *testing.T, ctx context.Context, s *stack.Stack) int64 {
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
-		`find /data/spool /data/cache -maxdepth 1 -type f ! -name '.tmp*' -printf '%s\n' 2>/dev/null`)
+		`find /data/cache -maxdepth 1 -type f ! -name '.tmp*' -printf '%s\n' 2>/dev/null`)
 	if err != nil {
-		t.Fatalf("list spool sizes: %v (stderr=%s)", err, errOut)
+		t.Fatalf("list cached blob sizes: %v (stderr=%s)", err, errOut)
 	}
 	var total int64
 	for _, line := range strings.Fields(out) {
 		n, err := strconv.ParseInt(line, 10, 64)
 		if err != nil {
-			t.Fatalf("parse spool size %q: %v", line, err)
+			t.Fatalf("parse cached blob size %q: %v", line, err)
 		}
 		total += n
 	}
 	return total
 }
 
-// localBlobPaths lists the body-blob files in the ingot container's spool and
-// cache (full paths, in-progress temp files excluded). Diffing two listings around
-// a PUT identifies the envelope(s) that PUT spooled — the filename is the
+// localBlobPaths lists the body-blob files in the ingot container's cache
+// (full paths, in-progress temp files excluded). Diffing two listings around
+// a PUT identifies the envelope(s) that PUT cached — the filename is the
 // ciphertext digest, so it cannot be computed from the plaintext.
 func localBlobPaths(t *testing.T, ctx context.Context, s *stack.Stack) map[string]bool {
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
-		`find /data/spool /data/cache -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null`)
+		`find /data/cache -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null`)
 	if err != nil {
-		t.Fatalf("list spool blobs: %v (stderr=%s)", err, errOut)
+		t.Fatalf("list cached blobs: %v (stderr=%s)", err, errOut)
 	}
 	paths := map[string]bool{}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
@@ -578,7 +585,7 @@ func newLocalPaths(before, after map[string]bool) []string {
 	return added
 }
 
-// corruptLocalFileTail overwrites 16 bytes of the spooled envelope at path,
+// corruptLocalFileTail overwrites 16 bytes of the cached envelope at path,
 // tailOffset bytes from its end, with zeros — a byte-level tamper inside the
 // final ciphertext chunk (the envelope's tail is STREAM ciphertext; 16
 // random bytes are all-zero with probability 2^-128). Fails if the file
@@ -594,7 +601,7 @@ func corruptLocalFileTail(t *testing.T, ctx context.Context, s *stack.Stack, pat
 		[ "$before" != "$after" ] || { echo "file unchanged" >&2; exit 1; }
 	`, path, tailOffset)
 	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", script); err != nil {
-		t.Fatalf("corrupt spool file %s: %v (stdout=%s stderr=%s)", path, err, out, errOut)
+		t.Fatalf("corrupt cached file %s: %v (stdout=%s stderr=%s)", path, err, out, errOut)
 	}
 }
 
@@ -723,7 +730,7 @@ func quotedMD5(b []byte) string {
 // whose every byte position is verifiable after a round trip. The (i>>16) term
 // mixes in the 64 KiB-blob index so each coarse-split blob has distinct content
 // (a purely position-linear pattern would make equal-length blobs identical and
-// dedup them in the spool).
+// dedup them).
 func patternBytes(n int) []byte {
 	b := make([]byte, n)
 	for i := range b {

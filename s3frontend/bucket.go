@@ -1,6 +1,7 @@
 package s3frontend
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,6 +23,7 @@ import (
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 func (b *Backend) ListBuckets(ctx context.Context, input s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {
@@ -117,16 +119,7 @@ func (b *Backend) PutObjectLockConfiguration(ctx context.Context, bucket string,
 		}
 		return err
 	}
-	if st.Versioning != registry.VersioningEnabled {
-		return s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotAllowed)
-	}
-	if err := b.reg.SetObjectLockConfig(ctx, bucket, config); err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
-		return fmt.Errorf("s3frontend: put object lock configuration: %w", err)
-	}
-	return nil
+	return b.runBucket(ctx, st.Space, registry.BucketSetLockConfigAction, &BucketSetLockConfigTask{Name: bucket, Config: config})
 }
 
 // GetBucketVersioning reports the bucket's versioning configuration. A bucket
@@ -171,20 +164,11 @@ func (b *Backend) PutBucketVersioning(ctx context.Context, bucket string, status
 	case types.BucketVersioningStatusEnabled:
 		v = registry.VersioningEnabled
 	case types.BucketVersioningStatusSuspended:
-		if st.ObjectLockConfig != nil {
-			return s3err.GetAPIError(s3err.ErrSuspendedVersioningNotAllowed)
-		}
 		v = registry.VersioningSuspended
 	default:
 		return s3err.GetAPIError(s3err.ErrMalformedXML)
 	}
-	if err := b.reg.SetVersioning(ctx, bucket, v); err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
-		return fmt.Errorf("s3frontend: put bucket versioning: %w", err)
-	}
-	return nil
+	return b.runBucket(ctx, st.Space, registry.BucketSetVersioningAction, &BucketSetVersioningTask{Name: bucket, State: string(v)})
 }
 
 func (b *Backend) HeadBucket(ctx context.Context, input *s3.HeadBucketInput) (*s3.HeadBucketOutput, error) {
@@ -271,114 +255,169 @@ func (b *Backend) CreateBucket(ctx context.Context, input *s3.CreateBucketInput,
 		}
 		return err
 	}
-	if err := b.reg.Create(ctx, name, id, init); err != nil {
-		if errors.Is(err, registry.ErrExists) {
-			return s3err.GetAPIError(s3err.ErrBucketAlreadyExists)
-		}
-		return err
-	}
-	return nil
+	return b.runBucket(ctx, id, registry.BucketCreateAction, &BucketCreateTask{
+		Name:       name,
+		Tenant:     init.Tenant.String(),
+		Versioning: string(init.Versioning),
+		LockConfig: init.ObjectLockConfig,
+	})
 }
 
 // SegmentDigestLister is the slice of the catalog log DeleteBucket needs to
 // release shipped-segment blob registrations: quiesce the bucket's log, then
-// enumerate every blob its shipped segments registered. It is matched by a
-// runtime type assertion (b.log is a blockstore.Log), which fails SILENTLY on
-// a signature drift — the compile-time assertion in the root package pins
-// *logstore.Manager to this shape so a drift is a build error instead.
+// release every blob its retired segments registered and enumerate the ones
+// its other segments did. It is matched by a runtime type assertion (b.log is
+// a blockstore.Log), which fails SILENTLY on a signature drift — the
+// compile-time assertion in the root package pins *logstore.Manager to this
+// shape so a drift is a build error instead.
 type SegmentDigestLister interface {
 	QuiesceBucketLog(ctx context.Context, bucket string) error
+	ReleaseRetiredSegments(ctx context.Context, bucket string, release func(multihash.Multihash) error) error
 	ShippedSegmentDigests(ctx context.Context, bucket string) ([]multihash.Multihash, error)
 }
 
 func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
-	return b.txns.WithLock(ctx, name, func(ctx context.Context) error {
-		st, err := b.reg.Get(ctx, name)
-		if err != nil {
-			if errors.Is(err, registry.ErrNotFound) {
-				return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+	st, err := b.reg.Get(ctx, name)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return err
+	}
+	// Closed first, so the bucket stays empty and gains no multipart upload
+	// while the ones in flight are aborted. In-flight uploads do not block
+	// deletion, as on AWS (and versitygw's conformance teardown deletes
+	// buckets without aborting them). The aborts run from here: the
+	// multipart queue is above the bucket queue, so no bucket task may run
+	// them. Each runs on the request's own proofs: hilt delegates blob.Abort
+	// and blob.Remove with s3:DeleteBucket, so a bucket that never saw a
+	// write has the authority to release what it holds.
+	if err := b.runBucket(ctx, st.Space, registry.BucketCloseAction, &BucketTask{Name: name}); err != nil {
+		return err
+	}
+	sessions, err := b.multipart.ListSessions(ctx, name, st.Space)
+	if err != nil {
+		return fmt.Errorf("s3frontend: delete bucket: list mp sessions: %w", err)
+	}
+	for _, s := range sessions {
+		switch s.State {
+		case registry.SessionOpen:
+			if err := b.abortUpload(ctx, s); err != nil && !errors.Is(err, s3err.GetAPIError(s3err.ErrNoSuchUpload)) {
+				return fmt.Errorf("s3frontend: delete bucket: abort multipart upload %s: %w", s.UploadID, err)
 			}
+		case registry.SessionCompleted:
+			if err := b.reapNow(ctx, s.UploadID); err != nil {
+				return fmt.Errorf("s3frontend: delete bucket: reap multipart upload %s: %w", s.UploadID, err)
+			}
+		}
+	}
+	if len(sessions) > 0 {
+		b.logger.Info("delete bucket: tore down multipart sessions",
+			zap.String("bucket", name), zap.Int("sessions", len(sessions)))
+	}
+	ctx = context.WithValue(ctx, deleteKey{}, name)
+	return b.runBucket(ctx, st.Space, registry.BucketDeleteAction, &BucketTask{Name: name})
+}
+
+// deleteKey is the context key a DeleteBucket request marks its context
+// with: the name of the bucket it deletes.
+type deleteKey struct{}
+
+// refuseNonEmpty refuses st's bucket when it holds any object. S3 forbids
+// deleting non-empty buckets. It walks the MST until it sees any leaf, then
+// bails. Any leaf counts — a versioned bucket holding only delete markers is
+// still non-empty, and reports the versioned error ("you must delete all
+// versions").
+func (b *Backend) refuseNonEmpty(ctx context.Context, st *registry.State) error {
+	if !st.Root.Defined() {
+		return nil
+	}
+	t := mst.LoadMST(b.read, st.Space, st.Root)
+	var seen bool
+	if err := t.WalkLeavesFromNocache(ctx, "", func(string, cid.Cid) error {
+		seen = true
+		return mst.ErrStopWalk
+	}); err != nil {
+		return err
+	}
+	if !seen {
+		return nil
+	}
+	if st.Versioning.Configured() {
+		return s3err.GetAPIError(s3err.ErrVersionedBucketNotEmpty)
+	}
+	return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
+}
+
+// runDeleteBucket is queue-bucket.delete, the last step of DeleteBucket,
+// after queue-bucket.close and the aborts of the bucket's multipart uploads.
+// It fails on a bucket that holds objects or an upload, which the close
+// makes impossible. Hilt authorizes the delete with the
+// signed S3 request itself, which reaches the task only through its caller's
+// context, marked by the DeleteBucket request for this bucket (deleteKey): a
+// delete run without that mark, resumed by a worker or by another request's
+// task, fails without acting, and the client, whose request failed with it,
+// retries with a freshly signed one. Every step before the Hilt call is safe
+// to repeat.
+func (b *Backend) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
+	var args BucketTask
+	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
+		return nil, taskrunner.Permanent(fmt.Errorf("decode delete: %w", err))
+	}
+	name := args.Name
+	if _, ok := reqscope.Request(ctx); !ok || ctx.Value(deleteKey{}) != name {
+		return nil, taskrunner.Permanent(errors.New("s3frontend: delete bucket: its request has gone"))
+	}
+	return nil, func() error {
+		st, err := b.bucketOn(ctx, name, t.Subject)
+		if err != nil {
 			return err
 		}
 
-		// S3 forbids deleting non-empty buckets. Walk the MST until we see any
-		// leaf, then bail. Any leaf counts — a versioned bucket holding only
-		// delete markers is still non-empty, and reports the versioned error
-		// ("you must delete all versions").
-		if st.Root.Defined() {
-			t := mst.LoadMST(b.read, st.Space, st.Root)
-			var seen bool
-			walkErr := t.WalkLeavesFromNocache(ctx, "", func(string, cid.Cid) error {
-				seen = true
-				return mst.ErrStopWalk
-			})
-			if walkErr != nil {
-				return walkErr
-			}
-			if seen {
-				if st.Versioning.Configured() {
-					return s3err.GetAPIError(s3err.ErrVersionedBucketNotEmpty)
-				}
-				return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
-			}
+		if err := b.refuseNonEmpty(ctx, st); err != nil {
+			return err
 		}
-
-		// In-flight multipart uploads do not block deletion (the upstream
-		// conformance contract's teardown deletes buckets without aborting
-		// them): tear down every session of the bucket — open ones aborted,
-		// stranded and completed ones reaped — recording their part blobs'
-		// releases before asking hilt to delete the space, which refuses
-		// while the space still holds blob registrations. A session whose
-		// releases cannot be recorded fails the delete: its part rows are
-		// the only index to its blobs, and with the bucket row gone the
-		// sweeper would have no space to record them against.
-		//
-		// Every leg — the session teardown, the shipped-segment release and
-		// the drain below — runs on the request's own proofs: hilt delegates
-		// blob.Abort and blob.Remove with s3:DeleteBucket, so a bucket that
-		// never saw a write has the authority to release what it holds.
-		sessions, err := b.multipart.ListSessions(ctx, name)
+		sessions, err := b.multipart.ListSessions(ctx, name, st.Space)
 		if err != nil {
 			return fmt.Errorf("s3frontend: delete bucket: list mp sessions: %w", err)
 		}
-		for _, s := range sessions {
-			var ok bool
-			switch s.State {
-			case registry.SessionOpen:
-				ok = b.abortOpenSession(ctx, s)
-			case registry.SessionCompleted:
-				ok = b.reapCompletedSession(ctx, s)
-			case registry.SessionCompleting:
-				// Crash-stranded, or a live Complete concluding its blobs
-				// off-lock. The latch is taken here, under the bucket
-				// lock: a live Complete re-checks its latch under this
-				// lock before committing and fails with NoSuchUpload, so
-				// it cannot commit a manifest over the blobs this releases.
-				won, err := b.multipart.LatchSession(ctx, s.UploadID, registry.SessionCompleting, registry.SessionAborting)
-				ok = err == nil && won && b.reapAbortingSession(ctx, s)
-			default:
-				ok = b.reapAbortingSession(ctx, s)
-			}
-			if !ok {
-				return fmt.Errorf("s3frontend: delete bucket: multipart session %s: releases not recorded; retry", s.UploadID)
-			}
-		}
 		if len(sessions) > 0 {
-			b.logger.Info("delete bucket: tore down multipart sessions",
-				zap.String("bucket", name), zap.Int("sessions", len(sessions)))
+			return fmt.Errorf("s3frontend: delete bucket: %d multipart uploads remain after the close: %w", len(sessions), errBucketClosing)
+		}
+
+		// Everything below releases blobs, and the catalog's own segments
+		// among them. An empty bucket's catalog describes nothing it still
+		// needs, so commit the empty tree first, ahead of this task's own
+		// commit: the bucket then reads no catalog block, and a delete that
+		// fails past this point (hilt refusing, a release erroring) leaves a
+		// bucket that lists empty and deletes on retry, not one whose root
+		// names released blocks. The same write clears forge_root_cid and
+		// drops the bucket's journaled blocks: the quiesce below leaves the
+		// last segment unshipped until the bucket's next write, and its rows
+		// would otherwise wait with it.
+		if err := b.reg.EmptyRoot(ctx, name, st.Root); err != nil {
+			return fmt.Errorf("s3frontend: delete bucket: empty the root: %w", err)
 		}
 
 		// Shipped catalog segments registered blobs in the bucket's space
-		// (each sealed CAR plus its sharded-dag-index blob), and hilt
-		// refuses to delete a space that still holds registrations — so
-		// release them first. Quiescing the bucket's log comes before the
-		// enumeration: it joins any in-flight ship, so a segment can't
-		// register its blobs after the release pass has already read the
-		// rows (the delete would race the flush goroutine and be refused).
-		// The release is idempotent (removing an unregistered blob is a
-		// no-op), so a retried DeleteBucket is safe.
+		// (each sealed CAR plus its sharded-dag-index blob, retired segments
+		// included), and hilt refuses to delete a space that still holds
+		// registrations — so release them first. The root is already empty,
+		// so nothing the bucket reads goes with them. Quiescing the bucket's
+		// log comes before the enumeration, so no segment seals after the
+		// release pass has read the rows. A ship runs on this subject, so
+		// none is in flight to register its blobs behind the pass. The
+		// release is idempotent (removing an unregistered blob is a no-op),
+		// so a retried DeleteBucket is safe; retired segments, which
+		// accumulate for the bucket's life, drop their rows as they are
+		// released, so a retry doesn't release them again.
 		if log, ok := b.log.(SegmentDigestLister); ok {
 			if err := log.QuiesceBucketLog(ctx, name); err != nil {
+				return fmt.Errorf("s3frontend: delete bucket: %w", err)
+			}
+			if err := log.ReleaseRetiredSegments(ctx, name, func(d multihash.Multihash) error {
+				return b.remover.RemoveBlob(ctx, st.Space, d)
+			}); err != nil {
 				return fmt.Errorf("s3frontend: delete bucket: %w", err)
 			}
 			digests, err := log.ShippedSegmentDigests(ctx, name)
@@ -396,7 +435,11 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		// releases sit in the deferred queue behind the reader grace, and
 		// hilt refuses to delete a space that still holds registrations.
 		// The bucket is provably empty here and its deletion explicit, so
-		// no grace is owed — execute the space's pending releases now.
+		// no grace is owed — execute the space's pending releases now. The
+		// workers that run them, and the object-count changes below, read
+		// this request's authority, lent for the space while it waits: what
+		// the tasks captured may have lapsed.
+		defer b.lendAuthority(ctx, st.Space)()
 		if err := b.drainSpaceReleases(ctx, st.Space); err != nil {
 			return fmt.Errorf("s3frontend: delete bucket: %w", err)
 		}
@@ -415,20 +458,39 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		if !ok {
 			return errors.New("s3frontend: delete bucket: no request in context")
 		}
-		if err := b.authority.DeleteBucket(ctx, req); err != nil {
-			if errors.Is(err, bucketauthority.ErrNotFound) {
-				return s3err.GetAPIError(s3err.ErrNoSuchBucket)
-			} else if errors.Is(err, bucketauthority.ErrNotEmpty) {
+		// Only an answer that the bucket stands reopens it. Not found means
+		// an earlier delete removed the space, so this one finishes the job
+		// here. A call that failed on its way may have deleted the space all
+		// the same, so the bucket stays closing until a retry settles it.
+		if err := b.authority.DeleteBucket(ctx, req); err != nil && !errors.Is(err, bucketauthority.ErrNotFound) {
+			if errors.Is(err, bucketauthority.ErrNotEmpty) || errors.Is(err, bucketauthority.ErrRefused) {
+				if cerr := b.reg.SetClosing(ctx, name, false); cerr != nil {
+					b.logger.Warn("delete bucket: clear the closing mark after the refusal", zap.String("bucket", name), zap.Error(cerr))
+				}
+			}
+			if errors.Is(err, bucketauthority.ErrNotEmpty) {
 				return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
 			}
 			return err
 		}
 
-		// Deleting the bucket row takes its queued object-count changes with
-		// it: upload_registrations cascades on the bucket. They share one
-		// fate by construction rather than by a cleanup step placed correctly
-		// relative to the remote delete.
-		if err := b.reg.Delete(ctx, name); err != nil {
+		// The bucket's segment history dies with it, while the row still
+		// holds the name: the log is the name's, and a bucket created under
+		// the name once the row goes runs under its own space, apart from
+		// this task, and writes a log this must not remove. Best-effort: Hilt
+		// has deleted the space, so a cleanup failure must not fail the API
+		// call, and a create under the name removes a log left behind.
+		if remover, ok := b.log.(bucketLogRemover); ok {
+			if rerr := remover.RemoveBucketLog(ctx, name); rerr != nil {
+				b.logger.Warn("bucket log cleanup failed",
+					zap.String("bucket", name), zap.Error(rerr))
+			}
+		}
+
+		// The space's object-count changes went out in the drain above; one
+		// that could not be sent stays in the queue as a failed task, which
+		// outlives the bucket as the record of the count it leaves wrong.
+		if err := b.reg.Delete(ctx, name, st.Space); err != nil {
 			if errors.Is(err, registry.ErrNotFound) {
 				return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 			} else if errors.Is(err, registry.ErrNotEmpty) {
@@ -436,20 +498,8 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 			}
 			return err
 		}
-
-		// The bucket's segment history dies with it. Best-effort: the
-		// bucket is already deleted, so a cleanup failure must not fail
-		// the API call.
-		if remover, ok := b.log.(interface {
-			RemoveBucketLog(ctx context.Context, bucket string) error
-		}); ok {
-			if rerr := remover.RemoveBucketLog(ctx, name); rerr != nil {
-				b.logger.Warn("bucket log cleanup failed",
-					zap.String("bucket", name), zap.Error(rerr))
-			}
-		}
 		return nil
-	})
+	}()
 }
 
 // validBucketName enforces AWS's general-purpose bucket naming rules

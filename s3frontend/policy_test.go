@@ -9,13 +9,13 @@ import (
 	hiltauth "github.com/fil-forge/hilt/pkg/rpc/service/auth"
 	s3 "github.com/fil-forge/libforge/commands/s3"
 	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
-	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/libforge/testutil"
 	ucanerrors "github.com/fil-forge/ucantone/errors"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/bucketauthority"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
@@ -50,9 +50,9 @@ func policyCtx(req s3.Request) (ctx context.Context, etag *string) {
 
 func policyBackend(t *testing.T, authority bucketauthority.BucketAuthority) *s3frontend.Backend {
 	t.Helper()
-	mem := inmem.NewMemStore()
-	require.NoError(t, mem.Create(t.Context(), "photos", did.Undef, registry.CreateState{}))
-	return s3frontend.New(s3frontend.Deps{Registry: mem, Authority: authority})
+	reg := registry.NewPostgres(pgtest.New(t))
+	require.NoError(t, reg.Create(t.Context(), "photos", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}))
+	return s3frontend.New(s3frontend.Deps{Registry: reg, Authority: authority})
 }
 
 // requireS3Error asserts err is the S3 error code, as versitygw's

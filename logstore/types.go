@@ -3,6 +3,8 @@ package logstore
 import (
 	"context"
 
+	block "github.com/ipfs/go-block-format"
+	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -75,6 +77,18 @@ type SegmentMeta struct {
 	// (the CAR + this index) — the registrations DeleteBucket must release.
 	IndexDigest multihash.Multihash
 
+	// DeadBytes is how much of this segment was dead on arrival, recorded
+	// when it shipped: the bytes of its blocks that its last op-root no
+	// longer reached. -1 when it wasn't measured. Meaningful only once
+	// ShippedAt is set.
+	DeadBytes int64
+
+	// RetiredAt is when retention unlinked this segment's files (unix
+	// seconds), or 0 while it is still on disk. A retired segment keeps its
+	// row: its blobs stay registered in the bucket's space until
+	// DeleteBucket releases them.
+	RetiredAt int64
+
 	// OpRoots are the per-batch (bucket, root) records. Populated only
 	// for catalog-plane segments — op-roots are MST roots.
 	OpRoots []blockstore.OpRoot
@@ -102,29 +116,63 @@ type Meta interface {
 		size int64, sha []byte, opRoots []blockstore.OpRoot) error
 
 	// MarkSegmentShipped records that this segment's CAR finished shipping
-	// to Forge, stamping shipped_at, and advances forge_root_cid in
+	// to Forge, stamping shipped_at and the segment's dead-on-arrival bytes
+	// (negative when they weren't measured), and advances forge_root_cid in
 	// ingot.buckets for every op-root recorded against this segment (catalog
 	// roots are the MST roots durable on Forge), all in one transaction.
-	MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error
+	MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, deadBytes int64, opRoots []blockstore.OpRoot) error
 
 	// DeleteSegment removes a segment row (cascades to op-root rows).
-	// Used by retention after the on-disk files are unlinked.
 	DeleteSegment(ctx context.Context, plane blockstore.Plane, seq uint64) error
 
-	// ListSegments returns every segment row for plane belonging to bucket
-	// (open + sealed) ordered by seq ascending, with op-roots hydrated.
-	// Recovery uses it to rebuild the read tier and re-enqueue unshipped
-	// segments.
+	// RetireSegment stamps retired_at on a segment row once its on-disk
+	// files are unlinked, and drops its op-root rows. The row itself stays:
+	// it is the record of the blobs the segment registered in the bucket's
+	// space, which DeleteBucket must release. Idempotent.
+	RetireSegment(ctx context.Context, plane blockstore.Plane, seq uint64, retiredAt int64) error
+
+	// ListSegments returns every unretired segment row for plane belonging
+	// to bucket (open + sealed) ordered by seq ascending, with op-roots
+	// hydrated. Recovery uses it to rebuild the read tier and re-enqueue
+	// unshipped segments.
 	ListSegments(ctx context.Context, plane blockstore.Plane, bucket string) ([]SegmentMeta, error)
 
+	// ListRetiredSegments returns every retired segment row for plane
+	// belonging to bucket, ordered by seq ascending, without op-roots.
+	ListRetiredSegments(ctx context.Context, plane blockstore.Plane, bucket string) ([]SegmentMeta, error)
+
 	// ListSegmentBuckets returns the distinct buckets that have at least
-	// one segment row for plane. The log manager's startup sweep uses it
-	// to re-open every bucket log with history, so unshipped segments
-	// re-enqueue without waiting for the bucket's next write.
+	// one unretired segment row for plane. The log manager's startup sweep
+	// uses it to re-open every bucket log with history, so unshipped
+	// segments re-enqueue without waiting for the bucket's next write.
 	ListSegmentBuckets(ctx context.Context, plane blockstore.Plane) ([]string, error)
 
 	// RehydrateSegment writes a segment row + its op-root rows from the
 	// on-disk `.idx` sidecar when the DB row is missing or torn.
 	// Idempotent on (seq) — replaces any existing row for that segment.
 	RehydrateSegment(ctx context.Context, m SegmentMeta) error
+
+	// EnsureSegmentSeqAbove moves the NextSegmentSeq allocator past seq, so
+	// it never hands out a seq a segment on disk already holds. A database
+	// restored behind the disk would otherwise reissue them. Startup calls
+	// it before allocating anything.
+	EnsureSegmentSeqAbove(ctx context.Context, seq uint64) error
+
+	// JournalBuckets returns the buckets that have catalog blocks in the
+	// journal (CommitRoot's copy of every block not yet shipped).
+	JournalBuckets(ctx context.Context) ([]string, error)
+
+	// JournalSegments returns the seqs bucket's journaled blocks are filed
+	// under, ascending.
+	JournalSegments(ctx context.Context, bucket string) ([]uint64, error)
+
+	// ReadJournal returns up to limit of the blocks journaled under seq, in
+	// CID byte order, starting after `after` (cid.Undef for the first page).
+	ReadJournal(ctx context.Context, seq uint64, after cid.Cid, limit int) ([]block.Block, error)
+
+	// MoveJournal re-files bucket's blocks journaled under seq from whose
+	// CIDs fall in [first, last] (byte order) under seq to, in one
+	// transaction. Recovery moves a lost segment's blocks onto the segment
+	// it rebuilt them into, once they are durable there.
+	MoveJournal(ctx context.Context, bucket string, from, to uint64, first, last cid.Cid) error
 }

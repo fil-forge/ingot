@@ -105,18 +105,15 @@ type Config struct {
 	RevocationServiceURL string `mapstructure:"revocation_service_url" yaml:"revocation_service_url"`
 	RevocationServiceDID string `mapstructure:"revocation_service_did" yaml:"revocation_service_did"`
 
-	// MultipartSessionTTL bounds abandoned multipart uploads (Go duration
-	// string, e.g. "168h"): a session whose state has not changed for this
-	// long is torn down by a background sweeper and its parts released.
-	// Empty → default 7 days; a negative duration disables the sweeper.
-	// A part keeps no local copy once it parks on its provider, so Complete
-	// relies on the provider keeping the parked allocation: a session
-	// completed after the provider has expired it fails, and the client must
-	// upload those parts again. The TTL counts from the session's last state
-	// change, and a Complete that fails returns the session to open, which
-	// restarts it; so it bounds a parked part's age only while no Complete
-	// fails. Keep it well under how long the provider keeps parked
-	// allocations.
+	// MultipartSessionTTL bounds multipart uploads (Go duration string,
+	// e.g. "168h"): an upload still open this long after its creation is
+	// aborted and its parts released, and a completed one is reaped this long
+	// after its Complete. Empty → default 7 days; a negative duration
+	// disables both. A part keeps no local copy once it parks on its
+	// provider, so Complete relies on the provider keeping the parked
+	// allocation: an upload completed after the provider has expired it
+	// fails, and the client must upload those parts again. Keep it well under
+	// how long the provider keeps parked allocations.
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
 
 	// CompleteMultipartKeepalive keeps a slow CompleteMultipartUpload's
@@ -140,35 +137,29 @@ type Config struct {
 	// immediately.
 	ReleaseGrace string `mapstructure:"release_grace" yaml:"release_grace"`
 
-	// LocalBlobMaxBytes is the byte budget for local blob storage: the spool
-	// (<data_dir>/spool: writes in progress, counted as their bytes land, and
-	// bodies waiting for upload) plus the cache (<data_dir>/cache: copies of
-	// bodies the provider holds). It does not cover the catalog log. A
-	// sweeper checks it every 30 seconds and evicts blobs the provider
-	// holds, oldest first, down to 90% of the budget; reads of an evicted blob go to the
-	// provider. Usage can exceed the budget by ingest rate × 30 seconds
-	// between sweeps, and by files that must stay (the spool's, and orphans
-	// younger than LocalBlobOrphanAge). 0 → no budget (the default); negative
+	// LocalBlobMaxBytes is the byte budget for local blob storage: the cache
+	// (<data_dir>/cache: copies of bodies the provider holds, and writes in
+	// progress, counted as their bytes land). It does not cover the catalog
+	// log. A
+	// sweeper checks it every 30 seconds and evicts cached blobs, the least
+	// recently cached or read first, down to 90% of the budget; reads of an
+	// evicted blob go to the provider. Usage can exceed the budget by ingest rate × 30 seconds
+	// between sweeps, and by files that must stay (writes in progress, and
+	// orphans younger than LocalBlobOrphanAge). 0 → no budget (the default); negative
 	// is an error.
 	LocalBlobMaxBytes int64 `mapstructure:"local_blob_max_bytes" yaml:"local_blob_max_bytes"`
-	// CacheMinResidency is the read-after-write window (Go duration string):
-	// the sweeper leaves alone a cached blob whose upload state changed less
-	// than this long ago (for a committed blob, its commit time) unless usage
-	// stays over budget without it. Costs ingest rate × residency in disk.
-	// Empty → default 10m; "0s" turns it off; negative is an error.
-	CacheMinResidency string `mapstructure:"cache_min_residency" yaml:"cache_min_residency"`
-	// CacheReadRetention is the read-cache window (Go duration string): the
-	// sweeper leaves alone a blob served from the cache within this long,
-	// unless usage stays over budget without it. Reads are remembered in
-	// memory, for a bounded number of blobs, and forgotten on restart. Empty
-	// → default 1h; "0s" turns it off; negative is an error.
-	CacheReadRetention string `mapstructure:"cache_read_retention" yaml:"cache_read_retention"`
+	// CacheTTL is how long a blob stays in the cache (Go duration string)
+	// after it was cached or last read, unless the budget evicts it first. A
+	// read extends it only once less than half is left, so most reads cost
+	// nothing. Empty → default 1h; zero or negative is an error (set
+	// cache_writes to false to cache nothing).
+	CacheTTL string `mapstructure:"cache_ttl" yaml:"cache_ttl"`
 	// LocalBlobOrphanAge is the age (file modification time) at which the
-	// sweeper deletes a .tmp-* file in the spool or the cache, or a spool blob
-	// file with no upload intent (Go duration string), hourly, whether or not a
-	// budget is set. It must exceed the longest time one request body takes to
-	// stream: the server sets no body read timeout, and a body still streaming
-	// past it can have its first blobs deleted, failing the request. Empty →
+	// sweeper deletes a .tmp-* file in the cache (Go duration string), hourly,
+	// whether or not a budget is set. It must exceed the longest time one
+	// request body takes to stream: the server sets no body read timeout, and
+	// a body still streaming past it loses its local copy, so it is not
+	// cached. Empty →
 	// default 24h; under 1h is an error.
 	LocalBlobOrphanAge string `mapstructure:"local_blob_orphan_age" yaml:"local_blob_orphan_age"`
 	// CacheWrites moves each body's local copy into the cache once the
@@ -223,6 +214,9 @@ type PlaneSettings struct {
 	Retain    int    `mapstructure:"retain" yaml:"retain"`
 }
 
+// DefaultRegion is the region the gateway advertises when Region is unset.
+const DefaultRegion = "us-east-1"
+
 // defaultReadCacheBytes is the block cache budget when ReadCacheBytes is 0.
 const defaultReadCacheBytes int64 = 256 << 20
 
@@ -275,13 +269,12 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 			releaseGrace = 0
 		}
 	}
-	cacheMinResidency, err := parseDurationKnob("cache_min_residency", c.CacheMinResidency, 10*time.Minute)
+	cacheTTL, err := parseDurationKnob("cache_ttl", c.CacheTTL, time.Hour)
 	if err != nil {
 		return ServerConfig{}, err
 	}
-	cacheReadRetention, err := parseDurationKnob("cache_read_retention", c.CacheReadRetention, time.Hour)
-	if err != nil {
-		return ServerConfig{}, err
+	if cacheTTL == 0 {
+		return ServerConfig{}, fmt.Errorf("ingot: cache_ttl %q: must be positive (set cache_writes to false to cache nothing)", c.CacheTTL)
 	}
 	localBlobOrphanAge, err := parseDurationKnob("local_blob_orphan_age", c.LocalBlobOrphanAge, 24*time.Hour)
 	if err != nil {
@@ -322,8 +315,7 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		ReleaseGrace:               releaseGrace,
 
 		LocalBlobMaxBytes:  c.LocalBlobMaxBytes,
-		CacheMinResidency:  cacheMinResidency,
-		CacheReadRetention: cacheReadRetention,
+		CacheTTL:           cacheTTL,
 		LocalBlobOrphanAge: localBlobOrphanAge,
 		DropAcceptedBodies: c.CacheWrites != nil && !*c.CacheWrites,
 

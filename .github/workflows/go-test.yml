@@ -1,11 +1,9 @@
 name: Go Test
 
-# Fast unit tests (the shared unified workflow) and the env-gated live tests
-# (real Postgres + OpenBao as service containers) run in parallel, and the
-# Docker-backed suites only run once the unit job passes — a broken unit test
-# fails the PR in ~2 minutes instead of tying up runners booting the Forge
-# stack. The live job exists because the unit job runs the same packages with
-# no INGOT_TEST_* env, silently skipping every *_live_test.go.
+# The test suite (job `test`) runs against the services it needs, Postgres and
+# OpenBao, as service containers, and the Docker-backed suites only run once it
+# passes — a broken test fails the PR in a few minutes instead of tying up
+# runners booting the Forge stack.
 #
 # The Docker-backed work spreads over seven runners: six `itest-groups` and
 # `s3compat`, which runs the compatibility corpus (the groups leave
@@ -38,28 +36,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  unit:
-    uses: ipdxco/unified-github-workflows/.github/workflows/go-test.yml@d9b156f4be9fae6843707f5e5cda2fb079f821ac # v1.0
-    with:
-      go-versions: '["this"]'
-    secrets:
-      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
-  live:
-    # The env-gated live tests: the SQL-backed stores and migrations against
-    # a real Postgres, and the OpenBao transit provider against a real
-    # OpenBao — behavior the in-memory fakes and httptest doubles cannot
-    # prove (bytea[] round-trips, CHECK constraints, derived-context
-    # binding, key rotation). Cheap enough to run in parallel with unit.
+  test:
+    # Every package's tests, each on a database of its own (internal/pgtest)
+    # on the Postgres service, and the region-key provider's against the
+    # OpenBao one. Linux only: service containers need a Linux runner.
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
-
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:17
         env:
           POSTGRES_PASSWORD: pw
-          POSTGRES_DB: ingot
         ports:
           - 55432:5432
         options: >-
@@ -88,21 +75,26 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Run live tests
+      - name: Run the tests
         env:
-          GOWORK: off
-          INGOT_TEST_DSN: postgres://postgres:pw@127.0.0.1:55432/ingot
+          INGOT_TEST_DSN: postgres://postgres:pw@127.0.0.1:55432/postgres?sslmode=disable
           INGOT_TEST_BAO_ADDR: http://127.0.0.1:8200
           INGOT_TEST_BAO_TOKEN: root
-        run: go test -v -count=1 -run '(Live|GraphValidates)' ./cmd/... ./registry/ ./migrations/ ./regionkey/
+        run: make test ARGS="-race -shuffle=on -count=1 -coverprofile=coverage.txt ./..."
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage.txt
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   itest-groups:
-    needs: unit
+    needs: test
     # Pin to 24.04 rather than -latest so the Docker version doesn't drift
     # from under us. The runner's preinstalled Docker is 28.x, well past
     # smelt's 25+ requirement.
     runs-on: ubuntu-24.04
-    # The slowest group is ~7 minutes of tests on top of ~2 minutes of image
+    # The slowest group is ~10 minutes of tests on top of ~2 minutes of image
     # pulls and the working-tree ingot build. Comfortably above `make
     # itest-group`'s own -timeout 20m, so a hung test hits Go's timeout and
     # dumps goroutine stacks before the runner is cut off.
@@ -138,7 +130,7 @@ jobs:
 
       - name: Docker and disk info
         # df because the `uploads` group's 5 GiB part test churns ~10-15 GiB
-        # (spool copy + piri copy): the runner image starts with ~73 GiB free,
+        # (piri's copy): the runner image starts with ~73 GiB free,
         # so this records the margin rather than needing anything freed.
         run: |
           docker version
@@ -205,7 +197,7 @@ jobs:
           test "${{ needs.itest-groups.result }}" = success
 
   s3compat:
-    needs: unit
+    needs: test
     # Its own runner, alongside `itest` — see the header comment: the two
     # suites each boot a Forge stack, and one `go test` process's startup
     # sweep would remove the other's containers.

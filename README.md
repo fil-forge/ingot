@@ -54,34 +54,36 @@ out of ordinary traversal.
 
 Writes are functional: a PUT or DELETE rewrites only the nodes on the path from
 the changed key up to the root (every other node is immutable and shared),
-producing a **new root CID**. ingot journals the changed blocks to the local
-log, then **compare-and-swaps the bucket's root in Postgres** from the old CID
-to the new one. That split is the heart of the design:
+producing a **new root CID**. Each change to a bucket runs as a task on the
+bucket's `queue-bucket` subject, one at a time: ingot journals the changed blocks to the local
+log, then **advances the bucket's root in Postgres** from the old CID to the
+new one, guarded on the old. That split is the heart of the design:
 
 - **The MST is the data** — immutable, content-addressed, self-verifying, and
   shippable to Forge exactly as it sits on disk.
 - **Postgres is the mutable index** — the authoritative *current* root per
-  bucket (the CAS keeps a bucket single-writer-correct), the segment
+  bucket (the bucket's queue keeps it single-writer), the segment
   lifecycle, and the blob claim ledger, all under the `ingot` schema.
 
 ## Bodies and catalog
 
 A write splits into two paths:
 
-- **Bodies** stream into a local spool (the BLAKE3 tree and md5 in one pass), split
-  into blobs of at most `max_blob_size`, and upload to Forge storage
-  synchronously: `/blob/add` via sprue, an HTTP PUT to the allocated piri,
-  and the accepted location commitment, all before the catalog commit.
+- **Bodies** split into blobs of at most `max_blob_size` as they arrive (the
+  BLAKE3 tree and md5 in the same pass) and stream to Forge storage
+  synchronously: `/blob/add` via sprue, an HTTP PUT to the allocated piri as
+  the bytes arrive, and the accepted location commitment, all before the
+  catalog commit.
   Identical bytes dedup by digest; a reference index (`blob_refs`) counts
   which versions still claim each blob and releases it (`/blob/remove`) when
   the count reaches zero.
 - **The catalog** (the dag-cbor MST nodes and manifests) journals to a local
   per-bucket log, seals into CAR segments by size or age, and ships to the
-  bucket's Forge space in the background; shipping advances the bucket's
-  `forge_root_cid` under a guard. See
+  bucket's Forge space as a `queue-bucket.ship` task queued on each seal;
+  shipping advances the bucket's `forge_root_cid` under a guard. See
   [`logstore/README.md`](./logstore/README.md).
 
-Reads fall through tiers: local disk (cache, then spool), the local log
+Reads fall through tiers: the local cache, the local log
 (catalog blocks), and finally the network, resolved by a local locator
 (`blob_locations` + `shard_inclusions`) and fetched with a ranged
 `content/retrieve` against the storing piri. The two routes are drawn side by side in
@@ -115,6 +117,7 @@ ingot blake3 hash --bao --chunk-log 4 < file  # an outboard at iroh's 16 KiB blo
 ingot blake3 verify <cid> < file              # whole-object check against an x-cid
 ingot blake3 range --outboard "$OUTBOARD" --chunk-log 12 5000-200000   # aligned Range to fetch
 ingot blake3 verify --outboard "$OUTBOARD" --chunk-log 12 --offset 0 <cid> < part  # ranged check
+ingot catalog usage                           # each bucket's catalog bytes: on Forge, dead on arrival, live (JSON; benchmarks)
 ```
 
 `blake3 range` and the ranged `verify` take the `Blake3` attribute of
@@ -124,10 +127,15 @@ base64 string from the XML (`--outboard`) or from a file holding that string
 or the raw bytes (`--outboard-file`). A mismatch exits 1; any other failure
 exits 2.
 
-`serve` requires Postgres (`postgres_dsn`), the sprue edge client
-(`upload_service_url`/`_did`), and the hilt auth/tenant service
+`serve` requires `addr` (default `0.0.0.0:8080`) and `data_dir`, Postgres
+(`postgres_dsn`), the agent's key (`identity.key_file`), the sprue edge client
+(`upload_service_url`/`_did`), the hilt auth/tenant service
 (`auth_service_url`/`_did` plus the `auth_service_proofs` delegation chains
-hilt issues to this agent). Tenants, access keys, and buckets are owned by
+hilt issues to this agent), a region-key provider (`regionkey.provider`:
+`openbao`, or `inprocess` for development) and the did:plc directory tenant
+wrap keys resolve from (`tenantkey.plc_directory_url`). Every key can also be
+set from the environment as `INGOT_` plus the key, `.` replaced by `_`
+(`INGOT_TENANTKEY_PLC_DIRECTORY_URL`). Tenants, access keys, and buckets are owned by
 [hilt](https://github.com/fil-forge/hilt): it authorizes every S3 request
 signed with a hilt-issued access key, mints each bucket's Forge space, and
 issues the S3 credentials; ingot never self-provisions. The gateway has no
@@ -138,8 +146,8 @@ the S3 facade runs **at the edge**, co-located with a provider's piri or as a
 standalone client — not inside the central upload-service.
 
 `serve` exports OpenTelemetry traces over OTLP/HTTP when
-`OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; with no endpoint, tracing is
-off. Each S3 request is a trace named for its S3 action, with the hilt, sprue,
+`OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) names a
+collector; with no endpoint, tracing is off. Each S3 request is a trace named for its S3 action, with the hilt, sprue,
 piri and Postgres calls it makes as child spans. The other standard `OTEL_*`
 environment variables apply: `OTEL_EXPORTER_OTLP_HEADERS` authenticates to the
 collector, and `OTEL_TRACES_SAMPLER_ARG` sets the fraction of requests traced
@@ -152,83 +160,56 @@ library, ingot records them on the global meter provider.
 
 ### Local disk
 
-`serve` keeps object bodies in two directories under `data_dir`, which
-must be on one filesystem (`serve` checks this at startup):
-
-- `<data_dir>/spool` holds each body as it is written and uploaded, until
-  the provider holds it;
-- `<data_dir>/cache` holds a body once the provider holds it (it moves there
-  by rename), so a read soon after a write is served from local disk.
+`serve` keeps copies of object bodies in `<data_dir>/cache`. A write tees
+each body blob into a temporary file there as it streams the blob to its
+provider, and keeps the file once the provider holds the blob, before the
+PUT answers, so a read soon after a write is served from local disk.
 
 A cached copy is not needed, so it goes:
 
-- when a deleted or overwritten object's release runs (`release_grace`,
-  default 60s, after its last reference drops). The release also removes the
+- when its time to live runs out: `cache_ttl` (default `1h`) after it was
+  cached or last read;
+- when a deleted or overwritten object's `queue-space-shard.release` runs
+  (`release_grace`, default 60s, after its last reference drops). The release also removes the
   provider's copy, so a GET still streaming the old object once the grace
   has passed fails when it reaches a blob it has not yet opened:
   `release_grace` bounds how long such a read may take;
 - with `local_blob_max_bytes` set, when a sweeper, checking every 30 seconds,
-  finds the two directories over the budget and evicts cached bodies, oldest
-  first, down to 90% of the budget. Later reads of an evicted body go to the
-  provider and take provider-read latency.
+  finds the cache over the budget and evicts cached bodies, the least
+  recently cached or read first, down to 90% of the budget, however much of
+  their time to live is left.
 
-Two windows keep cached bodies local while the budget allows:
-`cache_min_residency` (default `10m`) passes over bodies whose upload
-changed state that recently (for a committed object, its commit), so a
-client reading back what it just wrote reads from disk, and
-`cache_read_retention` (default `1h`) passes over bodies read from the cache
-that recently (remembered in memory for up to 65,536 bodies, and forgotten
-on restart). If usage is still over budget after that, the sweeper evicts
-inside the windows, since a full disk fails every write, but only down to
-the budget: first bodies inside `cache_min_residency` that no one has read
-recently, then, only if that is not enough, recently read ones too. It warns
-at most once an hour when it does; the `budget_forced` removals count each
-time. `0s` turns either window off.
+Later reads of an evicted body go to the provider and take provider-read
+latency. A read from the cache extends the body's time to live only once
+less than half of it is left, so most reads cost nothing. Each time to live
+is a `queue-shard.evict` task in Postgres, so it survives a restart.
 
-A multipart part's copy goes from the spool as soon as the part parks on its
-provider, so Complete relies on the provider keeping the parked allocation
-until then; keep `multipart_session_ttl` (default `168h`) well under how
-long the provider keeps parked allocations. The TTL counts from the
-session's last state change, and a failed Complete returns the session to
-open, which restarts it, so a part can outlive the TTL. The budget is off by default
-(`local_blob_max_bytes: 0`): without it the cache grows with every live
-object's bodies. A node that rarely reads back what it just wrote can keep
-no written bodies at all: with `cache_writes: false`, each body's copy goes
-as soon as the provider accepts it instead of moving to the cache, and every
-read goes to the provider. The spool then holds only bodies still being
-written or uploaded and the bodies of failed uploads, apart from a copy
-whose removal failed, which waits for its object's release or the budget;
-bodies cached before the setting was turned off stay until they are
-released or evicted. With or without a
-budget, the sweeper also deletes, at startup and then hourly, unfinished
-`.tmp-*` writes in either directory and spool files with no upload intent,
-once they are older than `local_blob_orphan_age` (default `24h`, at least
-`1h`). Once at each startup, `serve` also deletes the copies of objects
-deleted by a version of ingot that kept them.
+A multipart part keeps no local copy, so Complete relies on the provider
+keeping each parked allocation until it runs; keep `multipart_session_ttl`
+(default `168h`) well under how long the provider keeps parked allocations.
+The TTL counts from the upload's creation, when its auto-abort is
+scheduled, so no parked part outlives it. The budget is off by default (`local_blob_max_bytes: 0`): without it
+the cache grows with every live object's bodies. A node that rarely reads
+back what it just wrote can keep no written bodies at all: with
+`cache_writes: false`, a write keeps no copy and every read goes to the
+provider. Bodies cached before the setting was turned off stay until they
+are released or evicted. With or without a budget, the sweeper also
+deletes, hourly, unfinished `.tmp-*` writes once they are older than
+`local_blob_orphan_age` (default `24h`, at least `1h`); startup deletes
+every one it finds.
 
 **Sizing.** The filesystem needs room for:
 
 - `local_blob_max_bytes`, plus 10% headroom that must exceed the ingest rate
-  × 30 seconds (60 GB at 2 GB/s). To evict outside `cache_min_residency`,
-  the budget must also exceed the ingest rate × the window (1.2 TB at 2 GB/s
-  for the default `10m`); below that, sweeps evict inside the window, and
-  warn at most once an hour. Likewise, to keep recently read bodies, it must
-  exceed the bodies read within `cache_read_retention` (up to 65,536 of them,
-  each up to `max_blob_size`); a read working set bigger than the budget is
-  evicted inside the window every sweep;
-- the spool's bodies in flight, when they outgrow the budget: each
-  concurrent PUT or UploadPart writes its body as it streams, and a part can
-  be up to 5 GiB. The budget counts those bytes as they land, so the sweeper
-  evicts cached bodies to make room for them. But a body cannot be evicted
-  until the provider holds it, so if the spool alone exceeds the budget,
-  usage runs over it by the difference;
-- the bodies of uploads that failed: their upload intents stay `spooled` or
-  `uploading`, and nothing reclaims a failed PUT's spool files yet, so they
-  stay and count against the budget. (A multipart part's go with its
-  session, at Complete, Abort or `multipart_session_ttl`.) They are not safe
-  to delete by hand (see *Manual cleanup* below), so size the budget with
-  headroom for them. `ingot.local_blobs.stalled_bytes` reports how much they
-  hold;
+  × 30 seconds (60 GB at 2 GB/s). To keep bodies for their whole
+  `cache_ttl`, the budget must also exceed the bodies written or read within
+  it (7.2 TB at 2 GB/s of ingest for the default `1h`); below that, sweeps
+  evict bodies before their time runs out;
+- writes in progress, when they outgrow the budget: each concurrent object
+  write tees its body into the cache as it streams. The budget counts
+  those bytes as they land, so the sweeper evicts cached bodies to make room
+  for them. But a write in progress cannot be evicted, so if writes alone
+  exceed the budget, usage runs over it by the difference;
 - the catalog log, if it shares the filesystem: `<data_dir>/segments`, per
   bucket about (`retain` + the open and unshipped segments) × `seal_bytes`.
 
@@ -236,20 +217,21 @@ deleted by a version of ingot that kept them.
 
 | Metric | Meaning |
 | -- | -- |
-| `ingot.local_blobs.usage` | Bytes held, by `dir`: `spool` (writes in progress and bodies awaiting upload, which eviction cannot touch) or `cache` |
+| `ingot.local_blobs.usage` | Bytes held, by `dir` (always `cache`): cached bodies, and writes in progress (which eviction cannot touch) |
 | `ingot.local_blobs.budget` | `local_blob_max_bytes` (0: no budget) |
-| `ingot.local_blobs.stalled_bytes` | Bytes of bodies whose upload has stalled, by `state`: intents still `spooled` or `uploading` an hour after their last state change, which nothing reclaims yet for a failed PUT (a multipart part's go with its session). `spooled` bodies never left this node; `uploading` ones may have reached their provider. Growth means uploads are failing |
-| `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `parked`, `accepted` (with `cache_writes: false`), `budget`, `budget_forced` (inside a retention window), `orphan` |
+| `ingot.local_blobs.stalled_bytes` | Bytes of bodies whose upload has stalled, by `state`: intents still `uploading` an hour after their last state change. They hold no local bytes; the provider expires an allocation that is never concluded. Growth means uploads are failing |
+| `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `expired` (its `cache_ttl` ran out), `budget`, `orphan` (an unfinished write's temporary file) |
 | `ingot.local_blobs.reads` | Body-blob reads, by `tier`: `local` or `network` (the local hit ratio) |
 
-Multipart uploads' parts are accepted in the background while the client
-uploads them (see DESIGN_NOTES), and report:
+Multipart uploads' parts are accepted while the client uploads them, each
+blob by a `queue-space-shard.accept` task the upload's
+`queue-multipart-upload.accept` queues (see DESIGN_NOTES), and report:
 
 | Metric | Meaning |
 | -- | -- |
-| `ingot.multipart.parked_age` | Seconds the oldest parked part of an open or completing upload has waited for acceptance, measured every 30s; 0 when none waits. Parts are accepted within seconds, so growth means the acceptance queue is stuck |
-| `ingot.multipart.accept_passes` | Acceptor passes that concluded parts, by `outcome`: `accepted` or `failed` (retried after a backoff; a timed-out pass included) |
-| `ingot.multipart.complete_deferred` | CompleteMultipartUpload requests answered OperationAborted because a part they name was still queued. Botocore clients (the AWS CLI) treat that as a failed upload |
+| `ingot.multipart.parked_age` | Seconds the oldest parked part of an open upload has waited for acceptance, read from the part rows when collected; 0 when none waits. Parts are accepted within seconds, so growth means the acceptance queue is stuck |
+| `ingot.multipart.accept_passes` | Part blobs concluded, by `outcome`: `accepted` or `failed` (the blob's accept retries; a timed-out conclude included) |
+| `ingot.multipart.complete_deferred` | CompleteMultipartUpload requests answered OperationAborted because the parts' accepts did not finish in time. Botocore clients (the AWS CLI) treat that as a failed upload |
 
 Each commit also journals its catalog blocks in Postgres until their segment
 ships (see `logstore/README.md`), so a copy of the database holds the
@@ -260,36 +242,71 @@ catalog only this host's disk would otherwise hold. The journal reports:
 | `ingot.catalog_journal.blocks`, `ingot.catalog_journal.bytes` | Catalog blocks, and their bytes, journaled in Postgres whose segment has not shipped yet |
 | `ingot.catalog_journal.oldest_age` | Seconds since the oldest journaled block was written; 0 when the journal is empty. Segments ship within seconds of sealing, so growth means shipping has stalled and the unshipped catalog is building up in Postgres |
 
-**Manual cleanup.** Every file in `<data_dir>/cache` is safe to delete: the
-provider holds its body. A file in `<data_dir>/spool` may be the only copy.
-The one kind safe to delete is a body the provider already holds, left in
-the spool by an interrupted move; this query lists those (the file names are
-the hex digests):
+The task queues report queue depth, the oldest ready task's age, lease waits
+and takeovers, task duration and busy workers as `taskrunner.*`, listed in
+[`taskrunner/README.md`](./taskrunner/README.md#metrics).
 
-```sql
-SELECT encode(i.digest, 'hex') FROM ingot.upload_intents i
-WHERE i.state IN ('accepted', 'published')
-  AND EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.digest = i.digest);
-```
+**Manual cleanup.** Every blob file in `<data_dir>/cache` is safe to
+delete: the provider holds its body. Restart `serve` after deleting files by
+hand: the byte count sees such a change at startup, or only at an hourly
+scan that no write overlapped.
 
-Never delete the spool file of a `spooled` or `uploading` intent: it may be
-the only copy. Restart `serve` after deleting files by hand: the byte counts
-see such a change at startup, or only at an hourly scan that no write
-overlapped.
+### Catalog storage on Forge
+
+Nothing collects dead catalog blocks yet: each shipped catalog segment stays
+on Forge until its bucket is deleted, retired segments included. With metrics
+on, these gauges show how much catalog storage each bucket holds there and how
+much of it was dead before it shipped. Each is labeled by the bucket's `space`
+DID, not its name, and refreshed every five minutes: each refresh reads every
+segment row in Postgres.
+
+| Metric | Meaning |
+| -- | -- |
+| `ingot.catalog.forge_bytes` | Bytes of the bucket's shipped catalog segments, retired ones included (their CARs; their index blobs are not counted) |
+| `ingot.catalog.dead_on_arrival_bytes` | Bytes of those segments' blocks that were already dead when their segment shipped: superseded by later writes in the same segment |
+| `ingot.catalog.unmeasured_bytes` | Bytes of shipped segments whose dead-on-arrival bytes were not measured, such as every segment shipped before the measurement existed |
+
+Blocks that die after their segment ships are not measured: that would take a
+walk of the bucket's live catalog, most of which is only on Forge.
+
+A test stack can measure them. `ingot catalog usage` prints, as JSON, each
+bucket's figures above beside its local segment files and the live bytes its
+root reaches. The walk reads a block no local segment holds, such as one of a
+retired segment, with the rest of its segment from Forge, authorized by an
+access key the command takes from `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`. Without one such blocks count as missing, and so do
+those of a bucket the key may not list. Dead after shipping is then roughly
+what's left: CAR headers count only in the bytes on Forge, blocks of segments
+not yet shipped count as live, an unmeasured segment's dead-on-arrival bytes
+count as dead after shipping, and a block can count both as live and as dead
+on arrival in an older segment.
+The walk holds every segment it reads in memory, so it is for benchmark runs,
+not production nodes. A production node could not run it anyway: it holds no
+tenant's secret, and its authority over a bucket arrives only with that
+tenant's signed requests.
+
+`forge_bytes` undercounts a bucket whose segments retired before retired rows
+were kept (migration `00033`): those rows were deleted, so their CARs, still on
+Forge, count nowhere, not even as unmeasured. Read such a bucket's figures as a
+floor, or reset its data.
 
 ## Build & test
 
 ```bash
-make build   # GOWORK=off go build ./...
-make test    # unit tests (seconds, no Docker)
-make itest   # integration tests (boots the Forge stack in Docker, ~6 min)
-make gen     # regenerate CBOR marshalers after changing bucket types
+make build                 # the daemon binary, ./ingot (GOWORK=off)
+make test                  # every package's tests (starts Postgres and OpenBao in Docker)
+make itest                 # integration tests (boots the Forge stack in Docker, ~20 min)
+make itest-group GROUP=auth  # one of the groups CI runs on its own runner
+make s3compat              # the S3 compatibility corpus, written as an HTML report
+make gen                   # regenerate CBOR marshalers after changing bucket, registry or s3frontend task types
+make gen-check             # fail if the generated bucket marshalers are stale
 ```
 
 The `itest/` package boots the real Forge stack via smelt's Go SDK and runs
 this working tree's binary against it — including the curated S3 conformance
 partition (per-group expected-pass and known-fail tables of versitygw cases).
-CI runs it after unit tests pass. See `itest/README.md`.
+CI runs it, split into `make itest-group` groups, after unit tests pass. See
+`itest/README.md`.
 
 ## Deploying to the dev node
 
@@ -319,8 +336,8 @@ must never import `fil-forge/sprue` or `fil-forge/guppy` (guppy embeds ingot
 
 ## Status
 
-The S3 core is exercised two ways: `make test` runs the unit tier in seconds,
-and `make itest` boots the real Forge stack (smelt, in Docker) and runs this
+The S3 core is exercised two ways: `make test` runs every package's tests
+against a real Postgres, and `make itest` boots the real Forge stack (smelt, in Docker) and runs this
 working tree's binary against it, including a curated partition of the
 upstream versitygw S3 conformance suite. Known gaps are tracked in
 [`DESIGN_NOTES.md`](./DESIGN_NOTES.md).

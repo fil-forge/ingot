@@ -4,30 +4,38 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
+	"go.uber.org/zap/zaptest"
 	"testing"
+	"time"
 
 	"github.com/fil-forge/libforge/identity"
+	"github.com/fil-forge/ucantone/did"
+	"github.com/multiformats/go-multihash"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/iam"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/pgtest"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/regionkey"
+	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/tenantkey"
 )
 
-// TestServerReportsLocalBlobGauges: New registers the local blob and catalog
-// journal gauges on the global meter provider, and Stop unregisters them.
+// TestServerReportsLocalBlobGauges: New registers the local blob, catalog
+// journal and multipart gauges on the global meter provider, and Stop
+// unregisters them.
 func TestServerReportsLocalBlobGauges(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	prev := otel.GetMeterProvider()
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
 	t.Cleanup(func() { otel.SetMeterProvider(prev) })
 
-	s := newInmemServer(t, config.ServerConfig{LocalBlobMaxBytes: 1 << 20})
+	s := newTestServer(t, config.ServerConfig{LocalBlobMaxBytes: 1 << 20})
 
 	require.Equal(t, map[string]bool{
 		"ingot.local_blobs.usage":          true,
@@ -35,10 +43,97 @@ func TestServerReportsLocalBlobGauges(t *testing.T) {
 		"ingot.catalog_journal.blocks":     true,
 		"ingot.catalog_journal.bytes":      true,
 		"ingot.catalog_journal.oldest_age": true,
+		"ingot.multipart.parked_age":       true,
 	}, metricNames(t, reader), "metrics reported after New")
 
 	require.NoError(t, s.Stop(context.Background()))
 	require.Empty(t, metricNames(t, reader), "metrics reported after Stop")
+}
+
+// TestServerReportsCatalogUsageGauges: with a catalog usage store, the
+// catalog usage gauges report each bucket's shipped catalog segments under
+// its space, retired ones included, once the sweep Start runs has refreshed
+// them; a later refresh replaces the figures, and Stop unregisters them.
+func TestServerReportsCatalogUsageGauges(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	prev := otel.GetMeterProvider()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	t.Cleanup(func() { otel.SetMeterProvider(prev) })
+
+	ctx := t.Context()
+	mem := registry.NewPostgres(pgtest.New(t))
+	space, err := did.Parse("did:web:catalog-usage.example")
+	require.NoError(t, err)
+	require.NoError(t, mem.Create(ctx, "bk", space, registry.CreateState{Tenant: space}))
+	index := multihash.Multihash("index-digest")
+	// segment records a shipped segment of bk, and retires it if asked.
+	segment := func(size, dead int64, index multihash.Multihash, retire bool) {
+		t.Helper()
+		seq, err := mem.NextSegmentSeq(ctx)
+		require.NoError(t, err)
+		require.NoError(t, mem.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, "bk"))
+		require.NoError(t, mem.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, seq, 1, size, nil, nil))
+		require.NoError(t, mem.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, 2, index, dead, nil))
+		if retire {
+			require.NoError(t, mem.RetireSegment(ctx, blockstore.PlaneCatalog, seq, 3))
+		}
+	}
+	segment(1000, 300, index, false)
+	segment(500, -1, index, false) // unmeasured
+	segment(2000, 900, index, true)
+	segment(59, 0, nil, false) // shipped without registering anything: not on Forge
+
+	s := newTestServer(t, config.ServerConfig{}, func(d *ServerDeps) { d.CatalogUsage = mem })
+	require.Empty(t, gaugeValues(t, reader, "ingot.catalog.forge_bytes"), "reported before the first refresh")
+
+	require.NoError(t, s.Start(ctx))
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			_ = s.Stop(context.Background())
+		}
+	})
+	key := space.String()
+	require.Eventually(t, func() bool {
+		return gaugeValues(t, reader, "ingot.catalog.forge_bytes")[key] == 3500
+	}, 5*time.Second, 10*time.Millisecond, "the startup sweep never reported the bucket's shipped bytes")
+	require.Equal(t, map[string]int64{key: 1200}, gaugeValues(t, reader, "ingot.catalog.dead_on_arrival_bytes"))
+	require.Equal(t, map[string]int64{key: 500}, gaugeValues(t, reader, "ingot.catalog.unmeasured_bytes"))
+
+	// A segment shipped since counts at the next refresh.
+	segment(400, 100, index, false)
+	n, err := s.backend.RefreshCatalogUsage(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	require.Equal(t, map[string]int64{key: 3900}, gaugeValues(t, reader, "ingot.catalog.forge_bytes"))
+	require.Equal(t, map[string]int64{key: 1300}, gaugeValues(t, reader, "ingot.catalog.dead_on_arrival_bytes"))
+
+	stopped = true
+	require.NoError(t, s.Stop(context.Background()))
+	require.Empty(t, metricNames(t, reader), "metrics reported after Stop")
+}
+
+// gaugeValues returns the int64 gauge name's current values by their space
+// attribute.
+func gaugeValues(t *testing.T, reader *sdkmetric.ManualReader, name string) map[string]int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	out := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			g, ok := m.Data.(metricdata.Gauge[int64])
+			require.True(t, ok, "%s is a %T", name, m.Data)
+			for _, dp := range g.DataPoints {
+				v, _ := dp.Attributes.Value("space")
+				out[v.AsString()] = dp.Value
+			}
+		}
+	}
+	return out
 }
 
 // metricNames returns the names of the metrics reader collects now.
@@ -55,9 +150,10 @@ func metricNames(t *testing.T, reader *sdkmetric.ManualReader) map[string]bool {
 	return names
 }
 
-// newInmemServer builds a Server over the in-memory fakes. cfg's address,
-// data directory, region and connection limits are filled in.
-func newInmemServer(t *testing.T, cfg config.ServerConfig) *Server {
+// newTestServer builds a Server over a Postgres registry and fakes of the
+// network. cfg's address, data directory, region and connection limits are
+// filled in; each of opts may adjust the dependencies before New.
+func newTestServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerDeps)) *Server {
 	t.Helper()
 	id, err := identity.New("", "did:web:ingot.test")
 	require.NoError(t, err)
@@ -69,35 +165,43 @@ func newInmemServer(t *testing.T, cfg config.ServerConfig) *Server {
 	require.NoError(t, err)
 	tenantPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	require.NoError(t, err)
-	mem := inmem.NewMemStore()
+	pool := pgtest.New(t)
+	tasks, err := provideTaskRunner(pool, id, zaptest.NewLogger(t))
+	require.NoError(t, err)
+	require.NoError(t, tasks.Migrate(t.Context()))
+	mem := registry.NewPostgres(pool, registry.WithTasks(tasks))
 	cfg.Addr = freeAddr(t)
 	cfg.DataDir = t.TempDir()
 	cfg.Region = "us-east-1"
 	cfg.MaxConnections = 16
 	cfg.MaxRequests = 16
-	s, err := New(t.Context(), cfg, ServerDeps{
-		BaseBlockReader: inmem.NopBaseReader{},
-		Uploader:        inmem.NopUploader{},
-		BodyUploader:    inmem.NopUploader{},
-		Deferred:        inmem.NopUploader{},
-		Remover:         inmem.NopUploader{},
-		Registrar:       inmem.NopUploader{},
+	deps := ServerDeps{
+		BaseBlockReader: testfakes.NopBaseReader{},
+		Uploader:        testfakes.NopUploader{},
+		Streaming:       testfakes.NopUploader{},
+		Deferred:        testfakes.NopUploader{},
+		Remover:         testfakes.NopUploader{},
+		Registrar:       testfakes.NopUploader{},
 		Registry:        mem,
-		UploadRegs:      mem,
 		Intents:         mem,
 		Locations:       mem,
 		Inclusions:      mem,
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
-		PendingReleases: mem,
+		Claims:          mem,
 		EncParams:       mem,
 		RegionKeys:      regionKeys,
 		TenantKeys:      tenantkey.NewStatic(tenantPriv.PublicKey()),
 		Meta:            mem,
 		Identity:        id,
 		IAM:             svc,
-	})
+		Tasks:           tasks,
+	}
+	for _, opt := range opts {
+		opt(&deps)
+	}
+	s, err := New(t.Context(), cfg, deps)
 	require.NoError(t, err)
 	return s
 }

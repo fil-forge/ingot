@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/google/uuid"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -18,7 +19,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 )
@@ -48,16 +49,16 @@ func (r *recordingRemover) removedDigests() map[string]int {
 }
 
 // newRefTestBackend builds a Backend over real in-process collaborators (a
-// MemStore, an on-disk spool, a catalog log) plus a recording remover, so a
+// MemStore, an on-disk cache, a catalog log) plus a recording remover, so a
 // test can drive PutObject/DeleteObject and inspect blob_refs + releases.
-func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStore, *recordingRemover) {
+func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *testStore, *recordingRemover) {
 	t.Helper()
 	var mbs int64
 	if len(maxBlob) > 0 {
 		mbs = maxBlob[0]
 	}
 	ctx := context.Background()
-	mem := inmem.NewMemStore()
+	mem := newTestStore(t)
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(t.TempDir(), "segments"),
 		Meta:    mem,
@@ -73,40 +74,34 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 
 // newRefTestBackendOver is newRefTestBackend over a given catalog log. Each
 // opt adjusts the Deps before the Backend is built.
-func newRefTestBackendOver(t *testing.T, mem *inmem.MemStore, log blockstore.Log, mbs int64, opts ...func(*Deps)) (*Backend, *inmem.MemStore, *recordingRemover) {
+func newRefTestBackendOver(t *testing.T, mem *testStore, log blockstore.Log, mbs int64, opts ...func(*Deps)) (*Backend, *testStore, *recordingRemover) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	spool, err := blockstore.NewSpool(filepath.Join(dir, "spool"))
-	if err != nil {
-		t.Fatalf("spool: %v", err)
-	}
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
 	if err != nil {
-		t.Fatalf("spool: %v", err)
+		t.Fatalf("cache: %v", err)
 	}
 
 	rm := &recordingRemover{}
 	deps := Deps{
-		Authority:       mem,
-		Registry:        mem,
-		Intents:         mem,
-		Locations:       mem,
-		GC:              mem,
-		Multipart:       mem,
-		Parks:           mem,
-		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, inmem.NopBaseReader{}),
-		Log:             log,
-		Spool:           spool,
-		Cache:           cache,
-		Uploader:        inmem.NopUploader{},
-		Deferred:        inmem.NopUploader{},
-		Remover:         rm,
-		Registrar:       inmem.NopUploader{},
-		EncParams:       mem,
-		RegionKeys:      testRegionKeys(t),
-		TenantKeys:      testTenantKeys(),
-		PendingReleases: mem,
+		Authority:  mem,
+		Registry:   mem,
+		Intents:    mem,
+		Locations:  mem,
+		GC:         mem,
+		Multipart:  mem,
+		Parks:      mem,
+		Reads:      blockstore.NewLayered(cache, log, testfakes.NopBaseReader{}),
+		Log:        log,
+		Cache:      cache,
+		Deferred:   testfakes.NopUploader{},
+		Remover:    rm,
+		Registrar:  testfakes.NopUploader{},
+		EncParams:  mem,
+		RegionKeys: testRegionKeys(t),
+		TenantKeys: testTenantKeys(),
+		Claims:     mem,
 		// ReleaseGrace stays zero: releases are due immediately, and tests
 		// drain them explicitly with drainReleases.
 		MaxBlobSize: mbs,
@@ -114,7 +109,9 @@ func newRefTestBackendOver(t *testing.T, mem *inmem.MemStore, log blockstore.Log
 	for _, opt := range opts {
 		opt(&deps)
 	}
+	withStreaming(t, &deps, dir)
 	b := New(deps)
+	mem.start(t, b)
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
@@ -175,7 +172,7 @@ func putObj(t *testing.T, b *Backend, key string, data []byte) {
 	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{
 		Bucket: &bucket,
 		Key:    &key,
-		Body:   bytes.NewReader(data),
+		Body:   bytes.NewReader(data), ContentLength: byteLen(data),
 	}); err != nil {
 		t.Fatalf("PutObject %s: %v", key, err)
 	}
@@ -189,14 +186,14 @@ func deleteObj(t *testing.T, b *Backend, key string) {
 	}
 }
 
-func claims(t *testing.T, mem *inmem.MemStore, digest []byte) int {
+func claims(t *testing.T, mem *testStore, digest []byte) int {
 	t.Helper()
-	// MemStore buckets carry no space (did.Undef), so claims recorded via
-	// the backend are keyed under did.Undef; count under the same key.
+	// MemStore buckets carry no space (mem.bk()), so claims recorded via
+	// the backend are keyed under mem.bk(); count under the same key.
 	// Space-keyed claim counting is covered by the live Postgres test.
-	n, err := mem.CountClaims(context.Background(), did.Undef, digest)
+	n, err := mem.CountReferences(context.Background(), mem.bk(), digest, uuid.Nil)
 	if err != nil {
-		t.Fatalf("CountClaims: %v", err)
+		t.Fatalf("CountReferences: %v", err)
 	}
 	return n
 }
@@ -383,12 +380,12 @@ type failCommitRoot struct {
 	fails int
 }
 
-func (f *failCommitRoot) CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c registry.RootCommit) error {
+func (f *failCommitRoot) RootCommitWrites(ctx context.Context, name string, expect, next cid.Cid, c registry.RootCommit, gc []cid.Cid) (registry.CommitWrites, error) {
 	if f.fails > 0 {
 		f.fails--
-		return errors.New("postgres unavailable")
+		return registry.CommitWrites{}, errors.New("postgres unavailable")
 	}
-	return f.Registry.CommitRoot(ctx, name, expect, next, c)
+	return f.Registry.RootCommitWrites(ctx, name, expect, next, c, gc)
 }
 
 // TestCommitFailureWritesNoClaim: the reference index is written in the
@@ -399,7 +396,6 @@ func (f *failCommitRoot) CommitRoot(ctx context.Context, name string, expect, ne
 func TestCommitFailureWritesNoClaim(t *testing.T) {
 	reg := &failCommitRoot{}
 	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
-		d.Uploader = inmem.NopUploader{}
 		reg.Registry = d.Registry
 		d.Registry = reg
 	})
@@ -414,7 +410,7 @@ func TestCommitFailureWritesNoClaim(t *testing.T) {
 
 	reg.fails = 1
 	bucket := "bk"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader([]byte("second body"))}); err == nil {
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader([]byte("second body")), ContentLength: byteLen([]byte("second body"))}); err == nil {
 		t.Fatal("PutObject succeeded although its root swap failed")
 	}
 	// The overwrite published nothing: the first version stands, with its
@@ -425,7 +421,7 @@ func TestCommitFailureWritesNoClaim(t *testing.T) {
 	if n := claims(t, mem, old); n != 1 {
 		t.Fatalf("claims on the first version after the failed overwrite = %d, want 1", n)
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("a failed overwrite recorded releases: %v", pending)
 	}
 	// A claim publishes its blob's intent; the failed write's blob was never
@@ -447,7 +443,7 @@ func TestCommitFailureWritesNoClaim(t *testing.T) {
 	if n := claims(t, mem, old); n != 0 {
 		t.Fatalf("claims on the superseded version = %d, want 0", n)
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 1 || string(pending[0].Digest) != string(old) {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 1 || string(pending[0].Digest) != string(old) {
 		t.Fatalf("releases after the retry = %v, want the superseded blob's", pending)
 	}
 }
@@ -459,9 +455,9 @@ type stallCommitRoot struct {
 	delay time.Duration
 }
 
-func (s *stallCommitRoot) CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c registry.RootCommit) error {
+func (s *stallCommitRoot) RootCommitWrites(ctx context.Context, name string, expect, next cid.Cid, c registry.RootCommit, gc []cid.Cid) (registry.CommitWrites, error) {
 	time.Sleep(s.delay)
-	return s.Registry.CommitRoot(ctx, name, expect, next, c)
+	return s.Registry.RootCommitWrites(ctx, name, expect, next, c, gc)
 }
 
 // TestReleaseGraceRunsFromTheCommit: a reader that resolved the superseded
@@ -473,7 +469,6 @@ func TestReleaseGraceRunsFromTheCommit(t *testing.T) {
 	const grace, stall = 150 * time.Millisecond, 250 * time.Millisecond
 	reg := &stallCommitRoot{delay: stall}
 	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
-		d.Uploader = inmem.NopUploader{}
 		d.ReleaseGrace = grace
 		reg.Registry = d.Registry
 		d.Registry = reg
@@ -485,7 +480,7 @@ func TestReleaseGraceRunsFromTheCommit(t *testing.T) {
 
 	start := time.Now()
 	putObj(t, b, key, []byte("second body"))
-	pending, err := mem.ListReleasesBySpace(ctx, did.Undef)
+	pending, err := mem.ListReleasesBySpace(ctx, mem.bk())
 	if err != nil || len(pending) != 1 || string(pending[0].Digest) != string(old) {
 		t.Fatalf("releases after the overwrite = %v (err %v), want the superseded blob's", pending, err)
 	}

@@ -20,6 +20,9 @@ var (
 	ErrExists          = errors.New("bucketauthority: bucket already exists")
 	ErrAlreadyOwned    = errors.New("bucketauthority: bucket already owned by you")
 	ErrInvalidArgument = errors.New("bucketauthority: invalid argument")
+	// ErrRefused wraps any other error Hilt itself answered DeleteBucket
+	// with, as against a call that failed on its way: the bucket stands.
+	ErrRefused = errors.New("bucketauthority: refused")
 
 	// The bucket policy operations' rejections, from Hilt's /s3/bucket/policy.
 	ErrNoPolicy            = errors.New("bucketauthority: bucket has no policy")
@@ -81,6 +84,7 @@ func (s *Service) DeleteBucket(ctx context.Context, req s3.Request) error {
 			case bucketrpc.BucketNotEmptyErrorName:
 				return ErrNotEmpty
 			}
+			return fmt.Errorf("%w: %w", ErrRefused, err)
 		}
 		return err
 	}

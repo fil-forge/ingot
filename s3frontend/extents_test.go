@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/versitygw/s3response"
 
-	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
@@ -51,7 +52,7 @@ func TestExtents_PutObjectReadsBack(t *testing.T) {
 	b, _, _ := newRefTestBackend(t, extentBlobSize)
 	data := testBody(1100*extentBlobSize + 300) // 1,101 blobs
 	bucket, key := "bk", "big"
-	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)}); err != nil {
+	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)}); err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
 	assertExtents(t, b, key, 1)
@@ -80,7 +81,7 @@ func TestExtents_DeleteReleasesEveryBlob(t *testing.T) {
 	ctx := context.Background()
 	data := testBody(1100 * extentBlobSize)
 	bucket, key := "bk", "big"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)}); err != nil {
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)}); err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
 	rv := assertExtents(t, b, key, 1)
@@ -89,42 +90,42 @@ func TestExtents_DeleteReleasesEveryBlob(t *testing.T) {
 		t.Fatalf("%d blobs, want 1100", len(digests))
 	}
 	for _, d := range digests {
-		if n, _ := mem.CountClaims(ctx, rv.st.Space, d); n != 1 {
+		if n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil); n != 1 {
 			t.Fatalf("blob %x: %d claims before the delete, want 1", d, n)
 		}
 	}
 	deleteFrom(t, b, bucket, key)
 	drainReleases(t, b)
 	for _, d := range digests {
-		if n, _ := mem.CountClaims(ctx, rv.st.Space, d); n != 0 {
+		if n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil); n != 0 {
 			t.Fatalf("blob %x: %d claims after the delete, want 0", d, n)
 		}
 	}
 }
 
-// TestExtents_CopyWritesItsOwnExtents: a copy into another bucket of the
-// same space claims every blob again and reads back through extents its own
-// commit wrote into that bucket's catalog.
+// TestExtents_CopyWritesItsOwnExtents: a copy into another bucket, so another
+// space, claims each of its blobs in that space and reads back through
+// extents its own commit wrote into that bucket's catalog.
 func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 	// One log per bucket, as in production, so dropping the source bucket's
 	// catalog drops every block only it holds.
 	ctx := context.Background()
-	mem := inmem.NewMemStore()
+	mem := newTestStore(t)
 	logs, err := logstore.OpenManager(ctx, logstore.ManagerConfig{Dir: t.TempDir(), Meta: mem, Logger: zaptest.NewLogger(t)})
 	if err != nil {
 		t.Fatalf("logstore: %v", err)
 	}
 	t.Cleanup(func() { _ = logs.Close(ctx) })
 	b, mem, _ := newRefTestBackendOver(t, mem, logs, extentBlobSize)
-	space, tenant := testutil.RandomDID(t), testutil.RandomDID(t)
+	tenant := testutil.RandomDID(t)
 	for _, name := range []string{"src", "dst"} {
-		if err := mem.Create(ctx, name, space, registry.CreateState{Tenant: tenant}); err != nil {
+		if err := mem.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: tenant}); err != nil {
 			t.Fatalf("create bucket %s: %v", name, err)
 		}
 	}
 	data := testBody(1100 * extentBlobSize)
 	bucket, key := "src", "big"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)}); err != nil {
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)}); err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
 	dstBucket, dst, src := "dst", "copy", "src/big"
@@ -133,8 +134,8 @@ func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 	}
 	rv := assertExtentsIn(t, b, dstBucket, dst, 1)
 	for _, d := range storedBlobs(t, b, rv).DigestList() {
-		if n, _ := mem.CountClaims(ctx, rv.st.Space, d); n != 2 {
-			t.Fatalf("blob %x: %d claims, want 2 (source and copy)", d, n)
+		if n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil); n != 1 {
+			t.Fatalf("blob %x: %d claims in the copy's space, want the copy's", d, n)
 		}
 	}
 	// The source bucket's catalog goes, as DeleteBucket removes it: the copy
@@ -156,6 +157,10 @@ func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 // TestExtents_MultipartPartNumberAcrossExtents: a multipart object whose
 // parts span several extents serves ?partNumber and ranges from them.
 func TestExtents_MultipartPartNumberAcrossExtents(t *testing.T) {
+	// Complete accepts each of the parts' thousands of tiny blobs on its own.
+	saved := acceptWaitBudget
+	acceptWaitBudget = 5 * time.Minute
+	t.Cleanup(func() { acceptWaitBudget = saved })
 	b, _, _ := newRefTestBackend(t, extentBlobSize)
 	part1 := testBody(5 << 20) // 5,120 blobs
 	part2 := bytes.Repeat([]byte("second part "), 30000)

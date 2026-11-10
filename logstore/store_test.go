@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -32,11 +33,22 @@ type fakeMeta struct {
 	// onShipFail, if set, is called with each failed call's seq.
 	failShips  int
 	onShipFail func(seq uint64)
+	// failSeals and onSealFail do the same for MarkSegmentSealed.
+	failSeals  int
+	onSealFail func(seq uint64)
+	// sealGate, if set, holds every MarkSegmentSealed call until it is
+	// closed, after calling onSealWait with the call's seq: a stamp that
+	// hangs, as on a connection lost in a failover.
+	sealGate   chan struct{}
+	onSealWait func(seq uint64)
 }
 
 type shipEvent struct {
 	seq   uint64
 	plane blockstore.Plane
+	// rowSealed is whether the row was stamped sealed, with a sha256, when
+	// the ship stamped it.
+	rowSealed bool
 }
 
 func newFakeMeta() *fakeMeta {
@@ -48,6 +60,24 @@ func (f *fakeMeta) NextSegmentSeq(_ context.Context) (uint64, error) {
 	defer f.mu.Unlock()
 	f.nextSeq++
 	return f.nextSeq, nil
+}
+
+func (f *fakeMeta) EnsureSegmentSeqAbove(_ context.Context, seq uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextSeq = max(f.nextSeq, seq)
+	return nil
+}
+
+// The fake keeps no journal; rebuild_test.go drives the journal through
+// the Postgres registry.
+func (f *fakeMeta) JournalBuckets(context.Context) ([]string, error)          { return nil, nil }
+func (f *fakeMeta) JournalSegments(context.Context, string) ([]uint64, error) { return nil, nil }
+func (f *fakeMeta) ReadJournal(context.Context, uint64, cid.Cid, int) ([]block.Block, error) {
+	return nil, nil
+}
+func (f *fakeMeta) MoveJournal(context.Context, string, uint64, uint64, cid.Cid, cid.Cid) error {
+	return nil
 }
 
 func (f *fakeMeta) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, seq uint64, bucket string) error {
@@ -63,7 +93,23 @@ func (f *fakeMeta) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, 
 func (f *fakeMeta) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, seq uint64, sealedAt int64,
 	size int64, sha []byte, opRoots []blockstore.OpRoot) error {
 	f.mu.Lock()
+	gate, waiting := f.sealGate, f.onSealWait
+	f.mu.Unlock()
+	if gate != nil {
+		if waiting != nil {
+			waiting(seq)
+		}
+		<-gate
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failSeals > 0 {
+		f.failSeals--
+		if f.onSealFail != nil {
+			f.onSealFail(seq)
+		}
+		return fmt.Errorf("fake: seal of seq %d failed", seq)
+	}
 	m, ok := f.segments[seq]
 	if !ok {
 		return fmt.Errorf("fake: seal missing seq %d", seq)
@@ -80,7 +126,7 @@ func (f *fakeMeta) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, 
 	return nil
 }
 
-func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error {
+func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, deadBytes int64, opRoots []blockstore.OpRoot) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failShips > 0 {
@@ -99,7 +145,8 @@ func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane,
 	}
 	m.ShippedAt = shippedAt
 	m.IndexDigest = slices.Clone(indexDigest)
-	f.shipped = append(f.shipped, shipEvent{seq: seq, plane: plane})
+	m.DeadBytes = deadBytes
+	f.shipped = append(f.shipped, shipEvent{seq: seq, plane: plane, rowSealed: m.State == StateSealed && len(m.SHA256) > 0})
 	return nil
 }
 
@@ -110,17 +157,35 @@ func (f *fakeMeta) DeleteSegment(_ context.Context, plane blockstore.Plane, seq 
 	return nil
 }
 
+func (f *fakeMeta) RetireSegment(_ context.Context, plane blockstore.Plane, seq uint64, retiredAt int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if m, ok := f.segments[seq]; ok && m.RetiredAt == 0 {
+		m.RetiredAt = retiredAt
+		m.OpRoots = nil
+	}
+	return nil
+}
+
 func (f *fakeMeta) ListSegments(_ context.Context, plane blockstore.Plane, bucket string) ([]SegmentMeta, error) {
+	return f.listSegments(plane, bucket, false), nil
+}
+
+func (f *fakeMeta) ListRetiredSegments(_ context.Context, plane blockstore.Plane, bucket string) ([]SegmentMeta, error) {
+	return f.listSegments(plane, bucket, true), nil
+}
+
+func (f *fakeMeta) listSegments(plane blockstore.Plane, bucket string, retired bool) []SegmentMeta {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []SegmentMeta
 	for _, m := range f.segments {
-		if m.Plane != plane || m.Bucket != bucket {
+		if m.Plane != plane || m.Bucket != bucket || (m.RetiredAt != 0) != retired {
 			continue
 		}
 		out = append(out, *m)
 	}
-	return out, nil
+	return out
 }
 
 func (f *fakeMeta) ListSegmentBuckets(_ context.Context, plane blockstore.Plane) ([]string, error) {
@@ -129,7 +194,7 @@ func (f *fakeMeta) ListSegmentBuckets(_ context.Context, plane blockstore.Plane)
 	seen := map[string]struct{}{}
 	var out []string
 	for _, m := range f.segments {
-		if m.Plane != plane {
+		if m.Plane != plane || m.RetiredAt != 0 {
 			continue
 		}
 		if _, ok := seen[m.Bucket]; ok {
@@ -190,18 +255,62 @@ func newTestStore(t *testing.T, sealBytes int64, sealAge time.Duration, retain i
 		flushCalls.add(1)
 		return nil, nil
 	}
+	sh := &shipper{}
 	cfg := Config{
 		Dir:     dir,
 		Meta:    meta,
-		Catalog: PlaneConfig{SealBytes: sealBytes, SealAge: sealAge, Ship: true, Flush: flush, Retain: retain},
+		Catalog: PlaneConfig{SealBytes: sealBytes, SealAge: sealAge, Ship: true, Flush: flush, Retain: retain, OnSealed: sh.sealed},
 		Logger:  logger,
 	}
 	s, err := Open(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	t.Cleanup(func() { _ = s.Close(context.Background()) })
+	sh.start(t, s)
 	return s, meta, flushCalls
+}
+
+// shipper stands in for the ship queue: each seal starts a Ship, retried
+// until it succeeds or the test ends.
+type shipper struct {
+	mu   sync.Mutex
+	s    *Store
+	ctx  context.Context
+	wg   sync.WaitGroup
+	todo bool
+}
+
+func (sh *shipper) sealed() {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if sh.s == nil {
+		sh.todo = true
+		return
+	}
+	sh.wg.Add(1)
+	go func() {
+		defer sh.wg.Done()
+		for sh.s.Ship(sh.ctx) != nil && sh.ctx.Err() == nil {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+}
+
+// start ships through s from now on, and ships what sealed before.
+func (sh *shipper) start(t *testing.T, s *Store) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sh.mu.Lock()
+	sh.s, sh.ctx = s, ctx
+	todo := sh.todo
+	sh.mu.Unlock()
+	t.Cleanup(func() {
+		cancel()
+		sh.wg.Wait()
+		_ = s.Close(context.Background())
+	})
+	if todo {
+		sh.sealed()
+	}
 }
 
 type atomicCounter struct{ n int64 }
@@ -295,13 +404,20 @@ func TestSealByAge(t *testing.T) {
 	}
 }
 
+// TestRetentionDropsOldFlushed: retention unlinks shipped segments past the
+// Retain window but keeps their rows, stamped retired with their op-roots
+// dropped, as the record of what each ship registered in the space.
 func TestRetentionDropsOldFlushed(t *testing.T) {
-	s, _, _ := newTestStore(t, 64, 50*time.Millisecond, 2)
+	s, meta, _ := newTestStore(t, 64, 50*time.Millisecond, 2)
 	dir := filepath.Dir(s.catalog.dir)
 
 	// Issue 5 PUTs; each one large enough to exceed SealBytes=64 in
-	// a single batch, so each becomes its own segment.
+	// a single batch. The seal it requests is asynchronous, so pause past
+	// SealAge between them to land each in its own segment.
 	for i := 0; i < 5; i++ {
+		if i > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
 		payload := make([]byte, 80)
 		for j := range payload {
 			payload[j] = byte(i)
@@ -336,6 +452,97 @@ func TestRetentionDropsOldFlushed(t *testing.T) {
 	if len(entries) > 3 {
 		t.Fatalf("retain=2 should leave at most 3 segments (open + retained); got %d (%v)",
 			len(entries), entries)
+	}
+
+	// The retired stamp lands after the unlink; wait for it. newTestStore
+	// opens the store with no bucket, so its rows carry the empty name.
+	var retired []SegmentMeta
+	for deadline := time.Now().Add(3 * time.Second); len(retired) == 0 && time.Now().Before(deadline); {
+		if retired, err = meta.ListRetiredSegments(context.Background(), blockstore.PlaneCatalog, ""); err != nil {
+			t.Fatalf("ListRetiredSegments: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(retired) == 0 {
+		t.Fatalf("expected retired segment rows to survive retention")
+	}
+	if entries, err = readSegmentSeqs(dir, "catalog"); err != nil {
+		t.Fatalf("readDir: %v", err)
+	}
+	onDisk := map[string]bool{}
+	for _, e := range entries {
+		onDisk[e] = true
+	}
+	for _, r := range retired {
+		if r.RetiredAt == 0 || r.ShippedAt == 0 || len(r.SHA256) == 0 || len(r.OpRoots) != 0 {
+			t.Fatalf("retired row %d = %+v, want retired_at, shipped_at and sha256 set and no op-roots", r.Seq, r)
+		}
+		if onDisk[carName(r.Seq)] {
+			t.Fatalf("retired segment %d still has its CAR on disk", r.Seq)
+		}
+	}
+}
+
+// TestRecoveryRetiresSealedRowWithoutCAR: a sealed row whose CAR is gone (a
+// crash between retention's unlink and its retired stamp) is retired, not
+// deleted, so DeleteBucket still releases what it registered; an open row
+// whose CAR is gone never shipped and is deleted.
+func TestRecoveryRetiresSealedRowWithoutCAR(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	meta := newFakeMeta()
+	cfg := Config{
+		Dir:     dir,
+		Bucket:  "bk",
+		Meta:    meta,
+		Catalog: PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: false},
+		Logger:  zaptest.NewLogger(t),
+	}
+	s, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.AppendBatch(ctx, []block.Block{makeBlock(t, []byte("sealed-then-lost"))}, blockstore.OpRoot{
+		Bucket: "bk",
+		Root:   makeRoot(t, "lost"),
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	catDir := s.catalog.dir
+	if err := s.Close(ctx); err != nil { // seals the open segment
+		t.Fatalf("Close: %v", err)
+	}
+	rows, err := meta.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
+	if err != nil || len(rows) != 1 || rows[0].State != StateSealed {
+		t.Fatalf("want one sealed row before the loss, got %+v (err %v)", rows, err)
+	}
+	sealedSeq := rows[0].Seq
+	if err := os.Remove(filepath.Join(catDir, carName(sealedSeq))); err != nil {
+		t.Fatalf("remove CAR: %v", err)
+	}
+	const openSeq = 1 << 40
+	if err := meta.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, openSeq, "bk"); err != nil {
+		t.Fatalf("InsertSegmentOpen: %v", err)
+	}
+
+	s2, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatalf("re-Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close(ctx) })
+
+	retired, err := meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk")
+	if err != nil || len(retired) != 1 || retired[0].Seq != sealedSeq {
+		t.Fatalf("want sealed seg %d retired, got %+v (err %v)", sealedSeq, retired, err)
+	}
+	live, err := meta.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
+	if err != nil {
+		t.Fatalf("ListSegments: %v", err)
+	}
+	for _, r := range live {
+		if r.Seq == sealedSeq || r.Seq == openSeq {
+			t.Fatalf("seg %d should not be live after recovery: %+v", r.Seq, r)
+		}
 	}
 }
 
@@ -568,6 +775,126 @@ func TestFailedShipStampRetriedWithoutReshipping(t *testing.T) {
 	}
 }
 
+// TestFailedSealStampRecordedBeforeShip: a seal whose stamp in Meta fails
+// (Postgres failing over, say) leaves the segment frozen and readable, and
+// writes move on to a new segment. The ship records the seal before it
+// ships, so the row it stamps shipped is sealed, with its sha256 for
+// DeleteBucket's release.
+func TestFailedSealStampRecordedBeforeShip(t *testing.T) {
+	ctx := context.Background()
+	s, meta, flushes := newTestStore(t, 64, 50*time.Millisecond, 6)
+	sealFailed := make(chan uint64, 8)
+	meta.mu.Lock()
+	meta.failSeals = 2 // the seal itself, then the first ship's
+	meta.onSealFail = func(seq uint64) { sealFailed <- seq }
+	meta.mu.Unlock()
+
+	blk := makeBlock(t, append([]byte("seal-"), make([]byte, 80)...))
+	seq, err := s.AppendBatch(ctx, []block.Block{blk},
+		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "seal")})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	select {
+	case failed := <-sealFailed:
+		if failed != seq {
+			t.Fatalf("seal stamp failed for seq %d, want %d", failed, seq)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the seal stamp never failed")
+	}
+
+	if got, err := s.Get(ctx, blk.Cid()); err != nil || string(got.RawData()) != string(blk.RawData()) {
+		t.Fatalf("Get after a failed seal stamp: %v", err)
+	}
+	next := makeBlock(t, append([]byte("next-"), make([]byte, 80)...))
+	seq2, err := s.AppendBatch(ctx, []block.Block{next},
+		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "next")})
+	if err != nil {
+		t.Fatalf("append after a failed seal stamp: %v", err)
+	}
+	if seq2 == seq {
+		t.Fatalf("append after a failed seal stamp went to the frozen segment %d", seq)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		meta.mu.Lock()
+		var ship *shipEvent
+		for i := range meta.shipped {
+			if meta.shipped[i].seq == seq {
+				ship = &meta.shipped[i]
+			}
+		}
+		meta.mu.Unlock()
+		if ship != nil {
+			if !ship.rowSealed {
+				t.Fatalf("segment %d shipped while its row wasn't stamped sealed", seq)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("segment %d never shipped (%d flushes)", seq, flushes.load())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got, err := s.Get(ctx, blk.Cid()); err != nil || string(got.RawData()) != string(blk.RawData()) {
+		t.Fatalf("Get after the ship: %v", err)
+	}
+}
+
+// TestReadsGoOnWhileTheSealStampWaits: a seal stamp that hangs, as on a
+// Postgres connection lost in a failover, doesn't hold up reads of the
+// segment being sealed.
+func TestReadsGoOnWhileTheSealStampWaits(t *testing.T) {
+	ctx := context.Background()
+	s, meta, _ := newTestStore(t, 64, 50*time.Millisecond, 6)
+	gate := make(chan struct{})
+	waiting := make(chan uint64, 1)
+	meta.mu.Lock()
+	meta.sealGate = gate
+	meta.onSealWait = func(seq uint64) {
+		select {
+		case waiting <- seq:
+		default:
+		}
+	}
+	meta.mu.Unlock()
+	t.Cleanup(func() { close(gate) }) // before the store's Close, registered earlier
+
+	blk := makeBlock(t, append([]byte("hang-"), make([]byte, 80)...))
+	seq, err := s.AppendBatch(ctx, []block.Block{blk},
+		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "hang")})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	select {
+	case waited := <-waiting:
+		if waited != seq {
+			t.Fatalf("seal stamp waiting for seq %d, want %d", waited, seq)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the seal never reached its stamp")
+	}
+
+	got := make(chan error, 1)
+	go func() {
+		b, err := s.Get(ctx, blk.Cid())
+		if err == nil && string(b.RawData()) != string(blk.RawData()) {
+			err = fmt.Errorf("read other bytes")
+		}
+		got <- err
+	}()
+	select {
+	case err := <-got:
+		if err != nil {
+			t.Fatalf("Get while the seal stamp waits: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a read waited on the seal's stamp")
+	}
+}
+
 // TestCatalogNeverShips covers the standalone-mode permutation: a catalog
 // plane configured never to ship keeps its CARs on local disk indefinitely
 // (the source for every read), and its shipped_at never advances (so
@@ -659,63 +986,11 @@ func readSegmentSeqs(dir, plane string) ([]string, error) {
 	return out, nil
 }
 
-// shortShipBackoff shortens the queued ship's backoff for one test, restoring
-// it after the test's stores have closed.
-func shortShipBackoff(t *testing.T) {
-	t.Helper()
-	prev := shipBackoff
-	shipBackoff = time.Millisecond
-	t.Cleanup(func() { shipBackoff = prev })
-}
-
-// TestExhaustedShipRetriedBySweep checks that a segment whose queued ship ran
-// out of attempts isn't left until a restart: the retry sweep keeps trying
-// it, and it ships once the upload service is back.
-func TestExhaustedShipRetriedBySweep(t *testing.T) {
-	shortShipBackoff(t)
-	var down atomic.Bool
-	down.Store(true)
-	var attempts atomicCounter
-	meta := newFakeMeta()
-	s, err := Open(context.Background(), Config{
-		Dir:  t.TempDir(),
-		Meta: meta,
-		Catalog: PlaneConfig{SealBytes: 64, SealAge: 50 * time.Millisecond, Ship: true, ShipRetry: 50 * time.Millisecond,
-			Flush: func(context.Context, *Segment) (multihash.Multihash, error) {
-				attempts.add(1)
-				if down.Load() {
-					return nil, errors.New("upload service down")
-				}
-				return nil, nil
-			}},
-		Logger: zaptest.NewLogger(t),
-	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close(context.Background()) })
-
-	blk := makeBlock(t, append([]byte("sweep-"), make([]byte, 80)...))
-	if _, err := s.AppendBatch(context.Background(), []block.Block{blk},
-		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "sweep")}); err != nil {
-		t.Fatalf("append: %v", err)
-	}
-	waitFor(t, "the queued ship's attempts and a sweep's", func() bool {
-		return attempts.load() > queuedShipAttempts
-	})
-	down.Store(false)
-	waitFor(t, "the segment to ship", func() bool {
-		meta.mu.Lock()
-		defer meta.mu.Unlock()
-		return len(meta.shipped) == 1
-	})
-}
-
-// TestRetrySweepOldestFirst checks the sweep's order and its stop: it tries
-// the oldest unshipped segment first, stops at the first that fails, and
-// once ships succeed, ships them all in seq order.
-func TestRetrySweepOldestFirst(t *testing.T) {
-	shortShipBackoff(t)
+// TestShipStopsAtTheFirstFailure checks Ship's order and its stop: it
+// tries the oldest unshipped segment first, stops at the first that fails
+// and returns its error, and once ships succeed, ships them all in seq
+// order. A segment already shipped never goes to Flush again.
+func TestShipStopsAtTheFirstFailure(t *testing.T) {
 	var down atomic.Bool
 	down.Store(true)
 	var mu sync.Mutex
@@ -724,9 +999,7 @@ func TestRetrySweepOldestFirst(t *testing.T) {
 	s, err := Open(context.Background(), Config{
 		Dir:  t.TempDir(),
 		Meta: meta,
-		// No sweep runs on its own (the first lands at a random point within
-		// ShipRetry): the test runs them.
-		Catalog: PlaneConfig{SealBytes: 64, SealAge: time.Hour, Ship: true, ShipRetry: 1000 * time.Hour,
+		Catalog: PlaneConfig{SealBytes: 64, SealAge: time.Hour, Ship: true,
 			Flush: func(_ context.Context, seg *Segment) (multihash.Multihash, error) {
 				mu.Lock()
 				tried = append(tried, seg.Seq())
@@ -743,49 +1016,41 @@ func TestRetrySweepOldestFirst(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close(context.Background()) })
 
-	// distinct returns the seqs tried so far, in ascending order.
-	distinct := func() []uint64 {
-		mu.Lock()
-		defer mu.Unlock()
-		var out []uint64
-		for _, seq := range tried {
-			if !slices.Contains(out, seq) {
-				out = append(out, seq)
-			}
-		}
-		slices.Sort(out)
-		return out
-	}
-	// Each batch is over SealBytes, so it seals its segment; waiting for
-	// that segment's ship keeps the next batch out of it.
+	// Each batch is over SealBytes, so it seals its segment.
 	for i := 0; i < 3; i++ {
 		blk := makeBlock(t, append([]byte(fmt.Sprintf("order-%d-", i)), make([]byte, 80)...))
 		if _, err := s.AppendBatch(context.Background(), []block.Block{blk},
 			blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, fmt.Sprintf("order-%d", i))}); err != nil {
 			t.Fatalf("append %d: %v", i, err)
 		}
-		waitFor(t, fmt.Sprintf("segment %d to seal and start shipping", i), func() bool {
-			return len(distinct()) == i+1
+		waitFor(t, fmt.Sprintf("segment %d to seal", i), func() bool {
+			s.catalog.catMu.RLock()
+			defer s.catalog.catMu.RUnlock()
+			return len(s.catalog.sealed) == i+1
 		})
 	}
-	waitFor(t, "every queued ship to run out of attempts", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(tried) == 3*queuedShipAttempts
-	})
-	seqs := distinct()
+	s.catalog.catMu.RLock()
+	var seqs []uint64
+	for _, seg := range s.catalog.sealed {
+		seqs = append(seqs, seg.Seq())
+	}
+	s.catalog.catMu.RUnlock()
+	slices.Sort(seqs)
 
-	s.catalog.retryUnshipped()
+	if err := s.Ship(context.Background()); err == nil {
+		t.Fatal("Ship succeeded with the upload service down")
+	}
 	mu.Lock()
-	if n, last := len(tried), tried[len(tried)-1]; n != 3*queuedShipAttempts+1 || last != seqs[0] {
+	if !slices.Equal(tried, seqs[:1]) {
 		mu.Unlock()
-		t.Fatalf("a failing sweep made %d attempts, the last on seq %d; want one attempt, on the oldest (%d)",
-			n-3*queuedShipAttempts, last, seqs[0])
+		t.Fatalf("a failing Ship tried %v; want one attempt, on the oldest (%d)", tried, seqs[0])
 	}
 	mu.Unlock()
 
 	down.Store(false)
-	s.catalog.retryUnshipped()
+	if err := s.Ship(context.Background()); err != nil {
+		t.Fatalf("Ship: %v", err)
+	}
 	meta.mu.Lock()
 	shippedSeqs := make([]uint64, len(meta.shipped))
 	for i, ev := range meta.shipped {
@@ -796,24 +1061,16 @@ func TestRetrySweepOldestFirst(t *testing.T) {
 		t.Fatalf("shipped seqs %v, want %v in order", shippedSeqs, seqs)
 	}
 
-	// A segment the sweep has shipped may still be queued: shipping it from
-	// the queue again must not reach Flush.
 	mu.Lock()
 	before := len(tried)
 	mu.Unlock()
-	s.catalog.catMu.RLock()
-	shipped := s.catalog.sealed[0]
-	s.catalog.catMu.RUnlock()
-	if !shipped.IsShipped() {
-		t.Fatalf("segment %d not shipped", shipped.Seq())
-	}
-	if !s.catalog.flushOne(shipped, queuedShipAttempts) {
-		t.Fatalf("flushOne on shipped segment %d reported it unshipped", shipped.Seq())
+	if err := s.Ship(context.Background()); err != nil {
+		t.Fatalf("Ship of nothing: %v", err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	if len(tried) != before {
-		t.Fatalf("shipped segment %d went to Flush again", shipped.Seq())
+		t.Fatalf("shipped segments went to Flush again: %v", tried[before:])
 	}
 }
 

@@ -17,8 +17,8 @@ import (
 // TestStopWaitsForSweepers: Stop cancels the background sweepers and returns
 // only once they have exited, even while they sweep on every tick.
 func TestStopWaitsForSweepers(t *testing.T) {
-	// A 2ms session TTL makes the multipart sweeper tick every millisecond.
-	s := newInmemServer(t, config.ServerConfig{MultipartSessionTTL: 2 * time.Millisecond})
+	shortSweepInterval(t)
+	s := newTestServer(t, config.ServerConfig{})
 	require.NoError(t, s.Start(t.Context()))
 	// A sweeper that is still busy for a while after the cancellation:
 	// Stop must not return before it does.
@@ -40,7 +40,7 @@ func TestStopWaitsForSweepers(t *testing.T) {
 // TestStopLogsNoListenerError: the listener's close is Stop's own doing, not
 // a listener failure to report.
 func TestStopLogsNoListenerError(t *testing.T) {
-	s := newInmemServer(t, config.ServerConfig{})
+	s := newTestServer(t, config.ServerConfig{})
 	core, logs := observer.New(zap.ErrorLevel)
 	s.logger = zap.New(core)
 	served := make(chan struct{})

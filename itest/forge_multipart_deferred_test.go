@@ -66,8 +66,8 @@ func TestForgeDeferredMultipart(t *testing.T) {
 			partDigests = append(partDigests, partBlobDigests(t, ctx, s, aws.ToString(create.UploadId), pn)...)
 			// A parked part keeps no local copy: its bytes are on piri.
 			hexDigests := partBlobDigestsHex(t, ctx, s, aws.ToString(create.UploadId), pn)
-			if spooled := spooledDigests(t, ctx, s, hexDigests); len(spooled) != 0 {
-				t.Fatalf("part %d blobs still in the spool after UploadPart: %v", pn, spooled)
+			if local := localDigests(t, ctx, s, hexDigests); len(local) != 0 {
+				t.Fatalf("part %d blobs have local copies after UploadPart: %v", pn, local)
 			}
 		}
 		if len(partDigests) != len(partData) {

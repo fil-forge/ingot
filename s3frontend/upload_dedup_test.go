@@ -10,7 +10,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
@@ -19,15 +19,15 @@ import (
 )
 
 // countingUploader records how many times each digest is uploaded. It returns
-// a non-empty location so the backend records it (what uploadBlobs'
+// a non-empty location so the backend records it (what the add's
 // already-located short-circuit reads back).
 type countingUploader struct {
-	inmem.NopUploader
+	testfakes.NopUploader
 	mu    sync.Mutex
 	calls map[string]int
 }
 
-func (u *countingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+func (u *countingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string) (uploader.UploadedBlob, error) {
 	u.mu.Lock()
 	u.calls[string(digest)]++
 	u.mu.Unlock()
@@ -41,20 +41,16 @@ func (u *countingUploader) UploadBlob(_ context.Context, _ did.DID, digest multi
 // TestUpload_IdenticalContentUploadsDistinctBlobs pins the encryption RFC's
 // stated dedup trade-off: every write mints a fresh CEK, so identical
 // plaintext produces a different ciphertext digest each time and each PUT
-// uploads its own blob exactly once. (uploadBlobs still short-circuits on an
+// uploads its own blob exactly once. (The add still short-circuits on an
 // already-recorded location — that guard now only fires for digests shared
 // by same-space copies, where no re-upload is needed.)
 func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	mem := inmem.NewMemStore()
-	spool, err := blockstore.NewSpool(filepath.Join(dir, "spool"))
-	if err != nil {
-		t.Fatalf("spool: %v", err)
-	}
+	mem := newTestStore(t)
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
 	if err != nil {
-		t.Fatalf("spool: %v", err)
+		t.Fatalf("cache: %v", err)
 	}
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(dir, "segments"),
@@ -68,24 +64,26 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 	t.Cleanup(func() { _ = log.Close(ctx) })
 
 	up := &countingUploader{calls: map[string]int{}}
-	b := New(Deps{
-		Authority:       mem,
-		Registry:        mem,
-		Intents:         mem,
-		Locations:       mem,
-		GC:              mem,
-		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, inmem.NopBaseReader{}),
-		Log:             log,
-		Spool:           spool,
-		Cache:           cache,
-		Uploader:        up,
-		Remover:         &recordingRemover{},
-		PendingReleases: mem,
-		Registrar:       inmem.NopUploader{},
-		EncParams:       mem,
-		RegionKeys:      testRegionKeys(t),
-		TenantKeys:      testTenantKeys(),
-	})
+	deps := Deps{
+		Authority:  mem,
+		Registry:   mem,
+		Intents:    mem,
+		Locations:  mem,
+		GC:         mem,
+		Reads:      blockstore.NewLayered(cache, log, testfakes.NopBaseReader{}),
+		Log:        log,
+		Cache:      cache,
+		Deferred:   up,
+		Remover:    &recordingRemover{},
+		Claims:     mem,
+		Registrar:  testfakes.NopUploader{},
+		EncParams:  mem,
+		RegionKeys: testRegionKeys(t),
+		TenantKeys: testTenantKeys(),
+	}
+	withStreaming(t, &deps, dir)
+	b := New(deps)
+	mem.start(t, b)
 	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}

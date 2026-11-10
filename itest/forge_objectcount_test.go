@@ -45,9 +45,8 @@ func TestForgeObjectCount(t *testing.T) {
 	}
 	space := bucketSpace(t, ctx, s, bucket)
 
-	// One PUT, one object. The write queues the change and the registration
-	// sweeper applies it, so every count below is awaited rather than read
-	// once.
+	// One PUT, one object. The write queues the change and a queue worker
+	// sends it, so every count below is awaited rather than read once.
 	if err := ingottest.PutBytes(ctx, cfg, bucket, "a", patternBytes(4<<10)); err != nil {
 		t.Fatalf("put a: %v", err)
 	}
@@ -85,17 +84,16 @@ func TestForgeObjectCount(t *testing.T) {
 	}
 
 	// Nothing is left owing: the queue drained rather than stalling.
-	if left := ingotSQL(t, ctx, s, "SELECT count(*) FROM ingot.upload_registrations"); left != "0" {
-		t.Fatalf("upload_registrations still holds %s rows; the sweeper is not draining", left)
+	owing := fmt.Sprintf(`SELECT count(*) FROM ingot.queue_space_upload_tasks
+		WHERE subject = '%s' AND state IN ('pending', 'failed') AND action <> 'flush'`, space)
+	if left := ingotSQL(t, ctx, s, owing); left != "0" {
+		t.Fatalf("the space still owes %s object-count changes; the queue is not draining", left)
 	}
 
-	// Deleting the bucket takes its queued changes with it. A row left behind
-	// would be retried against a space that no longer exists, keep its bearer
-	// proofs on disk, and sit in front of a new bucket of the same name.
-	// Emptied and deleted back to back, with no sweep in between — what a
-	// script does. The retraction "b" owes is still queued, and deleting the
-	// bucket cascades the queue away, so the delete has to apply it first or
-	// the upload service keeps that root and its count for good.
+	// Emptied and deleted back to back — what a script does. The retraction
+	// "b" owes may still be queued, and nothing would send it once the space
+	// is gone, so the delete sends it first or the upload service keeps that
+	// root and its count for good.
 	if err := ingottest.DeleteObject(ctx, cfg, bucket, "b"); err != nil {
 		t.Fatalf("delete b: %v", err)
 	}
@@ -110,15 +108,14 @@ func TestForgeObjectCount(t *testing.T) {
 	if got := spaceObjectCount(t, ctx, s, space); got != 0 {
 		t.Fatalf("the deleted bucket's space reports %d objects, want 0", got)
 	}
-	q := fmt.Sprintf("SELECT count(*) FROM ingot.upload_registrations WHERE space = '%s'", space)
-	if left := ingotSQL(t, ctx, s, q); left != "0" {
-		t.Fatalf("the deleted bucket's space still holds %s queued changes", left)
+	if left := ingotSQL(t, ctx, s, owing); left != "0" {
+		t.Fatalf("the deleted bucket's space still owes %s object-count changes", left)
 	}
 }
 
-// awaitObjectCount waits for the space's object count to reach want. The
-// registration sweeper applies the queued changes off the request path, so the
-// count trails the write by up to a sweep interval.
+// awaitObjectCount waits for the space's object count to reach want. Queue
+// workers send the changes off the request path, so the count trails the
+// write by a moment.
 func awaitObjectCount(t *testing.T, ctx context.Context, s *stack.Stack, space string, want int, stage string) {
 	t.Helper()
 	deadline := time.Now().Add(90 * time.Second)

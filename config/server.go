@@ -45,12 +45,11 @@ type ServerConfig struct {
 	MaxConnections int
 	MaxRequests    int
 
-	// MultipartSessionTTL bounds abandoned multipart uploads: a session whose
-	// state has not changed for this long is torn down by a background
-	// sweeper — open ones aborted (releasing their parked parts), completed
-	// rows retained for Complete idempotency reaped. A Complete's latch
-	// restarts the clock, so a live Complete on an old session is not swept
-	// from under it. Zero → default 7 days; negative → sweeper disabled.
+	// MultipartSessionTTL bounds multipart uploads: an upload still open this
+	// long after its creation is aborted (releasing its parked parts), and a
+	// completed one, kept so a repeated Complete gets the same answer, is
+	// reaped this long after its Complete. Zero → default 7 days; negative →
+	// neither.
 	MultipartSessionTTL time.Duration
 
 	// CompleteMultipartKeepalive is the interval between the newlines a
@@ -66,17 +65,14 @@ type ServerConfig struct {
 	// means releases are due immediately.
 	ReleaseGrace time.Duration
 
-	// LocalBlobMaxBytes is the byte budget for the spool and the cache
-	// together, writes in progress included, enforced by the local blob
-	// sweeper; zero means no budget. CacheMinResidency and
-	// CacheReadRetention are the read-after-write and read-cache windows the
-	// sweeper honours while it can; zero turns each off. LocalBlobOrphanAge
-	// is the age at which the sweeper deletes files no upload intent names;
-	// zero → 24h. Config.ServerConfig() applies the defaults documented on
+	// LocalBlobMaxBytes is the byte budget for the cache, writes in progress
+	// included, enforced by the local blob sweeper; zero means no budget.
+	// CacheTTL is how long a blob stays cached after it was cached or last
+	// read; zero → 1h. LocalBlobOrphanAge is the age at which the sweeper
+	// deletes a write's unfinished temporary file; zero → 24h. Config.ServerConfig() applies the defaults documented on
 	// Config.
 	LocalBlobMaxBytes  int64
-	CacheMinResidency  time.Duration
-	CacheReadRetention time.Duration
+	CacheTTL           time.Duration
 	LocalBlobOrphanAge time.Duration
 	// DropAcceptedBodies removes each body's local copy as soon as the
 	// provider has accepted it (Config.CacheWrites false).

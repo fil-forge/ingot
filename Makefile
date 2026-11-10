@@ -17,9 +17,10 @@ GO ?= go
 build:
 	$(GO) build -o ingot ./cmd/ingot
 
-## test: run the unit test suite (fast, no Docker)
+## test: run the test suite, starting Postgres and OpenBao in Docker unless
+## INGOT_TEST_DSN and INGOT_TEST_BAO_ADDR name running ones. ARGS go to go test.
 test:
-	$(GO) test ./...
+	GO="$(GO)" scripts/test.sh $(ARGS)
 
 ## itest: run the integration test suite (boots the Forge stack in Docker; ~20 min)
 itest:
@@ -42,7 +43,7 @@ GROUP_uploads     := TestForgeMaxSizePart                 # 3m02, needs INGOT_IT
 GROUP_uploads     += TestForgeScenarios                   # 2m16
 GROUP_uploads     += TestForgeMultipartExpiryShred        # 1m33
 GROUP_releases    := TestForgeDeleteReleasesNetworkBlob   # 2m48, waits on piri's removal sweep
-GROUP_releases    += TestForgeObjectCount                 # 2m19, waits on the registration sweeper
+GROUP_releases    += TestForgeObjectCount                 # 2m19
 GROUP_releases    += TestForgeDeleteBucketReleases        # 1m52
 GROUP_auth        := TestForgeAccessKeyExpiry             # 2m29, waits for the key to lapse
 GROUP_auth        += TestForgeCopyAuthorization           # 0m51
@@ -54,11 +55,12 @@ GROUP_auth        += TestForgeBucketPolicy                # skips unless INGOT_I
 GROUP_CLAIMED := $(GROUP_encryption) $(GROUP_conformance) $(GROUP_uploads) $(GROUP_releases) $(GROUP_auth) TestForgeS3Compat
 
 # `rest` is the complement, so a test added to itest/ runs there rather than
-# matching no group and silently never running: LocalBlobBudget (1m21),
-# BucketEncryption (1m16), ReadAfterCatalogRetention (0m56), and
-# ReadAfterEviction, UncachedWrites, NativeProvision and DeferredMultipart at
-# ~0m50 each (~6m50 in total); MultipartManyParts skips unless
-# INGOT_ITEST_MP_BENCH=1.
+# matching no group and silently never running: CatalogUsage (1m27),
+# LocalBlobBudget (1m21), BucketEncryption (1m16), RebuildAfterLostVolume
+# (0m57), ReadAfterCatalogRetention (0m56), and ReadAfterEviction,
+# UncachedWrites, NativeProvision and DeferredMultipart at ~0m50 each (~9m20 in
+# total);
+# MultipartManyParts skips unless INGOT_ITEST_MP_BENCH=1.
 GROUP_ALL  = $(filter Test%,$(shell GOWORK=off $(GO) test -tags itest -list '.*' ./itest))
 GROUP_rest = $(filter-out $(GROUP_CLAIMED),$(GROUP_ALL))
 

@@ -34,9 +34,8 @@
 // -> Stop over the fx lifecycle. Module layers the production providers (the
 // Postgres registry, the Forge reader, the sprue uploader, the hilt
 // client/IAM) and a migration pre-start hook on top. A test harness, by
-// contrast, includes ServerModule directly and supplies in-memory fakes for
-// the same seams — so both paths construct the Server through identical
-// wiring.
+// contrast, includes ServerModule directly and supplies fakes for the same
+// seams — so both paths construct the Server through identical wiring.
 //
 // # Using ingot without fx
 //
@@ -75,6 +74,8 @@ import (
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/revocation"
+	"github.com/fil-forge/ingot/s3frontend"
+	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/tokenstore"
 	"github.com/fil-forge/ingot/uploader"
@@ -105,10 +106,11 @@ func Module(cfg config.Config) fx.Option {
 		fx.Provide(cfg.ServerConfig),
 		fx.Provide(
 			provideRegistry,
+			provideTaskRunner,
 			provideForgeReader,
 			provideTokenStore,
 			provideForgeClient,
-			provideAuthServiceClient,
+			NewAuthServiceClient,
 			provideUploader,
 			provideMigrationHook,
 			provideKeyProofs,
@@ -138,7 +140,7 @@ func Module(cfg config.Config) fx.Option {
 // embedded S3 Server from a ServerConfig, a *zap.Logger, the four collaborator
 // interfaces, and any registered PreStartHooks. It is exported so a test
 // harness (or an alternative host) can supply its own implementations of the
-// collaborators — in-memory fakes, say — and still construct the Server through
+// collaborators — fakes of the network, say — and still construct the Server through
 // exactly the wiring production uses. Module supplies the production
 // implementations on top of this.
 var ServerModule = fx.Module("ingot-server",
@@ -147,23 +149,19 @@ var ServerModule = fx.Module("ingot-server",
 
 // serverParams are the inputs ServerModule binds the server's start/stop hooks
 // over. The collaborators are interfaces, so any provider satisfying them
-// (production's Postgres + Forge, or a harness's in-memory fakes) wires in.
+// (production's Postgres + Forge, or a harness's fakes) wires in.
 type serverParams struct {
 	fx.In
 
-	Config       config.ServerConfig
-	Logger       *zap.Logger
-	Reader       blockstore.BlockReader
-	Uploader     uploader.Uploader
-	BodyUploader uploader.BodyUploader
-	Deferred     uploader.DeferredBodyUploader
-	Remover      uploader.BlobRemover
-	Registrar    uploader.UploadRegistrar
-	UploadRegs   registry.UploadRegistrationStore
-	// Streaming and Streams are optional: without them every body blob is
-	// spooled before it is uploaded (see ServerDeps.Streaming).
-	Streaming       uploader.StreamingBodyUploader `optional:"true"`
-	Streams         registry.StreamStore           `optional:"true"`
+	Config          config.ServerConfig
+	Logger          *zap.Logger
+	Reader          blockstore.BlockReader
+	Uploader        uploader.Uploader
+	Streaming       uploader.StreamingBodyUploader
+	Deferred        uploader.DeferredBodyUploader
+	Remover         uploader.BlobRemover
+	Registrar       uploader.UploadRegistrar
+	Tasks           *taskrunner.Runner
 	BucketAuthority bucketauthority.BucketAuthority
 	Registry        registry.Registry
 	Intents         registry.IntentStore
@@ -172,8 +170,11 @@ type serverParams struct {
 	GC              registry.GCStore
 	Multipart       registry.MultipartStore
 	Parks           registry.ParkStore
-	PendingReleases registry.PendingReleaseStore
+	Claims          registry.BlobRefStore
 	Meta            logstore.Meta
+	// CatalogUsage feeds the catalog usage gauges; without it they are not
+	// reported (see ServerDeps.CatalogUsage).
+	CatalogUsage registry.CatalogUsageStore `optional:"true"`
 	// Identity is the agent identity (the host-provided libforge identity, the
 	// issuer of every outbound invocation); the listener serves its DID
 	// document at /.well-known/did.json. Required.
@@ -218,13 +219,11 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Logger:          logger,
 				BaseBlockReader: p.Reader,
 				Uploader:        p.Uploader,
-				BodyUploader:    p.BodyUploader,
 				Deferred:        p.Deferred,
 				Remover:         p.Remover,
 				Streaming:       p.Streaming,
-				Streams:         p.Streams,
 				Registrar:       p.Registrar,
-				UploadRegs:      p.UploadRegs,
+				Tasks:           p.Tasks,
 				Authority:       p.BucketAuthority,
 				Registry:        p.Registry,
 				Intents:         p.Intents,
@@ -233,11 +232,12 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				GC:              p.GC,
 				Multipart:       p.Multipart,
 				Parks:           p.Parks,
-				PendingReleases: p.PendingReleases,
+				Claims:          p.Claims,
 				EncParams:       p.EncParams,
 				RegionKeys:      p.RegionKeys,
 				TenantKeys:      p.TenantKeys,
 				Meta:            p.Meta,
+				CatalogUsage:    p.CatalogUsage,
 				Identity:        p.Identity,
 				IAM:             p.IAM,
 			})
@@ -294,13 +294,13 @@ func provideForgeClient(cfg config.Config, id identity.Identity, store tokenstor
 	)
 }
 
-// provideAuthServiceClient builds the UCAN RPC client to the Hilt tenant-
+// NewAuthServiceClient builds the UCAN RPC client to the Hilt tenant-
 // management service (/s3/request/authorize, /s3/bucket/*). The agent identity
 // issues invocations; AuthServiceProofs supplies the Hilt→agent proof chains
 // and is required — Hilt rejects unproven invocations, so a client built
-// without them would fail every S3 request. The provider is lazy, so an
+// without them would fail every S3 request. As a provider it is lazy, so an
 // unconfigured Hilt only errors if a consumer actually needs the client.
-func provideAuthServiceClient(cfg config.Config, id identity.Identity, logger *zap.Logger) (*hiltclient.Client, error) {
+func NewAuthServiceClient(cfg config.Config, id identity.Identity, logger *zap.Logger) (*hiltclient.Client, error) {
 	if cfg.AuthServiceURL == "" || cfg.AuthServiceDID == "" {
 		return nil, fmt.Errorf("ingot: auth_service_url and auth_service_did are required for the auth service client")
 	}
@@ -494,24 +494,75 @@ type registryResult struct {
 	GC                registry.GCStore
 	Multipart         registry.MultipartStore
 	Parks             registry.ParkStore
-	Streams           registry.StreamStore
-	PendingReleases   registry.PendingReleaseStore
-	UploadRegs        registry.UploadRegistrationStore
+	Claims            registry.BlobRefStore
 	EncParams         registry.EncryptionParamsStore
 	RevocationCursors registry.RevocationCursorStore
+	CatalogUsage      registry.CatalogUsageStore
 	Meta              logstore.Meta
 }
 
 // provideRegistry wraps the host's pool in the postgres-backed registry and
 // exposes it under every interface ServerModule consumes. One *registry.Postgres
-// satisfies bucket state (Registry), the spool's upload_intents (IntentStore),
+// satisfies bucket state (Registry), the upload intents (IntentStore),
 // blob locations (LocationStore), the reference index (BlobRefStore), the GC
-// candidate log (GCStore), and segment metadata (Meta). The hilt client is
-// required: bucket create/delete/list are forwarded to Hilt, so forge mode
-// needs hilt_url/hilt_did configured.
-func provideRegistry(pool *pgxpool.Pool) registryResult {
-	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, GC: pg, Multipart: pg, Parks: pg, Streams: pg, PendingReleases: pg, UploadRegs: pg, EncParams: pg, RevocationCursors: pg, Meta: pg}
+// candidate log (GCStore), the catalog usage sums (CatalogUsageStore), and
+// segment metadata (Meta). The hilt client is required: bucket
+// create/delete/list are forwarded to Hilt, so forge mode needs
+// hilt_url/hilt_did configured.
+func provideRegistry(pool *pgxpool.Pool, tasks *taskrunner.Runner) registryResult {
+	pg := registry.NewPostgres(pool, registry.WithTasks(tasks))
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, GC: pg, Multipart: pg, Parks: pg, Claims: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Meta: pg}
+}
+
+// taskSchema is the Postgres schema the task queues' tables live in, beside
+// the rest of ingot's.
+const taskSchema = "ingot"
+
+// uploadRegistrationWorkers is how many spaces' object-count changes one
+// instance sends at once.
+const uploadRegistrationWorkers = 4
+
+// shardWorkers is how many cached blobs' moves and evictions one instance
+// runs at once. Each is a rename or an unlink.
+const shardWorkers = 4
+
+// releaseWorkers is how many blobs' releases, and multipart part blobs'
+// accepts, one instance runs at once. Each is a round trip to the upload
+// service.
+const releaseWorkers = 8
+
+// multipartWorkers is how many multipart uploads' accepts, auto-aborts and
+// reaps one instance runs at once. Their other changes run in their requests.
+// An accept only queues its parked blobs' accepts, with no round trip.
+const multipartWorkers = 4
+
+// bucketWorkers is how many buckets' catalog ships one instance runs at
+// once. Commits and the other bucket changes run in their requests.
+const bucketWorkers = 2
+
+// provideTaskRunner builds the runner for ingot's durable task queues, over
+// the host's pool. The backend registers its handlers (Server.New); the
+// migration hook creates its tables and the server starts and stops it.
+//
+// The runner's node, which tasks on this instance's local disk are placed on,
+// is the agent's DID. That names the S3 endpoint rather than the instance, and
+// each endpoint has one instance today; a second instance behind the same
+// endpoint needs a name of its own.
+func provideTaskRunner(pool *pgxpool.Pool, id identity.Identity, logger *zap.Logger) (*taskrunner.Runner, error) {
+	return taskrunner.New(pool, taskrunner.Options{
+		Schema: taskSchema,
+		Node:   id.DID().String(),
+		// In the RFC's queue order: a task may run sync children only on
+		// the queues after its own.
+		Queues: []taskrunner.QueueOptions{
+			{Name: registry.MultipartQueue, Workers: multipartWorkers},
+			{Name: registry.BucketQueue, Workers: bucketWorkers},
+			{Name: registry.UploadQueue, Workers: uploadRegistrationWorkers},
+			{Name: registry.ReleaseQueue, Workers: releaseWorkers},
+			{Name: s3frontend.ShardQueue, Workers: shardWorkers},
+		},
+		Logger: logger.Named("tasks"),
+	})
 }
 
 // migrationHookOut feeds the migration PreStartHook into the "ingot_prestart"
@@ -527,10 +578,13 @@ type migrationHookOut struct {
 // this never collides with the host's own migrations on the same database. It
 // must run before New (whose log recovery queries the registry), which the
 // PreStartHook ordering guarantees.
-func provideMigrationHook(pool *pgxpool.Pool, logger *zap.Logger) migrationHookOut {
+func provideMigrationHook(pool *pgxpool.Pool, tasks *taskrunner.Runner, logger *zap.Logger) migrationHookOut {
 	return migrationHookOut{Hook: func(ctx context.Context) error {
 		if err := migrations.Up(ctx, pool, logger); err != nil {
 			return fmt.Errorf("ingot: migrations: %w", err)
+		}
+		if err := tasks.Migrate(ctx); err != nil {
+			return fmt.Errorf("ingot: task queue migrations: %w", err)
 		}
 		return nil
 	}}
@@ -559,27 +613,27 @@ func provideForgeReader(cfg config.Config, id identity.Identity, locations regis
 	return blockstore.NewCached(forge, config.ResolveReadCacheBytes(cfg.ReadCacheBytes)), nil
 }
 
-// uploaderResult exposes the one *uploader.Forge under both upload seams:
-// Uploader (catalog CAR segments) and BodyUploader (per-blob body uploads).
+// uploaderResult exposes the one *uploader.Forge under every upload seam:
+// Uploader (catalog CAR segments), Streaming and Deferred (per-blob body
+// uploads), Remover and Registrar.
 type uploaderResult struct {
 	fx.Out
 
-	Uploader     uploader.Uploader
-	BodyUploader uploader.BodyUploader
-	Deferred     uploader.DeferredBodyUploader
-	Streaming    uploader.StreamingBodyUploader
-	Remover      uploader.BlobRemover
-	Registrar    uploader.UploadRegistrar
+	Uploader  uploader.Uploader
+	Deferred  uploader.DeferredBodyUploader
+	Streaming uploader.StreamingBodyUploader
+	Remover   uploader.BlobRemover
+	Registrar uploader.UploadRegistrar
 }
 
 // provideUploader builds the guppy-style edge client that ships to Forge via
 // the upload service (/blob/add → /ucan/conclude → /blob/accept → /index/add).
-// The same client both ships sealed catalog shards (Uploader) and uploads
-// individual body blobs by digest (BodyUploader).
+// The same client both ships sealed catalog shards (Uploader) and streams
+// individual body blobs (Streaming).
 func provideUploader(c *forgeclient.Client, logger *zap.Logger) (uploaderResult, error) {
 	f, err := uploader.NewForge(uploader.ForgeConfig{Client: c, PutClient: tracing.NewHTTPClient(), Logger: logger})
 	if err != nil {
 		return uploaderResult{}, err
 	}
-	return uploaderResult{Uploader: f, BodyUploader: f, Deferred: f, Streaming: f, Remover: f, Registrar: f}, nil
+	return uploaderResult{Uploader: f, Deferred: f, Streaming: f, Remover: f, Registrar: f}, nil
 }
