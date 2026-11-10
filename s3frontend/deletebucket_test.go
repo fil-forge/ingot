@@ -262,3 +262,48 @@ func TestDeleteBucket_OnlyARefusalReopens(t *testing.T) {
 		})
 	}
 }
+
+// nameHeldLog is a catalog log that records, for each bucket log it removes,
+// whether the bucket's row still held the name.
+type nameHeldLog struct {
+	blockstore.Log
+	reg registry.Registry
+
+	mu   sync.Mutex
+	held map[string]bool
+}
+
+func (l *nameHeldLog) RemoveBucketLog(ctx context.Context, bucket string) error {
+	_, err := l.reg.Get(ctx, bucket)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.held[bucket] = err == nil
+	return nil
+}
+
+// TestDeleteBucketRemovesItsLogWhileHoldingTheName: the log is the name's,
+// and a bucket created under the name once the row goes runs apart from the
+// delete, so the delete removes the log before it gives the name up.
+func TestDeleteBucketRemovesItsLogWhileHoldingTheName(t *testing.T) {
+	log := &nameHeldLog{held: map[string]bool{}}
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
+		log.Log, log.reg = d.Log, d.Registry
+		d.Log = log
+	})
+	ctx := context.WithValue(context.Background(), reqscope.RequestKey(), cmds3.Request{})
+	if err := b.DeleteBucket(ctx, "bk"); err != nil {
+		t.Fatalf("DeleteBucket: %v", err)
+	}
+	if _, err := mem.Get(ctx, "bk"); err == nil {
+		t.Fatal("the bucket row survived the delete")
+	}
+	log.mu.Lock()
+	held, removed := log.held["bk"]
+	log.mu.Unlock()
+	if !removed {
+		t.Fatal("the delete never removed the bucket's log")
+	}
+	if !held {
+		t.Fatal("the delete removed the bucket's log after giving its name up")
+	}
+}

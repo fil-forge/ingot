@@ -474,6 +474,19 @@ func (b *Backend) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t tas
 			return err
 		}
 
+		// The bucket's segment history dies with it, while the row still
+		// holds the name: the log is the name's, and a bucket created under
+		// the name once the row goes runs under its own space, apart from
+		// this task, and writes a log this must not remove. Best-effort: Hilt
+		// has deleted the space, so a cleanup failure must not fail the API
+		// call, and a create under the name removes a log left behind.
+		if remover, ok := b.log.(bucketLogRemover); ok {
+			if rerr := remover.RemoveBucketLog(ctx, name); rerr != nil {
+				b.logger.Warn("bucket log cleanup failed",
+					zap.String("bucket", name), zap.Error(rerr))
+			}
+		}
+
 		// The space's object-count changes went out in the drain above; one
 		// that could not be sent stays in the queue as a failed task, which
 		// outlives the bucket as the record of the count it leaves wrong.
@@ -484,16 +497,6 @@ func (b *Backend) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t tas
 				return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
 			}
 			return err
-		}
-
-		// The bucket's segment history dies with it. Best-effort: the
-		// bucket is already deleted, so a cleanup failure must not fail
-		// the API call.
-		if remover, ok := b.log.(bucketLogRemover); ok {
-			if rerr := remover.RemoveBucketLog(ctx, name); rerr != nil {
-				b.logger.Warn("bucket log cleanup failed",
-					zap.String("bucket", name), zap.Error(rerr))
-			}
 		}
 		return nil
 	}()

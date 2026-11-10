@@ -1337,8 +1337,8 @@ sequenceDiagram
     Q->>R: drainSpaceReleases: lend the request's authority for the space, Expedite its pending<br/>queue-space-shard.release tasks (subject space/*) and wait for the workers to run them (/blob/remove each)#59;<br/>a release still waiting fails the delete for the client to retry
     Q->>U: DrainSpaceRegistrations: send the space's pending queue-space-upload changes,<br/>then resend its failed retractions with the request's authority
     Q->>H: /s3/bucket/delete with the signed S3 request (hilt refuses while registrations remain)#59;<br/>a refusal clears the closing mark, not found finishes the delete,<br/>a failed call leaves the bucket closing for a retry
+    Q->>L: RemoveBucketLog, best-effort (directory + segment rows), while the row holds the name:<br/>the log is the name's, and a bucket created under it later runs under its own space
     Q->>R: reg.Delete (the local row, its catalog_journal rows cascading)
-    Q->>L: RemoveBucketLog, best-effort<br/>(directory + segment rows)
     Q-->>B: done
     B-->>C: 204
 ```
