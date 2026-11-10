@@ -134,7 +134,7 @@ if errors.As(err, &failed) {
 
 ## Submitting from a handler
 
-`ex.Submit` adds an async task that commits with the submitting task, so it exists only if the submitter succeeds. `ex.Run` runs a sync child inline. The child's writes join its parent's, its subject stays leased until the parent commits, and if it fails, the parent fails too, even if the parent's handler carries on.
+`ex.Submit` adds an async task that commits with the submitting task, so it exists only if the submitter succeeds. `ex.SubmitAll` adds many in one statement per queue, as `SubmitAllTx` does, for a handler that queues work for each of many subjects. `ex.Run` runs a sync child inline. The child's writes join its parent's, its subject stays leased until the parent commits, and if it fails, the parent fails too, even if the parent's handler carries on.
 
 ```go
 func commit(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
