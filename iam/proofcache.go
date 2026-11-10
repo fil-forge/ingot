@@ -6,6 +6,7 @@ import (
 	"iter"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	ucanlib "github.com/fil-forge/libforge/ucan"
@@ -55,6 +56,15 @@ type DelegationCache struct {
 	// delegation that is in it. Nil for a request-scoped store, which keeps a
 	// response's delegations for its onward retrieval.
 	revoked *gocache.Cache
+
+	// A registry reset after a revocation-cursor gap retires captured stores
+	// too. A nil generation denotes an independent request-scoped store.
+	generation         *atomic.Uint64
+	capturedGeneration uint64
+}
+
+func (d *DelegationCache) current() bool {
+	return d.generation == nil || d.generation.Load() == d.capturedGeneration
 }
 
 // indexKey is the exact-match probe the delegation matcher uses. Powerline
@@ -94,6 +104,8 @@ func NewDelegationCache(revocations *gocache.Cache) *DelegationCache {
 // nothing: if any proof has been named by a revocation, Add caches none of
 // them, renews that revocation when it has used up half its life, and
 // reports false.
+// A store retired by a registry-wide generation reset also refuses Add;
+// callers must not repopulate a pointer whose authority was invalidated.
 //
 // The check and the inserts hold d.mu, and [DelegationCache.Contains] takes
 // it too, which orders Add against [KeyProofs.InvalidateHolders]: that
@@ -104,6 +116,9 @@ func NewDelegationCache(revocations *gocache.Cache) *DelegationCache {
 func (d *DelegationCache) Add(proofs ...ucan.Delegation) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if !d.current() {
+		return false
+	}
 	if d.revoked != nil {
 		for _, p := range proofs {
 			link := p.Link().String()
@@ -179,6 +194,9 @@ func keyOf(dlg ucan.Delegation) indexKey {
 func (d *DelegationCache) Contains(link cid.Cid) bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	if !d.current() {
+		return false
+	}
 	_, ok := d.data.Get(link.String())
 	return ok
 }
@@ -186,6 +204,9 @@ func (d *DelegationCache) Contains(link cid.Cid) bool {
 // ProofChain assembles the root-first delegation chain granting cmd over sub
 // to aud, from the cached delegations. See [ucanlib.ProofChain].
 func (d *DelegationCache) ProofChain(ctx context.Context, aud did.DID, cmd ucan.Command, sub did.DID) ([]ucan.Delegation, []cid.Cid, error) {
+	if !d.current() {
+		return nil, nil, nil
+	}
 	return ucanlib.ProofChain(ctx, d.matchDelegations, aud, cmd, sub)
 }
 
@@ -199,6 +220,9 @@ func (d *DelegationCache) matchDelegations(ctx context.Context, aud did.DID, cmd
 // design; a chain that must prove the key's own authority, as the local fast
 // path's does, has to end in the key's delegation instead.
 func (d *DelegationCache) ProofChainVia(ctx context.Context, aud did.DID, cmd ucan.Command, sub, via did.DID) ([]ucan.Delegation, []cid.Cid, error) {
+	if !d.current() {
+		return nil, nil, nil
+	}
 	list := func(ctx context.Context, a did.DID, c ucan.Command, s did.DID) iter.Seq2[ucan.Delegation, error] {
 		all := d.listDelegations(ctx, a, c, s)
 		if a != aud {
@@ -248,6 +272,9 @@ func (d *DelegationCache) listDelegations(_ context.Context, aud did.DID, cmd uc
 
 	return func(yield func(ucan.Delegation, error) bool) {
 		for _, m := range matches {
+			if !d.current() {
+				return
+			}
 			if _, live := d.data.Get(m.link); !live {
 				continue // expired, janitor hasn't swept yet
 			}
@@ -300,7 +327,7 @@ func compareRemainingLife(a, b ucan.Delegation) int {
 // [KeyProofs.InvalidateHolders] drops both together and a stale set can
 // never outlive the proofs it was issued with.
 func (d *DelegationCache) PutPermissions(bucket did.DID, ttl time.Duration, actions []string) {
-	if ttl <= 0 || !bucket.Defined() || actions == nil {
+	if !d.current() || ttl <= 0 || !bucket.Defined() || actions == nil {
 		return
 	}
 	set := make(map[string]struct{}, len(actions))
@@ -316,7 +343,7 @@ func (d *DelegationCache) PutPermissions(bucket did.DID, ttl time.Duration, acti
 // the bucket DID Hilt named, a bucket whose local registry space disagrees
 // with Hilt's answer simply reports unknown and takes the Hilt path.
 func (d *DelegationCache) Permits(bucket did.DID, action string) (allowed, known bool) {
-	if !bucket.Defined() {
+	if !d.current() || !bucket.Defined() {
 		return false, false
 	}
 	v, ok := d.perms.Get(bucket.String())
