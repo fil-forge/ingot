@@ -12,7 +12,6 @@ import (
 
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 	"github.com/fil-forge/libforge/testutil"
 )
 
@@ -87,20 +86,11 @@ func runPartQueueSuite(t *testing.T, pool *pgxpool.Pool, st partQueueStore) {
 		return out
 	}
 
-	t.Run("a part is recorded parked with its sizes, and queues the accept", func(t *testing.T) {
+	t.Run("a part is recorded parked with its sizes", func(t *testing.T) {
 		part(id, 1, multihash.Multihash{0xd1, 0x0a}, multihash.Multihash{0xd1, 0x0b})
 		parts, err := st.ListParts(ctx, id)
 		if err != nil || len(parts) != 1 || parts[0].State != registry.PartParked || !slices.Equal(parts[0].SpanLengths, []int64{1, 2}) {
 			t.Fatalf("ListParts = %+v, err %v; want one parked part with sizes [1 2]", parts, err)
-		}
-		tasks, err := taskrunnertest.Tasks(ctx, pool, "ingot", registry.AcceptQueue)
-		if err != nil {
-			t.Fatalf("accept tasks: %v", err)
-		}
-		if !slices.ContainsFunc(tasks, func(q taskrunnertest.QueuedTask) bool {
-			return q.Subject == id && q.Action == registry.AcceptAction && q.State == "pending"
-		}) {
-			t.Fatalf("accept tasks = %+v; want one pending for %s", tasks, id)
 		}
 		// Sizes must match the digests one for one, which a constraint
 		// enforces.

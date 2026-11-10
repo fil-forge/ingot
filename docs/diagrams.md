@@ -250,7 +250,7 @@ flowchart TB
   that cannot add by digest code fails the write.
 - Multipart parts ride the body route with the conclude deferred (parked);
   each blob's `queue-space-shard.accept`, queued by the upload's
-  `queue-multipart-upload-shard.accept`, finishes it
+  `queue-multipart-upload.accept`, finishes it
   (the [multipart diagram](#multipart-upload-park-on-write-accept-in-the-background)).
 
 Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer),
@@ -501,7 +501,7 @@ change.
 ## Multipart upload: park on write, accept in the background
 
 Parts upload to the provider at `UploadPart` and park there (durable,
-unaccepted). Each upload's `queue-multipart-upload-shard.accept` task
+unaccepted). Each upload's `queue-multipart-upload.accept` task
 queues a `queue-space-shard.accept` for each blob of its parked parts, which
 concludes the blob under the blob's own subject while the client is still
 uploading, so `Complete` has only the last few left to accept.
@@ -512,7 +512,7 @@ sequenceDiagram
     actor C as S3 client
     participant B as s3frontend.Backend
     participant M as queue-multipart-upload<br/>(task, subject = uploadId)
-    participant A as queue-multipart-upload-shard.accept<br/>(task, subject = uploadId)
+    participant A as queue-multipart-upload.accept<br/>(task, the upload's subject)
     participant S as queue-space-shard.accept<br/>(task, subject = space/digest)
     participant R as registry<br/>(sessions, parts, parks, intents)
     participant U as sprue
@@ -578,8 +578,7 @@ sequenceDiagram
         end
         Note over B,C: from here the body is padded with a newline every<br/>complete_multipart_keepalive (5 s), and any error goes in the 200's body
         M->>R: manifest spans from each part's span_lengths<br/>(rows without them: intent size + FEE geometry)
-        M->>A: run the accept as a task of its own, not a child, limited to the named parts,<br/>after any running or pending accept
-        M->>S: bring the named blobs' accepts forward and wait for them, within acceptWaitBudget<br/>(30 s) in all#59; their writes commit before Complete reads the parts and assembles the tree
+        M->>S: queue the accept of each blob of the named parts still parked, committed at once,<br/>then bring them forward and wait for them, within acceptWaitBudget (30 s) in all#59;<br/>their writes commit before Complete reads the parts and assembles the tree
         alt the accepts did not finish in time
             B-->>C: OperationAborted in the 200's body#59; the upload stays open
         else a named part still parked (its blob's accept failed)
@@ -675,11 +674,11 @@ stateDiagram-v2
   request runs them itself when it can, rather than leave them to the
   runner's workers.
 - Complete requires every part it names to be `accepted` before the commit.
-  It runs the accept for those parts as a task of its own (parts it omits
-  cannot fail it), answers an accept that cannot start within 30 s with a 409 that
-  botocore clients treat as final, and fails with the accept's error when
-  the accept fails. A failed batch fails the whole accept, which records
-  nothing.
+  It queues the accept of each blob of those parts still parked (parts it
+  omits cannot fail it) and waits for them, answers accepts that do not
+  finish within 30 s with a 409 that botocore clients treat as final, and
+  fails for a retry when a blob's accept failed. A failed conclude fails
+  only its blob's accept, which records nothing.
 - Rows from before migration 00030 are `parked` or `accepted` and have no
   `span_lengths`; Complete derives their lengths per blob.
 

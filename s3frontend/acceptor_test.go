@@ -25,22 +25,21 @@ import (
 )
 
 // cancelQueuedAccepts cancels the accept UploadPart queued for uploadID, so
-// that a test runs the upload's accepts itself, one at a time. A sync accept
-// would otherwise run the queued one first.
+// that a test runs the upload's accepts itself, one at a time.
 func cancelQueuedAccepts(t *testing.T, b *Backend, uploadID string) {
 	t.Helper()
 	ctx := context.Background()
-	tasks, err := storeFor(b).queued(ctx, registry.AcceptQueue)
+	tasks, err := storeFor(b).queued(ctx, registry.MultipartQueue)
 	if err != nil {
 		t.Fatalf("queued accepts: %v", err)
 	}
 	var ids []taskrunner.TaskID
 	for _, task := range tasks {
-		if task.Subject == uploadID && task.State == "pending" {
+		if task.Subject == uploadID && task.Action == registry.MultipartAcceptAction && task.State == "pending" {
 			ids = append(ids, task.ID)
 		}
 	}
-	if err := b.accepts.Cancel(ctx, registry.AcceptQueue, ids...); err != nil {
+	if err := b.uploads.Cancel(ctx, registry.MultipartQueue, ids...); err != nil {
 		t.Fatalf("cancel queued accepts: %v", err)
 	}
 }
@@ -53,10 +52,10 @@ func runAccepts(t *testing.T, b *Backend, uploadID string) error {
 	t.Helper()
 	cancelQueuedAccepts(t, b, uploadID)
 	ctx := context.Background()
-	if _, err := b.accepts.Run(ctx, taskrunner.Spec{
-		Queue:   registry.AcceptQueue,
+	if _, err := b.uploads.Run(ctx, taskrunner.Spec{
+		Queue:   registry.MultipartQueue,
 		Subject: uploadID,
-		Action:  registry.AcceptAction,
+		Action:  registry.MultipartAcceptAction,
 	}); err != nil {
 		return err
 	}
@@ -184,6 +183,30 @@ func TestAcceptAcceptsPartsWhileUploading(t *testing.T) {
 	}
 }
 
+// TestUploadedPartsAreAcceptedInTheBackground: with no delay, the accept an
+// UploadPart queues runs on the upload queue's workers, and its blobs'
+// accepts on the space-shard queue's, so the parts are accepted with nothing
+// else run.
+func TestUploadedPartsAreAcceptedInTheBackground(t *testing.T) {
+	b, mem := newDeferredBackend(t, &countingConcluder{})
+	b.acceptDelay = 0
+	key := "accept-in-background"
+	uploadID := mpCreate(t, b, key, "", "")
+	uploadDistinctParts(t, b, key, uploadID, 2)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		states := partStates(t, mem, uploadID)
+		if allIn(states, registry.PartAccepted) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("part states = %v, want all accepted by the background accept", states)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // TestUploadPartQueuesOneAccept: a part is recorded parked and the upload's
 // accept is queued with it, durably; the parts of one upload share one
 // pending accept.
@@ -196,13 +219,13 @@ func TestUploadPartQueuesOneAccept(t *testing.T) {
 	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartParked) {
 		t.Fatalf("part states = %v, want all parked", states)
 	}
-	tasks, err := mem.queued(context.Background(), registry.AcceptQueue)
+	tasks, err := mem.queued(context.Background(), registry.MultipartQueue)
 	if err != nil {
 		t.Fatalf("queued: %v", err)
 	}
 	pending := 0
 	for _, task := range tasks {
-		if task.Subject == uploadID && task.Action == registry.AcceptAction && task.State == "pending" {
+		if task.Subject == uploadID && task.Action == registry.MultipartAcceptAction && task.State == "pending" {
 			pending++
 		}
 	}

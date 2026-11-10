@@ -1,8 +1,6 @@
 package registry
 
 import (
-	"bytes"
-	"fmt"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
@@ -11,38 +9,20 @@ import (
 	"github.com/fil-forge/ingot/taskrunner"
 )
 
-// AcceptQueue is the task queue a multipart upload's parked parts are
-// scheduled for acceptance on. Its subject is the upload ID, so an upload has
-// one accept running at a time, apart from the upload's other work.
-const AcceptQueue = "queue-multipart-upload-shard"
-
-// AcceptAction queues the acceptance of each blob of an upload's parked
-// parts: a queue-space-shard.accept on the blob's subject (BlobAcceptSpec).
-const AcceptAction = "accept"
-
 // BlobAcceptAction concludes a parked blob on the upload service and marks
 // accepted the parts it completes. It runs on queue-space-shard, under the
 // blob's subject (ReleaseSubject), so it never overlaps the blob's release
 // or a write's add of it.
 const BlobAcceptAction = "accept"
 
-// AcceptTask is a queue-multipart-upload-shard.accept task's arguments.
-type AcceptTask struct {
-	// Parts limits the accept to these part numbers; empty accepts every
-	// parked part. Complete names the parts it lists, so a part it drops
-	// cannot fail it.
-	Parts []int64
-}
-
-// AcceptSpec returns the accept an UploadPart queues for uploadID: a
-// replacement due now, so an upload has at most one pending.
-func AcceptSpec(uploadID string) taskrunner.Spec {
-	now := DueNow()
+// AcceptSpec returns the queue-multipart-upload.accept an UploadPart queues
+// for uploadID, due at: a replacement, so an upload has at most one pending.
+func AcceptSpec(uploadID string, at time.Time) taskrunner.Spec {
 	return taskrunner.Spec{
-		Queue:     AcceptQueue,
+		Queue:     MultipartQueue,
 		Subject:   uploadID,
-		Action:    AcceptAction,
-		NotBefore: &now,
+		Action:    MultipartAcceptAction,
+		NotBefore: &at,
 		Replace:   true,
 	}
 }
@@ -59,34 +39,6 @@ func BlobAcceptSpec(space did.DID, digest multihash.Multihash) taskrunner.Spec {
 		NotBefore: &now,
 		Replace:   true,
 	}
-}
-
-// CompleteAcceptSpec returns the accept Complete runs for uploadID's parts,
-// to start by expires.
-func CompleteAcceptSpec(uploadID string, parts []int64, expires time.Time) (taskrunner.Spec, error) {
-	var buf bytes.Buffer
-	if err := (&AcceptTask{Parts: parts}).MarshalCBOR(&buf); err != nil {
-		return taskrunner.Spec{}, fmt.Errorf("registry: encode accept: %w", err)
-	}
-	return taskrunner.Spec{
-		Queue:   AcceptQueue,
-		Subject: uploadID,
-		Action:  AcceptAction,
-		Args:    buf.Bytes(),
-		Expires: &expires,
-	}, nil
-}
-
-// AcceptTaskFrom decodes an accept task's arguments.
-func AcceptTaskFrom(t taskrunner.Task) (AcceptTask, error) {
-	var args AcceptTask
-	if len(t.Args) == 0 {
-		return args, nil
-	}
-	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
-		return AcceptTask{}, fmt.Errorf("registry: decode accept: %w", err)
-	}
-	return args, nil
 }
 
 // acceptedIntent marks the space's intent for a located blob accepted. A

@@ -172,7 +172,7 @@ at PUT time or a sealed catalog CAR from a `queue-bucket.ship`:
 
 Multipart parts stop after step 2 (**parked**: durable, unaccepted) and
 each blob's `queue-space-shard.accept`, queued by the upload's
-`queue-multipart-upload-shard.accept`, runs steps 3 and 4 in the background
+`queue-multipart-upload.accept`, runs steps 3 and 4 in the background
 while the client is still uploading; an abort unwinds a
 parked blob with `/blob/abort` and an accepted one with `/blob/remove`. A
 part keeps no local copy: the accept concludes each blob from its park row
@@ -202,11 +202,10 @@ listing leaves it on disk.
 The part rows are the acceptance queue. `UploadPart` parks every blob of
 the part through its `queue-space-shard.add`, then records the part as
 `parked`, with each blob's plaintext length. The same transaction queues the
-upload's `queue-multipart-upload-shard.accept` (`s3frontend/acceptor.go`,
+upload's `queue-multipart-upload.accept` (`s3frontend/acceptor.go`,
 `registry/accept.go`) as a replacement due now, so an upload has at most one
-accept pending. That accept runs on its own queue (`registry.AcceptQueue`)
-with the upload ID as its subject, and does nothing unless the session is
-`open`. It makes no network calls: it lists the upload's parked parts and
+accept pending. That accept runs on the upload's own subject, in turn with
+its other changes, and does nothing unless the session is `open`. It makes no network calls: it lists the upload's parked parts and
 queues, with its commit, a `queue-space-shard.accept` for each of their
 blobs (`registry.BlobAcceptSpec`), and marks a part with no blobs accepted.
 
@@ -251,13 +250,13 @@ the part rows when it is collected), `ingot.multipart.accept_passes` (blob
 concludes, by outcome) and `ingot.multipart.complete_deferred` report the
 queue's health; the README lists them.
 
-Complete runs the upload's accept for the parts it names, then brings those
-blobs' pending accepts forward from any retry's backoff and waits for them
-within `acceptWaitBudget` (30 s), a sync no-op on each blob's subject
-running once the tasks due before it there have run. Past the budget it
-answers OperationAborted. A named part still parked after the wait has a
-blob whose accept failed, and Complete fails for the client to retry; a part
-whose blob has gone answers InvalidPart.
+Complete queues the accept of each blob of the parts it names that are still
+parked, then brings those blobs' pending accepts forward from any retry's
+backoff and waits for them within `acceptWaitBudget` (30 s), a sync no-op on
+each blob's subject running once the tasks due before it there have run.
+Past the budget it answers OperationAborted. A named part still parked after
+the wait has a blob whose accept failed, and Complete fails for the client to
+retry; a part whose blob has gone answers InvalidPart.
 
 An abort, an auto-abort or a part re-upload queues a release of a blob the
 upload's accept may be concluding. The release runs under the blob's
@@ -292,15 +291,13 @@ up to 10 s (`replayWaitBudget`) for the upload's other changes, another
 Complete included, and past that answers OperationAborted. An upload
 already completed replays the result recorded on its session, the same
 ETag and version id. Otherwise Complete validates the parts, checks the
-re-hash budget, reserves and reports the version id, and runs the upload's
-accept limited to the part numbers it lists, so a part it drops cannot fail
-it. The accept runs as a task of its own, not a child, so its writes commit
-before Complete reads the parts again and assembles the object's tree,
-which reads the accepted blobs back through their locations. It cancels an
-accept the upload queued that has not started, since its own concludes
-every part it names, and waits for one already running. If it cannot start
-within 30 s (`acceptWaitBudget`), Complete answers OperationAborted, a 409,
-and the upload stays open. The AWS CLI and other botocore-based
+re-hash budget, reserves and reports the version id, and queues the accept of
+each blob of the parts it lists that are still parked, so a part it drops
+cannot fail it. It queues them outside its own commit, and waits for them, so
+their writes commit before Complete reads the parts again and assembles the
+object's tree, which reads the accepted blobs back through their locations.
+If they do not finish within 30 s (`acceptWaitBudget`), Complete answers
+OperationAborted, a 409, and the upload stays open. The AWS CLI and other botocore-based
 clients treat that 409 as final and abort the upload, so the 30 s budget is
 the margin before a client sees a failed upload. An accept that fails fails
 Complete with its error. After the accept, every listed part must be

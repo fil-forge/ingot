@@ -195,6 +195,37 @@ func TestSubmitAllTxAddsManyTasksAtOnce(t *testing.T) {
 	}
 }
 
+// SubmitAll adds tasks of several queues and commits them at once, returning
+// their IDs in order and keeping one of two replacements for one subject and
+// action.
+func TestSubmitAllAddsTasksOfSeveralQueues(t *testing.T) {
+	f := newFixture(t, 0)
+	noop := func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil }
+	f.handle(t, qTop, "release", noop)
+	f.handle(t, qBottom, "release", noop)
+	f.migrate(t)
+	ctx := waitCtx(t)
+	at := func(d time.Duration) *time.Time { v := time.Now().Add(d).Truncate(time.Millisecond); return &v }
+	specs := []taskrunner.Spec{
+		{Queue: qTop, Subject: "sp/a", Action: "release", NotBefore: at(time.Hour), Replace: true},
+		{Queue: qBottom, Subject: "sp/b", Action: "release"},
+		{Queue: qTop, Subject: "sp/a", Action: "release", NotBefore: at(3 * time.Hour), Replace: true},
+	}
+	ids, err := f.r.SubmitAll(ctx, specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 3 || ids[0] != ids[2] {
+		t.Fatalf("ids = %v, want three, the two sp/a replacements sharing one", ids)
+	}
+	if got := f.notBefore(t, qTop, ids[0]); !got.Equal(*specs[2].NotBefore) {
+		t.Errorf("sp/a due %v, want the later of the two, %v", got, *specs[2].NotBefore)
+	}
+	if got := f.state(t, qBottom, ids[1]); got != "pending" {
+		t.Errorf("sp/b is %s, want pending", got)
+	}
+}
+
 // waitForALockWait returns once a statement on the test database is waiting
 // for a row lock.
 func waitForALockWait(t *testing.T, f *fixture) {

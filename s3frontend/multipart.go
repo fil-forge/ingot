@@ -1123,12 +1123,13 @@ var errAcceptWaitExpired = errors.New("s3frontend: the parts' accepts did not fi
 
 // acceptRequested makes sure every part Complete names has its blobs
 // accepted on Forge. The upload's accept has been queueing its parts' blobs
-// for acceptance while the client uploaded them; Complete runs it once more
-// for the parts it names, after the response's headers have gone out, and
-// then waits for each of those blobs' accepts, brought forward from any
-// retry's backoff. It waits outside its own commit: the accepts' writes
-// commit before Complete reads the parts again, and before the object's tree
-// is assembled, which reads accepted blobs back through their locations.
+// for acceptance while the client uploaded them; Complete queues the accept
+// of each blob of the parts it names that are still parked, after the
+// response's headers have gone out, and then waits for each of those blobs'
+// accepts, brought forward from any retry's backoff. It queues them and waits
+// outside its own commit: the accepts' writes commit before Complete reads
+// the parts again, and before the object's tree is assembled, which reads
+// accepted blobs back through their locations.
 // Parts the upload holds and Complete omits are left out: they are orphans of
 // this completion. Then every named part must be accepted. One with a blob
 // released since the request validated it is no longer the part the client
@@ -1162,7 +1163,7 @@ func (b *Backend) acceptRequested(ctx context.Context, uploadID string, space di
 		if !ok || !sameDigests(cur.BlobDigests, rp.BlobDigests) {
 			return s3err.GetAPIError(s3err.ErrInvalidPart)
 		}
-		if cur.State == registry.PartAccepted {
+		if cur.State == registry.PartAccepted || len(cur.BlobDigests) == 0 {
 			continue
 		}
 		parked, err := b.anyParked(ctx, space, cur.BlobDigests)
@@ -1177,29 +1178,19 @@ func (b *Backend) acceptRequested(ctx context.Context, uploadID string, space di
 	return nil
 }
 
-// acceptAndWait runs the upload's accept for the parts Complete names and
-// waits for their blobs' accepts, every step bounded by expires.
+// acceptAndWait queues the accept of each blob of the parts Complete names
+// that are still parked, committed at once, and waits for them, every step
+// bounded by expires.
 func (b *Backend) acceptAndWait(ctx context.Context, uploadID string, space did.DID, requested []registry.MultipartPart, expires time.Time) error {
 	ctx, cancel := context.WithDeadline(ctx, expires)
 	defer cancel()
-	numbers := make([]int64, len(requested))
-	for i, p := range requested {
-		numbers[i] = int64(p.PartNumber)
+	var parked []registry.MultipartPart
+	for _, p := range requested {
+		if p.State == registry.PartParked {
+			parked = append(parked, p)
+		}
 	}
-	spec, err := registry.CompleteAcceptSpec(uploadID, numbers, expires)
-	if err != nil {
-		return err
-	}
-	queued, err := b.accepts.Pending(ctx, registry.AcceptQueue, []string{uploadID}, registry.AcceptAction)
-	if err != nil {
-		return fmt.Errorf("s3frontend: find the upload's queued accept: %w", err)
-	}
-	// Complete's own queues every part it names. Cancel leaves one that has
-	// started, which Complete then waits for.
-	if err := b.accepts.Cancel(ctx, registry.AcceptQueue, queued[uploadID]...); err != nil {
-		return fmt.Errorf("s3frontend: cancel the upload's queued accept: %w", err)
-	}
-	if _, err := b.accepts.Run(ctx, spec); err != nil {
+	if _, err := b.uploads.SubmitAll(ctx, blobAccepts(space, parked)); err != nil {
 		return err
 	}
 	return b.awaitBlobAccepts(ctx, space, requested, expires)
