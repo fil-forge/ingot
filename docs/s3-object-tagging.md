@@ -187,7 +187,7 @@ catalog stores it.
 **Storage.** `registry.State.BucketTagging` holds the set as a JSON object in the bucket row
 (`buckets.bucket_tagging`), beside the object-lock configuration `ObjectLockConfig` keeps
 there. The set is small, bounded, and read only by its own three methods, so it never enters
-the MST.
+the MST. Put and Delete write it through `queue-bucket.set-tagging`, on the bucket's subject.
 
 **Semantics.** Unlike object tagging, absence is a 404: a bucket with no tag set answers
 `NoSuchTagSet` (`ErrBucketTaggingNotFound`), which is the state `DeleteBucketTagging`

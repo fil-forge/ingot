@@ -112,7 +112,8 @@ Internal:
   task per bucket change, sync for the request, on the bucket's subject;
   applies an ordered list of key changes, `bucketchanges.go`, to one Tx),
   `bucketadmin.go` (`queue-bucket.create`, `.set-versioning`,
-  `.set-object-lock-config`, `.close`, `.admit-upload`), `bucketship.go`
+  `.set-object-lock-config`, `.set-tagging`, `.set-cors`, `.set-encryption`,
+  `.close`, `.admit-upload`), `bucketship.go`
   (`queue-bucket.ship`, queued on each seal), `multipart.go`,
   `multipartqueue.go` (`queue-multipart-upload`: every change to an upload,
   on the upload ID's subject), `acceptor.go`

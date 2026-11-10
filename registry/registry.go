@@ -174,20 +174,6 @@ type Registry interface {
 	// (State.Closing). Returns ErrNotFound if absent.
 	SetClosing(ctx context.Context, name string, closing bool) error
 
-	// SetBucketTagging stores the bucket's tag set, replacing any previous
-	// one; nil clears it. Returns ErrNotFound if the bucket is absent.
-	SetBucketTagging(ctx context.Context, name string, tags []byte) error
-
-	// SetCORSConfig stores the bucket's own CORS configuration document,
-	// replacing any previous one; nil clears it. Returns ErrNotFound if the
-	// bucket is absent.
-	SetCORSConfig(ctx context.Context, name string, cfg []byte) error
-
-	// SetEncryption stores the bucket's default encryption;
-	// BucketEncryptionUnset clears it. Returns ErrNotFound if the bucket is
-	// absent.
-	SetEncryption(ctx context.Context, name string, enc BucketEncryption) error
-
 	// AllocVersionSeq atomically advances and returns the bucket's version
 	// ordinal (the first call returns 1; 0 is reserved to mean "none").
 	// Gaps from failed commits are harmless — the ordinal only orders

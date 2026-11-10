@@ -56,6 +56,16 @@ type BucketSetLockConfigTask struct {
 	Config []byte
 }
 
+// BucketSetConfigTask is the arguments of a queue-bucket action that stores
+// one of the bucket's settings: set-tagging, set-cors and set-encryption.
+type BucketSetConfigTask struct {
+	// Name is the bucket's name.
+	Name string
+	// Value is the setting, validated by the S3 layer: the tag set or CORS
+	// document, or the encryption algorithm. Empty clears it.
+	Value []byte
+}
+
 // cborArgs is a task's arguments.
 type cborArgs interface {
 	MarshalCBOR(w io.Writer) error
@@ -76,9 +86,14 @@ func (b *Backend) registerBucketAdmin(r *taskrunner.Runner) error {
 		registry.BucketCreateAction:        b.runCreateBucket,
 		registry.BucketSetVersioningAction: b.runSetVersioning,
 		registry.BucketSetLockConfigAction: b.runSetLockConfig,
-		registry.BucketCloseAction:         b.runCloseBucket,
-		registry.BucketAdmitUploadAction:   b.runAdmitUpload,
-		registry.BucketDeleteAction:        b.runDeleteBucket,
+		registry.BucketSetTaggingAction:    b.runSetConfig(registry.TaggingSet),
+		registry.BucketSetCORSAction:       b.runSetConfig(registry.CORSSet),
+		registry.BucketSetEncryptionAction: b.runSetConfig(func(name string, v []byte) registry.Statement {
+			return registry.EncryptionSet(name, registry.BucketEncryption(v))
+		}),
+		registry.BucketCloseAction:       b.runCloseBucket,
+		registry.BucketAdmitUploadAction: b.runAdmitUpload,
+		registry.BucketDeleteAction:      b.runDeleteBucket,
 	} {
 		if err := r.Handle(registry.BucketQueue, action, h); err != nil {
 			return err
@@ -96,6 +111,36 @@ func (b *Backend) runBucket(ctx context.Context, space did.DID, action string, a
 	}
 	_, err = b.buckets.Run(ctx, b.bucketSpec(space, action, raw))
 	return err
+}
+
+// setBucketConfig stores value as one of bucket's settings, through action
+// on the bucket's subject: a bucket deleted and recreated under the name
+// since the request resolved it is not the bucket the request was for.
+func (b *Backend) setBucketConfig(ctx context.Context, bucket, action string, value []byte) error {
+	st, err := b.reg.Get(ctx, bucket)
+	if errors.Is(err, registry.ErrNotFound) {
+		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+	}
+	if err != nil {
+		return err
+	}
+	return b.runBucket(ctx, st.Space, action, &BucketSetConfigTask{Name: bucket, Value: value})
+}
+
+// runSetConfig returns the handler of a queue-bucket action that stores one
+// of the bucket's settings with write, with the task's commit.
+func (b *Backend) runSetConfig(write func(name string, value []byte) registry.Statement) taskrunner.Handler {
+	return func(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
+		var args BucketSetConfigTask
+		if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
+			return nil, taskrunner.Permanent(fmt.Errorf("decode %s: %w", t.Action, err))
+		}
+		if _, err := b.bucketOn(ctx, args.Name, t.Subject); err != nil {
+			return nil, err
+		}
+		st := write(args.Name, args.Value)
+		return nil, ex.WriteConditional(ctx, st.SQL, st.Args...)
+	}
 }
 
 // bucketOn returns bucket name's state when it still lives in the space

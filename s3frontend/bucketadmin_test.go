@@ -163,3 +163,37 @@ func TestACreateRemovesALeftoverLogOnce(t *testing.T) {
 		t.Fatalf("removed logs = %v, want the name's once", log.removed)
 	}
 }
+
+// TestBucketSettingsChangeOnlyTheirOwnBucket: a tagging, CORS or encryption
+// change queued for a bucket deleted and recreated under its name since, in
+// another space, is NoSuchBucket, and leaves the new bucket's settings as
+// they were.
+func TestBucketSettingsChangeOnlyTheirOwnBucket(t *testing.T) {
+	b, mem := newDeferredBackend(t, &parkingUploader{})
+	ctx := context.Background()
+	st, err := mem.Get(ctx, "bk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.Delete(ctx, "bk", st.Space); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: st.Tenant}); err != nil {
+		t.Fatal(err)
+	}
+	for action, value := range map[string]string{
+		registry.BucketSetTaggingAction:    `{"k":"v"}`,
+		registry.BucketSetCORSAction:       "<CORSConfiguration></CORSConfiguration>",
+		registry.BucketSetEncryptionAction: string(registry.BucketEncryptionNone),
+	} {
+		err := b.runBucket(ctx, st.Space, action, &BucketSetConfigTask{Name: "bk", Value: []byte(value)})
+		wantAPIErr(t, err, s3err.ErrNoSuchBucket)
+	}
+	now, err := mem.Get(ctx, "bk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if now.BucketTagging != nil || now.CORSConfig != nil || now.Encryption != registry.BucketEncryptionUnset {
+		t.Fatalf("the new bucket's settings changed: tagging %q, cors %q, encryption %q", now.BucketTagging, now.CORSConfig, now.Encryption)
+	}
+}

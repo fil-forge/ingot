@@ -27,6 +27,9 @@ const (
 	BucketShipAction          = "ship"
 	BucketSetVersioningAction = "set-versioning"
 	BucketSetLockConfigAction = "set-object-lock-config"
+	BucketSetTaggingAction    = "set-tagging"
+	BucketSetCORSAction       = "set-cors"
+	BucketSetEncryptionAction = "set-encryption"
 	BucketCloseAction         = "close"
 	BucketAdmitUploadAction   = "admit-upload"
 	BucketDeleteAction        = "delete"
@@ -282,6 +285,26 @@ func VersioningSet(name string, v VersioningState) (Statement, error) {
 // configuration. It is a guard: a bucket gone fails the task's commit.
 func LockConfigSet(name string, cfg []byte) Statement {
 	return Statement{`UPDATE ingot.buckets SET object_lock_config = $1 WHERE name = $2`, []any{cfg, name}}
+}
+
+// TaggingSet is the write that stores bucket name's tag set; nil clears it.
+// It is a guard: a bucket gone fails the task's commit.
+func TaggingSet(name string, tags []byte) Statement {
+	return Statement{`UPDATE ingot.buckets SET bucket_tagging = $1 WHERE name = $2`, []any{tags, name}}
+}
+
+// CORSSet is the write that stores bucket name's own CORS configuration
+// document; nil clears it. It is a guard: a bucket gone fails the task's
+// commit.
+func CORSSet(name string, cfg []byte) Statement {
+	return Statement{`UPDATE ingot.buckets SET cors_config = $1 WHERE name = $2`, []any{cfg, name}}
+}
+
+// EncryptionSet is the write that stores bucket name's default encryption;
+// BucketEncryptionUnset clears it. It is a guard: a bucket gone fails the
+// task's commit.
+func EncryptionSet(name string, enc BucketEncryption) Statement {
+	return Statement{`UPDATE ingot.buckets SET encryption = $1 WHERE name = $2`, []any{nullString(string(enc)), name}}
 }
 
 // ClosingSet is the write that marks bucket name closing, which

@@ -1128,7 +1128,8 @@ func TestABucketIsItsOwnSpace(t *testing.T) {
 
 // TestBucketCORSConfig round-trips a bucket's own CORS document through
 // the SQL store: the column scans back as the bytes stored, NULL reads as
-// nil, a nil write restores NULL, and a missing bucket is ErrNotFound.
+// nil, a nil write restores NULL, and a missing bucket's write affects no
+// row, which fails a queue-bucket.set-cors's commit.
 func TestBucketCORSConfig(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.New(t)
@@ -1148,9 +1149,16 @@ func TestBucketCORSConfig(t *testing.T) {
 	// Binary, with a zero byte, to exercise the bytea round trip rather than
 	// a text one.
 	doc := []byte("<CORSConfiguration>\x00</CORSConfiguration>")
-	if err := r.SetCORSConfig(ctx, "b", doc); err != nil {
-		t.Fatalf("SetCORSConfig: %v", err)
+	set := func(name string, cfg []byte) int64 {
+		t.Helper()
+		st := registry.CORSSet(name, cfg)
+		tag, err := pool.Exec(ctx, st.SQL, st.Args...)
+		if err != nil {
+			t.Fatalf("CORSSet: %v", err)
+		}
+		return tag.RowsAffected()
 	}
+	set("b", doc)
 	if st, err = r.Get(ctx, "b"); err != nil {
 		t.Fatalf("Get after set: %v", err)
 	}
@@ -1158,9 +1166,7 @@ func TestBucketCORSConfig(t *testing.T) {
 		t.Fatalf("CORSConfig = %q, want %q", st.CORSConfig, doc)
 	}
 
-	if err := r.SetCORSConfig(ctx, "b", nil); err != nil {
-		t.Fatalf("SetCORSConfig(nil): %v", err)
-	}
+	set("b", nil)
 	if st, err = r.Get(ctx, "b"); err != nil {
 		t.Fatalf("Get after clear: %v", err)
 	}
@@ -1168,7 +1174,7 @@ func TestBucketCORSConfig(t *testing.T) {
 		t.Fatalf("CORSConfig after clear = %q, want nil", st.CORSConfig)
 	}
 
-	if err := r.SetCORSConfig(ctx, "missing", doc); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("SetCORSConfig on a missing bucket = %v, want ErrNotFound", err)
+	if n := set("missing", doc); n != 0 {
+		t.Fatalf("CORSSet on a missing bucket affected %d rows, want none", n)
 	}
 }
