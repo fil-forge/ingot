@@ -2008,8 +2008,15 @@ func TestReapDoesNotRecordAReleaseAlreadyRunToCompletion(t *testing.T) {
 	if mp.fails > 0 {
 		t.Fatal("the session delete never failed")
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 1 {
-		t.Fatalf("pending releases after the first reap = %d, want 1", len(pending))
+	// The release workers may already have started the first pass's release
+	// when the second pass records it again, which then adds a second beside
+	// it, or finished it, which leaves none: either way only the part's blob
+	// has a release queued.
+	pending, _ := mem.ListReleasesBySpace(ctx, mem.bk())
+	for _, p := range pending {
+		if !bytes.Equal(p.Digest, d) {
+			t.Fatalf("release queued after the first reap for %x, want only the part's blob %x", p.Digest, d)
+		}
 	}
 
 	// The release sweeper runs them to completion: the parked blob is
