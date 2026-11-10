@@ -90,7 +90,7 @@ func TestForgeBucketEncryption(t *testing.T) {
 		digests := objectBlobDigestsHex(t, ctx, s, bucket, key)
 		return len(digests), countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", digests)
 	}
-	// localSHA256 is the sha256 of one spooled file inside the ingot container.
+	// localSHA256 is the sha256 of one cached file inside the ingot container.
 	localSHA256 := func(t *testing.T, path string) string {
 		t.Helper()
 		out, errOut, err := s.Exec(ctx, "ingot", "sha256sum", path)
@@ -110,7 +110,7 @@ func TestForgeBucketEncryption(t *testing.T) {
 		}
 		added := newLocalPaths(before, localBlobPaths(t, ctx, s))
 		if len(added) != 1 {
-			t.Fatalf("PutObject %s spooled %d files, want 1", key, len(added))
+			t.Fatalf("PutObject %s cached %d files, want 1", key, len(added))
 		}
 		return out.ServerSideEncryption, added[0]
 	}
@@ -152,7 +152,7 @@ func TestForgeBucketEncryption(t *testing.T) {
 			t.Fatalf("PUT reports %q, want no encryption", sse)
 		}
 		if got := localSHA256(t, path); got != plainHex {
-			t.Fatalf("spooled file sha256 = %s, want the plaintext's %s", got, plainHex)
+			t.Fatalf("cached file sha256 = %s, want the plaintext's %s", got, plainHex)
 		}
 		if blobs, rows := keyRows(t, "plain"); blobs != 1 || rows != 0 {
 			t.Fatalf("%d blobs with %d key rows, want 1 and 0", blobs, rows)
@@ -204,7 +204,7 @@ func TestForgeBucketEncryption(t *testing.T) {
 			t.Fatalf("PUT with AES256 reports %q, want AES256", sse)
 		}
 		if localSHA256(t, path) == plainHex {
-			t.Fatalf("spooled file is the plaintext; the object was not encrypted")
+			t.Fatalf("cached file is the plaintext; the object was not encrypted")
 		}
 		if blobs, rows := keyRows(t, "asked"); blobs != 1 || rows != 1 {
 			t.Fatalf("%d blobs with %d key rows, want 1 and 1", blobs, rows)

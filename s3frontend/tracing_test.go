@@ -5,7 +5,6 @@ import (
 	"context"
 	"io"
 	"testing"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -89,29 +88,28 @@ func TestPutObjectSpans(t *testing.T) {
 
 	tree := traceOp(t, func(ctx context.Context) {
 		if _, err := b.PutObject(ctx, s3response.PutObjectInput{
-			Bucket: &bucket, Key: &key, Body: bytes.NewReader(data),
+			Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data),
 		}); err != nil {
 			t.Fatalf("PutObject: %v", err)
 		}
 	})
 
-	spool := tree.one("body.spool")
-	if spool.Parent().SpanID() != tree.root.SpanID() {
-		t.Fatalf("expected body.spool under the request span")
+	write := tree.one("body.write")
+	if write.Parent().SpanID() != tree.root.SpanID() {
+		t.Fatalf("expected body.write under the request span")
 	}
-	requireAttr(t, spool, attribute.Int64("ingot.body.bytes", int64(len(data))))
-	requireAttr(t, spool, attribute.Int("ingot.body.blobs", 1))
-	if ev := spool.Events(); len(ev) != 1 || ev[0].Name != "body.received" {
-		t.Fatalf("expected a body.received event on body.spool, got %v", ev)
+	requireAttr(t, write, attribute.Int64("ingot.body.bytes", int64(len(data))))
+	requireAttr(t, write, attribute.Int("ingot.body.blobs", 1))
+	if ev := write.Events(); len(ev) != 1 || ev[0].Name != "body.received" {
+		t.Fatalf("expected a body.received event on body.write, got %v", ev)
 	}
 
-	requireAttr(t, tree.one("blob.upload"), attribute.String("ingot.blob.result", "uploaded"))
+	requireAttr(t, tree.one("blob.upload"), attribute.String("ingot.blob.result", "streamed"))
 
-	tx := tree.one("bucket.tx")
-	tree.requireChild(tx, tree.one("bucket.lock"))
 	commit := tree.one("bucket.commit")
-	tree.requireChild(tx, commit)
-	tree.requireChild(commit, tree.one("log.append"))
+	appended := tree.one("bucket.append")
+	tree.requireChild(commit, appended)
+	tree.requireChild(appended, tree.one("log.append"))
 }
 
 func TestReadSpans(t *testing.T) {
@@ -176,7 +174,7 @@ func TestMultipartSpans(t *testing.T) {
 			n := i
 			body := append(testBody(int(backend.MinPartSize)), byte(i))
 			out, err := b.UploadPart(ctx, &s3.UploadPartInput{
-				Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &n, Body: bytes.NewReader(body),
+				Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &n, Body: bytes.NewReader(body), ContentLength: byteLen(body),
 			})
 			if err != nil {
 				t.Fatalf("UploadPart %d: %v", n, err)
@@ -188,7 +186,7 @@ func TestMultipartSpans(t *testing.T) {
 	for _, sp := range parts.spans {
 		if sp.Name() == "blob.park" {
 			parts.requireInTrace(sp)
-			requireAttr(t, sp, attribute.String("ingot.blob.result", "parked"))
+			requireAttr(t, sp, attribute.String("ingot.blob.result", "streamed"))
 			parked++
 		}
 	}
@@ -204,19 +202,25 @@ func TestMultipartSpans(t *testing.T) {
 			t.Fatalf("CompleteMultipartUpload: %v", err)
 		}
 	})
-	conclude := complete.one("blobs.conclude")
-	if conclude.Parent().SpanID() != complete.root.SpanID() {
-		t.Fatalf("expected blobs.conclude under the request span")
+	// Each part's blob is concluded by its own accept, on the queue's
+	// workers rather than under the request.
+	concludes := 0
+	for _, sp := range complete.spans {
+		if sp.Name() == "blobs.conclude" {
+			requireAttr(t, sp, attribute.Int("ingot.blobs.total", 1))
+			requireAttr(t, sp, attribute.Int("ingot.blobs.concluded", 1))
+			concludes++
+		}
 	}
-	requireAttr(t, conclude, attribute.Int("ingot.blobs.total", 2))
-	requireAttr(t, conclude, attribute.Int("ingot.blobs.concluded", 2))
-	requireAttr(t, conclude, attribute.Int("ingot.blobs.uploaded", 0))
+	if concludes != 2 {
+		t.Fatalf("expected a blobs.conclude span per part blob, got %d", concludes)
+	}
 }
 
 // TestSweepLocalBlobsSpans: each pass of a local blob sweep records a span
 // under the caller's, carrying what it removed and why it stopped.
 func TestSweepLocalBlobsSpans(t *testing.T) {
-	b, _ := newSweepBackend(t, func(d *Deps) { d.CacheMinResidency = time.Hour })
+	b, _ := newSweepBackend(t)
 	digests := putSweepObjects(t, b, 4)
 	size := blobSize(t, b, digests[0])
 	budgetToEvict(b, 2, size)
@@ -229,12 +233,9 @@ func TestSweepLocalBlobsSpans(t *testing.T) {
 
 	budget := tree.one("local_blobs.budget_pass")
 	tree.requireInTrace(budget)
-	requireAttr(t, budget, attribute.Int64("ingot.sweep.files", 0))
-	requireAttr(t, budget, attribute.String("ingot.sweep.stop", "residency"))
-	forced := tree.one("local_blobs.forced_pass")
-	tree.requireInTrace(forced)
-	requireAttr(t, forced, attribute.Int64("ingot.sweep.files", 2))
-	requireAttr(t, forced, attribute.Int64("ingot.sweep.bytes", 2*size))
+	requireAttr(t, budget, attribute.Int64("ingot.sweep.files", 2))
+	requireAttr(t, budget, attribute.Int64("ingot.sweep.bytes", 2*size))
+	requireAttr(t, budget, attribute.String("ingot.sweep.stop", "watermark"))
 	tree.requireInTrace(tree.one("local_blobs.orphan_pass"))
 }
 

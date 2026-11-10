@@ -11,26 +11,11 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/fil-forge/ingot/blockstore"
 )
 
 // uniqueViolation is the Postgres SQLSTATE for a unique constraint
 // violation (matches the literal used elsewhere in sprue's stores).
 const uniqueViolation = "23505"
-
-// foreignKeyViolation is the Postgres SQLSTATE for a foreign key violation.
-const foreignKeyViolation = "23503"
-
-// pgxQuerier is the surface shared by *pgxpool.Pool and pgx.Tx, so a statement
-// can run standalone or inside a caller's transaction. Everything a statement
-// needs has to be here: reaching back to the pool from inside a transaction
-// would hold one connection while waiting for another, which deadlocks on a
-// single-connection pool.
-type pgxQuerier interface {
-	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
-	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-}
 
 // Postgres is a *pgxpool.Pool-backed Registry (and, via its sibling
 // files, the segment Meta and the relational stores). Schema is owned
@@ -45,13 +30,29 @@ type pgxQuerier interface {
 // here are plain SQL and read nothing from ctx.
 type Postgres struct {
 	pool *pgxpool.Pool
+	// tasks queues a commit's upload registrations in its transaction.
+	tasks TaskSubmitter
+}
+
+// PostgresOption configures a Postgres registry.
+type PostgresOption func(*Postgres)
+
+// WithTasks queues each commit's upload registrations through ts, in the
+// commit's transaction. A registry without it refuses a commit that carries
+// any.
+func WithTasks(ts TaskSubmitter) PostgresOption {
+	return func(r *Postgres) { r.tasks = ts }
 }
 
 // NewPostgres wraps an existing pool. Callers are responsible for
 // running pkg/ingot/migrations.Up against the same pool before any
 // registry method is called.
-func NewPostgres(pool *pgxpool.Pool) *Postgres {
-	return &Postgres{pool: pool}
+func NewPostgres(pool *pgxpool.Pool, opts ...PostgresOption) *Postgres {
+	r := &Postgres{pool: pool}
+	for _, o := range opts {
+		o(r)
+	}
+	return r
 }
 
 // Compile-time assertion.
@@ -74,9 +75,11 @@ func (r *Postgres) Create(ctx context.Context, name string, space did.DID, init 
 		name, space.String(), init.Tenant.String(), string(v), init.ObjectLockConfig)
 	if err != nil {
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
+		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation && pgErr.ConstraintName == "buckets_pkey" {
 			return ErrExists
 		}
+		// Another bucket holding the space breaks the rule that a bucket is
+		// its own space (buckets_space_key), which no client can cause.
 		return fmt.Errorf("registry: create %q: %w", name, err)
 	}
 	return nil
@@ -87,9 +90,10 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	var createdAt time.Time
 	var spaceStr, tenantStr, versioning string
 	var encryption *string
+	var closing bool
 	err := r.pool.QueryRow(ctx,
-		`SELECT root_cid, forge_root_cid, created_at, space, tenant, versioning, object_lock_config, bucket_tagging, cors_config, encryption FROM ingot.buckets WHERE name = $1`, name).
-		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &tenantStr, &versioning, &lockCfg, &tagging, &corsCfg, &encryption)
+		`SELECT root_cid, forge_root_cid, created_at, space, tenant, versioning, object_lock_config, bucket_tagging, cors_config, encryption, closing FROM ingot.buckets WHERE name = $1`, name).
+		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &tenantStr, &versioning, &lockCfg, &tagging, &corsCfg, &encryption, &closing)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -104,7 +108,7 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	if err != nil {
 		return nil, fmt.Errorf("registry: parse tenant %q: %w", tenantStr, err)
 	}
-	st := &State{Name: name, Space: space, Tenant: tenant, Versioning: VersioningState(versioning), ObjectLockConfig: lockCfg, BucketTagging: tagging, CORSConfig: corsCfg, CreatedAt: createdAt}
+	st := &State{Name: name, Space: space, Tenant: tenant, Versioning: VersioningState(versioning), ObjectLockConfig: lockCfg, BucketTagging: tagging, CORSConfig: corsCfg, Closing: closing, CreatedAt: createdAt}
 	if encryption != nil {
 		st.Encryption = BucketEncryption(*encryption)
 	}
@@ -117,117 +121,13 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	return st, nil
 }
 
-func (r *Postgres) Delete(ctx context.Context, name string) error {
-	if _, err := r.pool.Exec(ctx, `DELETE FROM ingot.buckets WHERE name = $1`, name); err != nil {
+func (r *Postgres) Delete(ctx context.Context, name string, space did.DID) error {
+	tag, err := r.pool.Exec(ctx, `DELETE FROM ingot.buckets WHERE name = $1 AND space = $2`, name, space.String())
+	if err != nil {
 		return fmt.Errorf("registry: delete %q: %w", name, err)
 	}
-	return nil
-}
-
-func (r *Postgres) CASRoot(ctx context.Context, name string, expect, next cid.Cid) error {
-	return r.casRoot(ctx, r.pool, name, expect, next)
-}
-
-// CommitRoot advances the root and records the commit's upload
-// registrations, blob claims, claim drops and journaled catalog blocks in
-// one transaction, so each row exists exactly when the version it describes
-// committed. A conflict, a missing bucket or a refused claim rolls
-// everything back with the CAS.
-func (r *Postgres) CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c RootCommit) error {
-	if c.Empty() {
-		return r.CASRoot(ctx, name, expect, next)
-	}
-
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("registry: begin cas %q: %w", name, err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	// The journal goes first: it locks the segment's row, and
-	// MarkSegmentShipped locks that row before the bucket's, so taking them
-	// in the same order keeps a commit racing its segment's ship from
-	// deadlocking with it.
-	if err := journalBlocks(ctx, tx, name, c.Journal); err != nil {
-		return err
-	}
-	if err := r.casRoot(ctx, tx, name, expect, next); err != nil {
-		return err
-	}
-	for _, reg := range c.Registrations {
-		// seq comes from the sequence, so the rows of one bucket are numbered
-		// in the order its lock let them commit.
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO ingot.upload_registrations (bucket, object_key, space, root, op, proofs)
-			VALUES ($1, $2, $3, $4, $5, $6)
-		`, reg.Bucket, reg.ObjectKey, reg.Space.String(), reg.Root.Bytes(), string(reg.Op), reg.Proofs); err != nil {
-			return fmt.Errorf("registry: enqueue upload registration for %q: %w", name, err)
-		}
-	}
-	// Every claim key the commit touches is locked up front, once, in one
-	// order for every commit, so two commits sharing digests cannot deadlock
-	// whichever of their claims and drops name them.
-	if err := lockClaimKeys(ctx, tx, c); err != nil {
-		return err
-	}
-	if err := addClaims(ctx, tx, c.Claims); err != nil {
-		return err
-	}
-	for _, p := range c.Pins {
-		if err := pinClaim(ctx, tx, p); err != nil {
-			return err
-		}
-	}
-	if err := dropClaims(ctx, tx, c.Drops, c.ReleaseGrace); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("registry: commit cas %q: %w", name, err)
-	}
-	return nil
-}
-
-// journalBlocks records a commit's catalog blocks under the log segment they
-// were appended to (RootCommit.Journal). It share-locks the segment's row
-// while it checks that the segment hasn't shipped, so MarkSegmentShipped,
-// which deletes the segment's rows, waits for this transaction to end: the
-// rows are either in place before the ship deletes them or never written,
-// and none outlives its segment. A shipped segment journals nothing, its
-// blocks being on Forge, and neither does one whose row is gone: retention
-// retires shipped segments only, and DeleteBucket removes a bucket's rows
-// under the bucket lock, which no commit to it can be holding.
-func journalBlocks(ctx context.Context, tx pgx.Tx, bucket string, j blockstore.Appended) error {
-	if len(j.Blocks) == 0 {
-		return nil
-	}
-	var shippedAt *int64
-	err := tx.QueryRow(ctx,
-		`SELECT shipped_at FROM ingot.segments WHERE seq = $1 FOR SHARE`, int64(j.Segment),
-	).Scan(&shippedAt)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && shippedAt != nil) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("registry: lock segment %d for journal: %w", j.Segment, err)
-	}
-	cids := make([][]byte, len(j.Blocks))
-	data := make([][]byte, len(j.Blocks))
-	for i, b := range j.Blocks {
-		cids[i] = b.Cid().Bytes()
-		data[i] = b.RawData()
-	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO ingot.catalog_journal (seq, bucket, cid, data)
-		SELECT $1, $2, c, d FROM unnest($3::bytea[], $4::bytea[]) AS u(c, d)
-		ON CONFLICT (seq, cid) DO NOTHING
-	`, int64(j.Segment), bucket, cids, data); err != nil {
-		// The rows reference the bucket, and journaling runs before the CAS
-		// that would otherwise report a deleted bucket.
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == foreignKeyViolation {
-			return ErrNotFound
-		}
-		return fmt.Errorf("registry: journal %d blocks for %q: %w", len(j.Blocks), bucket, err)
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
@@ -247,8 +147,9 @@ func (r *Postgres) CatalogJournalStats(ctx context.Context) (CatalogJournalStats
 	return st, nil
 }
 
-// EmptyRoot is CASRoot to the empty tree plus the rows an empty catalog no
-// longer needs, in one transaction (Registry).
+// EmptyRoot swaps the bucket root from expect to the empty tree, and in the
+// same transaction clears forge_root_cid and drops the bucket's journaled
+// catalog blocks, which nothing the empty tree reaches needs (Registry).
 func (r *Postgres) EmptyRoot(ctx context.Context, name string, expect cid.Cid) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -257,17 +158,30 @@ func (r *Postgres) EmptyRoot(ctx context.Context, name string, expect cid.Cid) e
 	defer tx.Rollback(ctx)
 	// Lock the bucket row as a deletion does before deleting its journal
 	// rows: a ship of one of its segments takes KEY SHARE on the row before
-	// deleting the same rows (MarkSegmentShipped), which the root swap's own
-	// lock wouldn't make it wait for.
+	// deleting the same rows (MarkSegmentShipped).
 	if _, err := tx.Exec(ctx, `SELECT 1 FROM ingot.buckets WHERE name = $1 FOR UPDATE`, name); err != nil {
 		return fmt.Errorf("registry: empty root %q: lock bucket: %w", name, err)
 	}
-	if err := r.casRoot(ctx, tx, name, expect, cid.Undef); err != nil {
-		return err
+	var expectBytes []byte
+	if expect.Defined() {
+		expectBytes = expect.Bytes()
 	}
-	if _, err := tx.Exec(ctx,
-		`UPDATE ingot.buckets SET forge_root_cid = NULL WHERE name = $1`, name); err != nil {
-		return fmt.Errorf("registry: empty root %q: clear forge root: %w", name, err)
+	tag, err := tx.Exec(ctx,
+		`UPDATE ingot.buckets SET root_cid = NULL, forge_root_cid = NULL
+		  WHERE name = $1 AND root_cid IS NOT DISTINCT FROM $2`, name, expectBytes)
+	if err != nil {
+		return fmt.Errorf("registry: empty root %q: %w", name, err)
+	}
+	if tag.RowsAffected() == 0 {
+		var exists bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM ingot.buckets WHERE name = $1)`, name).Scan(&exists); err != nil {
+			return fmt.Errorf("registry: empty root %q: %w", name, err)
+		}
+		if !exists {
+			return ErrNotFound
+		}
+		return ErrConflict
 	}
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM ingot.catalog_journal WHERE bucket = $1`, name); err != nil {
@@ -275,53 +189,6 @@ func (r *Postgres) EmptyRoot(ctx context.Context, name string, expect cid.Cid) e
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("registry: commit empty root %q: %w", name, err)
-	}
-	return nil
-}
-
-func (r *Postgres) casRoot(ctx context.Context, q pgxQuerier, name string, expect, next cid.Cid) error {
-	var (
-		expectBytes []byte
-		nextBytes   []byte
-	)
-	if expect.Defined() {
-		expectBytes = expect.Bytes()
-	}
-	if next.Defined() {
-		nextBytes = next.Bytes()
-	}
-
-	var (
-		tag pgconn.CommandTag
-		err error
-	)
-	if expectBytes == nil {
-		tag, err = q.Exec(ctx,
-			`UPDATE ingot.buckets SET root_cid = $1 WHERE name = $2 AND root_cid IS NULL`,
-			nextBytes, name)
-	} else {
-		tag, err = q.Exec(ctx,
-			`UPDATE ingot.buckets SET root_cid = $1 WHERE name = $2 AND root_cid = $3`,
-			nextBytes, name, expectBytes)
-	}
-	if err != nil {
-		return fmt.Errorf("registry: cas %q: %w", name, err)
-	}
-	if tag.RowsAffected() == 0 {
-		// Either the bucket doesn't exist or the expected root didn't match.
-		// Asked through the same querier: from inside this method's
-		// transaction it would otherwise want a second pooled connection
-		// while holding one, which deadlocks a single-connection pool.
-		var exists bool
-		if gerr := q.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM ingot.buckets WHERE name = $1)`, name,
-		).Scan(&exists); gerr != nil {
-			return fmt.Errorf("registry: cas %q: resolving conflict: %w", name, gerr)
-		}
-		if !exists {
-			return ErrNotFound
-		}
-		return ErrConflict
 	}
 	return nil
 }
@@ -343,67 +210,10 @@ func (r *Postgres) SetForgeRoot(ctx context.Context, name string, root cid.Cid) 
 	return nil
 }
 
-func (r *Postgres) SetVersioning(ctx context.Context, name string, v VersioningState) error {
-	if v != VersioningEnabled && v != VersioningSuspended {
-		return fmt.Errorf("registry: set versioning %q: invalid state %q", name, v)
-	}
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.buckets SET versioning = $1 WHERE name = $2`,
-		string(v), name)
+func (r *Postgres) SetClosing(ctx context.Context, name string, closing bool) error {
+	tag, err := r.pool.Exec(ctx, `UPDATE ingot.buckets SET closing = $2 WHERE name = $1`, name, closing)
 	if err != nil {
-		return fmt.Errorf("registry: set versioning %q: %w", name, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-func (r *Postgres) SetObjectLockConfig(ctx context.Context, name string, cfg []byte) error {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.buckets SET object_lock_config = $1 WHERE name = $2`,
-		cfg, name)
-	if err != nil {
-		return fmt.Errorf("registry: set object lock config %q: %w", name, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-func (r *Postgres) SetBucketTagging(ctx context.Context, name string, tags []byte) error {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.buckets SET bucket_tagging = $1 WHERE name = $2`,
-		tags, name)
-	if err != nil {
-		return fmt.Errorf("registry: set bucket tagging %q: %w", name, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-func (r *Postgres) SetCORSConfig(ctx context.Context, name string, cfg []byte) error {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.buckets SET cors_config = $1 WHERE name = $2`,
-		cfg, name)
-	if err != nil {
-		return fmt.Errorf("registry: set cors config %q: %w", name, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-func (r *Postgres) SetEncryption(ctx context.Context, name string, enc BucketEncryption) error {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.buckets SET encryption = $1 WHERE name = $2`,
-		nullString(string(enc)), name)
-	if err != nil {
-		return fmt.Errorf("registry: set encryption %q: %w", name, err)
+		return fmt.Errorf("registry: set closing %q: %w", name, err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound

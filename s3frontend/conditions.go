@@ -83,20 +83,20 @@ func isNoSuchKey(err error) bool {
 	return errors.Is(err, s3err.GetAPIError(s3err.ErrNoSuchKey))
 }
 
-// mapCommitError maps an error from a bucketop.WithTx commit closure to the
-// S3-facing error: a missing bucket becomes NoSuchBucket, a versitygw API error
-// (e.g. a precondition failure raised inside the closure) is surfaced verbatim
+// mapCommitError maps an error from a bucket commit, or from one of its
+// changes, to the S3-facing error: a missing bucket becomes NoSuchBucket, a
+// versitygw API error (e.g. a precondition failure raised by a change) is
+// surfaced verbatim
 // so its HTTP status is preserved, and anything else is wrapped with op for the
 // server log.
 func mapCommitError(err error, op string) error {
 	if errors.Is(err, bucketop.ErrBucketNotFound) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
-	if errors.Is(err, registry.ErrReleaseInProgress) {
-		// A release of one of the body's digests started after the write
-		// settled it (settleRelease) and is removing the blob: the swap
-		// refused the claim and wrote nothing, and the client retries once
-		// the release has run.
+	if errors.Is(err, registry.ErrReferenceExpired) {
+		// The write's reference to one of the body's blobs expired before
+		// the commit, and the blob may be released: the swap wrote nothing,
+		// and the client sends the write again.
 		return s3err.GetAPIError(s3err.ErrSlowDown)
 	}
 	// PreconditionFailedError, NoSuchVersionError, and InvalidArgumentError

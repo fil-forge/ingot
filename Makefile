@@ -17,9 +17,10 @@ GO ?= go
 build:
 	$(GO) build -o ingot ./cmd/ingot
 
-## test: run the unit test suite (fast, no Docker)
+## test: run the test suite, starting Postgres and OpenBao in Docker unless
+## INGOT_TEST_DSN and INGOT_TEST_BAO_ADDR name running ones. ARGS go to go test.
 test:
-	$(GO) test ./...
+	GO="$(GO)" scripts/test.sh $(ARGS)
 
 ## itest: run the integration test suite (boots the Forge stack in Docker; ~20 min)
 itest:
@@ -42,7 +43,7 @@ GROUP_uploads     := TestForgeMaxSizePart                 # 3m02, needs INGOT_IT
 GROUP_uploads     += TestForgeScenarios                   # 2m16
 GROUP_uploads     += TestForgeMultipartExpiryShred        # 1m33
 GROUP_releases    := TestForgeDeleteReleasesNetworkBlob   # 2m48, waits on piri's removal sweep
-GROUP_releases    += TestForgeObjectCount                 # 2m19, waits on the registration sweeper
+GROUP_releases    += TestForgeObjectCount                 # 2m19
 GROUP_releases    += TestForgeDeleteBucketReleases        # 1m52
 GROUP_auth        := TestForgeAccessKeyExpiry             # 2m29, waits for the key to lapse
 GROUP_auth        += TestForgeCopyAuthorization           # 0m51

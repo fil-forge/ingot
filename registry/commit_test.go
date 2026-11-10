@@ -1,13 +1,18 @@
 package registry_test
 
 import (
+	"time"
+
 	"context"
 	"errors"
 	"fmt"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/multiformats/go-multihash"
 	"sync/atomic"
 	"testing"
 
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
 )
@@ -33,7 +38,7 @@ func commit(t *testing.T, st registry.Registry, bucket string, space did.DID, c 
 	if err != nil {
 		t.Fatalf("Get %q: %v", bucket, err)
 	}
-	return st.CommitRoot(ctx, bucket, s.Root, liveCid(t, fmt.Sprintf("commit-%d", commitSeq.Add(1))), c)
+	return st.(*registry.Postgres).CommitRoot(ctx, bucket, s.Root, liveCid(t, fmt.Sprintf("commit-%d", commitSeq.Add(1))), c)
 }
 
 // claim commits one claim of a new generation.
@@ -49,12 +54,6 @@ func mustClaim(t *testing.T, st registry.Registry, c registry.BlobClaim) {
 	}
 }
 
-// pin commits claims borrowed from another object of the space.
-func pin(t *testing.T, st registry.Registry, claims []registry.BlobClaim) error {
-	t.Helper()
-	return commit(t, st, claims[0].Bucket, claims[0].Space, registry.RootCommit{Pins: claims})
-}
-
 // drop commits the removal of one claim.
 func drop(t *testing.T, st registry.Registry, d registry.ClaimDrop) {
 	t.Helper()
@@ -63,10 +62,44 @@ func drop(t *testing.T, st registry.Registry, d registry.ClaimDrop) {
 	}
 }
 
-// releaseRecorded reports whether space has a release record for digest.
-func releaseRecorded(t *testing.T, st registry.PendingReleaseStore, space did.DID, digest []byte) bool {
+// queuedRelease is a pending release, as a test reads it.
+type queuedRelease struct {
+	Digest    multihash.Multihash
+	NotBefore time.Time
+}
+
+// mustListReleases returns the space's pending releases, oldest first.
+func mustListReleases(t *testing.T, pool *pgxpool.Pool, space did.DID) []queuedRelease {
 	t.Helper()
-	for _, pr := range mustListReleases(t, st, space) {
+	tasks, err := taskrunnertest.Tasks(context.Background(), pool, "ingot", registry.ReleaseQueue)
+	if err != nil {
+		t.Fatalf("list releases: %v", err)
+	}
+	var out []queuedRelease
+	for _, q := range tasks {
+		if q.Action != registry.ReleaseAction || q.State != "pending" {
+			continue
+		}
+		sp, d, err := registry.ParseReleaseSubject(q.Subject)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sp != space {
+			continue
+		}
+		at := q.Created
+		if q.NotBefore != nil {
+			at = *q.NotBefore
+		}
+		out = append(out, queuedRelease{Digest: d, NotBefore: at})
+	}
+	return out
+}
+
+// releaseRecorded reports whether space has a release queued for digest.
+func releaseRecorded(t *testing.T, pool *pgxpool.Pool, space did.DID, digest []byte) bool {
+	t.Helper()
+	for _, pr := range mustListReleases(t, pool, space) {
 		if string(pr.Digest) == string(digest) {
 			return true
 		}

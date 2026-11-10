@@ -1,424 +1,106 @@
 package registry
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
-	"strings"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
+	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/multiformats/go-multihash"
+
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // Compile-time assertions: *Postgres satisfies every store interface.
 var (
-	_ BlobRefStore            = (*Postgres)(nil)
-	_ IntentStore             = (*Postgres)(nil)
-	_ LocationStore           = (*Postgres)(nil)
-	_ EncryptionParamsStore   = (*Postgres)(nil)
-	_ InclusionStore          = (*Postgres)(nil)
-	_ MultipartStore          = (*Postgres)(nil)
-	_ GCStore                 = (*Postgres)(nil)
-	_ CatalogUsageStore       = (*Postgres)(nil)
-	_ RevocationCursorStore   = (*Postgres)(nil)
-	_ PendingReleaseStore     = (*Postgres)(nil)
-	_ UploadRegistrationStore = (*Postgres)(nil)
+	_ BlobRefStore          = (*Postgres)(nil)
+	_ IntentStore           = (*Postgres)(nil)
+	_ LocationStore         = (*Postgres)(nil)
+	_ EncryptionParamsStore = (*Postgres)(nil)
+	_ InclusionStore        = (*Postgres)(nil)
+	_ MultipartStore        = (*Postgres)(nil)
+	_ GCStore               = (*Postgres)(nil)
+	_ CatalogUsageStore     = (*Postgres)(nil)
+	_ RevocationCursorStore = (*Postgres)(nil)
 )
 
 // BlobRefStore ===============================================================
 
-// addClaims records a new generation's claims, in the commit's transaction,
-// under the claim keys' locks (lockClaimKeys), and refuses them all with
-// ErrReleaseInProgress while a started release holds any digest or the
-// space has no location for one (see RootCommit.Claims). Set-based: a
-// multipart commit claims up to hundreds of thousands of blobs, so each
-// step is one statement over the whole generation rather than one per
-// claim.
-func addClaims(ctx context.Context, tx pgx.Tx, claims []BlobClaim) error {
-	if len(claims) == 0 {
-		return nil
-	}
-	n := len(claims)
-	digests := make([][]byte, n)
-	spaces := make([]string, n)
-	buckets := make([]string, n)
-	keys := make([]string, n)
-	versions := make([]string, n)
-	for i, c := range claims {
-		digests[i], spaces[i], buckets[i], keys[i], versions[i] = c.Digest, c.Space.String(), c.Bucket, c.ObjectKey, c.VersionID
-	}
-	// Refused while a started release holds any digest, or when the space
-	// has no location for one (a release ran to completion since the write
-	// settled it, and the blob is gone from the provider).
-	var refused bool
-	if err := tx.QueryRow(ctx,
-		`SELECT EXISTS (
-		    SELECT 1 FROM unnest($1::text[], $2::bytea[]) AS u(s, d)
-		     WHERE EXISTS (SELECT 1 FROM ingot.blob_release_intents r
-		                    WHERE r.space = u.s AND r.digest = u.d AND r.started_at IS NOT NULL)
-		        OR NOT EXISTS (SELECT 1 FROM ingot.blob_locations l
-		                        WHERE l.space = u.s AND l.digest = u.d))`,
-		spaces, digests).Scan(&refused); err != nil {
-		return fmt.Errorf("registry: add blob claims: release and location lookup: %w", err)
-	}
-	if refused {
-		return ErrReleaseInProgress // the commit rolls back
-	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
-		 SELECT * FROM unnest($1::bytea[], $2::text[], $3::text[], $4::text[], $5::text[])
-		 ON CONFLICT (digest, bucket, object_key, version_id) DO NOTHING`,
-		digests, buckets, keys, versions, spaces); err != nil {
-		return fmt.Errorf("registry: add blob claims: %w", err)
-	}
-	// The claim is the commit's durable trace on the blob; the intent's
-	// published state is how a multipart session's teardown recognises a
-	// committed blob and leaves it to its object's own release. A blob
-	// without an intent row (a shipped catalog segment) has nothing to mark.
-	if _, err := tx.Exec(ctx,
-		`UPDATE ingot.upload_intents i SET state = $3, updated_at = now()
-		   FROM (SELECT DISTINCT s, d FROM unnest($1::text[], $2::bytea[]) AS u(s, d)) u
-		  WHERE i.space = u.s AND i.digest = u.d AND i.state <> $3`,
-		spaces, digests, IntentPublished); err != nil {
-		return fmt.Errorf("registry: publish intents: %w", err)
-	}
-	return nil
-}
-
-// claimKeyLocksSQL takes the claim-key lock of each (space, digest) pair in
-// the order of the arrays $1 and $2 (see lockClaimKeys).
-const claimKeyLocksSQL = `SELECT pg_advisory_xact_lock(o.k)
-  FROM (SELECT hashtextextended(u.s || ':' || encode(u.d, 'hex'), 0) AS k
-          FROM unnest($1::text[], $2::bytea[]) WITH ORDINALITY AS u(s, d, i)
-         ORDER BY u.i) AS o`
-
-// lockClaimKeys takes a transaction-scoped advisory lock on every (space,
-// digest) a commit's claims, pins and drops name, each once, in digest
-// order, in one statement: the mutual exclusion between pinning a claim and
-// dropping the last one, and between claiming a blob and starting its
-// release, which read-committed snapshots alone do not give (a pin could
-// see a claim a concurrent drop is deleting, and the drop count could miss
-// the uncommitted pin). One order for every commit, so two commits sharing
-// digests cannot deadlock on them. The arrays are sorted, and the
-// subquery's ORDER BY carries that order to the lock calls: SQL promises no
-// row order otherwise, and a subquery with an ORDER BY is not flattened, so
-// the outer scan reads it sorted and takes one lock per row in turn.
-func lockClaimKeys(ctx context.Context, tx pgx.Tx, c RootCommit) error {
-	type key struct {
-		space  did.DID
-		digest multihash.Multihash
-	}
-	var keys []key
-	for _, cl := range c.Claims {
-		keys = append(keys, key{cl.Space, cl.Digest})
-	}
-	for _, p := range c.Pins {
-		keys = append(keys, key{p.Space, p.Digest})
-	}
-	for _, d := range c.Drops {
-		keys = append(keys, key{d.Space, d.Digest})
-	}
-	if len(keys) == 0 {
-		return nil
-	}
-	slices.SortFunc(keys, func(a, b key) int {
-		if n := bytes.Compare(a.digest, b.digest); n != 0 {
-			return n
-		}
-		return strings.Compare(a.space.String(), b.space.String())
-	})
-	keys = slices.CompactFunc(keys, func(a, b key) bool {
-		return a.space == b.space && bytes.Equal(a.digest, b.digest)
-	})
-	spaces := make([]string, len(keys))
-	digests := make([][]byte, len(keys))
-	for i, k := range keys {
-		spaces[i], digests[i] = k.space.String(), k.digest
-	}
-	if _, err := tx.Exec(ctx, claimKeyLocksSQL, spaces, digests); err != nil {
-		return fmt.Errorf("registry: lock claim keys: %w", err)
-	}
-	return nil
-}
-
-// lockClaimKey takes a transaction-scoped advisory lock on (space, digest).
-// A commit takes its keys through lockClaimKeys; a release takes the one key
-// it works on (StartRelease, CancelRelease).
-func lockClaimKey(ctx context.Context, tx pgx.Tx, space did.DID, digest multihash.Multihash) error {
-	if _, err := tx.Exec(ctx,
-		`SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || encode($2, 'hex'), 0))`,
-		space.String(), []byte(digest)); err != nil {
-		return fmt.Errorf("registry: lock claim key: %w", err)
-	}
-	return nil
-}
-
-// pinClaim records one claim borrowed from another object of the space, in
-// the commit's transaction, under the claim key's lock, and refuses it with
-// ErrClaimGone when the space holds no claim on the digest (see
-// RootCommit.Pins).
-func pinClaim(ctx context.Context, tx pgx.Tx, c BlobClaim) error {
-	// Under the key's lock, the existence check and the insert see one
-	// state: a claim exists and the pin joins it, or none does and the
-	// whole commit is refused.
-	tag, err := tx.Exec(ctx,
-		`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
-		 SELECT $1, $2, $3, $4, $5
-		 WHERE EXISTS (SELECT 1 FROM ingot.blob_refs WHERE space = $5 AND digest = $1)
-		 ON CONFLICT (digest, bucket, object_key, version_id) DO NOTHING`,
-		c.Digest, c.Bucket, c.ObjectKey, c.VersionID, c.Space)
-	if err != nil {
-		return fmt.Errorf("registry: pin blob claim: %w", err)
-	}
-	if tag.RowsAffected() == 1 {
-		return nil
-	}
-	// Nothing inserted: no claim to pin to, or this claim is already
-	// recorded (the conflict arm).
-	var own int
-	if err := tx.QueryRow(ctx,
-		`SELECT count(*) FROM ingot.blob_refs
-		 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
-		c.Digest, c.Bucket, c.ObjectKey, c.VersionID).Scan(&own); err != nil {
-		return fmt.Errorf("registry: pin blob claim lookup: %w", err)
-	}
-	if own == 0 {
-		return ErrClaimGone // the commit rolls back
-	}
-	return nil
-}
-
-// dropClaims deletes the discarded generations' claims, in the commit's
-// transaction, under the claim keys' locks (lockClaimKeys), and records a
-// release, due grace from now, for each digest the space holds no claim on
-// afterwards (see RootCommit.Drops). Set-based, as addClaims is: the
-// deletes are one statement and the remaining-claim checks and release
-// records another, however many blobs the discarded versions had, since
-// the bucket lock and the root row are held throughout.
-func dropClaims(ctx context.Context, tx pgx.Tx, drops []ClaimDrop, grace time.Duration) error {
-	if len(drops) == 0 {
-		return nil
-	}
-	n := len(drops)
-	digests := make([][]byte, n)
-	spaces := make([]string, n)
-	buckets := make([]string, n)
-	keys := make([]string, n)
-	versions := make([]string, n)
-	for i, d := range drops {
-		digests[i], spaces[i], buckets[i], keys[i], versions[i] = d.Digest, d.Space.String(), d.Bucket, d.ObjectKey, d.VersionID
-	}
-	if _, err := tx.Exec(ctx,
-		`DELETE FROM ingot.blob_refs r
-		  USING unnest($1::bytea[], $2::text[], $3::text[], $4::text[]) AS u(d, b, k, v)
-		  WHERE r.digest = u.d AND r.bucket = u.b AND r.object_key = u.k AND r.version_id = u.v`,
-		digests, buckets, keys, versions); err != nil {
-		return fmt.Errorf("registry: drop claims: %w", err)
-	}
-	// One record per (space, digest) the space no longer claims; a record
-	// already there keeps the later not_before. The grace runs from the
-	// statement's clock, not the transaction's start (now()): the swap may
-	// have waited on the bucket row or the claim-key locks since, and a
-	// reader that resolved the discarded version meanwhile is owed the
-	// whole grace from the commit.
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO ingot.blob_release_intents (space, digest, not_before)
-		 SELECT u.s, u.d, clock_timestamp() + make_interval(secs => $3)
-		   FROM (SELECT DISTINCT s, d FROM unnest($1::text[], $2::bytea[]) AS u(s, d)) u
-		  WHERE NOT EXISTS (SELECT 1 FROM ingot.blob_refs r WHERE r.space = u.s AND r.digest = u.d)
-		 ON CONFLICT (space, digest)
-		 DO UPDATE SET not_before = GREATEST(ingot.blob_release_intents.not_before, EXCLUDED.not_before)`,
-		spaces, digests, grace.Seconds()); err != nil {
-		return fmt.Errorf("registry: enqueue releases: %w", err)
-	}
-	return nil
-}
-
-func (r *Postgres) CountClaims(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
+func (r *Postgres) CountReferences(ctx context.Context, space did.DID, digest multihash.Multihash, except taskrunner.TaskID) (int, error) {
 	var n int
-	err := r.pool.QueryRow(ctx,
-		`SELECT count(*) FROM ingot.blob_refs WHERE space = $1 AND digest = $2`,
-		space, digest).Scan(&n)
+	err := r.pool.QueryRow(ctx, countReferencesSQL, space, digest, except, SessionOpen).Scan(&n)
 	if err != nil {
-		return 0, fmt.Errorf("registry: count claims: %w", err)
+		return 0, fmt.Errorf("registry: count references: %w", err)
 	}
 	return n, nil
 }
 
-// PendingReleaseStore =========================================================
-
-func (r *Postgres) EnqueueRelease(ctx context.Context, space did.DID, digest multihash.Multihash, notBefore time.Time) error {
-	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.blob_release_intents (space, digest, not_before)
-		 VALUES ($1, $2, $3)
-		 ON CONFLICT (space, digest)
-		 DO UPDATE SET not_before = GREATEST(ingot.blob_release_intents.not_before, EXCLUDED.not_before)`,
-		space, digest, notBefore)
-	if err != nil {
-		return fmt.Errorf("registry: enqueue release: %w", err)
-	}
-	return nil
-}
-
-func (r *Postgres) EnqueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) ([]PendingRelease, error) {
-	// ON CONFLICT DO UPDATE cannot touch one row twice in a statement, so a
-	// digest repeated in the input is recorded once.
-	seen := make(map[string]bool, len(digests))
-	in := make([][]byte, 0, len(digests))
-	for _, d := range digests {
-		if seen[string(d)] {
-			continue
-		}
-		seen[string(d)] = true
-		in = append(in, []byte(d))
-	}
-	if len(in) == 0 {
+func (r *Postgres) ExpiriesOf(ctx context.Context, refs []taskrunner.TaskID) ([]taskrunner.TaskID, error) {
+	if len(refs) == 0 {
 		return nil, nil
 	}
-	rows, err := r.pool.Query(ctx,
-		`INSERT INTO ingot.blob_release_intents (space, digest, not_before)
-		 SELECT $1, unnest($2::bytea[]), $3
-		 ON CONFLICT (space, digest)
-		 DO UPDATE SET not_before = GREATEST(ingot.blob_release_intents.not_before, EXCLUDED.not_before)
-		 RETURNING digest, not_before`,
-		space, in, notBefore)
-	if err != nil {
-		return nil, fmt.Errorf("registry: enqueue releases: %w", err)
+	var expires []taskrunner.TaskID
+	if err := r.pool.QueryRow(ctx,
+		`SELECT coalesce(array_agg(expire_task), '{}') FROM ingot.blob_pending_refs WHERE add_task = ANY($1)`,
+		refs).Scan(&expires); err != nil {
+		return nil, fmt.Errorf("registry: expiries of pending references: %w", err)
 	}
-	defer rows.Close()
-	out := make([]PendingRelease, 0, len(in))
-	for rows.Next() {
-		var digest []byte
-		pr := PendingRelease{Space: space}
-		if err := rows.Scan(&digest, &pr.NotBefore); err != nil {
-			return nil, fmt.Errorf("registry: enqueue releases scan: %w", err)
-		}
-		pr.Digest = multihash.Multihash(digest)
-		out = append(out, pr)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("registry: enqueue releases rows: %w", err)
-	}
-	return out, nil
+	return expires, nil
 }
 
-func (r *Postgres) ListDueReleases(ctx context.Context, now time.Time, limit int) ([]PendingRelease, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT space, digest, not_before, started_at FROM ingot.blob_release_intents
-		 WHERE not_before <= $1 ORDER BY not_before ASC LIMIT $2`,
-		now, limit)
+func (r *Postgres) PendingRefByExpiry(ctx context.Context, expire taskrunner.TaskID) (taskrunner.TaskID, error) {
+	var add taskrunner.TaskID
+	err := r.pool.QueryRow(ctx, `SELECT add_task FROM ingot.blob_pending_refs WHERE expire_task = $1`, expire).Scan(&add)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, ErrNotFound
+	}
 	if err != nil {
-		return nil, fmt.Errorf("registry: list due releases: %w", err)
+		return uuid.Nil, fmt.Errorf("registry: pending reference by expiry: %w", err)
 	}
-	defer rows.Close()
-
-	var out []PendingRelease
-	for rows.Next() {
-		var spaceStr string
-		var pr PendingRelease
-		var digest []byte
-		var started *time.Time
-		if err := rows.Scan(&spaceStr, &digest, &pr.NotBefore, &started); err != nil {
-			return nil, fmt.Errorf("registry: list due releases scan: %w", err)
-		}
-		if started != nil {
-			pr.StartedAt = *started
-		}
-		space, err := did.Parse(spaceStr)
-		if err != nil {
-			return nil, fmt.Errorf("registry: list due releases space %q: %w", spaceStr, err)
-		}
-		pr.Space, pr.Digest = space, multihash.Multihash(digest)
-		out = append(out, pr)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("registry: list due releases rows: %w", err)
-	}
-	return out, nil
+	return add, nil
 }
 
-func (r *Postgres) ListReleasesBySpace(ctx context.Context, space did.DID) ([]PendingRelease, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT space, digest, not_before, started_at FROM ingot.blob_release_intents
-		 WHERE space = $1 ORDER BY not_before ASC`,
-		space)
-	if err != nil {
-		return nil, fmt.Errorf("registry: list releases by space: %w", err)
-	}
-	defer rows.Close()
+// countReferencesSQL counts a space's references to a digest in one
+// statement, so one snapshot reads them all: a row that takes another's
+// reference over in one transaction (a claim or a part row taking a pending
+// reference) is counted before or after, never neither.
+const countReferencesSQL = `SELECT
+	  (SELECT count(*) FROM ingot.blob_refs WHERE space = $1 AND digest = $2)
+	+ (SELECT count(*) FROM ingot.blob_pending_refs WHERE space = $1 AND digest = $2 AND add_task <> $3)
+	+ (SELECT count(*) FROM ingot.multipart_parts p
+	     JOIN ingot.multipart_sessions s ON s.upload_id = p.upload_id
+	    WHERE p.blob_digests @> ARRAY[$2::bytea] AND s.space = $1 AND s.state = $4)`
 
-	var out []PendingRelease
-	for rows.Next() {
-		var spaceStr string
-		var pr PendingRelease
-		var digest []byte
-		var started *time.Time
-		if err := rows.Scan(&spaceStr, &digest, &pr.NotBefore, &started); err != nil {
-			return nil, fmt.Errorf("registry: list releases by space scan: %w", err)
-		}
-		if started != nil {
-			pr.StartedAt = *started
-		}
-		sp, err := did.Parse(spaceStr)
-		if err != nil {
-			return nil, fmt.Errorf("registry: list releases by space %q: %w", spaceStr, err)
-		}
-		pr.Space, pr.Digest = sp, multihash.Multihash(digest)
-		out = append(out, pr)
+func (r *Postgres) QueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time, release ReleaseTask) error {
+	if len(digests) == 0 {
+		return nil
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("registry: list releases by space rows: %w", err)
+	if r.tasks == nil {
+		return fmt.Errorf("registry: releases to queue but the registry has no task runner")
 	}
-	return out, nil
-}
-
-func (r *Postgres) DeleteIntentAndRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
+	specs := make([]taskrunner.Spec, len(digests))
+	for i, d := range digests {
+		var err error
+		if specs[i], err = release.Spec(space, d, notBefore); err != nil {
+			return err
+		}
+	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("registry: begin delete intent and release: %w", err)
+		return fmt.Errorf("registry: queue releases: begin: %w", err)
 	}
-	defer tx.Rollback(ctx)
-	// The digest's lock, not the claim key's: two spaces releasing the same
-	// digest take turns here, so exactly one of them counts no intent left.
-	if _, err := tx.Exec(ctx,
-		`SELECT pg_advisory_xact_lock(hashtextextended('intent:' || encode($1, 'hex'), 0))`,
-		[]byte(digest)); err != nil {
-		return 0, fmt.Errorf("registry: lock digest: %w", err)
-	}
-	if _, err := tx.Exec(ctx,
-		`DELETE FROM ingot.upload_intents WHERE space = $1 AND digest = $2`,
-		space, digest); err != nil {
-		return 0, fmt.Errorf("registry: delete intent: %w", err)
-	}
-	if _, err := tx.Exec(ctx,
-		`DELETE FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
-		space, digest); err != nil {
-		return 0, fmt.Errorf("registry: delete release: %w", err)
-	}
-	var remaining int
-	if err := tx.QueryRow(ctx,
-		`SELECT count(*) FROM ingot.upload_intents WHERE digest = $1`, digest).Scan(&remaining); err != nil {
-		return 0, fmt.Errorf("registry: count remaining intents: %w", err)
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := r.tasks.SubmitAllTx(ctx, tx, specs); err != nil {
+		return fmt.Errorf("registry: queue releases: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("registry: commit delete intent and release: %w", err)
-	}
-	return remaining, nil
-}
-
-func (r *Postgres) DeleteRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error {
-	_, err := r.pool.Exec(ctx,
-		`DELETE FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
-		space, digest)
-	if err != nil {
-		return fmt.Errorf("registry: delete release: %w", err)
+		return fmt.Errorf("registry: queue releases: commit: %w", err)
 	}
 	return nil
 }
@@ -426,31 +108,16 @@ func (r *Postgres) DeleteRelease(ctx context.Context, space did.DID, digest mult
 // IntentStore ================================================================
 
 func (r *Postgres) PutIntent(ctx context.Context, in UploadIntent) error {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("registry: begin put intent: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO ingot.upload_intents (space, digest, local_path, size, state, bucket)
-		 VALUES ($1, $2, $3, $4, $5, $6)
+	if _, err := r.pool.Exec(ctx,
+		`INSERT INTO ingot.upload_intents (space, digest, size, state, bucket)
+		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (space, digest) DO UPDATE
-		   SET local_path = EXCLUDED.local_path,
-		       size       = EXCLUDED.size,
+		   SET size       = EXCLUDED.size,
 		       state      = EXCLUDED.state,
 		       bucket     = EXCLUDED.bucket,
 		       updated_at = now()`,
-		in.Space, in.Digest, in.LocalPath, in.Size, in.State, nullString(in.Bucket)); err != nil {
+		in.Space, in.Digest, in.Size, in.State, nullString(in.Bucket)); err != nil {
 		return fmt.Errorf("registry: put intent: %w", err)
-	}
-	// The file is back on disk, for every space's intent.
-	if _, err := tx.Exec(ctx,
-		`UPDATE ingot.upload_intents SET evicted_at = NULL WHERE digest = $1 AND evicted_at IS NOT NULL`,
-		in.Digest); err != nil {
-		return fmt.Errorf("registry: put intent: clear evicted: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("registry: commit put intent: %w", err)
 	}
 	return nil
 }
@@ -474,9 +141,9 @@ func (r *Postgres) GetIntent(ctx context.Context, space did.DID, digest multihas
 	in := &UploadIntent{Space: space, Digest: digest}
 	var bucket *string
 	err := r.pool.QueryRow(ctx,
-		`SELECT local_path, size, state, bucket, updated_at
+		`SELECT size, state, bucket, updated_at
 		   FROM ingot.upload_intents WHERE space = $1 AND digest = $2`,
-		space, digest).Scan(&in.LocalPath, &in.Size, &in.State, &bucket, &in.UpdatedAt)
+		space, digest).Scan(&in.Size, &in.State, &bucket, &in.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -510,156 +177,27 @@ func (r *Postgres) CountOtherIntents(ctx context.Context, space did.DID, digest 
 	return n, nil
 }
 
-func (r *Postgres) ListEvictable(ctx context.Context, after EvictCursor, limit int) ([]UploadIntent, error) {
-	// A zero cursor starts before every row; the empty digest and the empty
-	// space sort first.
-	afterDigest := after.Digest
-	if afterDigest == nil {
-		afterDigest = multihash.Multihash{}
-	}
-	afterSpace := ""
-	if after.Space.Defined() {
-		afterSpace = after.Space.String()
-	}
-	// The state literals match the partial index upload_intents_evictable_idx
-	// (migration 00026); the planner uses it only when the query names the
-	// same constants, not parameters.
-	rows, err := r.pool.Query(ctx,
-		`SELECT `+intentColumns+`
-		   FROM ingot.upload_intents i
-		  WHERE i.evicted_at IS NULL
-		    AND i.state IN ('parked', 'accepted', 'published')
-		    AND (i.updated_at, i.digest, i.space) > ($1::timestamptz, $2::bytea, $3::text)
-		    AND CASE WHEN i.state = 'parked'
-		             THEN EXISTS (SELECT 1 FROM ingot.blob_parks p WHERE p.space = i.space AND p.digest = i.digest)
-		             ELSE EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.space = i.space AND l.digest = i.digest)
-		        END
-		    AND NOT EXISTS (SELECT 1 FROM ingot.upload_intents o
-		                     WHERE o.digest = i.digest AND o.state IN ('spooled', 'uploading'))
-		  ORDER BY i.updated_at, i.digest, i.space
-		  LIMIT $4`,
-		after.UpdatedAt, []byte(afterDigest), afterSpace, limit)
-	if err != nil {
-		return nil, fmt.Errorf("registry: list evictable intents: %w", err)
-	}
-	return scanIntents(rows)
-}
-
-func (r *Postgres) MarkEvicted(ctx context.Context, digest multihash.Multihash, notAfter time.Time) error {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.upload_intents SET evicted_at = now()
-		  WHERE digest = $1 AND updated_at <= $2`, digest, notAfter)
-	if err != nil {
-		return fmt.Errorf("registry: mark intent evicted: %w", err)
-	}
-	if tag.RowsAffected() > 0 {
-		return nil
-	}
-	// Nothing marked: no intent is left, or every one of them is a newer
-	// write's, whose file is on disk.
-	var exists bool
-	if err := r.pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM ingot.upload_intents WHERE digest = $1)`, digest).Scan(&exists); err != nil {
-		return fmt.Errorf("registry: mark intent evicted lookup: %w", err)
-	}
-	if !exists {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// releasedPublishedWhere is ListReleasedPublished's condition on intent i,
-// with the intent state as $1 and the live session states as $2 and $3.
-const releasedPublishedWhere = `i.state = $1
-		    AND NOT EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.digest = i.digest)
-		    AND NOT EXISTS (SELECT 1 FROM ingot.blob_refs c WHERE c.digest = i.digest)
-		    AND NOT EXISTS (SELECT 1 FROM ingot.blob_release_intents p WHERE p.digest = i.digest)
-		    AND NOT EXISTS (SELECT 1 FROM ingot.multipart_parts mp
-		                      JOIN ingot.multipart_sessions s ON s.upload_id = mp.upload_id
-		                     WHERE mp.blob_digests @> ARRAY[i.digest] AND s.state IN ($2, $3))
-		    AND NOT EXISTS (SELECT 1 FROM ingot.upload_intents o
-		                     WHERE o.digest = i.digest AND o.space <> i.space)`
-
-func (r *Postgres) ListReleasedPublished(ctx context.Context, after multihash.Multihash, limit int) ([]UploadIntent, error) {
-	// The empty digest sorts first, so a nil cursor starts at the beginning.
-	if after == nil {
-		after = multihash.Multihash{}
-	}
-	rows, err := r.pool.Query(ctx,
-		`SELECT `+intentColumns+`
-		   FROM ingot.upload_intents i
-		  WHERE i.digest > $4 AND `+releasedPublishedWhere+`
-		  ORDER BY i.digest
-		  LIMIT $5`,
-		IntentPublished, SessionOpen, SessionCompleting, []byte(after), limit)
-	if err != nil {
-		return nil, fmt.Errorf("registry: list released published intents: %w", err)
-	}
-	return scanIntents(rows)
-}
-
-func (r *Postgres) DeleteReleasedPublished(ctx context.Context, space did.DID, digest multihash.Multihash) (bool, error) {
-	tag, err := r.pool.Exec(ctx,
-		`DELETE FROM ingot.upload_intents i
-		  WHERE i.space = $4 AND i.digest = $5 AND `+releasedPublishedWhere,
-		IntentPublished, SessionOpen, SessionCompleting, space, []byte(digest))
-	if err != nil {
-		return false, fmt.Errorf("registry: delete released published intent: %w", err)
-	}
-	return tag.RowsAffected() > 0, nil
-}
-
-func (r *Postgres) StalledBytes(ctx context.Context, before time.Time) (StalledSizes, error) {
-	// The state literals match the partial index upload_intents_stalled_idx
-	// (migrations 00021 and 00023), as for ListEvictable; the index carries
-	// size and state, so the sums come from it alone.
-	var s StalledSizes
+func (r *Postgres) StalledBytes(ctx context.Context, before time.Time) (int64, error) {
+	// The state literal matches the partial index upload_intents_stalled_idx
+	// (migration 00035): the planner uses it only when the query names the
+	// same constant, not a parameter. The index carries size, so the sum
+	// comes from it alone.
+	var n int64
 	err := r.pool.QueryRow(ctx,
-		`SELECT COALESCE(sum(size) FILTER (WHERE state = 'spooled'), 0)::bigint,
-		        COALESCE(sum(size) FILTER (WHERE state = 'uploading'), 0)::bigint
+		`SELECT COALESCE(sum(size), 0)::bigint
 		   FROM ingot.upload_intents
-		  WHERE state IN ('spooled', 'uploading')
+		  WHERE state = 'uploading'
 		    AND updated_at < $1`,
-		before).Scan(&s.Spooled, &s.Uploading)
+		before).Scan(&n)
 	if err != nil {
-		return StalledSizes{}, fmt.Errorf("registry: sum stalled intents: %w", err)
+		return 0, fmt.Errorf("registry: sum stalled intents: %w", err)
 	}
-	return s, nil
-}
-
-func (r *Postgres) MissingIntents(ctx context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error) {
-	if len(digests) == 0 {
-		return nil, nil
-	}
-	raw := make([][]byte, len(digests))
-	for i, d := range digests {
-		raw[i] = d
-	}
-	rows, err := r.pool.Query(ctx,
-		`SELECT d FROM unnest($1::bytea[]) AS d
-		  WHERE NOT EXISTS (SELECT 1 FROM ingot.upload_intents i WHERE i.digest = d)`,
-		raw)
-	if err != nil {
-		return nil, fmt.Errorf("registry: missing intents: %w", err)
-	}
-	defer rows.Close()
-	var out []multihash.Multihash
-	for rows.Next() {
-		var d []byte
-		if err := rows.Scan(&d); err != nil {
-			return nil, fmt.Errorf("registry: missing intents scan: %w", err)
-		}
-		out = append(out, multihash.Multihash(d))
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("registry: missing intents rows: %w", err)
-	}
-	return out, nil
+	return n, nil
 }
 
 // intentColumns is the column list scanIntents reads, qualified for the
 // alias i (unqualified names resolve against it too).
-const intentColumns = `i.space, i.digest, i.local_path, i.size, i.state, i.bucket, i.updated_at`
+const intentColumns = `i.space, i.digest, i.size, i.state, i.bucket, i.updated_at`
 
 // scanIntents reads rows of intentColumns and closes them.
 func scanIntents(rows pgx.Rows) ([]UploadIntent, error) {
@@ -669,7 +207,7 @@ func scanIntents(rows pgx.Rows) ([]UploadIntent, error) {
 		var in UploadIntent
 		var space string
 		var bucket *string
-		if err := rows.Scan(&space, &in.Digest, &in.LocalPath, &in.Size, &in.State, &bucket, &in.UpdatedAt); err != nil {
+		if err := rows.Scan(&space, &in.Digest, &in.Size, &in.State, &bucket, &in.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("registry: list intents scan: %w", err)
 		}
 		sp, err := did.Parse(space)
@@ -899,15 +437,6 @@ func (r *Postgres) GetPark(ctx context.Context, space did.DID, digest multihash.
 	return park, nil
 }
 
-func (r *Postgres) HasParkFor(ctx context.Context, addTask []byte) (bool, error) {
-	var parked bool
-	if err := r.pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM ingot.blob_parks WHERE add_task = $1)`, addTask).Scan(&parked); err != nil {
-		return false, fmt.Errorf("registry: find park: %w", err)
-	}
-	return parked, nil
-}
-
 func (r *Postgres) DeletePark(ctx context.Context, space did.DID, digest multihash.Multihash) error {
 	_, err := r.pool.Exec(ctx,
 		`DELETE FROM ingot.blob_parks WHERE space = $1 AND digest = $2`, space, digest)
@@ -915,96 +444,6 @@ func (r *Postgres) DeletePark(ctx context.Context, space did.DID, digest multiha
 		return fmt.Errorf("registry: delete park: %w", err)
 	}
 	return nil
-}
-
-func (r *Postgres) ConcludePark(ctx context.Context, loc BlobLocation, addTask []byte) (bool, error) {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return false, fmt.Errorf("registry: conclude park: begin: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	tag, err := tx.Exec(ctx,
-		`DELETE FROM ingot.blob_parks WHERE space = $1 AND digest = $2 AND add_task = $3`, loc.Space, loc.Digest, addTask)
-	if err != nil {
-		return false, fmt.Errorf("registry: conclude park: delete park: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return false, nil
-	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO ingot.blob_locations (space, digest, provider, url, size)
-		 VALUES ($1, $2, $3, $4, $5)
-		 ON CONFLICT (space, digest) DO UPDATE
-		   SET provider = EXCLUDED.provider, url = EXCLUDED.url, size = EXCLUDED.size`,
-		loc.Space, loc.Digest, loc.Provider, loc.URL, loc.Size); err != nil {
-		return false, fmt.Errorf("registry: conclude park: put location: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("registry: conclude park: commit: %w", err)
-	}
-	return true, nil
-}
-
-// StreamStore ================================================================
-
-func (r *Postgres) PutStream(ctx context.Context, s BlobStream) error {
-	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.blob_streams (add_task, space, bucket, size)
-		 VALUES ($1, $2, $3, $4)`,
-		s.AddTask, s.Space.String(), s.Bucket, s.Size)
-	if err != nil {
-		return fmt.Errorf("registry: put stream: %w", err)
-	}
-	return nil
-}
-
-func (r *Postgres) TouchStreams(ctx context.Context, addTasks [][]byte) error {
-	if len(addTasks) == 0 {
-		return nil
-	}
-	_, err := r.pool.Exec(ctx,
-		`UPDATE ingot.blob_streams SET touched_at = now() WHERE add_task = ANY($1)`, addTasks)
-	if err != nil {
-		return fmt.Errorf("registry: touch streams: %w", err)
-	}
-	return nil
-}
-
-func (r *Postgres) DeleteStream(ctx context.Context, addTask []byte) error {
-	_, err := r.pool.Exec(ctx,
-		`DELETE FROM ingot.blob_streams WHERE add_task = $1`, addTask)
-	if err != nil {
-		return fmt.Errorf("registry: delete stream: %w", err)
-	}
-	return nil
-}
-
-func (r *Postgres) ListStaleStreams(ctx context.Context, olderThan time.Time, limit int) ([]BlobStream, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT add_task, space, bucket, size, created_at, touched_at
-		 FROM ingot.blob_streams WHERE touched_at < $1
-		 ORDER BY touched_at LIMIT $2`,
-		olderThan, limit)
-	if err != nil {
-		return nil, fmt.Errorf("registry: list stale streams: %w", err)
-	}
-	defer rows.Close()
-	var out []BlobStream
-	for rows.Next() {
-		var s BlobStream
-		var space string
-		if err := rows.Scan(&s.AddTask, &space, &s.Bucket, &s.Size, &s.CreatedAt, &s.TouchedAt); err != nil {
-			return nil, fmt.Errorf("registry: scan stream: %w", err)
-		}
-		if s.Space, err = did.Parse(space); err != nil {
-			return nil, fmt.Errorf("registry: stream space %q: %w", space, err)
-		}
-		out = append(out, s)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("registry: list stale streams: %w", err)
-	}
-	return out, nil
 }
 
 // InclusionStore =============================================================
@@ -1048,31 +487,11 @@ func (r *Postgres) GetInclusion(ctx context.Context, space did.DID, digest multi
 // MultipartStore =============================================================
 
 func (r *Postgres) CreateSession(ctx context.Context, s MultipartSession) error {
-	if !s.Space.Defined() {
-		return errors.New("registry: create session: space is required")
-	}
-	state := s.State
-	if state == "" {
-		state = SessionOpen
-	}
-	meta, err := marshalMetadata(s.Metadata)
+	st, err := CreatedSession(s)
 	if err != nil {
 		return err
 	}
-	_, err = r.pool.Exec(ctx,
-		`INSERT INTO ingot.multipart_sessions
-		   (upload_id, bucket, object_key, state, content_type, metadata,
-		    content_encoding, content_disposition, content_language, cache_control, expires,
-		    website_redirect_location, checksum_algorithm, checksum_type,
-		    lock_mode, lock_retain_until, lock_legal_hold, tagging, space, plaintext)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`,
-		s.UploadID, s.Bucket, s.ObjectKey, state, nullString(s.ContentType), meta,
-		nullString(s.ContentEncoding), nullString(s.ContentDisposition),
-		nullString(s.ContentLanguage), nullString(s.CacheControl), nullString(s.Expires),
-		nullString(s.WebsiteRedirectLocation), nullString(s.ChecksumAlgorithm), nullString(s.ChecksumType),
-		nullString(s.LockMode), s.LockRetainUntil, nullString(s.LockLegalHold), nullString(s.Tagging),
-		s.Space.String(), s.Plaintext)
-	if err != nil {
+	if _, err := r.pool.Exec(ctx, st.SQL, st.Args...); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
 			return ErrExists
@@ -1146,149 +565,12 @@ func scanSession(row pgx.Row) (*MultipartSession, error) {
 	return s, nil
 }
 
-func (r *Postgres) LatchSession(ctx context.Context, uploadID, from, to string) (bool, error) {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.multipart_sessions SET state = $3, state_changed_at = now()
-		 WHERE upload_id = $1 AND state = $2`,
-		uploadID, from, to)
-	if err != nil {
-		return false, fmt.Errorf("registry: latch session: %w", err)
-	}
-	return tag.RowsAffected() == 1, nil
-}
-
-func (r *Postgres) CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error) {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.multipart_sessions
-		 SET state = $2, committed_etag = $3, committed_version_id = $4, state_changed_at = now()
-		 WHERE upload_id = $1 AND state = $5`,
-		uploadID, SessionCompleted, etag, nullString(versionID), SessionCompleting)
-	if err != nil {
-		return false, fmt.Errorf("registry: complete session: %w", err)
-	}
-	return tag.RowsAffected() == 1, nil
-}
-
 func (r *Postgres) DeleteSession(ctx context.Context, uploadID string) error {
 	_, err := r.pool.Exec(ctx, `DELETE FROM ingot.multipart_sessions WHERE upload_id = $1`, uploadID)
 	if err != nil {
 		return fmt.Errorf("registry: delete session: %w", err)
 	}
 	return nil
-}
-
-func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree) ([]PendingRelease, error) {
-	state := p.State
-	if state == "" {
-		state = PartSpooled
-	}
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("registry: put part: begin: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	// Writes of one part number are serialised on a transaction-scoped
-	// advisory lock, so the row read here is the one the upsert below
-	// replaces. Read committed alone does not give that: two writes of the
-	// same part number can both read before either lands, and the second's
-	// upsert then replaces the first's row without reporting it. The lock
-	// is keyed by the upload and the part number, in the two-key lock space,
-	// apart from the claim-key locks; a hash collision serialises two
-	// unrelated writes, nothing worse.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2::int)`, p.UploadID, p.PartNumber); err != nil {
-		return nil, fmt.Errorf("registry: put part: lock: %w", err)
-	}
-	var replaced []multihash.Multihash
-	if err := tx.QueryRow(ctx,
-		`SELECT blob_digests FROM ingot.multipart_parts WHERE upload_id = $1 AND part_number = $2`,
-		p.UploadID, p.PartNumber).Scan(&replaced); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("registry: put part: read replaced: %w", err)
-	}
-	// BlobDigests ([]multihash.Multihash) rides pgx's underlying-type plan into
-	// bytea[]: pgx must try that plan before its Stringer plan, or a Multihash
-	// (whose String() is base58) would land as text — pgx v5.10+ orders them
-	// correctly; don't downgrade below that.
-	//
-	// The session row is read FOR SHARE: a latch (UPDATE of its state) in
-	// flight blocks this write until it commits, after which the state
-	// check re-evaluates and refuses the part; a latch arriving while this
-	// statement holds the row waits for the part to commit, so the
-	// teardown's part listing includes it.
-	tag, err := tx.Exec(ctx,
-		`INSERT INTO ingot.multipart_parts (upload_id, part_number, etag_md5, size, checksum, blob_digests, span_lengths, state)
-		 SELECT s.upload_id, $2, $3, $4, $5, $6, $7, $8
-		   FROM ingot.multipart_sessions s
-		  WHERE s.upload_id = $1 AND s.state = $9
-		    FOR SHARE
-		 ON CONFLICT (upload_id, part_number) DO UPDATE
-		   SET etag_md5 = EXCLUDED.etag_md5, size = EXCLUDED.size, checksum = EXCLUDED.checksum,
-		       blob_digests = EXCLUDED.blob_digests, span_lengths = EXCLUDED.span_lengths, state = EXCLUDED.state`,
-		p.UploadID, p.PartNumber, p.ETagMD5, p.Size, p.Checksum, p.BlobDigests, p.SpanLengths, state, SessionOpen)
-	if err != nil {
-		return nil, fmt.Errorf("registry: put part: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return nil, ErrNotFound
-	}
-	// The tree row follows the part row: a superseding part without a tree
-	// must not keep its predecessor's.
-	if t := tree; t != nil {
-		_, err = tx.Exec(ctx,
-			`INSERT INTO ingot.multipart_part_trees (upload_id, part_number, tree_offset, chunk_log, nodes, blocks, head, tail, root)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-			 ON CONFLICT (upload_id, part_number) DO UPDATE
-			   SET tree_offset = EXCLUDED.tree_offset, chunk_log = EXCLUDED.chunk_log, nodes = EXCLUDED.nodes,
-			       blocks = EXCLUDED.blocks, head = EXCLUDED.head, tail = EXCLUDED.tail, root = EXCLUDED.root`,
-			p.UploadID, p.PartNumber, t.Offset, int16(t.ChunkLog), t.Nodes, t.Blocks, t.Head, t.Tail, t.Root)
-	} else {
-		_, err = tx.Exec(ctx, `DELETE FROM ingot.multipart_part_trees WHERE upload_id = $1 AND part_number = $2`, p.UploadID, p.PartNumber)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("registry: put part tree: %w", err)
-	}
-	// The replaced row's blobs this part does not name lose their last part
-	// reference with this write; their releases are recorded with it, each
-	// digest once (ON CONFLICT DO UPDATE cannot touch one row twice), due
-	// now (a part blob was never readable through the catalog, so no reader
-	// grace is owed). The session's space is the release's.
-	var released []PendingRelease
-	if dropped := digestsDropped(replaced, p.BlobDigests); len(dropped) > 0 {
-		rows, err := tx.Query(ctx,
-			`INSERT INTO ingot.blob_release_intents (space, digest, not_before)
-			 SELECT s.space, unnest($2::bytea[]), now()
-			   FROM ingot.multipart_sessions s
-			  WHERE s.upload_id = $1
-			 ON CONFLICT (space, digest)
-			 DO UPDATE SET not_before = GREATEST(ingot.blob_release_intents.not_before, EXCLUDED.not_before)
-			 RETURNING space, digest, not_before`,
-			p.UploadID, dropped)
-		if err != nil {
-			return nil, fmt.Errorf("registry: put part: record releases: %w", err)
-		}
-		for rows.Next() {
-			var spaceStr string
-			var digest []byte
-			pr := PendingRelease{}
-			if err := rows.Scan(&spaceStr, &digest, &pr.NotBefore); err != nil {
-				rows.Close()
-				return nil, fmt.Errorf("registry: put part: scan release: %w", err)
-			}
-			if pr.Space, err = did.Parse(spaceStr); err != nil {
-				rows.Close()
-				return nil, fmt.Errorf("registry: put part: release space: %w", err)
-			}
-			pr.Digest = multihash.Multihash(digest)
-			released = append(released, pr)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, fmt.Errorf("registry: put part: record releases: %w", err)
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("registry: put part: commit: %w", err)
-	}
-	return released, nil
 }
 
 // digestsDropped returns the digests of replaced that kept does not name,
@@ -1309,49 +591,12 @@ func digestsDropped(replaced, kept []multihash.Multihash) [][]byte {
 	return out
 }
 
-func (r *Postgres) MoveParts(ctx context.Context, parts []MultipartPart, from, to string) (int, error) {
-	if len(parts) == 0 {
-		return 0, nil
-	}
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("registry: move parts: begin: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	// One statement per part: each is guarded by its own digest list, which
-	// a single array-valued statement cannot carry.
-	batch := &pgx.Batch{}
-	for _, p := range parts {
-		batch.Queue(
-			`UPDATE ingot.multipart_parts SET state = $4
-			 WHERE upload_id = $1 AND part_number = $2 AND blob_digests = $3 AND state = $5`,
-			p.UploadID, p.PartNumber, p.BlobDigests, to, from)
-	}
-	results := tx.SendBatch(ctx, batch)
-	moved := 0
-	for range parts {
-		tag, err := results.Exec()
-		if err != nil {
-			results.Close()
-			return 0, fmt.Errorf("registry: move parts: %w", err)
-		}
-		moved += int(tag.RowsAffected())
-	}
-	if err := results.Close(); err != nil {
-		return 0, fmt.Errorf("registry: move parts: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("registry: move parts: commit: %w", err)
-	}
-	return moved, nil
-}
-
-func (r *Postgres) ListParkedParts(ctx context.Context, uploadID string, limit int) ([]MultipartPart, error) {
+func (r *Postgres) ListParkedParts(ctx context.Context, uploadID string, after, limit int) ([]MultipartPart, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT part_number, etag_md5, size, checksum, blob_digests, span_lengths, state, created_at
-		 FROM ingot.multipart_parts WHERE upload_id = $1 AND state = $2
-		 ORDER BY part_number ASC LIMIT $3`,
-		uploadID, PartParked, limit)
+		 FROM ingot.multipart_parts WHERE upload_id = $1 AND state = $2 AND part_number > $3
+		 ORDER BY part_number ASC LIMIT $4`,
+		uploadID, PartParked, after, limit)
 	if err != nil {
 		return nil, fmt.Errorf("registry: list parked parts: %w", err)
 	}
@@ -1363,31 +608,14 @@ func (r *Postgres) OldestParkedPart(ctx context.Context) (time.Time, bool, error
 	if err := r.pool.QueryRow(ctx,
 		`SELECT min(p.created_at) FROM ingot.multipart_parts p
 		   JOIN ingot.multipart_sessions s ON s.upload_id = p.upload_id
-		  WHERE p.state = $1 AND s.state IN ($2, $3)`,
-		PartParked, SessionOpen, SessionCompleting).Scan(&oldest); err != nil {
+		  WHERE p.state = $1 AND s.state = $2`,
+		PartParked, SessionOpen).Scan(&oldest); err != nil {
 		return time.Time{}, false, fmt.Errorf("registry: oldest parked part: %w", err)
 	}
 	if oldest == nil {
 		return time.Time{}, false, nil
 	}
 	return *oldest, true, nil
-}
-
-func (r *Postgres) ListUploadsWithParkedParts(ctx context.Context) ([]string, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT s.upload_id FROM ingot.multipart_sessions s
-		 WHERE s.state IN ($1, $2)
-		   AND EXISTS (SELECT 1 FROM ingot.multipart_parts p
-		                WHERE p.upload_id = s.upload_id AND p.state = $3)`,
-		SessionOpen, SessionCompleting, PartParked)
-	if err != nil {
-		return nil, fmt.Errorf("registry: list uploads with parked parts: %w", err)
-	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	if err != nil {
-		return nil, fmt.Errorf("registry: list uploads with parked parts: %w", err)
-	}
-	return ids, nil
 }
 
 func (r *Postgres) DeletePartTrees(ctx context.Context, uploadID string) error {
@@ -1452,16 +680,16 @@ func (r *Postgres) ListPartTrees(ctx context.Context, uploadID string) (map[int]
 	return out, nil
 }
 
-func (r *Postgres) ListSessions(ctx context.Context, bucket string) ([]MultipartSession, error) {
+func (r *Postgres) ListSessions(ctx context.Context, bucket string, space did.DID) ([]MultipartSession, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
 		        content_encoding, content_disposition, content_language, cache_control, expires,
 		        website_redirect_location, checksum_algorithm, checksum_type,
 		        lock_mode, lock_retain_until, lock_legal_hold, tagging,
 		        committed_etag, committed_version_id, space, state_changed_at, plaintext
-		 FROM ingot.multipart_sessions WHERE bucket = $1
+		 FROM ingot.multipart_sessions WHERE bucket = $1 AND space = $2
 		 ORDER BY object_key ASC, created_at ASC, upload_id ASC`,
-		bucket)
+		bucket, space.String())
 	if err != nil {
 		return nil, fmt.Errorf("registry: list sessions: %w", err)
 	}
@@ -1481,35 +709,6 @@ func (r *Postgres) ListSessions(ctx context.Context, bucket string) ([]Multipart
 	return out, nil
 }
 
-func (r *Postgres) ListStaleSessions(ctx context.Context, state string, cutoff time.Time) ([]MultipartSession, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
-		        content_encoding, content_disposition, content_language, cache_control, expires,
-		        website_redirect_location, checksum_algorithm, checksum_type,
-		        lock_mode, lock_retain_until, lock_legal_hold, tagging,
-		        committed_etag, committed_version_id, space, state_changed_at, plaintext
-		 FROM ingot.multipart_sessions WHERE state = $1 AND state_changed_at < $2
-		 ORDER BY state_changed_at ASC`,
-		state, cutoff)
-	if err != nil {
-		return nil, fmt.Errorf("registry: list stale sessions: %w", err)
-	}
-	defer rows.Close()
-
-	var out []MultipartSession
-	for rows.Next() {
-		s, err := scanSession(rows)
-		if err != nil {
-			return nil, fmt.Errorf("registry: list stale sessions scan: %w", err)
-		}
-		out = append(out, *s)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("registry: list stale sessions rows: %w", err)
-	}
-	return out, nil
-}
-
 func (r *Postgres) CountPartRefs(ctx context.Context, digest multihash.Multihash, excludeUploadID string) (int, error) {
 	var n int
 	err := r.pool.QueryRow(ctx,
@@ -1518,19 +717,6 @@ func (r *Postgres) CountPartRefs(ctx context.Context, digest multihash.Multihash
 		digest, excludeUploadID).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("registry: count part refs: %w", err)
-	}
-	return n, nil
-}
-
-func (r *Postgres) CountLivePartRefs(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
-	var n int
-	err := r.pool.QueryRow(ctx,
-		`SELECT count(*) FROM ingot.multipart_parts p
-		 JOIN ingot.multipart_sessions s ON s.upload_id = p.upload_id
-		 WHERE p.blob_digests @> ARRAY[$2::bytea] AND s.space = $1 AND s.state IN ($3, $4)`,
-		space, digest, SessionOpen, SessionCompleting).Scan(&n)
-	if err != nil {
-		return 0, fmt.Errorf("registry: count live part refs: %w", err)
 	}
 	return n, nil
 }
@@ -1630,290 +816,4 @@ func unmarshalMetadata(b []byte) (map[string]string, error) {
 		return nil, fmt.Errorf("registry: unmarshal metadata: %w", err)
 	}
 	return m, nil
-}
-
-// UploadRegistrationStore =====================================================
-
-func (r *Postgres) ListDueUploadRegistrations(ctx context.Context, now time.Time, limit int) ([]UploadRegistration, error) {
-	// Per key, only the unbroken run of due rows from its oldest: a row whose
-	// key still holds an earlier row that is waiting out a backoff is not due
-	// either, however long it has been queued. Without that, a retraction
-	// could be replayed while the addition it retires is still held back, and
-	// the addition would land afterwards and leave the root counted for good.
-	rows, err := r.pool.Query(ctx,
-		`SELECT seq, bucket, object_key, space, root, op, attempts, next_at, proofs, dead_lettered_at, dead_letter_reason
-		 FROM ingot.upload_registrations r
-		 WHERE r.next_at <= $1 AND r.dead_lettered_at IS NULL
-		   AND NOT EXISTS (
-		     SELECT 1 FROM ingot.upload_registrations e
-		     WHERE e.bucket = r.bucket AND e.object_key = r.object_key
-		       AND e.seq < r.seq AND e.dead_lettered_at IS NULL AND e.next_at > $1
-		   )
-		 ORDER BY r.seq ASC LIMIT $2`,
-		now, limit)
-	if err != nil {
-		return nil, fmt.Errorf("registry: list due upload registrations: %w", err)
-	}
-	defer rows.Close()
-	return scanUploadRegistrations(rows)
-}
-
-func (r *Postgres) ListUploadRegistrationsBySpace(ctx context.Context, space did.DID) ([]UploadRegistration, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT seq, bucket, object_key, space, root, op, attempts, next_at, proofs, dead_lettered_at, dead_letter_reason
-		 FROM ingot.upload_registrations
-		 WHERE space = $1 ORDER BY seq ASC`,
-		space.String())
-	if err != nil {
-		return nil, fmt.Errorf("registry: list upload registrations by space: %w", err)
-	}
-	defer rows.Close()
-	return scanUploadRegistrations(rows)
-}
-
-func (r *Postgres) DeleteUploadRegistrations(ctx context.Context, seqs []int64) error {
-	if len(seqs) == 0 {
-		return nil
-	}
-	if _, err := r.pool.Exec(ctx,
-		`DELETE FROM ingot.upload_registrations WHERE seq = ANY($1)`, seqs); err != nil {
-		return fmt.Errorf("registry: delete %d upload registrations: %w", len(seqs), err)
-	}
-	return nil
-}
-
-func (r *Postgres) RescheduleUploadRegistrations(ctx context.Context, seqs []int64, nextAt time.Time) error {
-	if len(seqs) == 0 {
-		return nil
-	}
-	if _, err := r.pool.Exec(ctx,
-		`UPDATE ingot.upload_registrations
-		 SET attempts = attempts + 1, next_at = $2
-		 WHERE seq = ANY($1)`, seqs, nextAt); err != nil {
-		return fmt.Errorf("registry: reschedule %d upload registrations: %w", len(seqs), err)
-	}
-	return nil
-}
-
-func (r *Postgres) RefreshUploadRegistrationProofs(ctx context.Context, seq int64, proofs []byte) error {
-	if _, err := r.pool.Exec(ctx,
-		`UPDATE ingot.upload_registrations SET proofs = $2 WHERE seq = $1`, seq, proofs); err != nil {
-		return fmt.Errorf("registry: refresh upload registration %d proofs: %w", seq, err)
-	}
-	return nil
-}
-
-func (r *Postgres) DeadLetterUploadRegistrations(ctx context.Context, seqs []int64, reason string) error {
-	if len(seqs) == 0 {
-		return nil
-	}
-	if _, err := r.pool.Exec(ctx,
-		`UPDATE ingot.upload_registrations
-		 SET dead_lettered_at = now(), dead_letter_reason = $2
-		 WHERE seq = ANY($1) AND dead_lettered_at IS NULL`, seqs, reason); err != nil {
-		return fmt.Errorf("registry: dead-letter %d upload registrations: %w", len(seqs), err)
-	}
-	return nil
-}
-
-func (r *Postgres) ListDeadLetteredUploadRegistrations(ctx context.Context, limit int) ([]UploadRegistration, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT seq, bucket, object_key, space, root, op, attempts, next_at, proofs, dead_lettered_at, dead_letter_reason
-		 FROM ingot.upload_registrations
-		 WHERE dead_lettered_at IS NOT NULL ORDER BY seq ASC LIMIT $1`, limit)
-	if err != nil {
-		return nil, fmt.Errorf("registry: list dead-lettered upload registrations: %w", err)
-	}
-	defer rows.Close()
-	return scanUploadRegistrations(rows)
-}
-
-func scanUploadRegistrations(rows pgx.Rows) ([]UploadRegistration, error) {
-	var out []UploadRegistration
-	for rows.Next() {
-		var (
-			reg      UploadRegistration
-			spaceStr string
-			rootRaw  []byte
-			op       string
-		)
-		var reason *string
-		if err := rows.Scan(&reg.Seq, &reg.Bucket, &reg.ObjectKey, &spaceStr, &rootRaw, &op,
-			&reg.Attempts, &reg.NextAt, &reg.Proofs, &reg.DeadLetteredAt, &reason); err != nil {
-			return nil, fmt.Errorf("registry: scan upload registration: %w", err)
-		}
-		space, err := did.Parse(spaceStr)
-		if err != nil {
-			return nil, fmt.Errorf("registry: parse upload registration space: %w", err)
-		}
-		root, err := cid.Cast(rootRaw)
-		if err != nil {
-			return nil, fmt.Errorf("registry: parse upload registration root: %w", err)
-		}
-		reg.Space, reg.Root, reg.Op = space, root, UploadRegistrationOp(op)
-		if reason != nil {
-			reg.DeadLetterReason = *reason
-		}
-		out = append(out, reg)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("registry: upload registration rows: %w", err)
-	}
-	return out, nil
-}
-
-func (r *Postgres) StartRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (ReleaseStart, error) {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("registry: begin start release: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	if err := lockClaimKey(ctx, tx, space, digest); err != nil {
-		return 0, err
-	}
-	var started *time.Time
-	err = tx.QueryRow(ctx,
-		`SELECT started_at FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
-		space, digest).Scan(&started)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ReleaseCancelled, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("registry: start release lookup: %w", err)
-	}
-	if started != nil {
-		// A retry: the release owns the blob since it started, and a part
-		// recorded or a write begun since is waiting for it to finish.
-		return ReleaseStarted, nil
-	}
-	// Live part references before claims: see the interface.
-	var live int
-	if err := tx.QueryRow(ctx,
-		`SELECT count(*) FROM ingot.multipart_parts p
-		 JOIN ingot.multipart_sessions s ON s.upload_id = p.upload_id
-		 WHERE p.blob_digests @> ARRAY[$2::bytea] AND s.space = $1 AND s.state IN ($3, $4)`,
-		space, digest, SessionOpen, SessionCompleting).Scan(&live); err != nil {
-		return 0, fmt.Errorf("registry: start release count live part refs: %w", err)
-	}
-	if live > 0 {
-		return ReleaseReferenced, nil
-	}
-	var claims int
-	if err := tx.QueryRow(ctx,
-		`SELECT count(*) FROM ingot.blob_refs WHERE space = $1 AND digest = $2`,
-		space, digest).Scan(&claims); err != nil {
-		return 0, fmt.Errorf("registry: start release count claims: %w", err)
-	}
-	if claims > 0 {
-		// Stale: deleted here, under the lock, so a replacement a later
-		// drop enqueues is never the one a caller deletes.
-		if _, err := tx.Exec(ctx,
-			`DELETE FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
-			space, digest); err != nil {
-			return 0, fmt.Errorf("registry: start release: delete stale record: %w", err)
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return 0, fmt.Errorf("registry: commit start release: %w", err)
-		}
-		return ReleaseClaimed, nil
-	}
-	if _, err := tx.Exec(ctx,
-		`UPDATE ingot.blob_release_intents SET started_at = COALESCE(started_at, now())
-		 WHERE space = $1 AND digest = $2`,
-		space, digest); err != nil {
-		return 0, fmt.Errorf("registry: start release: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("registry: commit start release: %w", err)
-	}
-	return ReleaseStarted, nil
-}
-
-func (r *Postgres) GetRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (*PendingRelease, error) {
-	// Read under the claim-key lock, in a transaction of its own that
-	// changes nothing: a StartRelease in flight holds the lock until it
-	// commits, so the record read here is pending only if no release of it
-	// has started. A plain read could see a record a start is about to
-	// commit, and let a write reuse a blob the release then removes.
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("registry: get release: begin: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	if err := lockClaimKey(ctx, tx, space, digest); err != nil {
-		return nil, err
-	}
-	pr := PendingRelease{Space: space, Digest: multihash.Multihash(bytes.Clone(digest))}
-	var started *time.Time
-	err = tx.QueryRow(ctx,
-		`SELECT not_before, started_at FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
-		space, digest).Scan(&pr.NotBefore, &started)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("registry: get release: %w", err)
-	}
-	if started != nil {
-		pr.StartedAt = *started
-	}
-	return &pr, nil
-}
-
-func (r *Postgres) ReleasingDigests(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error) {
-	out := map[string]bool{}
-	if len(digests) == 0 {
-		return out, nil
-	}
-	raw := make([][]byte, len(digests))
-	for i, d := range digests {
-		raw[i] = d
-	}
-	rows, err := r.pool.Query(ctx,
-		`SELECT digest FROM ingot.blob_release_intents WHERE space = $1 AND digest = ANY($2::bytea[])`,
-		space, raw)
-	if err != nil {
-		return nil, fmt.Errorf("registry: releasing digests: %w", err)
-	}
-	found, err := pgx.CollectRows(rows, pgx.RowTo[[]byte])
-	if err != nil {
-		return nil, fmt.Errorf("registry: releasing digests: %w", err)
-	}
-	for _, d := range found {
-		out[string(d)] = true
-	}
-	return out, nil
-}
-
-func (r *Postgres) CancelRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (ReleaseCancel, error) {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("registry: begin cancel release: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	if err := lockClaimKey(ctx, tx, space, digest); err != nil {
-		return 0, err
-	}
-	var started *time.Time
-	err = tx.QueryRow(ctx,
-		`SELECT started_at FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
-		space, digest).Scan(&started)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ReleaseNone, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("registry: cancel release lookup: %w", err)
-	}
-	if started != nil {
-		return ReleaseInProgress, nil
-	}
-	if _, err := tx.Exec(ctx,
-		`DELETE FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
-		space, digest); err != nil {
-		return 0, fmt.Errorf("registry: cancel release: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("registry: commit cancel release: %w", err)
-	}
-	return ReleaseCancelledByWrite, nil
 }

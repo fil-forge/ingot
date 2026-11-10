@@ -101,9 +101,8 @@ func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plan
 		// The advance is GUARDED on root_cid: forge_root_cid moves to
 		// opr.Root only if the bucket's committed root still equals
 		// opr.Root. This closes the orphan-root hole — a writer whose
-		// logstore.Commit landed an op-root but whose subsequent CASRoot
-		// failed (cross-process race) leaves a durable op-root the bucket
-		// never adopted; without the guard, shipping that segment would
+		// log append landed an op-root but whose commit then failed
+		// leaves a durable op-root the bucket never adopted; without the guard, shipping that segment would
 		// advance forge_root past the bucket's real root.
 		for _, opr := range opRoots {
 			if !opr.Root.Defined() {
@@ -117,11 +116,10 @@ func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plan
 		}
 	}
 	// The segment's journaled blocks are on Forge now, so drop them, also
-	// when an earlier stamp already landed (idempotent). The UPDATE above
-	// took the segment row's lock first, so a commit that was journaling
-	// into this segment (journalBlocks holds a share lock on the row) has
-	// committed, and this statement sees its rows; any later commit sees the
-	// segment shipped and journals nothing.
+	// when an earlier stamp already landed (idempotent). A ship runs on the
+	// bucket's subject, as its commits do, so a commit that journaled into
+	// this segment has committed and this statement sees its rows; any later
+	// commit sees the segment shipped and journals nothing.
 	//
 	// Deleting a bucket, or emptying its root (EmptyRoot), locks its row and
 	// then deletes its journal rows, so the rows' bucket is locked first here

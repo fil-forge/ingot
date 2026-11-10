@@ -18,7 +18,7 @@ import (
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/cars"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 )
@@ -59,12 +59,13 @@ func cborBlock(t *testing.T, name string, links ...cid.Cid) block.Block {
 // directory whose bucket is gone is left out.
 func TestCatalogUsage(t *testing.T) {
 	ctx := context.Background()
-	mem := inmem.NewMemStore()
+	pool := pgtest.New(t)
+	mem := registry.NewPostgres(pool)
 	space, err := did.Parse("did:web:catalog-usage.example")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := mem.Create(ctx, "bk", space, registry.CreateState{}); err != nil {
+	if err := mem.Create(ctx, "bk", space, registry.CreateState{Tenant: space}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -89,12 +90,15 @@ func TestCatalogUsage(t *testing.T) {
 	if _, err := s.AppendBatch(ctx, []block.Block{x, r1, r2}, blockstore.OpRoot{Bucket: "bk", Root: r2.Cid()}); err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	if err := mem.CASRoot(ctx, "bk", cid.Undef, r2.Cid()); err != nil {
-		t.Fatalf("CASRoot: %v", err)
+	// The bucket's root, as a commit of r2 leaves it.
+	if _, err := pool.Exec(ctx, `UPDATE ingot.buckets SET root_cid = $1 WHERE name = 'bk'`, r2.Cid().Bytes()); err != nil {
+		t.Fatalf("set root: %v", err)
 	}
 	var shipped registry.CatalogUsage
 	deadline := time.Now().Add(5 * time.Second)
 	for {
+		// The segment seals on age; a ship runs it, as queue-bucket.ship would.
+		_ = s.Ship(ctx)
 		usage, err := mem.CatalogUsage(ctx)
 		if err != nil {
 			t.Fatalf("CatalogUsage: %v", err)
@@ -185,7 +189,7 @@ func frame(b block.Block) int64 { return cars.FrameSize(b.Cid(), uint64(len(b.Ra
 // TestCatalogUsageJSON: the report forge-perf reads keeps its shape with no
 // bucket at all: an empty list and zero totals, every field present.
 func TestCatalogUsageJSON(t *testing.T) {
-	report, err := catalogUsage(context.Background(), inmem.NewMemStore(), filepath.Join(t.TempDir(), "segments"), nil)
+	report, err := catalogUsage(context.Background(), registry.NewPostgres(pgtest.New(t)), filepath.Join(t.TempDir(), "segments"), nil)
 	if err != nil {
 		t.Fatalf("catalogUsage: %v", err)
 	}

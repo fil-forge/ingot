@@ -22,22 +22,24 @@ import (
 
 	"github.com/fil-forge/ingot/blockstore"
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/uploader"
 )
 
 // These benchmarks measure go-fee as the body write and read paths drive it:
-// SplitBody → encryptingBlobWriter → fee.EncryptWithCEK → the spool's
-// sha256+file copy on the way in, and decryptingOpener → aesstream.SpanReader
-// over a spool section on the way out. The layered variants peel the pipeline
-// apart so each pass can be attributed: the disk, the spool hash, the body
-// hashes, the FEE stream, and the AES-GCM floor.
+// SplitSizedBody → encryptingBlobWriter → fee.EncryptWithCEK → the stream's
+// sha256, PUT and local copy on the way in, and decryptingOpener →
+// aesstream.SpanReader over a cache section on the way out. The layered
+// variants peel the pipeline apart so each pass can be attributed: the disk,
+// the body hashes, the FEE stream, and the AES-GCM floor.
 //
 // Every drain goes through sink rather than io.Discard: io.Discard implements
 // io.ReaderFrom with its own 8 KiB buffer, which would replace the copy
 // pattern each benchmark claims to measure. sink has no fast path, so an
 // io.Copy into it uses the source's WriteTo when it has one (the encrypt
-// reader, as the spool sees it) and the generic 32 KiB loop otherwise (the
+// reader, as the stream sees it) and the generic 32 KiB loop otherwise (the
 // body reader, as the response writer sees it); the read benchmarks pass
 // that loop one reused buffer so the copy itself adds nothing to allocs/op.
 
@@ -63,7 +65,7 @@ func benchData(n int64) []byte {
 }
 
 type benchEnc struct {
-	spool     *blockstore.Spool
+	cache     *blockstore.BlobCache
 	keys      regionkey.Provider
 	space     did.DID
 	recipient fee.Recipient
@@ -71,7 +73,7 @@ type benchEnc struct {
 
 func newBenchEnc(tb testing.TB) *benchEnc {
 	tb.Helper()
-	spool, err := blockstore.NewSpool(filepath.Join(tb.TempDir(), "spool"))
+	cache, err := blockstore.NewBlobCache(filepath.Join(tb.TempDir(), "cache"))
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -92,25 +94,30 @@ func newBenchEnc(tb testing.TB) *benchEnc {
 		tb.Fatal(err)
 	}
 	return &benchEnc{
-		spool:     spool,
+		cache:     cache,
 		keys:      keys,
 		space:     space,
 		recipient: fee.NewECDHESRecipient([]byte("bench-kid"), priv.PublicKey()),
 	}
 }
 
-// hashingDiscardWriter is Spool.WriteBlob without the file: the sha256 pass
-// over the envelope and nothing else.
-type hashingDiscardWriter struct{}
+// benchProvider takes each streamed blob and drains it, as a provider that
+// costs nothing would.
+type benchProvider struct{ testfakes.NopUploader }
 
-func (hashingDiscardWriter) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, error) {
-	h := sha256.New()
-	n, err := io.Copy(h, r)
-	if err != nil || n == 0 {
-		return nil, n, err
+func (benchProvider) PutBlob(_ context.Context, _ uploader.StreamedBlob, body io.Reader) error {
+	_, err := io.Copy(sink{}, body)
+	return err
+}
+
+// benchSplit streams data through enc as the write path does.
+func benchSplit(tb testing.TB, enc *bodyWriter, data []byte) msbucket.BlobRefs {
+	tb.Helper()
+	_, blobs, err := msbucket.SplitSizedBody(context.Background(), enc, bytes.NewReader(data), int64(len(data)), 0)
+	if err != nil {
+		tb.Fatal(err)
 	}
-	digest, err := mh.Encode(h.Sum(nil), mh.SHA2_256)
-	return digest, n, err
+	return blobs
 }
 
 // sink is a writer with no ReaderFrom fast path; see the package comment.
@@ -118,24 +125,9 @@ type sink struct{}
 
 func (sink) Write(p []byte) (int, error) { return len(p), nil }
 
-// discardWriter drains the envelope and names it by a counter, so the
-// encrypting writer's map stays happy without any hash pass.
-type discardWriter struct{ n int }
-
-func (d *discardWriter) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, error) {
-	n, err := io.Copy(sink{}, r)
-	if err != nil || n == 0 {
-		return nil, n, err
-	}
-	d.n++
-	sum := sha256.Sum256(fmt.Append(nil, d.n))
-	digest, err := mh.Encode(sum[:], mh.SHA2_256)
-	return digest, n, err
-}
-
-// BenchmarkIngest_Full is the production write path end to end: SplitBody's
+// BenchmarkIngest_Full is the production write path end to end: the split's
 // BLAKE3 tree + async md5, EncryptWithCEK with the tenant recipient, the
-// spool's sha256 + temp file + rename, and the region-key wrap.
+// stream's sha256, PUT and local copy, and the region-key wrap.
 func BenchmarkIngest_Full(b *testing.B) {
 	for _, size := range benchSizes {
 		b.Run(sizeName(size), func(b *testing.B) {
@@ -144,18 +136,15 @@ func BenchmarkIngest_Full(b *testing.B) {
 			b.SetBytes(size)
 			b.ReportAllocs()
 			for b.Loop() {
-				enc := newEncryptingBlobWriter(env.spool, env.keys, env.space, []fee.Recipient{env.recipient})
-				_, blobs, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0)
-				if err != nil {
-					b.Fatal(err)
-				}
-				// Deleting the blob is not part of ingest; keep it out of the
-				// measurement, and fail rather than let blobs pile up on disk.
+				enc := newEncryptingBlobWriter(benchProvider{}, env.keys, env.space, []fee.Recipient{env.recipient})
+				enc.cache = env.cache
+				benchSplit(b, enc, data)
+				// Dropping the copies is not part of ingest; keep it out of
+				// the measurement, and fail rather than let them pile up.
 				b.StopTimer()
-				for _, ref := range blobs {
-					if _, err := env.spool.Remove(ref.Digest); err != nil {
-						b.Fatal(err)
-					}
+				enc.drop()
+				if n := env.cache.InFlight(); n != 0 {
+					b.Fatalf("%d bytes left in the cache", n)
 				}
 				b.StartTimer()
 			}
@@ -163,8 +152,8 @@ func BenchmarkIngest_Full(b *testing.B) {
 	}
 }
 
-// BenchmarkIngest_NoDisk is the same path with the spool's file replaced by
-// nothing: the three hash passes, the FEE stream and the wrap remain.
+// BenchmarkIngest_NoDisk is the same path with no local copy: the three hash
+// passes, the FEE stream and the wrap remain.
 func BenchmarkIngest_NoDisk(b *testing.B) {
 	for _, size := range benchSizes {
 		b.Run(sizeName(size), func(b *testing.B) {
@@ -173,29 +162,8 @@ func BenchmarkIngest_NoDisk(b *testing.B) {
 			b.SetBytes(size)
 			b.ReportAllocs()
 			for b.Loop() {
-				enc := newEncryptingBlobWriter(hashingDiscardWriter{}, env.keys, env.space, []fee.Recipient{env.recipient})
-				if _, _, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
-	}
-}
-
-// BenchmarkIngest_NoSpoolHash drops the spool's sha256 too: SplitBody's body
-// hashes and the FEE stream only.
-func BenchmarkIngest_NoSpoolHash(b *testing.B) {
-	for _, size := range benchSizes {
-		b.Run(sizeName(size), func(b *testing.B) {
-			env := newBenchEnc(b)
-			data := benchData(size)
-			b.SetBytes(size)
-			b.ReportAllocs()
-			for b.Loop() {
-				enc := newEncryptingBlobWriter(&discardWriter{}, env.keys, env.space, []fee.Recipient{env.recipient})
-				if _, _, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0); err != nil {
-					b.Fatal(err)
-				}
+				enc := newEncryptingBlobWriter(benchProvider{}, env.keys, env.space, []fee.Recipient{env.recipient})
+				benchSplit(b, enc, data)
 			}
 		})
 	}
@@ -294,7 +262,7 @@ func BenchmarkGCMSeal(b *testing.B) {
 	}
 }
 
-// BenchmarkSHA256 is one sha256 pass over the data (the spool's ciphertext
+// BenchmarkSHA256 is one sha256 pass over the data (the stream's ciphertext
 // hash, the one sha256 ingot pays per body).
 func BenchmarkSHA256(b *testing.B) {
 	const size = 64 << 20
@@ -307,10 +275,10 @@ func BenchmarkSHA256(b *testing.B) {
 	}
 }
 
-// BenchmarkFileWrite is the spool's disk pass alone: the data written to a
+// BenchmarkFileWrite is the local copy's disk pass alone: the data written to a
 // temp file in sealed-chunk-sized pieces (256 KiB + tag, what the encrypt
-// reader's WriteTo hands the spool's MultiWriter), then renamed, as
-// Spool.WriteBlob does. Both ends are wrapped so neither bytes.Reader's
+// reader's WriteTo hands the stream's MultiWriter), then renamed, as
+// BlobCache.Adopt does. Both ends are wrapped so neither bytes.Reader's
 // WriteTo nor os.File's ReadFrom replaces that write pattern.
 func BenchmarkFileWrite(b *testing.B) {
 	for _, size := range benchSizes[1:] {
@@ -350,10 +318,13 @@ func BenchmarkFileWrite(b *testing.B) {
 // opener with its prefetched params, exactly as bodyOpener would build it.
 func benchStored(b *testing.B, env *benchEnc, data []byte) (msbucket.BlobRefs, *decryptingOpener) {
 	b.Helper()
-	enc := newEncryptingBlobWriter(env.spool, env.keys, env.space, []fee.Recipient{env.recipient})
-	_, body, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0)
-	if err != nil {
-		b.Fatal(err)
+	enc := newEncryptingBlobWriter(benchProvider{}, env.keys, env.space, []fee.Recipient{env.recipient})
+	enc.cache = env.cache
+	body := benchSplit(b, enc, data)
+	for digest, local := range enc.locals() {
+		if _, err := env.cache.Adopt(local, mh.Multihash(digest)); err != nil {
+			b.Fatal(err)
+		}
 	}
 	encMap := make(map[string]encBlob)
 	for _, ref := range body {
@@ -367,11 +338,11 @@ func benchStored(b *testing.B, env *benchEnc, data []byte) (msbucket.BlobRefs, *
 		}
 		encMap[string(ref.Digest)] = encBlob{params: params, storedSize: stored}
 	}
-	return body, &decryptingOpener{read: env.spool, keys: env.keys, enc: encMap}
+	return body, &decryptingOpener{read: env.cache, keys: env.keys, enc: encMap}
 }
 
 // BenchmarkRead_Full is the production read path: OpenBody over the
-// decrypting opener (region-key unwrap, spool section, SpanReader), drained
+// decrypting opener (region-key unwrap, cache section, SpanReader), drained
 // with io.Copy's 32 KiB reads as the response writer does.
 func BenchmarkRead_Full(b *testing.B) {
 	for _, size := range benchSizes {
@@ -486,10 +457,8 @@ func BenchmarkIngest_NoDiskParallel(b *testing.B) {
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			enc := newEncryptingBlobWriter(hashingDiscardWriter{}, env.keys, env.space, []fee.Recipient{env.recipient})
-			if _, _, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0); err != nil {
-				b.Fatal(err)
-			}
+			enc := newEncryptingBlobWriter(benchProvider{}, env.keys, env.space, []fee.Recipient{env.recipient})
+			benchSplit(b, enc, data)
 		}
 	})
 }

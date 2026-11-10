@@ -45,9 +45,9 @@ import (
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/uploader"
-	"github.com/fil-forge/libforge/syncutil"
 )
 
 // Backend implements versitygw's backend.Backend directly over the
@@ -57,88 +57,107 @@ import (
 type Backend struct {
 	backend.BackendUnsupported
 
-	read       blockstore.ReadStore
-	authority  bucketauthority.BucketAuthority
-	reg        registry.Registry
-	intents    registry.IntentStore
-	locations  registry.LocationStore
-	gc         registry.GCStore
-	multipart  registry.MultipartStore
-	txns       *bucketop.Coordinator
-	log        blockstore.Log
-	spool      *blockstore.Spool
-	cache      *blockstore.BlobCache
-	uploader   uploader.BodyUploader
-	deferred   uploader.DeferredBodyUploader
-	parks      registry.ParkStore
-	remover    uploader.BlobRemover
-	registrar  uploader.UploadRegistrar
-	uploadRegs registry.UploadRegistrationStore
+	read      blockstore.ReadStore
+	authority bucketauthority.BucketAuthority
+	reg       registry.Registry
+	intents   registry.IntentStore
+	locations registry.LocationStore
+	gc        registry.GCStore
+	multipart registry.MultipartStore
+	txns      *bucketop.Coordinator
+	log       blockstore.Log
+	cache     *blockstore.BlobCache
+	deferred  uploader.DeferredBodyUploader
+	parks     registry.ParkStore
+	remover   uploader.BlobRemover
+	registrar uploader.UploadRegistrar
+	// tasks runs the queue-space-upload tasks (RegisterUploadTasks).
+	tasks *taskrunner.Runner
+	// shards runs the queue-shard tasks that keep the cache's copies
+	// (RegisterShardTasks). renewals is when this process last renewed each cached blob's time in
+	// the cache, and cacheTTL how long a renewal lasts.
+	shards   *taskrunner.Runner
+	renewals *recencyMap
+	// lent is the authority requests lend for their spaces while they wait
+	// on queued work (lendAuthority).
+	lent     lends
+	cacheTTL time.Duration
+	// uploadRetry is the queue-space-upload retry policy, and drainTimeout
+	// how long a bucket delete waits for its space's changes; tests shorten
+	// both.
+	uploadRetry  taskrunner.RetryPolicy
+	drainTimeout time.Duration
+	// failedPage overrides how many failed tasks a bucket delete's drain
+	// lists per query, for tests; zero takes uploadRegistrationBatch.
+	failedPage int
 	encParams  registry.EncryptionParamsStore
-	// streaming sends a body blob to its provider while it is spooled;
-	// streams records each such upload until its park or acceptance is
-	// recorded.
+	// streaming sends each body blob to its provider as the body arrives.
 	streaming uploader.StreamingBodyUploader
-	streams   registry.StreamStore
-	// pendingReleases is the deferred-release queue; releaseGrace is how far
-	// past the last-claim drop each release is scheduled (readers holding the
+	// claims counts a blob's claims for a release's recheck; releases runs
+	// the queue-space-shard tasks (RegisterReleaseTasks); releaseGrace is how
+	// far past the last-claim drop each release is due (readers holding the
 	// prior catalog root get at least this long to finish their prefetch).
-	pendingReleases registry.PendingReleaseStore
-	releaseGrace    time.Duration
+	claims   registry.BlobRefStore
+	releases *taskrunner.Runner
+	// buckets runs the queue-bucket tasks (RegisterBucketTasks).
+	buckets *taskrunner.Runner
+	// uploads runs the queue-multipart-upload tasks
+	// (RegisterMultipartTasks).
+	uploads *taskrunner.Runner
+	// acceptDelay is how long after a part lands its upload's accept is due:
+	// none, but tests delay it so that only they run it.
+	acceptDelay time.Duration
+	// multipartTTL is how long an upload stays open before its auto-abort,
+	// and a completed one is kept (Deps.MultipartSessionTTL).
+	multipartTTL time.Duration
+	// shipMu guards shipReady and earlyShips: the ships the catalog log
+	// reported before the ship handler was registered, which registering it
+	// queues.
+	shipMu     sync.Mutex
+	shipReady  bool
+	earlyShips []string
+	// shipOwed are the buckets whose ship could not be queued, which
+	// retryOwedShips queues once it can; shipRetrying is set while it runs,
+	// and shipStop, closed by Drain, ends it. shipMu guards them too.
+	shipOwed map[string]bool
+	// shipAwaiting are the buckets whose ship found no authority to send
+	// with, which the bucket's next commit queues again (awaitShipAuthority).
+	shipAwaiting map[string]bool
+	shipRetrying bool
+	shipStop     chan struct{}
+	shipStopped  bool
+	releaseGrace time.Duration
+	// releaseRetry is the queue-space-shard.release retry policy; tests
+	// shorten it.
+	releaseRetry taskrunner.RetryPolicy
 	// Local blob sweeper knobs (see Deps). localBlobSweepMu serialises
 	// SweepLocalBlobs; lastOrphanPass is when its orphan pass last ran.
-	// localBlobSweepBatch overrides the rows a pass reads per query, for
-	// tests; zero takes the default.
 	localBlobMaxBytes  int64
-	cacheMinResidency  time.Duration
-	cacheReadRetention time.Duration
 	localBlobOrphanAge time.Duration
 	dropAcceptedBodies bool
 	localBlobSweepMu   sync.Mutex
-	// blobKeys serialises, within this process, the writes that make one
-	// (space, digest) durable on its provider, keyed by blobKey: the check
-	// for a location or a park, the upload or park, and the row that records
-	// it, so a second write of the same bytes finds the first's row. The
-	// registry stays the guard between instances (ParkStore.PutPark refuses
-	// to overwrite a park).
-	blobKeys syncutil.KeyedMutex
-	// acceptors runs each multipart upload's acceptor (see acceptor.go).
-	acceptors acceptors
-	// concluding counts, by blobKey, the conclusions in flight in this
-	// process (see markConcluding).
-	concluding          concludingSet
-	lastOrphanPass      time.Time
-	localBlobSweepBatch int
+	lastOrphanPass     time.Time
 	// overBudgetWarned and timeLimitLogged are set once the sweeper has
-	// logged that usage is over budget with nothing left to evict, or that an
-	// eviction pass (budget or forced, whichever ran out first) ran out of
-	// time, and cleared when usage falls back to the low watermark, so each
-	// message comes once per episode. lastForcedWarn is when the forced pass
-	// last warned that it evicted inside the retention windows; a forced pass
-	// usually brings usage back under budget, so that warning is limited by
-	// time instead. Guarded by localBlobSweepMu.
+	// logged that usage is over budget with nothing left to evict, or that the
+	// budget pass ran out of time, and cleared when usage falls back to the
+	// low watermark, so each message comes once per episode. Guarded by
+	// localBlobSweepMu.
 	overBudgetWarned bool
 	timeLimitLogged  bool
-	lastForcedWarn   time.Time
-	// stalledSpooled and stalledUploading are the sweeper's latest sums of
-	// stalled uploads by intent state (see SweepLocalBlobs), read by the
-	// stalled_bytes gauge; stalledKnown is set once a sweep has computed them.
-	stalledSpooled   atomic.Int64
+	// stalledUploading is the sweeper's latest sum of stalled uploads (see
+	// SweepLocalBlobs), read by the stalled_bytes gauge; stalledKnown is set
+	// once a sweep has computed it.
 	stalledUploading atomic.Int64
 	stalledKnown     atomic.Bool
 	// localBlobMetrics counts local blob removals; localBlobGauges is the
 	// registration of the usage and budget gauges (nil when not registered).
 	localBlobMetrics localBlobMetrics
 	localBlobGauges  metric.Registration
-	// multipartMetrics counts acceptor passes and deferred Completes;
+	// multipartMetrics counts part blobs' concludes and deferred Completes;
 	// multipartGauges is the registration of the parked-age gauge (nil when
-	// not registered). parkedAgeSeconds is the accept sweeper's latest
-	// measure of the oldest parked part's wait, read by that gauge;
-	// parkedAgeKnown is set once a sweep has measured it.
+	// not registered).
 	multipartMetrics multipartMetrics
 	multipartGauges  metric.Registration
-	parkedAgeSeconds atomic.Int64
-	parkedAgeKnown   atomic.Bool
 	// journalGauges is the registration of the catalog journal gauges (nil
 	// when not registered).
 	journalGauges metric.Registration
@@ -170,8 +189,8 @@ type Deps struct {
 	Authority bucketauthority.BucketAuthority
 	// Registry tracks per-bucket roots; IntentStore tracks each local blob's
 	// upload_intents lifecycle; LocationStore records where each accepted body
-	// blob can be retrieved from. Production passes one *registry.Postgres for
-	// all three; the harness one *inmem.MemStore.
+	// blob can be retrieved from. Production and tests pass one
+	// *registry.Postgres for all three.
 	Registry  registry.Registry
 	Intents   registry.IntentStore
 	Locations registry.LocationStore
@@ -187,11 +206,9 @@ type Deps struct {
 	Reads blockstore.ReadStore
 	Log   blockstore.Log
 
-	// Spool is where SplitBody writes body blobs on PUT and where each waits
-	// until the provider holds it; Cache then holds it as a read-after-write
-	// copy until it is evicted. Reads serves both (blockstore.LocalBlobs).
-	// Both are required.
-	Spool *blockstore.Spool
+	// Cache holds a read-after-write copy of each object-body blob written
+	// here, from when the provider holds it until it is evicted. Reads serves
+	// it first. Required.
 	Cache *blockstore.BlobCache
 
 	// Ships is the catalog log's ship uploader. Each commit hands it its
@@ -199,13 +216,10 @@ type Deps struct {
 	// (bucketop.Deps.Ships). Optional.
 	Ships bucketop.ShipAuthority
 
-	// Uploader makes each spooled body blob durable on Forge (allocate→PUT→
-	// accept) synchronously, before the manifest commits. Remover releases a
-	// space's claim on a blob when its last reference is dropped.
-	Uploader uploader.BodyUploader
-	// Deferred extends Uploader for multipart's deferred accept
-	// (WithConclude(false), then ConcludeBlobs/AbortBlob); Parks persists
-	// park state between UploadPart and Complete/Abort.
+	// Deferred concludes and aborts blobs parked on their providers
+	// (ConcludeBlobs/AbortBlob); Parks persists park state between
+	// UploadPart and Complete/Abort. Remover releases a space's claim on a
+	// blob when its last reference is dropped.
 	Deferred uploader.DeferredBodyUploader
 	Parks    registry.ParkStore
 	Remover  uploader.BlobRemover
@@ -213,16 +227,10 @@ type Deps struct {
 	// catalog: one entry per committed object version, which is what the
 	// service counts to report the space's object count.
 	Registrar uploader.UploadRegistrar
-	// UploadRegs is the outbox the registration sweeper drains.
-	UploadRegs registry.UploadRegistrationStore
 
-	// Streaming uploads each body blob while it is spooled,
-	// allocating it by size and hash function before its digest is known;
-	// Streams records each such upload until its park or acceptance is recorded.
-	// Without Streaming every blob is spooled first and uploaded by digest.
-	// Streams is required with it.
+	// Streaming uploads each body blob as the body arrives, allocating it by
+	// size and hash function before its digest is known. Required.
 	Streaming uploader.StreamingBodyUploader
-	Streams   registry.StreamStore
 
 	// EncParams is the per-blob FEE encryption-parameter table: what the
 	// decrypting read path needs to serve an encrypted blob. RegionKeys
@@ -237,43 +245,39 @@ type Deps struct {
 	// Required: a write that cannot obtain it fails.
 	TenantKeys tenantkey.Source
 
-	// PendingReleases is the deferred-release queue (blob_release_intents):
-	// a last-claim drop enqueues here and the release sweeper executes after
-	// ReleaseGrace. Same instance as Registry in production. Required.
-	PendingReleases registry.PendingReleaseStore
+	// Claims counts the claims on a blob, which a release rechecks before it
+	// removes the blob. Same instance as Registry in production. Required.
+	Claims registry.BlobRefStore
 	// ReleaseGrace schedules each release this far past its last-claim drop.
 	// Zero means immediately due (the server applies the production default
-	// before construction; tests use zero so a manual sweep drains).
+	// before construction; tests use zero so releases run as soon as they are
+	// queued).
 	ReleaseGrace time.Duration
+	// MultipartSessionTTL bounds a multipart upload: an open one is aborted
+	// this long after its creation, and a completed one kept this long after
+	// its Complete. Zero means 7 days; negative, never.
+	MultipartSessionTTL time.Duration
 
-	// LocalBlobMaxBytes is the byte budget for the spool and the cache
-	// together, writes in progress included, enforced by SweepLocalBlobs.
-	// Zero turns the budget and forced passes off: eviction needs a network
-	// read tier to serve evicted blobs, which the in-memory fakes do not
-	// have.
+	// LocalBlobMaxBytes is the byte budget for the cache, writes in progress
+	// included, enforced by SweepLocalBlobs.
+	// Zero turns the budget pass off: eviction needs a network read tier to
+	// serve evicted blobs, which the test fakes do not have.
 	LocalBlobMaxBytes int64
-	// CacheMinResidency is how long after its last state change (for a
-	// committed blob, its commit) the budget pass leaves a blob alone, so a
-	// client reading back what it just wrote reads from local disk. Zero
-	// turns it off.
-	CacheMinResidency time.Duration
-	// CacheReadRetention is how long after a read from the cache the budget
-	// pass leaves a blob alone, so objects read repeatedly stay local. Zero
-	// turns it off.
-	CacheReadRetention time.Duration
+	// CacheTTL is how long a blob stays in the cache after it was cached or
+	// last read, unless the budget pass evicts it first. Zero →
+	// DefaultCacheTTL.
+	CacheTTL time.Duration
 	// LocalBlobOrphanAge is the age at which SweepLocalBlobs deletes a .tmp-*
-	// file in either directory, or a spool blob file with no intent row. Zero →
-	// DefaultLocalBlobOrphanAge.
+	// file in the cache. Zero → DefaultLocalBlobOrphanAge.
 	LocalBlobOrphanAge time.Duration
-	// DropAcceptedBodies removes each body's local copy as soon as its
-	// location is recorded and its intent accepted, instead of moving it
-	// into the cache for reads. Off in the in-memory harness, whose base
-	// tier cannot serve a body. It gives up the read-after-write copy, which
-	// is safe while reads resolve through the local location table; an
-	// indexer-backed locator could miss a digest not yet published.
+	// DropAcceptedBodies keeps no local copy of a body, so every read goes to
+	// its provider. Off in tests whose base tier cannot serve a body. It
+	// gives up the read-after-write copy, which is safe while reads resolve
+	// through the local location table; an indexer-backed locator could miss
+	// a digest not yet published.
 	DropAcceptedBodies bool
 
-	// MeterProvider supplies the spool's instruments: usage and budget
+	// MeterProvider supplies the cache's instruments: usage and budget
 	// gauges, and removals by reason. Nil → the global provider, a no-op
 	// until a host installs one.
 	MeterProvider metric.MeterProvider
@@ -333,34 +337,34 @@ func New(d Deps) *Backend {
 		localBlobOrphanAge = DefaultLocalBlobOrphanAge
 	}
 	b := &Backend{
-		authority:       d.Authority,
-		read:            d.Reads,
-		reg:             d.Registry,
-		intents:         d.Intents,
-		locations:       d.Locations,
-		gc:              d.GC,
-		multipart:       d.Multipart,
-		txns:            bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads, Ships: d.Ships}),
-		log:             d.Log,
-		spool:           d.Spool,
-		cache:           d.Cache,
-		uploader:        d.Uploader,
-		deferred:        d.Deferred,
-		parks:           d.Parks,
-		remover:         d.Remover,
-		streaming:       d.Streaming,
-		streams:         d.Streams,
-		registrar:       d.Registrar,
-		uploadRegs:      d.UploadRegs,
-		encParams:       d.EncParams,
-		regionKeys:      d.RegionKeys,
-		tenantKeys:      d.TenantKeys,
-		pendingReleases: d.PendingReleases,
-		releaseGrace:    d.ReleaseGrace,
+		authority:    d.Authority,
+		read:         d.Reads,
+		reg:          d.Registry,
+		intents:      d.Intents,
+		locations:    d.Locations,
+		gc:           d.GC,
+		multipart:    d.Multipart,
+		txns:         bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads, Ships: d.Ships}),
+		log:          d.Log,
+		cache:        d.Cache,
+		deferred:     d.Deferred,
+		parks:        d.Parks,
+		remover:      d.Remover,
+		streaming:    d.Streaming,
+		registrar:    d.Registrar,
+		uploadRetry:  uploadRegistrationRetry,
+		drainTimeout: uploadDrainTimeout,
+		encParams:    d.EncParams,
+		regionKeys:   d.RegionKeys,
+		tenantKeys:   d.TenantKeys,
+		claims:       d.Claims,
+		releaseRetry: releaseRetry,
+		releaseGrace: d.ReleaseGrace,
+		multipartTTL: d.MultipartSessionTTL,
 
 		localBlobMaxBytes:  d.LocalBlobMaxBytes,
-		cacheMinResidency:  d.CacheMinResidency,
-		cacheReadRetention: d.CacheReadRetention,
+		cacheTTL:           cmp.Or(d.CacheTTL, DefaultCacheTTL),
+		renewals:           newRecencyMap(renewalCapacity),
 		localBlobOrphanAge: localBlobOrphanAge,
 		dropAcceptedBodies: d.DropAcceptedBodies,
 
@@ -396,12 +400,12 @@ func (*Backend) Shutdown() {}
 // invariants need verifying before the listener accepts traffic.
 func (b *Backend) Recover(_ context.Context) error { return nil }
 
-// Drain shuts the log down via the Coordinator: seals the open
-// segment, drains the flush queue, and updates per-bucket
-// forge_root_cid for every op_root that landed in a flushed
-// segment. After Drain returns cleanly, no acked write is
-// unrepresented in Postgres.
+// Drain shuts the log down via the Coordinator: it seals each bucket's
+// open segment, which ships from the bucket's queue once the log is open
+// again. After Drain returns cleanly, no acked write is unrepresented in
+// Postgres.
 func (b *Backend) Drain(ctx context.Context) error {
+	b.stopShipRetries()
 	if b.txns == nil {
 		return nil
 	}

@@ -20,7 +20,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/revocation"
 )
@@ -181,7 +181,7 @@ func waitFor(t *testing.T, cond func() bool) {
 
 func TestConsumerStartsAtTheHeadWithNoCursor(t *testing.T) {
 	ctx := context.Background()
-	store := inmem.NewMemStore()
+	store := registry.NewPostgres(pgtest.New(t))
 	src := &fakeSource{}
 	c := revocation.NewConsumer(src, store, &fakeInvalidator{})
 	stop := run(c)
@@ -198,7 +198,7 @@ func TestConsumerStartsAtTheHeadWithNoCursor(t *testing.T) {
 
 func TestConsumerResumesAfterStoredCursor(t *testing.T) {
 	ctx := context.Background()
-	store := inmem.NewMemStore()
+	store := registry.NewPostgres(pgtest.New(t))
 	require.NoError(t, store.PutRevocationCursor(ctx, registry.RevocationCursor{
 		Token:      "cursor-earlier",
 		RecordedAt: time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC),
@@ -223,7 +223,7 @@ func TestConsumerRetriesTheHeadUntilTheServiceAnswers(t *testing.T) {
 		errors.New("connection refused"),
 	}}
 	core, logs := observer.New(zap.WarnLevel)
-	c := revocation.NewConsumer(src, inmem.NewMemStore(), &fakeInvalidator{},
+	c := revocation.NewConsumer(src, registry.NewPostgres(pgtest.New(t)), &fakeInvalidator{},
 		revocation.WithLogger(zap.New(core)),
 		revocation.WithBackoff(time.Millisecond, time.Millisecond))
 	stop := run(c)
@@ -239,7 +239,7 @@ func TestConsumerStopsWhileWaitingForTheHead(t *testing.T) {
 	src := &fakeSource{headErrs: []error{errors.New("connection refused")}}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	c := revocation.NewConsumer(src, inmem.NewMemStore(), &fakeInvalidator{},
+	c := revocation.NewConsumer(src, registry.NewPostgres(pgtest.New(t)), &fakeInvalidator{},
 		revocation.WithBackoff(time.Hour, time.Hour))
 	go func() { defer close(done); c.Run(ctx) }()
 
@@ -295,9 +295,9 @@ func TestConsumerRetriesAFailedHeadSave(t *testing.T) {
 }
 
 // storedCursor returns a store holding a cursor from before a refusal.
-func storedCursor(t *testing.T) *inmem.MemStore {
+func storedCursor(t *testing.T) *registry.Postgres {
 	t.Helper()
-	store := inmem.NewMemStore()
+	store := registry.NewPostgres(pgtest.New(t))
 	require.NoError(t, store.PutRevocationCursor(context.Background(), registry.RevocationCursor{
 		Token:      "cursor-moved",
 		RecordedAt: time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC),
@@ -388,7 +388,7 @@ func TestConsumerInvalidatesAndPersistsCursor(t *testing.T) {
 	rec1 := record(t, "dlg-1", at1)
 	rec2 := record(t, "dlg-2", at2)
 
-	store := inmem.NewMemStore()
+	store := registry.NewPostgres(pgtest.New(t))
 	inv := &fakeInvalidator{}
 	src := &fakeSource{scripts: []streamScript{{records: []swarfclient.Event{rec1, rec2}}}}
 	c := revocation.NewConsumer(src, store, inv,
@@ -558,7 +558,7 @@ func TestConsumerReconnectsFromLastRecord(t *testing.T) {
 		// Second connection ends cleanly (server close), forcing a third.
 		{},
 	}}
-	c := revocation.NewConsumer(src, inmem.NewMemStore(), &fakeInvalidator{},
+	c := revocation.NewConsumer(src, registry.NewPostgres(pgtest.New(t)), &fakeInvalidator{},
 		revocation.WithBackoff(time.Millisecond, time.Millisecond))
 	stop := run(c)
 	defer stop()
@@ -572,7 +572,7 @@ func TestConsumerReconnectsFromLastRecord(t *testing.T) {
 
 func TestConsumerStopsOnCancel(t *testing.T) {
 	src := &fakeSource{} // no scripts: the stream blocks until ctx cancel
-	c := revocation.NewConsumer(src, inmem.NewMemStore(), &fakeInvalidator{})
+	c := revocation.NewConsumer(src, registry.NewPostgres(pgtest.New(t)), &fakeInvalidator{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

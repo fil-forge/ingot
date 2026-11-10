@@ -20,7 +20,7 @@ import (
 
 	"github.com/fil-forge/ingot/cars"
 	"github.com/fil-forge/ingot/iam"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/registry"
 )
@@ -97,7 +97,7 @@ func TestForgeSegments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mem := inmem.NewMemStore()
+	mem := registry.NewPostgres(pgtest.New(t))
 	blobs := &fakeBlobs{cars: map[string][]byte{}}
 	shard := func(blocks ...block.Block) mh.Multihash {
 		var buf bytes.Buffer

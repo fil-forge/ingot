@@ -12,15 +12,13 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/oklog/ulid/v2"
-	"go.uber.org/zap"
-
-	uploadcmds "github.com/fil-forge/libforge/commands/upload"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // This file implements the per-key version-tree design of
@@ -271,42 +269,6 @@ type discardedVersion struct {
 	manifest cid.Cid
 }
 
-// commitVersion runs the §5 write rule for one new version (a PutObject /
-// CopyObject / CompleteMultipartUpload manifest, or a delete marker): it
-// allocates the seq under the per-bucket critical section, stamps mf with
-// Seq/VersionID, supersedes the current version per the bucket's versioning
-// state, splices the rebuilt value (the manifest itself until the key's
-// first retained supersession creates its leaf, §2.1/§5.2), and carries the
-// reference index with the commit: claims for the new version, drops (and
-// releases) for discarded ones, all in the root swap's transaction.
-// preCheck, when non-nil, runs under
-// the lock against the superseded current manifest (nil when the key is new)
-// before anything is written, so conditional mutations are race-safe.
-//
-// blobs is the body's blob list as written; the commit cuts it into the
-// manifest's inline list and extent blocks (msbucket.BuildBlobList) and
-// claims its digests. Nil means mf.Body.Blobs is final as it stands (a
-// delete marker, which has no blobs).
-//
-// initState, when non-nil, is the new version's creation-time lock state
-// (the x-amz-object-lock-* headers): it is stamped into the key's
-// version-state tree in this same commit, forcing the leaf form for a new
-// key, so the version and its protections land in one root swap
-// (docs/s3-object-lock.md §7).
-//
-// The returned VersioningState is the bucket state read UNDER the lock — the
-// state that actually decided the version's id. Response shaping must gate on
-// it, not on the caller's pre-lock snapshot, so a racing PutBucketVersioning
-// can't mint an id the response then omits.
-//
-// pinned says the body's digests belong to another object of the space (a
-// same-space copy) rather than to this write's own ingest: their claims are
-// then taken conditionally (see addClaims), and the commit fails with
-// registry.ErrClaimGone if the source is gone.
-func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, blobs msbucket.BlobRefs, initState *msbucket.VersionState, pinned bool, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
-	return b.commitVersionAt(ctx, bucketState, key, mf, blobs, initState, pinned, nil, preCheck)
-}
-
 // versionReservation is what a multipart Complete reported of its version
 // while it still had parts to accept: a seq and id taken before the commit
 // lock by reserveVersion, or, with VersionID empty, no id at all, which
@@ -328,7 +290,7 @@ type versionReservation struct {
 var errReservationSuperseded = errors.New("reserved version superseded")
 
 // reserveVersion allocates a version seq and mints its id ahead of the
-// commit, for an Enabled bucket. Only commitVersionAt may install it, and it
+// commit, for an Enabled bucket. Only applyPut may install it, and it
 // refuses to once the reservation is superseded (errReservationSuperseded).
 // A reservation that never commits leaves a harmless seq gap.
 func (b *Backend) reserveVersion(ctx context.Context, bucket string) (versionReservation, error) {
@@ -339,19 +301,71 @@ func (b *Backend) reserveVersion(ctx context.Context, bucket string) (versionRes
 	return versionReservation{Seq: seq, VersionID: mintVersionID(seq)}, nil
 }
 
-// commitVersionAt is commitVersion under what a Complete reported
-// (versionReservation) when reserved is non-nil. Under the lock it
-// re-checks that a reserved version is still the key's newest in an Enabled
-// bucket, which keeps invariant 2 of docs/s3-versioning.md §2.4 although
-// the seq was allocated outside the lock, and that a Complete that reported
-// no id commits no numbered version.
-func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, blobs msbucket.BlobRefs, initState *msbucket.VersionState, pinned bool, reserved *versionReservation, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
+// applyPut runs the §5 write rule for one new version (a PutObject /
+// CopyObject / CompleteMultipartUpload manifest, or a delete marker): it
+// allocates the seq, stamps the manifest with Seq/VersionID, supersedes the
+// current version per the bucket's versioning state at the commit, splices
+// the rebuilt value (the manifest itself until the key's first retained
+// supersession creates its leaf, §2.1/§5.2), and carries the reference index
+// with the commit: claims for the new version, drops (and releases) for
+// discarded ones. The put's preconditions run against the superseded current
+// manifest (nil when the key is new) before anything is written.
+//
+// The put's blobs are the body's blob list as written; the commit cuts it
+// into the manifest's inline list and extent blocks (msbucket.BuildBlobList)
+// and claims its digests. A put without them claims the manifest's body as
+// it stands (a delete marker, which has no blobs).
+//
+// Its init state, when set, is the new version's creation-time lock state
+// (the x-amz-object-lock-* headers): it is stamped into the key's
+// version-state tree in this same commit, forcing the leaf form for a new
+// key, so the version and its protections land in one root advance
+// (docs/s3-object-lock.md §7).
+//
+// Its refs are the write's pending references to the body's blobs, which the
+// commit's claims take over (see addClaims); one already gone fails the put
+// with ErrReferenceExpired.
+//
+// A put under what a Complete reported (Reserved) re-checks that a reserved
+// version is still the key's newest in an Enabled bucket, which keeps
+// invariant 2 of docs/s3-versioning.md §2.4 although the seq was allocated
+// before the commit, and that a Complete that reported no id commits no
+// numbered version.
+func (b *Backend) applyPut(ctx context.Context, sc *commitScope, key string, p *PutChange) (ChangeResult, cid.Cid, error) {
+	tx := sc.tx
+	mf, blobs, initState := p.Manifest, p.putBlobs(), p.InitState
+	if mf == nil {
+		return ChangeResult{}, cid.Undef, taskrunner.Permanent(fmt.Errorf("put of %q has no manifest", key))
+	}
+	refs, err := refMap(p.Refs)
+	if err != nil {
+		return ChangeResult{}, cid.Undef, taskrunner.Permanent(fmt.Errorf("put of %q: %w", key, err))
+	}
+	if len(refs) > 0 {
+		ids := make([]taskrunner.TaskID, 0, len(refs))
+		for _, id := range refs {
+			ids = append(ids, id)
+		}
+		held, err := b.reg.PendingRefsHeld(ctx, ids)
+		if err != nil {
+			return ChangeResult{}, cid.Undef, err
+		}
+		if !held {
+			return ChangeResult{}, cid.Undef, registry.ErrReferenceExpired
+		}
+	}
+	var reserved *versionReservation
+	if p.Reserved != nil {
+		reserved = &versionReservation{Seq: p.Reserved.Seq, VersionID: p.Reserved.VersionID}
+	}
+	preCheck, err := b.putPreCheck(ctx, p)
+	if err != nil {
+		return ChangeResult{}, cid.Undef, err
+	}
 	var node msbucket.VersionNode
-	var effState registry.VersioningState
-	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
+	root, err := func() (cid.Cid, error) {
 		var discards []discardedVersion
 		st := tx.State()
-		effState = st.Versioning
 
 		// The ordinal is allocated inside the critical section so seq order
 		// matches commit order per bucket; a failed commit leaves a harmless gap.
@@ -429,8 +443,8 @@ func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.Sta
 			return cid.Undef, errReservationSuperseded
 		}
 
-		// Race-safe re-check of the caller's preconditions against the current
-		// state under the lock.
+		// The caller's preconditions, against the key's current version as
+		// the commit sees it.
 		if preCheck != nil {
 			if err := preCheck(supersededMf); err != nil {
 				return cid.Undef, err
@@ -482,9 +496,7 @@ func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.Sta
 				}
 				discards = append(discards, discardedVersion{superseded.VersionID, superseded.Seq, digests, superseded.Manifest})
 				discardSeqs = append(discardSeqs, superseded.Seq)
-				if err := b.gc.AddGCCandidate(ctx, superseded.Manifest.Bytes(), st.Name); err != nil {
-					return cid.Undef, fmt.Errorf("gc candidate: %w", err)
-				}
+				tx.AddGCCandidate(superseded.Manifest)
 			}
 
 			// Only one null per key: a new null evicts a noncurrent null (§2.4).
@@ -510,9 +522,7 @@ func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.Sta
 						if prevTree, err = prevTree.Delete(ctx, nullKey); err != nil {
 							return cid.Undef, fmt.Errorf("prev delete null: %w", err)
 						}
-						if err := b.gc.AddGCCandidate(ctx, nullCid.Bytes(), st.Name); err != nil {
-							return cid.Undef, fmt.Errorf("gc candidate: %w", err)
-						}
+						tx.AddGCCandidate(nullCid)
 						evictedNull = true
 					case errors.Is(nerr, mst.ErrNotFound):
 						// NullSeq stale (shouldn't happen); nothing to evict.
@@ -527,9 +537,7 @@ func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.Sta
 			// old block either lives on as a prev entry or was queued for GC
 			// on the discard path above.
 			if oldLeaf != nil {
-				if err := b.gc.AddGCCandidate(ctx, oldValCid.Bytes(), st.Name); err != nil {
-					return cid.Undef, fmt.Errorf("gc candidate: %w", err)
-				}
+				tx.AddGCCandidate(oldValCid)
 			}
 		}
 
@@ -611,8 +619,8 @@ func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.Sta
 		node = newNode
 
 		// Reference index (§8): the new generation's claims land and the
-		// discarded generations' claims drop in the root swap's transaction,
-		// each last-claim drop recording a deferred release. A commit that
+		// discarded generations' claims drop with the root's advance,
+		// each last-claim drop queueing a release. A commit that
 		// fails writes none of them; a racing writer that later supersedes
 		// this generation always finds the rows to drop.
 		claimed := blobs.DigestList()
@@ -621,92 +629,49 @@ func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.Sta
 				return cid.Undef, err
 			}
 		}
-		b.addClaims(tx, st, key, claimVersionID(vid, seq), claimed, pinned)
+		b.addClaims(tx, st, key, claimVersionID(vid, seq), claimed, refs)
 		for _, d := range discards {
-			b.dropClaims(tx, st, key, claimVersionID(d.versionID, d.seq), d.digests)
+			b.dropClaims(sc, st, key, claimVersionID(d.versionID, d.seq), d.digests)
 		}
 
 		// Content entries (the space's object count): this version registers,
 		// the ones it discarded retract. Queued in the commit's own
-		// transaction, so the rows exist exactly when the version does, and
-		// numbered under this lock, so the sweeper replays a key's changes in
-		// commit order. Every write rule runs through here, so a PUT, a
+		// transaction, so the rows exist exactly when the version does, on
+		// queue-space-upload's subject for the space, so a key's changes go out
+		// in commit order. Every write rule runs through here, so a PUT, a
 		// multipart Complete, a CopyObject destination and a delete marker all
 		// count as one object — which is what AWS reports for NumberOfObjects.
-		b.enqueueRegistration(ctx, tx, st, key, mfCid, registry.UploadRegistrationAdd)
+		b.register(sc, st, key, mfCid, registry.UploadRegistrationAdd)
 		for _, d := range discards {
-			b.enqueueRegistration(ctx, tx, st, key, d.manifest, registry.UploadRegistrationRemove)
+			b.register(sc, st, key, d.manifest, registry.UploadRegistrationRemove)
 		}
 		return t2.GetPointer(ctx, tx)
-	})
+	}()
 	if err != nil {
-		return node, effState, mapCommitError(err, "commit version")
+		return ChangeResult{}, cid.Undef, err
 	}
-	return node, effState, nil
+	return ChangeResult{VersionID: node.VersionID, Seq: node.Seq}, root, nil
 }
 
-// enqueueRegistration queues one change to the space's content-entry list for
-// this commit to carry. Best-effort in one respect only: a request with no
-// proof store cannot produce authority for the sweeper to use later, and
-// failing the write over the object count would fail a write that otherwise
-// succeeded. The row is skipped and logged, and the count under-reports until
-// something registers that root again.
-func (b *Backend) enqueueRegistration(ctx context.Context, tx *bucketop.Tx, st *registry.State, key string, root cid.Cid, op registry.UploadRegistrationOp) {
-	if !root.Defined() {
-		return
-	}
-	cmd := uploadcmds.Add.Command
-	if op == registry.UploadRegistrationRemove {
-		cmd = uploadcmds.Remove.Command
-	}
-	proofs, err := b.registrar.CaptureAuthority(ctx, st.Space, cmd)
-	if err != nil {
-		b.logger.Warn("commit: no authority to queue an upload registration; object count will drift",
-			zap.String("bucket", st.Name),
-			zap.String("op", string(op)),
-			zap.Stringer("space", st.Space),
-			zap.Stringer("root", root),
-			zap.Error(err),
-		)
-		return
-	}
-	tx.EnqueueUploadRegistration(registry.UploadRegistration{
-		Bucket:    st.Name,
-		ObjectKey: key,
-		Space:     st.Space,
-		Root:      root,
-		Op:        op,
-		Proofs:    proofs,
-	})
-}
-
-// scopedDeleteResult reports a version-scoped delete: whether a version was
-// actually removed and whether it was a delete marker (§7.2). An absent
-// version is a success no-op (found=false), matching S3/versitygw.
-// versioning is the bucket state read under the commit lock, for response
-// shaping (§4.3).
-type scopedDeleteResult struct {
-	found      bool
-	wasMarker  bool
-	versioning registry.VersioningState
-}
-
-// deleteVersionScoped permanently removes one specific version (§7.2): the
+// applyDeleteVersion permanently removes one specific version (§7.2): the
 // current version (promoting the newest prev entry, or dropping the leaf when
 // none remain) or a prev entry. Its claims drop with the commit; delete
 // markers have none.
-func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry.State, key, versionID string, preconds *backend.ObjectDeletePreconditions) (scopedDeleteResult, error) {
+func (b *Backend) applyDeleteVersion(ctx context.Context, sc *commitScope, key, versionID string, pre *DeletePreconditions) (ChangeResult, cid.Cid, error) {
 	kind, seq := classifyVersionID(versionID)
 	switch kind {
 	case versionKindInvalid, versionKindCurrent:
-		return scopedDeleteResult{}, errInvalidVersionID(versionID)
+		return ChangeResult{}, cid.Undef, errInvalidVersionID(versionID)
 	}
-
-	var res scopedDeleteResult
-	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
-		res = scopedDeleteResult{}
+	var preconds *backend.ObjectDeletePreconditions
+	if pre != nil {
+		p := pre.preconditions()
+		preconds = &p
+	}
+	tx := sc.tx
+	var res ChangeResult
+	root, err := func() (cid.Cid, error) {
 		st := tx.State()
-		res.versioning = st.Versioning
 		if !st.Root.Defined() {
 			return cid.Undef, nil // no-op success: nothing to delete
 		}
@@ -746,14 +711,12 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 			if err != nil {
 				return cid.Undef, err
 			}
-			b.dropClaims(tx, st, key, claimVersionID(targetVersionID(kind, mf), mf.Seq), digests)
-			res.found, res.wasMarker = true, mf.DeleteMarker
+			b.dropClaims(sc, st, key, claimVersionID(targetVersionID(kind, mf), mf.Seq), digests)
+			res.Found, res.DeleteMarker = true, mf.DeleteMarker
 			// The version is gone for good, so the space stops counting it.
-			b.enqueueRegistration(ctx, tx, st, key, valCid, registry.UploadRegistrationRemove)
+			b.register(sc, st, key, valCid, registry.UploadRegistrationRemove)
 			// The value block is the manifest — one GC candidate covers it.
-			if err := b.gc.AddGCCandidate(ctx, valCid.Bytes(), st.Name); err != nil {
-				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
-			}
+			tx.AddGCCandidate(valCid)
 			t2, err := t.Delete(ctx, key)
 			if err != nil {
 				return cid.Undef, fmt.Errorf("mst delete: %w", err)
@@ -825,16 +788,12 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 		if err != nil {
 			return cid.Undef, err
 		}
-		b.dropClaims(tx, st, key, claimVersionID(targetVersionID(kind, targetMf), targetMf.Seq), digests)
-		res.found, res.wasMarker = true, targetMf.DeleteMarker
+		b.dropClaims(sc, st, key, claimVersionID(targetVersionID(kind, targetMf), targetMf.Seq), digests)
+		res.Found, res.DeleteMarker = true, targetMf.DeleteMarker
 		// The version is gone for good, so the space stops counting it.
-		b.enqueueRegistration(ctx, tx, st, key, targetCid, registry.UploadRegistrationRemove)
-		if err := b.gc.AddGCCandidate(ctx, targetCid.Bytes(), st.Name); err != nil {
-			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
-		}
-		if err := b.gc.AddGCCandidate(ctx, valCid.Bytes(), st.Name); err != nil {
-			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
-		}
+		b.register(sc, st, key, targetCid, registry.UploadRegistrationRemove)
+		tx.AddGCCandidate(targetCid)
+		tx.AddGCCandidate(valCid)
 
 		// The removed version's state entry goes with it, in this commit
 		// (docs/s3-object-lock.md §9). removedSeq covers all three exits.
@@ -900,11 +859,12 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 			return cid.Undef, err
 		}
 		return b.spliceLeaf(ctx, tx, t, key, newLeaf, prevTree)
-	})
+	}()
 	if err != nil {
-		return res, mapCommitError(err, "delete version")
+		return ChangeResult{}, cid.Undef, err
 	}
-	return res, nil
+	res.VersionID = versionID
+	return res, root, nil
 }
 
 // pruneVersionState removes seq's entry from a leaf's version-state tree,
@@ -925,9 +885,7 @@ func (b *Backend) pruneVersionState(ctx context.Context, tx *bucketop.Tx, st *re
 	if err != nil {
 		return nil, fmt.Errorf("state get: %w", err)
 	}
-	if err := b.gc.AddGCCandidate(ctx, scid.Bytes(), st.Name); err != nil {
-		return nil, fmt.Errorf("gc candidate: %w", err)
-	}
+	tx.AddGCCandidate(scid)
 	if t, err = t.Delete(ctx, revSeqKey(seq)); err != nil {
 		return nil, fmt.Errorf("state delete: %w", err)
 	}

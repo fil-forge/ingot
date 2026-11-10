@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 	"github.com/fil-forge/ucantone/did"
@@ -16,19 +16,18 @@ import (
 )
 
 // batchRecordingUploader is a parking uploader that records how many blobs
-// each conclude carried, so a test can tell one call carrying every blob from
-// a call per blob.
+// each conclude carried.
 type batchRecordingUploader struct {
-	inmem.NopUploader
+	testfakes.NopUploader
 	mu sync.Mutex
 	// calls holds the blob count of each ConcludeBlobs call, in order.
 	calls []int
 }
 
-func (u *batchRecordingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+func (u *batchRecordingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string) (uploader.UploadedBlob, error) {
 	// No Location: the blob parks, which is what UploadPart does.
 	c := cidOfDigest(digest)
-	return uploader.UploadedBlob{Digest: digest, Size: size, AddTask: c, AcceptTask: c}, nil
+	return uploader.UploadedBlob{Digest: digest, Size: size, AddTask: c, AcceptTask: c, PutInvocation: []byte("put")}, nil
 }
 
 func (u *batchRecordingUploader) ConcludeBlobs(ctx context.Context, space did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
@@ -38,11 +37,10 @@ func (u *batchRecordingUploader) ConcludeBlobs(ctx context.Context, space did.DI
 	return u.NopUploader.ConcludeBlobs(ctx, space, parked)
 }
 
-// TestCompleteConcludesPartsInOneCall is the batching gate on the completion
-// path: a multipart upload of many parts must conclude them all in a single
-// call, because each call is a round trip to the upload service and a
-// completion that pays one per part is what times out on large objects.
-func TestCompleteConcludesPartsInOneCall(t *testing.T) {
+// TestCompleteConcludesEachPartBlobOnce: Complete of an upload whose parts
+// were not yet accepted concludes each part's blob once, on its own, under
+// the blob's subject.
+func TestCompleteConcludesEachPartBlobOnce(t *testing.T) {
 	const parts = 5
 
 	b, mem, up := newBatchRecordingBackend(t)
@@ -54,7 +52,7 @@ func TestCompleteConcludesPartsInOneCall(t *testing.T) {
 	var digests []multihash.Multihash
 	for i := 1; i <= parts; i++ {
 		n := int32(i)
-		// Distinct bodies: identical parts would share one spooled blob and
+		// Distinct bodies: identical parts would share one stored blob and
 		// collapse the batch.
 		body := append(testBody(int(backend.MinPartSize)), byte(i))
 		out, err := mpUploadPart(t, b, key, uploadID, n, body, nil)
@@ -73,11 +71,13 @@ func TestCompleteConcludesPartsInOneCall(t *testing.T) {
 	calls := append([]int{}, up.calls...)
 	up.mu.Unlock()
 
-	if len(calls) != 1 {
-		t.Fatalf("Complete made %d ConcludeBlobs calls (%v), want 1", len(calls), calls)
+	if len(calls) != len(digests) {
+		t.Fatalf("Complete made %d ConcludeBlobs calls (%v), want one per blob (%d)", len(calls), calls, len(digests))
 	}
-	if calls[0] != len(digests) {
-		t.Errorf("ConcludeBlobs carried %d blobs, want all %d", calls[0], len(digests))
+	for _, n := range calls {
+		if n != 1 {
+			t.Fatalf("ConcludeBlobs calls = %v, want one blob each", calls)
+		}
 	}
 
 	// Every part blob is accepted, and its park is gone.
@@ -96,7 +96,7 @@ func TestCompleteConcludesPartsInOneCall(t *testing.T) {
 	}
 }
 
-func newBatchRecordingBackend(t *testing.T) (*Backend, *inmem.MemStore, *batchRecordingUploader) {
+func newBatchRecordingBackend(t *testing.T) (*Backend, *testStore, *batchRecordingUploader) {
 	t.Helper()
 	up := &batchRecordingUploader{}
 	b, mem := newDeferredBackend(t, up)

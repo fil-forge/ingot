@@ -11,8 +11,8 @@ import (
 	"github.com/fil-forge/ingot/blockstore/locator"
 )
 
-// fakeLocStore is a minimal in-test LocationReader + InclusionReader (avoids
-// importing inmem, which imports registry). Keyed by string(digest).
+// fakeLocStore is a minimal in-test LocationReader + InclusionReader, so the
+// locator's lookups are tested without a database. Keyed by string(digest).
 type fakeLocStore struct {
 	locs map[string]*BlobLocation
 	incs map[string]*BlobInclusion

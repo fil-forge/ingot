@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
@@ -17,222 +17,222 @@ import (
 
 // BlobCache holds local copies of blobs the provider already holds, keyed by
 // digest: a read-after-write cache, so a just-written blob is served straight
-// from disk, skipping the network read tier. A blob arrives only from the
-// Spool (Take), once the S3 layer has recorded that the provider holds it, so
-// every file here may be removed at any time; a read of a removed blob goes to
-// the network. Network reads do not fill it yet: a cache that fills on reads
-// is undecided and unbuilt, not ruled out.
+// from disk, skipping the network read tier. A write tees the blob into a
+// temporary file here as it streams it to the provider (CreateTemp), and the
+// S3 layer adopts the file under its digest once it has recorded that the
+// provider holds the blob (Adopt), so every blob file here may be removed at
+// any time; a read of a removed blob goes to the network. Network reads do
+// not fill it yet: a cache that fills on reads is undecided and unbuilt, not
+// ruled out.
 //
-// Like the Spool, it holds no policy: it knows a blob only as bytes under a
-// digest, and the S3 layer decides what to remove. Besides the files and their
-// byte count, it remembers in memory when each blob was last read from it,
-// which the S3 layer's eviction consults. At most one BlobCache may use a
-// directory at a time. Its directory must be on the Spool's filesystem, so
-// Take is a rename.
+// It holds no policy: it knows a blob only as bytes under a digest, and the
+// S3 layer decides what to remove and when. It tells the S3 layer about each
+// read it serves (OnRead), which extends the blob's time in the cache. At
+// most one BlobCache may use a directory at a time: NewBlobCache deletes
+// every temporary file it finds, which would destroy another live cache's
+// writes in progress.
 type BlobCache struct {
 	*blobDir
-	reads *recencyMap
+	onRead func(context.Context, mh.Multihash)
+	// inFlight is every byte written so far to temporary files not yet
+	// adopted or discarded. It is kept apart from the blob files' count,
+	// which a scan measures and may reset, so a scan never measures a write
+	// mid-way.
+	inFlight atomic.Int64
 }
 
-// NewBlobCache opens (creating if needed) a cache rooted at dir and counts its
-// blob files.
+// tempPrefix names the files a write streams into before they are adopted
+// under their digest.
+const tempPrefix = ".tmp-"
+
+// NewBlobCache opens (creating if needed) a cache rooted at dir, deletes
+// every leftover temporary file it can (a write the previous process never
+// finished; nothing can be writing one before the listener starts) and counts
+// the blob files. A leftover it cannot delete is left for the sweeper's
+// orphan pass, which retries and logs it, rather than failing startup.
+// Entries that are neither, such as lost+found on a dedicated filesystem, are
+// ignored.
 func NewBlobCache(dir string) (*BlobCache, error) {
 	d, err := newBlobDir(dir, "cache")
 	if err != nil {
 		return nil, err
 	}
-	if err := d.count(func(BlobFile) {}); err != nil {
+	var temps []string
+	if err := d.count(func(f BlobFile) {
+		if f.Digest == nil {
+			temps = append(temps, f.Name)
+		}
+	}); err != nil {
 		return nil, err
 	}
-	return &BlobCache{blobDir: d, reads: newRecencyMap(recencyCapacity)}, nil
+	for _, name := range temps {
+		_, _ = d.RemoveTemp(name)
+	}
+	return &BlobCache{blobDir: d}, nil
 }
 
-// LastRead reports when the blob with the given digest was last served from
-// the cache by this process, if it is still remembered.
-func (c *BlobCache) LastRead(digest mh.Multihash) (time.Time, bool) {
-	return c.reads.get(string(digest))
+// OnRead sets fn to be called with each blob the cache serves, in the
+// reader's goroutine, before the read returns. Call it before the cache
+// serves any read.
+func (c *BlobCache) OnRead(fn func(ctx context.Context, digest mh.Multihash)) {
+	c.onRead = fn
 }
 
-// OpenBlob streams the cached blob, or returns ErrNotFound, and records the
-// read.
+// read reports a blob the cache served.
+func (c *BlobCache) read(ctx context.Context, digest mh.Multihash) {
+	if c.onRead != nil {
+		c.onRead(ctx, digest)
+	}
+}
+
+// OpenBlob streams the cached blob, or returns ErrNotFound.
 func (c *BlobCache) OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash) (io.ReadCloser, error) {
 	rc, err := c.blobDir.OpenBlob(ctx, space, digest)
 	if err == nil {
-		c.reads.touch(string(digest), time.Now())
+		c.read(ctx, digest)
 	}
 	return rc, err
 }
 
 // OpenBlobRange streams stored bytes [start, end] of the cached blob, or
-// returns ErrNotFound, and records the read.
+// returns ErrNotFound.
 func (c *BlobCache) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, error) {
 	rc, err := c.blobDir.OpenBlobRange(ctx, space, digest, start, end)
 	if err == nil {
-		c.reads.touch(string(digest), time.Now())
+		c.read(ctx, digest)
 	}
 	return rc, err
 }
 
 // GetBlock reads the cached blob stored under cid's multihash, or returns
-// ErrNotFound, and records the read.
+// ErrNotFound.
 func (c *BlobCache) GetBlock(ctx context.Context, space did.DID, k cid.Cid) (block.Block, error) {
 	b, err := c.blobDir.GetBlock(ctx, space, k)
 	if err == nil {
-		c.reads.touch(string(k.Hash()), time.Now())
+		c.read(ctx, k.Hash())
 	}
 	return b, err
 }
 
-// CheckTake confirms that Take can move blobs from spool into the cache, which
-// needs the two directories on one filesystem, by moving an empty probe file
-// between them. Call it at startup: a cache mounted elsewhere would otherwise
-// fail every Take, one warning per blob.
-func (c *BlobCache) CheckTake(spool *Spool) error {
-	f, err := os.CreateTemp(spool.dir, spoolTempPrefix+"probe-*")
+// Touch sets the cached blob's modification time to at, which orders the
+// budget pass's evictions, oldest first. It reports whether the blob is
+// cached.
+func (c *BlobCache) Touch(digest mh.Multihash, at time.Time) (bool, error) {
+	err := os.Chtimes(c.Path(digest), at, at)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
 	if err != nil {
-		return fmt.Errorf("blockstore: cache probe: %w", err)
+		return false, fmt.Errorf("blockstore: cache touch: %w", err)
 	}
-	from := f.Name()
-	_ = f.Close()
-	to := filepath.Join(c.dir, filepath.Base(from))
-	if err := os.Rename(from, to); err != nil {
-		_ = os.Remove(from)
-		return fmt.Errorf("blockstore: cache %s must be on the spool's filesystem (%s): %w", c.dir, spool.dir, err)
+	return true, nil
+}
+
+// Usage returns the byte count of the cache: its blob files and the bytes
+// written so far to temporary files.
+func (c *BlobCache) Usage() int64 {
+	return c.finished() + c.inFlight.Load()
+}
+
+// InFlight returns the bytes written so far to temporary files.
+func (c *BlobCache) InFlight() int64 {
+	return c.inFlight.Load()
+}
+
+// TempBlob is a blob being written into the cache, not yet under its digest.
+// Each byte written counts toward the cache's usage as it lands. Close ends
+// the writes; Adopt or Discard ends it. Not safe for concurrent use.
+type TempBlob struct {
+	c      *BlobCache
+	f      *os.File
+	n      int64
+	closed bool
+	done   bool
+}
+
+// CreateTemp starts a blob write into the cache.
+func (c *BlobCache) CreateTemp() (*TempBlob, error) {
+	f, err := os.CreateTemp(c.dir, tempPrefix+"*")
+	if err != nil {
+		return nil, fmt.Errorf("blockstore: cache tempfile: %w", err)
 	}
-	if err := os.Remove(to); err != nil {
-		return fmt.Errorf("blockstore: cache probe: %w", err)
+	return &TempBlob{c: c, f: f}, nil
+}
+
+func (t *TempBlob) Write(p []byte) (int, error) {
+	n, err := t.f.Write(p)
+	t.n += int64(n)
+	t.c.inFlight.Add(int64(n))
+	return n, err
+}
+
+// Ended reports whether the temporary file has been adopted or discarded.
+func (t *TempBlob) Ended() bool {
+	return t.done
+}
+
+// Close ends the writes and closes the file, keeping it for Adopt or Discard,
+// so a finished blob holds no file descriptor while the rest of its object
+// streams. Closing it again does nothing.
+func (t *TempBlob) Close() error {
+	if t.closed {
+		return nil
+	}
+	t.closed = true
+	if err := t.f.Close(); err != nil {
+		return fmt.Errorf("blockstore: cache tempfile close: %w", err)
 	}
 	return nil
 }
 
-// Remove deletes the cached blob, as blobDir.Remove does, and forgets when it
-// was last read. A read that opened the file before the removal can record
-// itself after it; that entry holds an LRU slot until it ages out, and keeps
-// the blob a little longer only if the same digest is cached again.
-func (c *BlobCache) Remove(digest mh.Multihash) (int64, error) {
-	freed, err := c.blobDir.Remove(digest)
-	if err == nil {
-		c.reads.forget(string(digest))
+// Discard deletes the temporary file and takes its bytes off the count.
+// Discarding it again, once adopted, or a nil TempBlob, does nothing.
+func (t *TempBlob) Discard() {
+	if t == nil || t.done {
+		return
 	}
-	return freed, err
+	t.done = true
+	_ = t.Close()
+	_ = os.Remove(t.f.Name())
+	t.c.inFlight.Add(-t.n)
 }
 
-// Usage returns the byte count of the cache's blob files.
-func (c *BlobCache) Usage() int64 {
-	return c.finished()
-}
-
-// Take moves the blob with the given digest from spool into the cache and
-// returns its size, moving the bytes between the two counts. Idempotent: a
-// blob not in the spool moves nothing and is not an error. Only a blob the
-// provider holds may be taken; the caller decides that. A copy already in the
-// cache (the same bytes stored as received and written again) is replaced,
-// and its bytes leave the count as the new copy's enter it.
+// Adopt moves a finished temporary file under digest and returns its size,
+// moving its bytes from the in-flight count to the blob files'. Only a blob
+// the provider holds may be adopted; the caller decides that. A copy already
+// cached under the digest (the same bytes stored as received and written
+// again) is replaced, and its bytes leave the count as the new copy's enter
+// it. A temporary file that fails to adopt is discarded.
 //
-// A blob a write in flight still holds (Spool.Hold) stays where it is and
-// moves nothing: that write uploads from the spool path, and the move waits
-// for its own cache move, or for eviction, once the hold has ended.
-//
-// Take holds both directories exclusively, so a move never overlaps a
-// removal of the same blob, or a hold being taken: whether the removal
-// finds the file in the spool or in the cache, the bytes come off one
-// count, once.
-func (c *BlobCache) Take(spool *Spool, digest mh.Multihash) (int64, error) {
-	spool.mu.Lock()
-	defer spool.mu.Unlock()
+// Adopt holds the directory exclusively, so it never overlaps a removal of
+// the same digest: the removal finds the old copy or the new one, and the
+// bytes come off the count once.
+func (c *BlobCache) Adopt(t *TempBlob, digest mh.Multihash) (int64, error) {
+	if t.done {
+		return 0, fmt.Errorf("blockstore: cache adopt: temporary file already ended")
+	}
+	defer t.Discard()
+	if err := t.Close(); err != nil {
+		return 0, fmt.Errorf("blockstore: cache adopt: %w", err)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if spool.Held(digest) {
-		return 0, nil
-	}
-	from := spool.Path(digest)
-	info, err := os.Stat(from)
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("blockstore: cache take: %w", err)
-	}
 	var replaced int64
 	if prev, err := os.Stat(c.Path(digest)); err == nil {
 		replaced = prev.Size()
 	}
-	if err := os.Rename(from, c.Path(digest)); err != nil {
-		if _, statErr := os.Stat(from); errors.Is(err, os.ErrNotExist) && errors.Is(statErr, os.ErrNotExist) {
-			// Removed since the first Stat, by something outside this
-			// process, which holding both directories rules out within it:
-			// the spool no longer holds its bytes. (A missing cache
-			// directory also fails the rename with ErrNotExist, but leaves
-			// the file where it was, so it is an error below.)
-			spool.usage.Add(-info.Size())
-			spool.changes.Add(1)
-			return 0, nil
-		}
-		return 0, fmt.Errorf("blockstore: cache take: %w", err)
+	if err := os.Rename(t.f.Name(), c.Path(digest)); err != nil {
+		return 0, fmt.Errorf("blockstore: cache adopt: %w", err)
 	}
-	spool.usage.Add(-info.Size())
-	c.usage.Add(info.Size() - replaced)
-	spool.changes.Add(1)
+	t.done = true
+	c.inFlight.Add(-t.n)
+	c.usage.Add(t.n - replaced)
 	c.changes.Add(1)
-	return info.Size(), nil
-}
-
-// LocalBlobs reads a blob from local disk wherever it is: the cache, then the
-// spool. A blob only ever moves from the spool to the cache, so one that moves
-// between the two lookups is found by looking in the cache once more.
-type LocalBlobs struct {
-	Cache *BlobCache
-	Spool *Spool
-}
-
-// localTier is what LocalBlobs reads from each directory.
-type localTier interface {
-	BlockReader
-	BlobReader
-	BlobRangeReader
-}
-
-// OpenBlob streams the blob from local disk, or returns ErrNotFound.
-func (l LocalBlobs) OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash) (io.ReadCloser, error) {
-	return localLookup(func(d localTier) (io.ReadCloser, error) { return d.OpenBlob(ctx, space, digest) }, l)
-}
-
-// OpenBlobRange streams stored bytes [start, end] of the blob from local disk,
-// or returns ErrNotFound.
-func (l LocalBlobs) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, error) {
-	return localLookup(func(d localTier) (io.ReadCloser, error) {
-		return d.OpenBlobRange(ctx, space, digest, start, end)
-	}, l)
-}
-
-// GetBlock reads the blob stored under c's multihash from local disk, or
-// returns ErrNotFound.
-func (l LocalBlobs) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (block.Block, error) {
-	return localLookup(func(d localTier) (block.Block, error) { return d.GetBlock(ctx, space, c) }, l)
-}
-
-// localLookup tries the cache, the spool, then the cache again. A block that
-// is never local, such as a catalog block on its way to the log, costs three
-// failed opens.
-func localLookup[T any](get func(localTier) (T, error), l LocalBlobs) (T, error) {
-	var zero T
-	for _, d := range []localTier{l.Cache, l.Spool, l.Cache} {
-		v, err := get(d)
-		if err == nil {
-			return v, nil
-		}
-		if !errors.Is(err, ErrNotFound) {
-			return zero, err
-		}
-	}
-	return zero, ErrNotFound
+	return t.n, nil
 }
 
 var (
 	_ BlockReader     = (*BlobCache)(nil)
 	_ BlobReader      = (*BlobCache)(nil)
 	_ BlobRangeReader = (*BlobCache)(nil)
-	_ BlockReader     = LocalBlobs{}
-	_ BlobReader      = LocalBlobs{}
-	_ BlobRangeReader = LocalBlobs{}
 )

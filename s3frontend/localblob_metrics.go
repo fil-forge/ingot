@@ -16,16 +16,14 @@ const meterName = "github.com/fil-forge/ingot/s3frontend"
 // Why a local blob file was removed: the reason attribute on the removal
 // counters.
 const (
-	removedReleased     = "released"      // its object was deleted or its upload abandoned
-	removedParked       = "parked"        // a multipart part parked on its provider
-	removedAccepted     = "accepted"      // its provider accepted it, with written bodies not cached
-	removedBudget       = "budget"        // the budget pass evicted it
-	removedBudgetForced = "budget_forced" // the forced pass evicted it inside a retention window
-	removedOrphan       = "orphan"        // the orphan pass found no intent for it
+	removedReleased = "released" // its object was deleted
+	removedBudget   = "budget"   // the budget pass evicted it
+	removedExpired  = "expired"  // its time in the cache ran out
+	removedOrphan   = "orphan"   // the orphan pass found it left by an unfinished write
 )
 
 // localBlobMetrics counts the files removed from local blob storage (the
-// spool and the cache), by reason. The usage and budget gauges are observed
+// cache), by reason. The usage and budget gauges are observed
 // by a callback (registerLocalBlobGauges).
 type localBlobMetrics struct {
 	removedBytes metric.Int64Counter
@@ -58,22 +56,17 @@ func newLocalBlobMetrics(mp metric.MeterProvider, b *Backend, logger *zap.Logger
 }
 
 var (
-	inSpool = metric.WithAttributes(attribute.String("dir", "spool"))
 	inCache = metric.WithAttributes(attribute.String("dir", "cache"))
-	// The intent state a stalled upload's bytes are in: spooled, a body that
-	// never left this node, or uploading, one that may have reached its
-	// provider.
-	stalledSpooled   = metric.WithAttributes(attribute.String("state", "spooled"))
+	// The intent state a stalled upload's bytes are in.
 	stalledUploading = metric.WithAttributes(attribute.String("state", "uploading"))
 )
 
-// registerLocalBlobGauges reports the bytes each directory holds, the budget
-// they share, and the bytes of stalled uploads once a sweep has summed them.
-// The spool's figure includes writes in progress, and is what eviction cannot
-// touch.
+// registerLocalBlobGauges reports the bytes the cache holds, writes in
+// progress included, its budget, and the bytes of stalled uploads once a
+// sweep has summed them.
 func registerLocalBlobGauges(meter metric.Meter, b *Backend) (metric.Registration, error) {
 	usage, err := meter.Int64ObservableGauge("ingot.local_blobs.usage", metric.WithUnit("By"),
-		metric.WithDescription("Bytes held by local blob storage, by dir: spool (writes in progress and bodies awaiting upload) or cache"))
+		metric.WithDescription("Bytes held by local blob storage, by dir: cache (cached bodies and writes in progress)"))
 	if err != nil {
 		return nil, err
 	}
@@ -83,19 +76,17 @@ func registerLocalBlobGauges(meter metric.Meter, b *Backend) (metric.Registratio
 		return nil, err
 	}
 	stalled, err := meter.Int64ObservableGauge("ingot.local_blobs.stalled_bytes", metric.WithUnit("By"),
-		metric.WithDescription("Bytes of bodies whose upload has stalled, by state: spooled (never left this node) or uploading (may have reached its provider) for over an hour, which nothing reclaims yet"))
+		metric.WithDescription("Bytes of bodies whose upload has stalled, by state: uploading (may have reached its provider) for over an hour; a provider expires an allocation never concluded within a day, and one accepted before a crash stays until reconciled"))
 	if err != nil {
 		return nil, err
 	}
 	return meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
-		if b.spool == nil || b.cache == nil {
+		if b.cache == nil {
 			return nil
 		}
-		o.ObserveInt64(usage, b.spool.Usage(), inSpool)
 		o.ObserveInt64(usage, b.cache.Usage(), inCache)
 		o.ObserveInt64(budget, b.localBlobMaxBytes)
 		if b.stalledKnown.Load() {
-			o.ObserveInt64(stalled, b.stalledSpooled.Load(), stalledSpooled)
 			o.ObserveInt64(stalled, b.stalledUploading.Load(), stalledUploading)
 		}
 		return nil
