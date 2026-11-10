@@ -277,7 +277,6 @@ sequenceDiagram
         B->>B: fresh CEK → FEE envelope (COSE_Encrypt, AES-256-GCM STREAM,<br/>one recipient: ECDH-ES+A256KW to the tenant wrap key)#59;<br/>its length is known from the header + plaintext length
         B->>U: /blob/add (digestCode sha2-256, envelope size, random nonce)
         U-->>B: allocation address, put and accept tasks
-        B->>R: PutStream(add task): the upload's name until parked or accepted
         par
             B->>SP: spool under the CIPHERTEXT digest<br/>(BLAKE3 tree + md5 of the plaintext in the same pass)
         and
@@ -289,7 +288,7 @@ sequenceDiagram
     loop each streamed blob (uploadBlobs → concludeStreamed)
         B->>U: /ucan/conclude the put receipt, reporting the spooled digest
         U-->>B: accept receipt + /assert/location commitment
-        B->>R: PutLocation, then SetIntentState(accepted)#59; DeleteStream
+        B->>R: PutLocation, then SetIntentState(accepted)
         B->>B: BlobCache.Take: the file moves from the spool to the cache
     end
     loop each spooled-first blob (uploadBlobs)
@@ -318,13 +317,10 @@ sequenceDiagram
     Note over B,U: the release sweeper runs each record once its grace passes:<br/>/blob/remove (+ crypto-shred: its blob_encryption_params row deleted)
 ```
 
-- A request that dies after allocating a streamed blob leaves its
-  `blob_streams` row; the stream sweeper (on the release sweeper's tick)
-  aborts such an upload by its add task once the row's lease (`touched_at`,
-  renewed every 10 minutes by the request that owns it) has gone 30 minutes
-  unrenewed, unless its blob was parked, and
-  drops the row once the abort lands or the provider reports the blob
-  accepted.
+- A streamed blob whose body fails aborts its allocation at once. One a
+  dying request leaves behind is never concluded, and the provider expires
+  it within a day: an unaccepted blob counts toward no space's usage and is
+  never served.
 - Encryption makes the stored digest a ciphertext digest: **content dedup is
   gone for bodies** (fresh CEK per write ⇒ unique envelope), by design per
   the encryption RFC. Manifest spans, `Body.Size`, the BLAKE3 tree, md5 and ETag stay
@@ -391,8 +387,7 @@ sequenceDiagram
 Cross-references: [`architecture.md` §7.1](./architecture.md#71-write-single-shot-putobject).
 
 Sources: `s3frontend/object.go` (PutObject, ingestBody, uploadBlobs,
-concludeStreamed), `s3frontend/stream.go` (WriteSizedBlob,
-SweepStaleStreams), `bucket/sized.go`, `uploader/stream.go`,
+concludeStreamed), `s3frontend/stream.go` (WriteSizedBlob), `bucket/sized.go`, `uploader/stream.go`,
 `s3frontend/copy.go` (CopyObject, copySourceBucket),
 `s3frontend/version.go` (commitVersion, enqueueRegistration),
 `s3frontend/uploadqueue.go` (the queue-space-upload handlers), `bucketop/bucketop.go`,
@@ -512,7 +507,7 @@ sequenceDiagram
     B->>R: PutPart(spooled, span_lengths): open sessions only, the row held FOR SHARE<br/>against a concurrent latch#59; writes of one part number serialised on an advisory lock#59;<br/>a release record, due now, for each blob the replaced row named and this part<br/>does not, in the same transaction, returned to run#59; a refused part records its blobs' releases
     loop each part blob (parkBlobs)
         alt streamed while spooled
-            B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked,<br/>DeleteStream: the PUT already went to piri in splitSpool
+            B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked:<br/>the PUT already went to piri in splitSpool
             B->>B: removeLocal (the part's local copy#59; the acceptor concludes from the park)
         else blob_locations already has the digest
             B->>R: intent accepted (dedup, no park)
@@ -1152,14 +1147,6 @@ erDiagram
         bytea accept_task
         bytea put_invocation
         bigint size
-    }
-    blob_streams {
-        bytea add_task PK "an upload allocated by digest code"
-        text space
-        text bucket
-        bigint size
-        timestamptz created_at "when the sweeper stops retrying the abort"
-        timestamptz touched_at "the owning request's lease, renewed while it runs; the stream sweeper's clock"
     }
     multipart_sessions {
         text upload_id PK

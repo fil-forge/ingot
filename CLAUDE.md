@@ -99,7 +99,8 @@ Internal:
   (Put/Get/Head/Delete/List), `version.go` (resolveVersion / commitVersion,
   the per-key version tree), `multipart.go`, `bucket.go`, `listversions.go`,
   `backend.go`, `stream.go` (each body blob streams to its
-  provider while spooling it; the stale-stream sweeper).
+  provider while spooling it; a failed stream aborts its allocation, and one
+  a dead request leaves is expired by the provider).
 - **`bucketop/`** — `Coordinator`/`Tx`: per-bucket write transaction (lock,
   snapshot root, staging buffer, CAS commit).
 - **`blockstore/`** — block I/O contracts + impls: `log.go` (`Log`, `Plane`
@@ -117,7 +118,7 @@ Internal:
   `ingot.catalog_journal` until their segment ships),
   `segments.go` (`logstore.Meta`, and `CatalogUsage`, the per-bucket sums
   the catalog usage gauges report), `stores*.go` (intents, locations,
-  inclusions, blob_refs, GC, multipart sessions/parts, parks, streams),
+  inclusions, blob_refs, GC, multipart sessions/parts, parks),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
   all of them.
 - **`taskrunner/`** — durable task queues in Postgres (one tasks table and

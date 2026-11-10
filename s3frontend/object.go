@@ -315,7 +315,6 @@ func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.R
 	if err != nil {
 		return msbucket.Body{}, nil, err
 	}
-	defer body.lease.end()
 	defer body.unholdAll()
 	if err := b.uploadBlobs(ctx, bucket.Space, body); err != nil {
 		return msbucket.Body{}, nil, err
@@ -332,9 +331,6 @@ type spooledBody struct {
 	// Body.Blobs (see msbucket.BuildBlobList). It shadows that field here.
 	Blobs    msbucket.BlobRefs
 	streamed map[string]uploader.StreamedBlob
-	// lease renews the streamed blobs' rows until the caller has recorded
-	// their parks or acceptances, and ends it.
-	lease *streamLease
 	// holds end the spool holds on the body's blobs, by string(digest): each
 	// is ended once its blob's upload has read the file (unhold), and all of
 	// them when the write is over (unholdAll), whichever comes first.
@@ -412,11 +408,13 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 		enc = newEncryptingBlobWriter(b.spool, b.regionKeys, space, []fee.Recipient{recipient})
 	}
 	// Each spooled blob is published held, until its upload has read it; a
-	// failed split leaves no caller to end the holds.
+	// failed split leaves no caller to end the holds, or to conclude the
+	// blobs it streamed before the failure.
 	enc.holdWrites = true
 	defer func() {
 		if err != nil {
 			enc.unholdAll()
+			enc.abandonStreamed(ctx)
 		}
 	}()
 	splitOpts := append([]msbucket.SplitOption(nil), opts...)
@@ -426,14 +424,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 	var body msbucket.Body
 	var blobs msbucket.BlobRefs
 	if b.streaming != nil {
-		enc.stream, enc.streams, enc.bucket, enc.logger = b.streaming, b.streams, bucket, b.logger
-		enc.lease = newStreamLease(b.streams, b.logger)
-		// A failed split leaves no caller to end the lease.
-		defer func() {
-			if err != nil {
-				enc.lease.end()
-			}
-		}()
+		enc.stream, enc.bucket, enc.logger = b.streaming, bucket, b.logger
 		body, blobs, err = msbucket.SplitSizedBody(ctx, enc, r, size, b.maxBlobSize, splitOpts...)
 		switch {
 		case errors.Is(err, msbucket.ErrBodyShort):
@@ -495,7 +486,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 			return spooledBody{}, fmt.Errorf("record encryption params: %w", err)
 		}
 	}
-	return spooledBody{Body: body, Blobs: blobs, streamed: streamed, lease: enc.lease, holds: enc.holds}, nil
+	return spooledBody{Body: body, Blobs: blobs, streamed: streamed, holds: enc.holds}, nil
 }
 
 // uploadBlobs uploads each spooled blob to Forge by digest (allocate→PUT→
@@ -590,7 +581,6 @@ func (b *Backend) concludeStreamed(ctx context.Context, space did.DID, blob msbu
 		if rerr := b.recordAccepted(ctx, space, blob.Digest, *locations[0], func() { body.unhold(blob.Digest) }); rerr != nil {
 			return errors.Join(err, rerr)
 		}
-		b.finishStream(ctx, sb)
 	}
 	if err != nil {
 		return fmt.Errorf("conclude streamed blob: %w", err)
