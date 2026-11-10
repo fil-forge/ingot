@@ -472,7 +472,7 @@ queue-space-shard.accept (subject = space/digest: never beside the blob's releas
      located → nothing to conclude; nothing in the space references it → left for its release
      parked → conclude it (one /ucan/conclude, 2 min timeout); writes commit with the task:
         park → location while the concluded park stands; intent → accepted;
-        lock the parts that name the blob, then part → accepted once all its blobs are located
+        take the blob off its parts' lists of blobs still to accept; a part left with none → accepted
      a failed conclude fails the task, which records nothing; it runs at most 5 times,
         retrying from 5 s, up to 1 min apart
 CompleteMultipartUpload([parts]) → queue-multipart-upload.complete
@@ -546,9 +546,9 @@ gone and records nothing; one that runs after removes the accepted blob. Ingot r
 acceptance only while the park row it concluded stands, matched by its `/blob/add` task, swapping
 the park for the location in the accept's commit; the release deletes the park and location rows
 together in its commit, so a location is never written for a blob a release has taken, nor over a
-later park of the same bytes. A part is marked accepted once every one of its blobs is located: the
-accepts of its blobs lock its row before checking, so the last to commit sees the others. A part
-replaced or dropped mid-conclude is not there to mark. Ingot treats a `/blob/remove` receipt as
+later park of the same bytes. A part lists the blobs still to be accepted, and each blob's accept
+takes itself off the list while it is located, so the part is marked accepted by the last of its
+blobs to be accepted. A part replaced or dropped mid-conclude is not there to mark. Ingot treats a `/blob/remove` receipt as
 final. If the upload service registers an accepted blob only after a remove that arrived earlier,
 as it may when a conclude Ingot gave up on is still running there, that window is the upload
 service's to fix, and Ingot does not guard it.
@@ -984,6 +984,7 @@ CREATE TABLE ingot.multipart_parts (
                       CHECK (state IN ('parked','accepted')),
     created_at    timestamptz NOT NULL DEFAULT now(),
     checksum      text   NOT NULL DEFAULT '',
+    unaccepted    bytea[] NOT NULL DEFAULT '{}',         -- a parked part's blobs still to be accepted; each blob's accept takes itself off
     PRIMARY KEY (upload_id, part_number),
     CHECK (span_lengths IS NULL OR cardinality(span_lengths) = cardinality(blob_digests))
 );

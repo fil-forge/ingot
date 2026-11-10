@@ -1139,28 +1139,9 @@ var errAcceptWaitExpired = errors.New("s3frontend: the parts' accepts did not fi
 // request past the client's read timeout.
 func (b *Backend) acceptRequested(ctx context.Context, uploadID string, space did.DID, requested []registry.MultipartPart) error {
 	expires := time.Now().Add(acceptWaitBudget)
-	numbers := make([]int64, len(requested))
-	for i, p := range requested {
-		numbers[i] = int64(p.PartNumber)
-	}
-	spec, err := registry.CompleteAcceptSpec(uploadID, numbers, expires)
-	if err != nil {
-		return err
-	}
-	queued, err := b.accepts.Pending(ctx, registry.AcceptQueue, []string{uploadID}, registry.AcceptAction)
-	if err != nil {
-		return fmt.Errorf("s3frontend: find the upload's queued accept: %w", err)
-	}
-	// Complete's own queues every part it names. Cancel leaves one that has
-	// started, which Complete then waits for.
-	if err := b.accepts.Cancel(ctx, registry.AcceptQueue, queued[uploadID]...); err != nil {
-		return fmt.Errorf("s3frontend: cancel the upload's queued accept: %w", err)
-	}
-	_, err = b.accepts.Run(ctx, spec)
-	if err == nil {
-		err = b.awaitBlobAccepts(ctx, space, requested, expires)
-	}
-	if errors.Is(err, taskrunner.ErrExpired) || errors.Is(err, errAcceptWaitExpired) {
+	err := b.acceptAndWait(ctx, uploadID, space, requested, expires)
+	if errors.Is(err, taskrunner.ErrExpired) || errors.Is(err, errAcceptWaitExpired) ||
+		(errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil) {
 		b.multipartMetrics.completeDeferred.Add(ctx, 1)
 		b.logger.Info("multipart completion deferred: the parts' accepts did not finish in time",
 			zap.String("upload_id", uploadID))
@@ -1196,9 +1177,40 @@ func (b *Backend) acceptRequested(ctx context.Context, uploadID string, space di
 	return nil
 }
 
+// acceptAndWait runs the upload's accept for the parts Complete names and
+// waits for their blobs' accepts, every step bounded by expires.
+func (b *Backend) acceptAndWait(ctx context.Context, uploadID string, space did.DID, requested []registry.MultipartPart, expires time.Time) error {
+	ctx, cancel := context.WithDeadline(ctx, expires)
+	defer cancel()
+	numbers := make([]int64, len(requested))
+	for i, p := range requested {
+		numbers[i] = int64(p.PartNumber)
+	}
+	spec, err := registry.CompleteAcceptSpec(uploadID, numbers, expires)
+	if err != nil {
+		return err
+	}
+	queued, err := b.accepts.Pending(ctx, registry.AcceptQueue, []string{uploadID}, registry.AcceptAction)
+	if err != nil {
+		return fmt.Errorf("s3frontend: find the upload's queued accept: %w", err)
+	}
+	// Complete's own queues every part it names. Cancel leaves one that has
+	// started, which Complete then waits for.
+	if err := b.accepts.Cancel(ctx, registry.AcceptQueue, queued[uploadID]...); err != nil {
+		return fmt.Errorf("s3frontend: cancel the upload's queued accept: %w", err)
+	}
+	if _, err := b.accepts.Run(ctx, spec); err != nil {
+		return err
+	}
+	return b.awaitBlobAccepts(ctx, space, requested, expires)
+}
+
 // awaitBlobAccepts waits, until expires, for the pending accepts of the
 // blobs of parts in space, making each due now first: a sync no-op on a
-// blob's subject runs once the tasks due before it there have run.
+// blob's subject runs once the tasks due before it there have run. Each
+// blob's accepts are brought forward by its subject, which also stops their
+// being replaced, so one another upload submits meanwhile is added behind
+// the no-op and leaves the accepts ahead of it where they are.
 func (b *Backend) awaitBlobAccepts(ctx context.Context, space did.DID, parts []registry.MultipartPart, expires time.Time) error {
 	seen := map[string]bool{}
 	var subjects []string
@@ -1211,21 +1223,15 @@ func (b *Backend) awaitBlobAccepts(ctx context.Context, space did.DID, parts []r
 			}
 		}
 	}
-	pending, err := b.releases.Pending(ctx, registry.ReleaseQueue, subjects, registry.BlobAcceptAction)
-	if err != nil {
-		return fmt.Errorf("find the blobs' accepts: %w", err)
-	}
-	if len(pending) == 0 {
-		return nil
-	}
-	var ids []taskrunner.TaskID
-	waiting := make([]string, 0, len(pending))
-	for subject, tasks := range pending {
-		ids = append(ids, tasks...)
-		waiting = append(waiting, subject)
-	}
-	if err := b.releases.ExpediteTasks(ctx, registry.ReleaseQueue, ids...); err != nil {
-		return fmt.Errorf("bring the blobs' accepts forward: %w", err)
+	var waiting []string
+	for _, subject := range subjects {
+		due, err := b.releases.Expedite(ctx, registry.ReleaseQueue, subject, registry.BlobAcceptAction)
+		if err != nil {
+			return fmt.Errorf("bring the blobs' accepts forward: %w", err)
+		}
+		if len(due[subject]) > 0 {
+			waiting = append(waiting, subject)
+		}
 	}
 
 	var (

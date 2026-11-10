@@ -128,13 +128,14 @@ func (r *Postgres) PartWrites(ctx context.Context, p MultipartPart, tree *PartTr
 	// upload's subject already keeps a Complete or an Abort from running
 	// meanwhile.
 	w.Guards = append(w.Guards, Statement{
-		`INSERT INTO ingot.multipart_parts (upload_id, part_number, etag_md5, size, checksum, blob_digests, span_lengths, state)
-		 SELECT s.upload_id, $2, $3, $4, $5, $6, $7, $8
+		`INSERT INTO ingot.multipart_parts (upload_id, part_number, etag_md5, size, checksum, blob_digests, span_lengths, state, unaccepted)
+		 SELECT s.upload_id, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $8 = 'parked' THEN $6::bytea[] ELSE '{}' END
 		   FROM ingot.multipart_sessions s
 		  WHERE s.upload_id = $1 AND s.state = $9
 		 ON CONFLICT (upload_id, part_number) DO UPDATE
 		   SET etag_md5 = EXCLUDED.etag_md5, size = EXCLUDED.size, checksum = EXCLUDED.checksum,
-		       blob_digests = EXCLUDED.blob_digests, span_lengths = EXCLUDED.span_lengths, state = EXCLUDED.state`,
+		       blob_digests = EXCLUDED.blob_digests, span_lengths = EXCLUDED.span_lengths, state = EXCLUDED.state,
+		       unaccepted = EXCLUDED.unaccepted`,
 		[]any{p.UploadID, p.PartNumber, p.ETagMD5, p.Size, p.Checksum, p.BlobDigests, p.SpanLengths, pstate, SessionOpen},
 	})
 	if err := r.refWrites(ctx, &w, p.Refs); err != nil {

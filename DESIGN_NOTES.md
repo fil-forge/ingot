@@ -231,12 +231,16 @@ blob's park row is swapped for its location row only while the park the
 conclude started from stands, matched by its `/blob/add` task. Its upload
 intent is marked `accepted`, and a `published` intent stays `published`. A
 blob found already located has any park left beside the location dropped,
-only while that location stands. Every parked part of an open session in
-the space that names the blob is then marked `accepted` once all its blobs
-are located. Those part rows are locked first, in a fixed order: a part's
-other blobs are accepted under other subjects, and lock the same rows, so
-whichever accept commits second sees the first's location and marks the
-part. A part replaced or dropped meanwhile is not there to mark. A park of
+only while that location stands. A parked part lists the blobs still to be
+accepted (`multipart_parts.unaccepted`, every blob it names when it is
+written). While the blob is located, its accept takes it off the list of
+every parked part of an open session in the space that names it, and marks
+`accepted` each part it leaves with none. That costs each accept one update
+of each such part's row, not a check of every blob the part names. A part's
+other blobs are accepted under other subjects, and their updates take turns
+on the row, so the last sees the others' removals. A part written since it
+was listed still lists all its blobs, each with an accept of its own to come,
+and a part replaced or dropped meanwhile is not there to mark. A park of
 the same bytes recorded since by another write names another allocation,
 and stays for its own conclude. A failed conclude fails the blob's accept,
 and nothing it wrote is recorded; the retry concludes again, which the

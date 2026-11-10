@@ -128,29 +128,28 @@ func LocatedBlob(space did.DID, digest multihash.Multihash) []Statement {
 	}
 }
 
-// AcceptedParts is the writes that mark accepted every parked part of an
-// open session in space that names digest, once every one of the part's
-// blobs is located there. They follow the writes that locate digest in the
-// same commit. The part rows are locked first, in a fixed order: the accepts
-// of a part's other blobs run under other subjects, and lock the same rows,
-// so whichever commits second sees the first's location and marks the part.
-// A part replaced or dropped meanwhile is not there to mark.
+// AcceptedParts is the write that takes digest off the list of blobs still
+// to be accepted of every parked part of an open session in space that names
+// it, and marks accepted each part it leaves with none. It follows the writes
+// that locate digest in the same commit, and applies only while digest is
+// located: a conclude whose park was taken, or a location gone before the
+// commit, leaves the parts as they are. Each part's row is locked by the
+// update, so two accepts of one part's blobs, which run under different
+// subjects, take turns on it, and the second sees the first's removal. A part
+// written since it was listed lists every one of its own blobs, each with an
+// accept of its own to come, and a part replaced or dropped meanwhile is not
+// there to mark.
 func AcceptedParts(space did.DID, digest multihash.Multihash) []Statement {
-	args := []any{space, []byte(digest), SessionOpen}
-	return []Statement{
-		{`SELECT 1 FROM ingot.multipart_parts p
-		   JOIN ingot.multipart_sessions s ON s.upload_id = p.upload_id
-		  WHERE s.space = $1 AND s.state = $3 AND p.blob_digests @> ARRAY[$2::bytea] AND p.state = 'parked'
-		  ORDER BY p.upload_id, p.part_number
-		  FOR UPDATE OF p`, args},
-		{`UPDATE ingot.multipart_parts p SET state = 'accepted'
+	return []Statement{{
+		`UPDATE ingot.multipart_parts p
+		    SET unaccepted = array_remove(p.unaccepted, $2::bytea),
+		        state = CASE WHEN cardinality(array_remove(p.unaccepted, $2::bytea)) = 0 THEN 'accepted' ELSE p.state END
 		   FROM ingot.multipart_sessions s
 		  WHERE s.upload_id = p.upload_id AND s.space = $1 AND s.state = $3
-		    AND p.blob_digests @> ARRAY[$2::bytea] AND p.state = 'parked'
-		    AND NOT EXISTS (
-		      SELECT 1 FROM unnest(p.blob_digests) AS b(digest)
-		       WHERE NOT EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.space = $1 AND l.digest = b.digest))`, args},
-	}
+		    AND p.blob_digests @> ARRAY[$2::bytea] AND p.unaccepted @> ARRAY[$2::bytea] AND p.state = 'parked'
+		    AND EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.space = $1 AND l.digest = $2)`,
+		[]any{space, []byte(digest), SessionOpen},
+	}}
 }
 
 // AcceptedEmptyPart is the write that marks p, a parked part with no blobs,

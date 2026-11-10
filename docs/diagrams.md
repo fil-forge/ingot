@@ -558,7 +558,7 @@ sequenceDiagram
     else neither, or nothing references it
         S->>S: nothing to do: its release aborts the allocation
     end
-    S->>R: with the task's commit: park swapped for the location while the concluded park<br/>(by AddTask) stands#59; intent accepted (published stays)#59; a park beside a standing<br/>location dropped#59; the parts naming the blob locked, then those with every blob located accepted
+    S->>R: with the task's commit: park swapped for the location while the concluded park<br/>(by AddTask) stands#59; intent accepted (published stays)#59; a park beside a standing<br/>location dropped#59; the blob taken off its parts' lists of blobs still to accept, while it is located, and a part left with none accepted
     Note over S,R: a failed conclude fails the task and records nothing#59; the retry concludes again<br/>(a repeat to sprue)#59; 5 attempts from 5 s, doubling, up to 1 min
     C->>B: CompleteMultipartUpload(parts)
     B->>M: run sync: queue-multipart-upload.complete, to start within replayWaitBudget (10 s)<br/>behind the upload's other changes, another Complete included
@@ -614,9 +614,9 @@ sequenceDiagram
   location rows in its commit, so the accept finds no park and records
   nothing; one that runs after removes the accepted blob. The swap matches
   the park's `/blob/add` task, so a later park of the same bytes stays for
-  its own conclude. A part is marked accepted once every one of its blobs is
-  located: each blob's accept locks the parts naming it before checking, so
-  the last to commit sees the others.
+  its own conclude. A part lists the blobs still to be accepted, and each
+  blob's accept takes itself off the list while it is located, so the last
+  of a part's blobs to be accepted marks it.
 - Ingot treats a `/blob/remove` receipt as final. If sprue registers an
   accepted blob only after a remove that arrived earlier, as it may when a
   conclude Ingot gave up on is still running there, that window is sprue's
