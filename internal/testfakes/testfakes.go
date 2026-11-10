@@ -6,7 +6,9 @@ package testfakes
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"sync/atomic"
 
 	"github.com/fil-forge/libforge/commands/s3"
 	"github.com/fil-forge/libforge/commands/s3/bucket"
@@ -83,6 +85,31 @@ func (NopUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Mul
 	return uploader.UploadedBlob{Digest: digest, Size: size, Location: &uploader.BlobLocation{Size: size}}, nil
 }
 
+// StartBlob allocates nothing: the blob is named by a fresh add task.
+func (NopUploader) StartBlob(_ context.Context, _ did.DID, size int64) (uploader.StreamedBlob, error) {
+	sum, err := multihash.Sum(fmt.Appendf(nil, "nop stream %d", nopStreams.Add(1)), multihash.SHA2_256, -1)
+	if err != nil {
+		return uploader.StreamedBlob{}, err
+	}
+	add := cid.NewCidV1(cid.Raw, sum)
+	return uploader.StreamedBlob{Size: size, AddTask: add, AcceptTask: add}, nil
+}
+
+// nopStreams numbers NopUploader's add tasks.
+var nopStreams atomic.Int64
+
+// PutBlob reads the body to its end and keeps none of it.
+func (NopUploader) PutBlob(_ context.Context, blob uploader.StreamedBlob, body io.Reader) error {
+	n, err := io.Copy(io.Discard, body)
+	if err != nil {
+		return err
+	}
+	if n != blob.Size {
+		return fmt.Errorf("testfakes: streamed %d bytes, allocated %d", n, blob.Size)
+	}
+	return nil
+}
+
 func (NopUploader) RemoveBlob(_ context.Context, _ did.DID, _ multihash.Multihash) error { return nil }
 
 func (NopUploader) ConcludeBlobs(_ context.Context, _ did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
@@ -126,6 +153,7 @@ var (
 	_ uploader.Uploader               = NopUploader{}
 	_ uploader.BodyUploader           = NopUploader{}
 	_ uploader.DeferredBodyUploader   = NopUploader{}
+	_ uploader.StreamingBodyUploader  = NopUploader{}
 	_ uploader.BlobRemover            = NopUploader{}
 	_ uploader.UploadRegistrar        = NopUploader{}
 )

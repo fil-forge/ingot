@@ -68,9 +68,8 @@ type ServerDeps struct {
 	// abort at Abort.
 	Deferred uploader.DeferredBodyUploader
 	Remover  uploader.BlobRemover
-	// Streaming, when set, uploads each body blob while it is spooled,
-	// allocating it before its digest is known. Without Streaming every blob
-	// is spooled first and uploaded by digest.
+	// Streaming uploads each body blob while it is spooled, allocating it
+	// before its digest is known. Required: every multipart part streams.
 	Streaming uploader.StreamingBodyUploader
 
 	// Registrar keeps the upload service's content-entry list in step with the
@@ -789,6 +788,9 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.BodyUploader == nil {
 		return errors.New("ingot: ServerDeps.BodyUploader is required")
+	}
+	if deps.Streaming == nil {
+		return errors.New("ingot: ServerDeps.Streaming is required")
 	}
 	if deps.Deferred == nil {
 		return errors.New("ingot: ServerDeps.Deferred is required")

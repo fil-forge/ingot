@@ -555,8 +555,8 @@ sequenceDiagram
         B->>R: ListParts: the named parts' states
         alt a named part still parked
             B-->>C: OperationAborted in the 200's body#59; the deferred revert reopens the session
-        else every part accepted, or spooled
-            B->>U: spooled parts only: concludeBlobs (conclude, or upload a never-parked blob)
+        else every part accepted, or written
+            B->>U: written parts only: concludeBlobs (conclude, or InvalidPart for a blob with neither a park nor a location)
             B->>TX: commitVersionAt under what was reported (see the PutObject diagram)#59;<br/>refused (errReservationSuperseded) if the key gained a later seq,<br/>or the versioning no longer fits the report#59; the claims land<br/>in the root swap's transaction, set-based
             B->>R: LatchSession(completing to completed), best-effort
             B-->>C: the result ends the body: ETag = md5-of-part-md5s + "-N"
@@ -595,10 +595,11 @@ sequenceDiagram
 - A part is written only while its session is open, in the statement that
   checks the state; a teardown that took the session refuses it, and the
   upload queues releases for the blobs it had spooled.
-- A never-parked blob at Complete falls back to a full synchronous
-  `UploadBlob`, after rechecking for a park under the blob's lock: an
-  UploadPart still parking the blob when Complete classified it holds that
-  lock, and its park is concluded rather than allocated beside.
+- A blob with neither a park nor a location at Complete is looked for again
+  under the blob's lock: an UploadPart still parking the blob when Complete
+  classified it holds that lock, and its park is then concluded. A blob still
+  with neither has gone from its provider, and Complete answers
+  `InvalidPart`; nothing keeps a part's bytes to upload them again.
 - Complete reports its response headers through versitygw's
   `CompleteMultipartUploadReportingHeaders` before it accepts the parts,
   and the response commits to 200 at the report, as S3's does. A reserved
@@ -712,10 +713,10 @@ flowchart TB
     end
 
     spooled -->|"dedup: blob_locations hit;<br/>file moves to the cache"| accepted
-    spooled -->|"first network call begins<br/>(uploadBlobs, parkBlobs, concludeBlobs fallback)"| uploading
+    spooled -->|"first network call begins<br/>(uploadBlobs for an object, parkBlobs for a part)"| uploading
     uploading -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept;<br/>queue-shard.cache moves the file to the cache"| accepted
-    uploading -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT (or already streamed); blob_parks row written;<br/>local copy removed (removeLocal)"| parked
-    parked -->|"acceptParked (the upload's acceptor, or Complete for a spooled part):<br/>/ucan/conclude; ConcludePark swaps the blob_parks row for blob_locations"| accepted
+    uploading -->|"parkBlobs: the part streamed to its provider;<br/>blob_parks row written;<br/>local copy removed (removeLocal)"| parked
+    parked -->|"acceptParked (the upload's acceptor, or Complete for a written part):<br/>/ucan/conclude; ConcludePark swaps the blob_parks row for blob_locations"| accepted
     spooled -->|"queue-space-shard.release (runRelease), local only<br/>(the blob never left this node):<br/>rows deleted in the task's commit;<br/>local copy removed"| gone([deleted])
     uploading -->|"queue-space-shard.release: /blob/remove<br/>(idempotent: the accept may have landed, its location not);<br/>rows deleted in the task's commit;<br/>local copy removed"| gone
     parked -->|"queue-space-shard.release: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>rows deleted in the task's commit;<br/>local copy removed"| gone

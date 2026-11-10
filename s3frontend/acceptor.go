@@ -418,9 +418,10 @@ func (b *Backend) acceptPass(ctx context.Context, uploadID string) (did bool, er
 		return false, err
 	}
 	// A part holding a blob the acceptor left is not its to finish, and goes
-	// back to 'spooled' for Complete: a blob with neither a park nor a
-	// location is uploaded from its spool copy, and one with a release
-	// record is settled by Complete's commit, which claims it. A part
+	// back to 'written': a blob with neither a park nor a location has gone
+	// from its provider, and Complete refuses the part (InvalidPart) so the
+	// client uploads it again; one with a pending release is settled by
+	// Complete's commit, which claims it. A part
 	// holding a blob whose conclude failed stays parked for the retry. Every
 	// other part is accepted, even in a pass that failed: one blob's failure
 	// says nothing about its neighbours, and holding them back would keep
@@ -429,7 +430,7 @@ func (b *Backend) acceptPass(ctx context.Context, uploadID string) (did bool, er
 	// replaced, or a session's teardown deleted, is left as it is and its
 	// release runs.
 	missing, unaccepted := digestSet(out.left), digestSet(out.failed)
-	var accepted, respooled []registry.MultipartPart
+	var accepted, unfinished []registry.MultipartPart
 	for _, p := range batch {
 		leftOut, failedOut := false, false
 		for _, d := range p.BlobDigests {
@@ -442,16 +443,16 @@ func (b *Backend) acceptPass(ctx context.Context, uploadID string) (did bool, er
 		}
 		switch {
 		case leftOut:
-			respooled = append(respooled, p)
+			unfinished = append(unfinished, p)
 		case !failedOut:
 			accepted = append(accepted, p)
 		}
 	}
-	if len(respooled) > 0 {
+	if len(unfinished) > 0 {
 		b.logger.Info("multipart accept: parts left for Complete (a blob unparked or being released)",
-			zap.String("upload_id", uploadID), zap.Int("parts", len(respooled)))
-		if _, merr := b.multipart.MoveParts(ctx, respooled, registry.PartParked, registry.PartSpooled); merr != nil {
-			return false, errors.Join(err, fmt.Errorf("return parts to spooled: %w", merr))
+			zap.String("upload_id", uploadID), zap.Int("parts", len(unfinished)))
+		if _, merr := b.multipart.MoveParts(ctx, unfinished, registry.PartParked, registry.PartWritten); merr != nil {
+			return false, errors.Join(err, fmt.Errorf("return parts to written: %w", merr))
 		}
 	}
 	if _, merr := b.multipart.MoveParts(ctx, accepted, registry.PartParked, registry.PartAccepted); merr != nil {

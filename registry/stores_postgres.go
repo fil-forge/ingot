@@ -888,7 +888,7 @@ func (r *Postgres) DeleteSession(ctx context.Context, uploadID string) error {
 func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree, release ReleaseTask) ([]multihash.Multihash, error) {
 	state := p.State
 	if state == "" {
-		state = PartSpooled
+		state = PartWritten
 	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {

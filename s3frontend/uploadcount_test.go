@@ -148,7 +148,7 @@ func newCountingBackend(t *testing.T) (*Backend, *recordingRegistrar) {
 	t.Cleanup(func() { _ = log.Close(ctx) })
 
 	reg := &recordingRegistrar{}
-	b := New(Deps{
+	deps := Deps{
 		Authority:  mem,
 		Registry:   mem,
 		Intents:    mem,
@@ -168,7 +168,9 @@ func newCountingBackend(t *testing.T) (*Backend, *recordingRegistrar) {
 		RegionKeys: testRegionKeys(t),
 		TenantKeys: testTenantKeys(),
 		Claims:     mem,
-	})
+	}
+	withStreaming(t, &deps, dir)
+	b := New(deps)
 	mem.start(t, b)
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)

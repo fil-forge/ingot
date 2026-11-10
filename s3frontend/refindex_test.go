@@ -114,6 +114,7 @@ func newRefTestBackendOver(t *testing.T, mem *testStore, log blockstore.Log, mbs
 	for _, opt := range opts {
 		opt(&deps)
 	}
+	withStreaming(t, &deps, dir)
 	b := New(deps)
 	mem.start(t, b)
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
@@ -176,7 +177,7 @@ func putObj(t *testing.T, b *Backend, key string, data []byte) {
 	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{
 		Bucket: &bucket,
 		Key:    &key,
-		Body:   bytes.NewReader(data),
+		Body:   bytes.NewReader(data), ContentLength: byteLen(data),
 	}); err != nil {
 		t.Fatalf("PutObject %s: %v", key, err)
 	}
@@ -415,7 +416,7 @@ func TestCommitFailureWritesNoClaim(t *testing.T) {
 
 	reg.fails = 1
 	bucket := "bk"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader([]byte("second body"))}); err == nil {
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader([]byte("second body")), ContentLength: byteLen([]byte("second body"))}); err == nil {
 		t.Fatal("PutObject succeeded although its root swap failed")
 	}
 	// The overwrite published nothing: the first version stands, with its
