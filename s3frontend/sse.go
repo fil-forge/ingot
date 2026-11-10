@@ -194,24 +194,12 @@ func (b *Backend) PutBucketEncryption(ctx context.Context, bucket string, config
 	default:
 		return errSSEArgument("The encryption method specified is not supported")
 	}
-	if err := b.reg.SetEncryption(ctx, bucket, enc); err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
-		return fmt.Errorf("s3frontend: put bucket encryption: %w", err)
-	}
-	return nil
+	return b.setBucketConfig(ctx, bucket, registry.BucketSetEncryptionAction, []byte(enc))
 }
 
 // DeleteBucketEncryption clears the bucket's default encryption, returning
 // it to the unconfigured state: objects written from here on are encrypted,
 // and GetBucketEncryption answers not found. Idempotent.
 func (b *Backend) DeleteBucketEncryption(ctx context.Context, bucket string) error {
-	if err := b.reg.SetEncryption(ctx, bucket, registry.BucketEncryptionUnset); err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
-		return fmt.Errorf("s3frontend: delete bucket encryption: %w", err)
-	}
-	return nil
+	return b.setBucketConfig(ctx, bucket, registry.BucketSetEncryptionAction, []byte(registry.BucketEncryptionUnset))
 }

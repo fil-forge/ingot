@@ -221,45 +221,6 @@ func (r *Postgres) SetClosing(ctx context.Context, name string, closing bool) er
 	return nil
 }
 
-func (r *Postgres) SetBucketTagging(ctx context.Context, name string, tags []byte) error {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.buckets SET bucket_tagging = $1 WHERE name = $2`,
-		tags, name)
-	if err != nil {
-		return fmt.Errorf("registry: set bucket tagging %q: %w", name, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-func (r *Postgres) SetCORSConfig(ctx context.Context, name string, cfg []byte) error {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.buckets SET cors_config = $1 WHERE name = $2`,
-		cfg, name)
-	if err != nil {
-		return fmt.Errorf("registry: set cors config %q: %w", name, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-func (r *Postgres) SetEncryption(ctx context.Context, name string, enc BucketEncryption) error {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.buckets SET encryption = $1 WHERE name = $2`,
-		nullString(string(enc)), name)
-	if err != nil {
-		return fmt.Errorf("registry: set encryption %q: %w", name, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
 func (r *Postgres) AllocVersionSeq(ctx context.Context, name string) (uint64, error) {
 	var seq int64
 	err := r.pool.QueryRow(ctx,

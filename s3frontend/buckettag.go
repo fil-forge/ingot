@@ -68,15 +68,8 @@ func (b *Backend) DeleteBucketTagging(ctx context.Context, bucket string) error 
 	return b.setBucketTagging(ctx, bucket, nil)
 }
 
-// setBucketTagging stores doc as the bucket's tag set. The registry reports
-// a missing row itself, so both writers reach the S3 sentinel without a
-// separate existence check.
+// setBucketTagging stores doc as the bucket's tag set
+// (queue-bucket.set-tagging).
 func (b *Backend) setBucketTagging(ctx context.Context, bucket string, doc []byte) error {
-	if err := b.reg.SetBucketTagging(ctx, bucket, doc); err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
-		return fmt.Errorf("s3frontend: set bucket tagging %q: %w", bucket, err)
-	}
-	return nil
+	return b.setBucketConfig(ctx, bucket, registry.BucketSetTaggingAction, doc)
 }

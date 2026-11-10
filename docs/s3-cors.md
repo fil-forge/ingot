@@ -48,7 +48,9 @@ owns the schema, the backend owns the bytes.
 `ingot.buckets.cors_config` (migration 00031), a nullable `bytea` read on
 the same row as everything else `registry.Get` returns, so the per-request
 read costs nothing extra. `registry.State.CORSConfig` carries it, nil when
-the bucket has none of its own, and `SetCORSConfig` writes it, nil clearing.
+the bucket has none of its own, and `queue-bucket.set-cors` writes it on the
+bucket's subject, nil clearing, so a bucket deleted and recreated under the
+name is never written by a request meant for the old one.
 
 The gateway-wide document is marshalled once at construction
 (`Deps.CORS`); `cors_allowed_origins` in the config is the default for

@@ -477,7 +477,7 @@ HEAD never decrypts. See `s3frontend/decrypt.go`.
 **Bucket encryption** (`s3frontend/sse.go`) is the S3 bucket-encryption API
 over the same machinery. A bucket's default encryption
 (`ingot.buckets.encryption`, set by PutBucketEncryption, cleared by
-DeleteBucketEncryption) is `AES256`, S3's SSE-S3 and the same envelope every
+DeleteBucketEncryption, both through `queue-bucket.set-encryption`) is `AES256`, S3's SSE-S3 and the same envelope every
 unconfigured bucket writes, or the non-standard `none`: objects stored as
 received, with no envelope, no key wraps and no params row, content-addressed
 by their own bytes. `none` is for tenants whose data is encrypted before it
@@ -623,9 +623,10 @@ draws the chains and the stores.
 - **The MST is the data**: immutable, content-addressed, self-verifying,
   shipped to Forge as-is.
 - A bucket is single-writer: every change to it (`queue-bucket.commit`,
-  `.create`, `.set-versioning`, `.set-object-lock-config`, `.close`,
-  `.admit-upload`, `.delete`, `.ship`) runs as a task on its `queue-bucket`
-  subject, one at a time, and
+  `.create`, `.set-versioning`, `.set-object-lock-config`, `.set-tagging`,
+  `.set-cors`, `.set-encryption`, `.close`, `.admit-upload`, `.delete`,
+  `.ship`) runs as a task on its `queue-bucket` subject, one at a time, and
+  acts only on the bucket that still lives in that space, and
   the root's advance is guarded on the root the commit started from. The
   versioning state and the lock configuration change on the same subject, so
   set-versioning's refusal of Suspended under a lock configuration and
