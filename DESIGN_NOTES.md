@@ -170,9 +170,10 @@ at PUT time or a sealed catalog CAR from a `queue-bucket.ship`:
    range are recorded locally (`blob_locations` and `shard_inclusions`)
    before the segment is marked shipped.
 
-Multipart parts stop after step 2 (**parked**: durable, unaccepted) and the
-upload's `queue-multipart-upload-shard.accept` task runs steps 3 and 4 in
-the background while the client is still uploading; an abort unwinds a
+Multipart parts stop after step 2 (**parked**: durable, unaccepted) and
+each blob's `queue-space-shard.accept`, queued by the upload's
+`queue-multipart-upload-shard.accept`, runs steps 3 and 4 in the background
+while the client is still uploading; an abort unwinds a
 parked blob with `/blob/abort` and an accepted one with `/blob/remove`. A
 part keeps no local copy: the accept concludes each blob from its park row
 and never reads its bytes. A part
@@ -203,59 +204,69 @@ the part through its `queue-space-shard.add`, then records the part as
 `parked`, with each blob's plaintext length. The same transaction queues the
 upload's `queue-multipart-upload-shard.accept` (`s3frontend/acceptor.go`,
 `registry/accept.go`) as a replacement due now, so an upload has at most one
-accept pending. The accept runs on its own queue (`registry.AcceptQueue`)
-with the upload ID as its subject, so one accept runs per upload at a time,
-apart from the upload's other work. It does nothing unless the session is
-`open`. It lists the parked parts in part order behind a
-part-number cursor, in batches of up to `MaxConcludeReceipts` (1000) blobs,
-and never splits a part across batches. It concludes each batch and
-continues until no parked part is left after the cursor, so parts that land
-while it runs are taken by the same task.
+accept pending. That accept runs on its own queue (`registry.AcceptQueue`)
+with the upload ID as its subject, and does nothing unless the session is
+`open`. It makes no network calls: it lists the upload's parked parts and
+queues, with its commit, a `queue-space-shard.accept` for each of their
+blobs (`registry.BlobAcceptSpec`), and marks a part with no blobs accepted.
 
-A batch concludes its blobs in one `/ucan/conclude`: one invocation carrying
-up to `MaxConcludeReceipts` put receipts (`receipts`, the plural argument,
-which is a different shape from the batch of invocations `/upload/add`
-sends). Sprue accepts them one request per storage node, and each blob's
-`/blob/accept` receipt and location commitment come back in the conclude
-response, so an upload of thousands of parts costs a few round trips rather
-than one per part. Step 4's polling remains the fallback for a blob the
-response did not cover. Each batch's conclude has a 2-minute timeout
-(`acceptBatchTimeout`), since the Forge client sets no timeout of its own.
+A blob's accept runs under the blob's own subject (`registry.ReleaseSubject`:
+the space and the digest), the one the blob's releases and a write's adds
+run under, so a blob's conclude never overlaps its release or a reference
+being taken. It is a replacement due now, so a blob has at most one accept
+pending however many parts or uploads name it. A blob already located (a
+dedup) needs nothing concluded. A parked blob is concluded on its own in one
+`/ucan/conclude`, whose response carries the blob's `/blob/accept` receipt
+and location commitment; step 4's polling remains the fallback. The
+conclude has a 2-minute timeout (`acceptConcludeTimeout`), since the Forge
+client sets no timeout of its own. A parked blob nothing in the space
+references any more, as a dropped part's is, is left for its release, which
+aborts the allocation. So is a blob with neither a park nor a location: it
+has been released.
 
-The accept's writes commit with the task, as SQL statements whose `WHERE`
-clauses apply each one only while the rows it depends on stand
-(`registry.ConcludedBlob`, `LocatedBlob`, `AcceptedPart`). A concluded
+The blob's accept writes commit with the task, as SQL statements whose
+`WHERE` clauses apply each one only while the rows it depends on stand
+(`registry.ConcludedBlob`, `LocatedBlob`, `AcceptedParts`). A concluded
 blob's park row is swapped for its location row only while the park the
 conclude started from stands, matched by its `/blob/add` task. Its upload
 intent is marked `accepted`, and a `published` intent stays `published`. A
-blob found already located (a dedup) has any park left beside the location
-dropped, only while that location stands. A part is marked `accepted` only
-while its row names the same blobs and every one of its blobs is located,
-so a part replaced or dropped while the accept ran stays as it is. A blob
-with neither a park nor a location has been released, and its part is left
-`parked`. A park of the same bytes recorded since by another write names
-another allocation, and stays for its own conclude. A failed batch fails the
-whole task, and nothing the task wrote is recorded. The retry concludes again, which the
-upload service treats as a repeat. A background accept retries 5 times,
-from 5 s, doubling, up to 1 minute (`acceptRetry`); a later part's accept,
-or Complete's, concludes whatever is left. `ingot.multipart.parked_age`
-(read from the part rows when it is collected), `ingot.multipart.accept_passes`
-(accept batches, by outcome) and `ingot.multipart.complete_deferred` report
-the queue's health; the README lists them.
+blob found already located has any park left beside the location dropped,
+only while that location stands. Every parked part of an open session in
+the space that names the blob is then marked `accepted` once all its blobs
+are located. Those part rows are locked first, in a fixed order: a part's
+other blobs are accepted under other subjects, and lock the same rows, so
+whichever accept commits second sees the first's location and marks the
+part. A part replaced or dropped meanwhile is not there to mark. A park of
+the same bytes recorded since by another write names another allocation,
+and stays for its own conclude. A failed conclude fails the blob's accept,
+and nothing it wrote is recorded; the retry concludes again, which the
+upload service treats as a repeat. A blob's accept retries 5 times, from
+5 s, doubling, up to 1 minute (`acceptRetry`); a later part's accept, or
+Complete's, queues whatever is left. `ingot.multipart.parked_age` (read from
+the part rows when it is collected), `ingot.multipart.accept_passes` (blob
+concludes, by outcome) and `ingot.multipart.complete_deferred` report the
+queue's health; the README lists them.
 
-An abort, an auto-abort or a part re-upload can release a blob while an
-accept is concluding it, and the upload service decides the order: a
-released allocation refuses the accept, and an accepted blob refuses
-`/blob/abort`, so the release follows it with `/blob/remove`. The release
-deletes the park and location rows together in its commit, so a conclude
-that finishes after it finds no park and records nothing; a location
-written then would let a later write of the same bytes reuse a blob that is
-gone. Ingot treats a `/blob/remove` receipt as final. If the upload service
-registers an accepted blob only after a remove that arrived earlier, that
-window is the upload service's to fix, and Ingot does not guard it. Two
-uploads in one space holding the same bytes share a park, and both accepts
-may conclude it: a repeated conclude is harmless upstream, the first record
-swaps the park, and the second finds the location.
+Complete runs the upload's accept for the parts it names, then brings those
+blobs' pending accepts forward from any retry's backoff and waits for them
+within `acceptWaitBudget` (30 s), a sync no-op on each blob's subject
+running once the tasks due before it there have run. Past the budget it
+answers OperationAborted. A named part still parked after the wait has a
+blob whose accept failed, and Complete fails for the client to retry; a part
+whose blob has gone answers InvalidPart.
+
+An abort, an auto-abort or a part re-upload queues a release of a blob the
+upload's accept may be concluding. The release runs under the blob's
+subject, so it runs before the conclude, and the accept finds the park gone
+and records nothing, or after it, and removes the accepted blob. The release
+deletes the park and location rows together in its commit, so a location is
+never written for a blob a release has taken. Ingot treats a `/blob/remove`
+receipt as final. If the upload service registers an accepted blob only
+after a remove that arrived earlier, as it may when a conclude Ingot gave up
+on is still running there, that window is the upload service's to fix, and
+Ingot does not guard it. Two uploads in one space holding the same bytes
+share a park, and its one accept concludes it once and marks both uploads'
+parts.
 
 Every change to a multipart upload runs as a task on
 `queue-multipart-upload` (`s3frontend/multipartqueue.go`), with the upload

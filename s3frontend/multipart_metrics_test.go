@@ -43,9 +43,9 @@ func collectMultipartMetrics(t *testing.T, reader *sdkmetric.ManualReader) map[s
 	return got
 }
 
-// TestMultipartMetrics_AcceptPasses: a batch that fails and the retry's
-// batch that accepts are counted by outcome; an accept that found nothing to
-// do counts nothing.
+// TestMultipartMetrics_AcceptPasses: a blob's conclude that fails and the
+// retry's that accepts are counted by outcome; an accept that found the blob
+// located counts nothing.
 func TestMultipartMetrics_AcceptPasses(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	cc := &countingConcluder{fails: 1}
@@ -54,10 +54,7 @@ func TestMultipartMetrics_AcceptPasses(t *testing.T) {
 	uploadID := mpCreate(t, b, key, "", "")
 	uploadDistinctParts(t, b, key, uploadID, 1)
 
-	if err := runAccepts(t, b, uploadID); err == nil {
-		t.Fatal("the first accept did not fail")
-	}
-	for range 2 {
+	for range 3 {
 		if err := runAccepts(t, b, uploadID); err != nil {
 			t.Fatalf("accept: %v", err)
 		}

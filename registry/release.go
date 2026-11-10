@@ -13,9 +13,10 @@ import (
 	"github.com/fil-forge/ingot/taskrunner"
 )
 
-// ReleaseQueue is the task queue a space's blobs are released on. Its subject
-// is the space and the digest (ReleaseSubject), so at most one release of a
-// blob in a space runs at a time, and a space's subjects share a prefix.
+// ReleaseQueue is the task queue a space's blobs are released on, and its
+// multipart part blobs accepted on (BlobAcceptAction). Its subject is the
+// space and the digest (ReleaseSubject), so at most one task on a blob in a
+// space runs at a time, and a space's subjects share a prefix.
 const ReleaseQueue = "queue-space-shard"
 
 // ReleaseAction removes a blob nothing in the space claims any more from the

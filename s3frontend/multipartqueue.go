@@ -224,9 +224,6 @@ func (b *Backend) runAbort(ctx context.Context, ex *taskrunner.Exec, t taskrunne
 		}
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
 	}
-	if err := b.awaitRunningAccept(ctx, t.Subject); err != nil {
-		return nil, fmt.Errorf("wait for the upload's accept: %w", err)
-	}
 	digests, published, err := b.sessionReleases(ctx, sess.Space, t.Subject)
 	if err != nil {
 		return nil, err
@@ -270,16 +267,15 @@ func (b *Backend) runReap(ctx context.Context, ex *taskrunner.Exec, t taskrunner
 // spawnReleases queues, with the task, a release due at of each of digests
 // in space, carrying release's authority.
 func spawnReleases(ctx context.Context, ex *taskrunner.Exec, space did.DID, digests []mh.Multihash, release registry.ReleaseTask, at time.Time) error {
-	for _, d := range digests {
-		spec, err := release.Spec(space, d, at)
-		if err != nil {
-			return err
-		}
-		if _, err := ex.Submit(ctx, spec); err != nil {
+	specs := make([]taskrunner.Spec, len(digests))
+	for i, d := range digests {
+		var err error
+		if specs[i], err = release.Spec(space, d, at); err != nil {
 			return err
 		}
 	}
-	return nil
+	_, err := ex.SubmitAll(ctx, specs)
+	return err
 }
 
 // applyCommitWrites adds w to the task's commit: its guards, then its
@@ -296,10 +292,8 @@ func applyCommitWrites(ctx context.Context, ex *taskrunner.Exec, w registry.Comm
 			return err
 		}
 	}
-	for _, spec := range w.Spawns {
-		if _, err := ex.Submit(ctx, spec); err != nil {
-			return err
-		}
+	if _, err := ex.SubmitAll(ctx, w.Spawns); err != nil {
+		return err
 	}
 	return ex.Cancel(ctx, registry.ReleaseQueue, w.Expiries...)
 }

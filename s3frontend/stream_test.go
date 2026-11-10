@@ -416,10 +416,14 @@ func TestStreamedUploadPart(t *testing.T) {
 
 	_, err = mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: ptrInt32(1), ETag: out.ETag}}, nil)
 	require.NoError(t, err)
-	require.Len(t, su.concluded, len(digests))
-	for i, d := range digests {
-		require.Equal(t, d, su.concluded[i].Digest)
+	// Each blob is concluded on its own, in no set order.
+	var concluded []multihash.Multihash
+	su.mu.Lock()
+	for _, c := range su.concluded {
+		concluded = append(concluded, c.Digest)
 	}
+	su.mu.Unlock()
+	require.ElementsMatch(t, digests, concluded)
 	require.Equal(t, part, getRange(t, b, key, ""))
 }
 

@@ -202,13 +202,19 @@ func TestMultipartSpans(t *testing.T) {
 			t.Fatalf("CompleteMultipartUpload: %v", err)
 		}
 	})
-	conclude := complete.one("blobs.conclude")
-	if conclude.Parent().SpanID() != complete.root.SpanID() {
-		t.Fatalf("expected blobs.conclude under the request span")
+	// Each part's blob is concluded by its own accept, on the queue's
+	// workers rather than under the request.
+	concludes := 0
+	for _, sp := range complete.spans {
+		if sp.Name() == "blobs.conclude" {
+			requireAttr(t, sp, attribute.Int("ingot.blobs.total", 1))
+			requireAttr(t, sp, attribute.Int("ingot.blobs.concluded", 1))
+			concludes++
+		}
 	}
-	requireAttr(t, conclude, attribute.Int("ingot.blobs.total", 2))
-	requireAttr(t, conclude, attribute.Int("ingot.blobs.concluded", 2))
-	requireAttr(t, conclude, attribute.Int("ingot.blobs.unparked", 0))
+	if concludes != 2 {
+		t.Fatalf("expected a blobs.conclude span per part blob, got %d", concludes)
+	}
 }
 
 // TestSweepLocalBlobsSpans: each pass of a local blob sweep records a span

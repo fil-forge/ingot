@@ -523,8 +523,9 @@ const uploadRegistrationWorkers = 4
 // runs at once. Each is a rename or an unlink.
 const shardWorkers = 4
 
-// releaseWorkers is how many blobs' releases one instance runs at once. Each
-// is a round trip to the upload service.
+// releaseWorkers is how many blobs' releases, and multipart part blobs'
+// accepts, one instance runs at once. Each is a round trip to the upload
+// service.
 const releaseWorkers = 8
 
 // multipartWorkers is how many multipart uploads' auto-aborts and reaps one
@@ -532,7 +533,7 @@ const releaseWorkers = 8
 const multipartWorkers = 2
 
 // acceptWorkers is how many multipart uploads' accepts one instance runs at
-// once. Each concludes up to a batch of blobs per round trip.
+// once. Each only queues its parked blobs' accepts, with no round trip.
 const acceptWorkers = 4
 
 // bucketWorkers is how many buckets' catalog ships one instance runs at

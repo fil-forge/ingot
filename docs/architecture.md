@@ -448,8 +448,9 @@ durable and accepted in Piri, so a crash never leaves a catalog entry pointing a
 ### 7.2 Multipart
 
 Parts upload concurrently, and each part's blobs are accepted while the client is still uploading.
-Each upload's `queue-multipart-upload-shard.accept` task concludes its parked parts in batches, so
-`Complete` has only the last few parts left to accept before it commits.
+Each upload's `queue-multipart-upload-shard.accept` task queues a `queue-space-shard.accept` for each
+blob of its parked parts, which concludes that blob under the blob's own subject, so `Complete` has
+only the last few parts left to accept before it commits.
 
 ```
 create, add-part, complete, abort and reap run on queue-multipart-upload (subject = uploadId; one at a time)
@@ -465,21 +466,24 @@ UploadPart(n)         → ingest + split; blob/add + PUT as the body arrives
                         ETag = hex(part MD5); a part keeps no local copy
 queue-multipart-upload-shard.accept (subject = uploadId; one runs per upload at a time)
      session not open → nothing to do
-     each batch: parked parts after a part-number cursor, up to 1000 blobs, a part never split
-     conclude them (one /ucan/conclude); writes commit with the task:
+     queue, with its commit, a queue-space-shard.accept per blob of the parked parts
+        (a replacement due now: one pending per blob); a part with no blobs → accepted
+queue-space-shard.accept (subject = space/digest: never beside the blob's release or adds)
+     located → nothing to conclude; nothing in the space references it → left for its release
+     parked → conclude it (one /ucan/conclude, 2 min timeout); writes commit with the task:
         park → location while the concluded park stands; intent → accepted;
-        part → accepted while its row names the same blobs, all located
-     continues until no parked part is left after the cursor
-     a failed batch fails the task, which records nothing; it runs at most 5 times,
+        lock the parts that name the blob, then part → accepted once all its blobs are located
+     a failed conclude fails the task, which records nothing; it runs at most 5 times,
         retrying from 5 s, up to 1 min apart
 CompleteMultipartUpload([parts]) → queue-multipart-upload.complete
      waiting > 10 s behind the upload's other changes → 409 OperationAborted
      upload already completed → replay its ETag and version id
      validate parts (S3 rules); check the re-hash budget; reserve and report the version id
      run the accept as a task of its own, limited to the named parts (omitted parts cannot
-        fail it); its writes commit before Complete reads the parts and assembles the tree
-     accept not started within 30 s → 409 OperationAborted, the upload stays open
-     accept failed → Complete fails with its error
+        fail it), then bring their blobs' accepts forward and wait for them; their writes
+        commit before Complete reads the parts and assembles the tree
+     accepts not finished within 30 s → 409 OperationAborted, the upload stays open
+     a named part still parked (its blob's accept failed) → Complete fails, for a retry
      a named part not accepted with the same blobs → InvalidPart, and the client uploads it again
      COMMIT (queue-bucket.commit as a sync child, a Put change): manifest pins ordered
         [blobs..]+ranges; object ETag = hex(md5(concat part MD5s)) + "-N";
@@ -535,17 +539,19 @@ delete, as on AWS. Only Hilt refusing the delete reopens the bucket. Hilt not fi
 means an earlier delete removed it, so this one finishes, and a call that failed on its way leaves
 the bucket closing until a retry settles it.
 
-The accept runs on its own queue, apart from the upload's changes, so an abort, an auto-abort or a
-part re-upload can release a blob while an accept is concluding it. The upload service decides the
-order. A released allocation refuses the later accept, and an accepted blob refuses the later `/blob/abort`, so the release
-follows it with `/blob/remove`. Ingot records an acceptance only while the park row it concluded
-stands, matched by its `/blob/add` task, swapping the park for the location in the accept's commit;
-the release deletes the park and location rows together in its commit, so a location is never
-written for a blob a release has taken, nor over a later park of the same bytes. A part is marked
-accepted only while its row names the blobs the accept read and every one of them is located, so a
-part replaced or dropped mid-conclude stays as it is. Ingot treats a `/blob/remove` receipt as
+A blob's accept runs under the blob's subject, the one its releases and a write's adds run under,
+so an abort, an auto-abort or a part re-upload that releases the blob never does so while it is
+being concluded. A release that runs first aborts the allocation, and the accept then finds the park
+gone and records nothing; one that runs after removes the accepted blob. Ingot records an
+acceptance only while the park row it concluded stands, matched by its `/blob/add` task, swapping
+the park for the location in the accept's commit; the release deletes the park and location rows
+together in its commit, so a location is never written for a blob a release has taken, nor over a
+later park of the same bytes. A part is marked accepted once every one of its blobs is located: the
+accepts of its blobs lock its row before checking, so the last to commit sees the others. A part
+replaced or dropped mid-conclude is not there to mark. Ingot treats a `/blob/remove` receipt as
 final. If the upload service registers an accepted blob only after a remove that arrived earlier,
-that window is the upload service's to fix, and Ingot does not guard it.
+as it may when a conclude Ingot gave up on is still running there, that window is the upload
+service's to fix, and Ingot does not guard it.
 
 ### 7.4 Read (`GetObject`)
 
@@ -643,7 +649,7 @@ negotiations).
 | Parked-allocation GC + honor `Expires`                                                         | Piri                            | **exists**   | The provider expires an allocation never concluded, which bounds leakage when an abort never arrives.                                                                                                               |
 | Indexer delete by `(space, digest)` / location-claim CID                                       | Indexer + Sprue                 | **to-build** | IPNI removal mechanics are the indexer's.                                                                                                                                                                           |
 | Bare location commitment served by blob digest                                                 | Indexer                         | **exists**   | `accept` publishes it; the indexer caches it. Ingot's locator must learn to consume it ([§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index)).                                                        |
-| Batch `allocate`/`accept`                                                                      | libforge + Sprue + Piri + Ingot | **partial**  | `accept` is batched without new command shapes: an accept batch's `/ucan/conclude` carries up to 1000 blobs' put receipts, and Sprue issues the accepts to each node in one request, with a receipt per blob. `allocate` is still one RPC per blob.                 |
+| Batch `allocate`/`accept`                                                                      | libforge + Sprue + Piri + Ingot | **partial**  | `/ucan/conclude` takes up to 1000 blobs' put receipts, and Sprue issues the accepts to each node in one request, with a receipt per blob. Ingot concludes each blob on its own, under the blob's subject, as the blobs arrive. `allocate` is one RPC per blob. |
 | Lift the 256 MiB blob ceiling (streaming commP)                                                | Piri                            | **optional** | Reduces large-object splitting; not required for the first cut.                                                                                                                                                     |
 | `allocate-by-size` + bind-digest-after (streamed body writes)                                  | Piri + Sprue + Ingot            | **exists**   | [§10](#10-deployment-topology--the-digest-before-upload-cost). Every body blob is added by size and hash function (`/blob/add` by digest code) and its digest computed during the PUT.                              |
 
@@ -1195,10 +1201,12 @@ harness (`make itest`); unit tests cover libraries and pure logic only:
   resolve through the local location table (`LocalLocator`); with an indexer-backed locator, §5's
   race on a digest not yet published would return.
 - **Multipart parts park at UploadPart and are accepted during the upload.** (Built: `parkBlobs`
-  over the `blob_parks` table, and the `queue-multipart-upload-shard.accept` task in
-  `s3frontend/acceptor.go` and `registry/accept.go`.) A part holds no local bytes: its blobs
-  stream to their providers, and the accept concludes each from its park row. Complete runs the
-  accept for the parts it names, and answers an accept that cannot start within 30 s with a 409 that the AWS CLI treats as final. Abort and the
+  over the `blob_parks` table, and the `queue-multipart-upload-shard.accept` and
+  `queue-space-shard.accept` tasks in `s3frontend/acceptor.go` and `registry/accept.go`.) A part
+  holds no local bytes: its blobs stream to their providers, and each blob's accept concludes it
+  from its park row. Complete runs the upload's accept for the parts it names and waits for their
+  blobs' accepts, and answers accepts that do not finish within 30 s with a 409 that the AWS CLI
+  treats as final. Abort and the
   auto-abort unwind parked blobs with `/blob/abort` and accepted ones with `/blob/remove`
   ([§7.2](#72-multipart)–[7.3](#73-one-change-per-upload-the-abortcomplete-race)).
 - **Crash recovery is not built.** A write that dies after its `queue-space-shard.add` tasks commit

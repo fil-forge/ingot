@@ -33,7 +33,9 @@ import (
 // Every reference a write takes enters through a queue-space-shard.add on the
 // same subject (shardref.go), so the subject's lease keeps a release and a
 // write of the same blob apart: a release finds the reference, or the write's
-// add runs after it and finds the blob gone.
+// add runs after it and finds the blob gone. A parked part blob's
+// queue-space-shard.accept (acceptor.go) runs under it too, so a release
+// never runs while the blob is being concluded.
 
 // releaseAttemptTimeLimit bounds one release attempt's network calls.
 // Package-level so tests can shrink it.

@@ -66,7 +66,8 @@ func newTestStore(t testing.TB) *testStore {
 			{Name: registry.MultipartQueue, Workers: 2},
 			// No workers: an upload's accept runs when a test runs it
 			// (runAccepts) or Complete does, which cancels the one UploadPart
-			// queued and runs its own.
+			// queued and runs its own. The blobs' accepts it queues run on
+			// queue-space-shard's workers.
 			{Name: registry.AcceptQueue},
 			// Commits run sync, in the request; the workers run ships.
 			{Name: registry.BucketQueue, Workers: 2},
