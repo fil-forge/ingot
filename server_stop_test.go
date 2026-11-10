@@ -15,7 +15,7 @@ import (
 // only once they have exited, even while they sweep on every tick.
 func TestStopWaitsForSweepers(t *testing.T) {
 	// A 2ms session TTL makes the multipart sweeper tick every millisecond.
-	s := newInmemServer(t, config.ServerConfig{MultipartSessionTTL: 2 * time.Millisecond})
+	s := newTestServer(t, config.ServerConfig{MultipartSessionTTL: 2 * time.Millisecond})
 	require.NoError(t, s.Start(t.Context()))
 	// A sweeper that is still busy for a while after the cancellation:
 	// Stop must not return before it does.

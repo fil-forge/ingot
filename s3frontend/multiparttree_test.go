@@ -15,7 +15,6 @@ import (
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
-	"github.com/valyala/fasthttp"
 	"lukechampine.com/blake3"
 
 	"github.com/fil-forge/ingot/blake3tree"
@@ -39,7 +38,7 @@ func wantCID(t *testing.T, data []byte) string {
 func assertObjectTree(t *testing.T, b *Backend, key string, data []byte) {
 	t.Helper()
 	bucket := "bk"
-	rc := &fasthttp.RequestCtx{}
+	rc := newRequestCtx()
 	if _, err := b.HeadObject(rc, &s3.HeadObjectInput{Bucket: &bucket, Key: &key}); err != nil {
 		t.Fatalf("HeadObject: %v", err)
 	}
@@ -291,7 +290,7 @@ func TestMultipartTree(t *testing.T) {
 		if !strings.Contains(apiErr.Description, strconv.Itoa(minPart)) {
 			t.Fatalf("refusal names %q, want the %d bytes to re-hash", apiErr.Description, minPart)
 		}
-		if _, err := b.HeadObject(&fasthttp.RequestCtx{}, &s3.HeadObjectInput{Bucket: &bucket, Key: &key}); err == nil {
+		if _, err := b.HeadObject(newRequestCtx(), &s3.HeadObjectInput{Bucket: &bucket, Key: &key}); err == nil {
 			t.Fatal("object exists after a refused Complete")
 		}
 		// A refusal keeps the parts' trees, so the retry merges them.

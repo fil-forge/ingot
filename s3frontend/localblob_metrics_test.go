@@ -15,7 +15,7 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -113,7 +113,7 @@ func TestLocalBlobMetrics_ParkedPart(t *testing.T) {
 
 func TestLocalBlobMetrics_Release(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
-	b, _ := newDeferredBackend(t, inmem.NopUploader{}, meteredBackend(reader))
+	b, _ := newDeferredBackend(t, testfakes.NopUploader{}, meteredBackend(reader))
 	key := "deleted"
 	putObj(t, b, key, testBody(1<<10))
 	size := blobSize(t, b, blobDigestOf(t, b, key, ""))
@@ -188,7 +188,7 @@ func TestLocalBlobMetrics_OrphanPass(t *testing.T) {
 // already gone, as on a retry after the copy was removed, counts nothing.
 func TestLocalBlobMetrics_ReleaseOfACopyAlreadyGone(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
-	b, _ := newDeferredBackend(t, inmem.NopUploader{}, meteredBackend(reader))
+	b, _ := newDeferredBackend(t, testfakes.NopUploader{}, meteredBackend(reader))
 	key := "deleted"
 	putObj(t, b, key, testBody(1<<10))
 	if err := os.Remove(localPath(b, blobDigestOf(t, b, key, ""))); err != nil {

@@ -19,34 +19,19 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/logstore"
-	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
 )
 
-// TestCatalogJournal_Live checks the catalog journal against a real Postgres:
+// TestCatalogJournal checks the catalog journal against a real Postgres:
 // the rows a commit writes, the rows a ship deletes, and the lock order that
 // keeps a commit racing its segment's ship from deadlocking or leaving rows
-// behind. Skipped unless INGOT_TEST_DSN names a reachable database (see
-// TestPostgresStores_Live).
-func TestCatalogJournal_Live(t *testing.T) {
-	dsn := os.Getenv("INGOT_TEST_DSN")
-	if dsn == "" {
-		t.Skip("set INGOT_TEST_DSN to run the live catalog journal test")
-	}
+// behind.
+func TestCatalogJournal(t *testing.T) {
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer pool.Close()
-	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
-		t.Fatalf("migrations.Up: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `TRUNCATE ingot.catalog_journal, ingot.segments, ingot.buckets CASCADE`); err != nil {
-		t.Fatalf("truncate: %v", err)
-	}
+	pool := pgtest.New(t)
 	r := registry.NewPostgres(pool)
 	if err := r.Create(ctx, "jb", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("Create: %v", err)

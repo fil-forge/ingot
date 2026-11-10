@@ -3,16 +3,12 @@ package registry_test
 import (
 	"context"
 	"errors"
-	"os"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multiformats/go-multihash"
-	"go.uber.org/zap/zaptest"
 
-	"github.com/fil-forge/ingot/inmem"
-	"github.com/fil-forge/ingot/migrations"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
@@ -28,33 +24,9 @@ type releaseStartStore interface {
 	registry.LocationStore
 }
 
-// TestReleaseStartLive runs the release start and cancel against the
-// in-memory store and, when INGOT_TEST_DSN is set, against Postgres (the
-// Live suffix puts it in CI's live-Postgres job).
-func TestReleaseStartLive(t *testing.T) {
-	t.Run("inmem", func(t *testing.T) {
-		runReleaseStartSuite(t, inmem.NewMemStore())
-	})
-	t.Run("postgres", func(t *testing.T) {
-		dsn := os.Getenv("INGOT_TEST_DSN")
-		if dsn == "" {
-			t.Skip("set INGOT_TEST_DSN to run the release start against Postgres")
-		}
-		ctx := t.Context()
-		pool, err := pgxpool.New(ctx, dsn)
-		if err != nil {
-			t.Fatalf("connect: %v", err)
-		}
-		t.Cleanup(pool.Close)
-		if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
-			t.Fatalf("migrations.Up: %v", err)
-		}
-		if _, err := pool.Exec(ctx, `TRUNCATE ingot.blob_refs, ingot.blob_release_intents,
-			ingot.multipart_sessions, ingot.multipart_parts CASCADE`); err != nil {
-			t.Fatalf("truncate: %v", err)
-		}
-		runReleaseStartSuite(t, registry.NewPostgres(pool))
-	})
+// TestReleaseStart runs the release start and cancel against Postgres.
+func TestReleaseStart(t *testing.T) {
+	runReleaseStartSuite(t, registry.NewPostgres(pgtest.New(t)))
 }
 
 func runReleaseStartSuite(t *testing.T, st releaseStartStore) {

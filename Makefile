@@ -17,9 +17,10 @@ GO ?= go
 build:
 	$(GO) build -o ingot ./cmd/ingot
 
-## test: run the unit test suite (fast, no Docker)
+## test: run the test suite, starting Postgres and OpenBao in Docker unless
+## INGOT_TEST_DSN and INGOT_TEST_BAO_ADDR name running ones. ARGS go to go test.
 test:
-	$(GO) test ./...
+	GO="$(GO)" scripts/test.sh $(ARGS)
 
 ## itest: run the integration test suite (boots the Forge stack in Docker; ~20 min)
 itest:

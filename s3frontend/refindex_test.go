@@ -18,7 +18,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 )
@@ -50,14 +50,14 @@ func (r *recordingRemover) removedDigests() map[string]int {
 // newRefTestBackend builds a Backend over real in-process collaborators (a
 // MemStore, an on-disk spool, a catalog log) plus a recording remover, so a
 // test can drive PutObject/DeleteObject and inspect blob_refs + releases.
-func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStore, *recordingRemover) {
+func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *testStore, *recordingRemover) {
 	t.Helper()
 	var mbs int64
 	if len(maxBlob) > 0 {
 		mbs = maxBlob[0]
 	}
 	ctx := context.Background()
-	mem := inmem.NewMemStore()
+	mem := newTestStore(t)
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(t.TempDir(), "segments"),
 		Meta:    mem,
@@ -73,7 +73,7 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 
 // newRefTestBackendOver is newRefTestBackend over a given catalog log. Each
 // opt adjusts the Deps before the Backend is built.
-func newRefTestBackendOver(t *testing.T, mem *inmem.MemStore, log blockstore.Log, mbs int64, opts ...func(*Deps)) (*Backend, *inmem.MemStore, *recordingRemover) {
+func newRefTestBackendOver(t *testing.T, mem *testStore, log blockstore.Log, mbs int64, opts ...func(*Deps)) (*Backend, *testStore, *recordingRemover) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -95,14 +95,14 @@ func newRefTestBackendOver(t *testing.T, mem *inmem.MemStore, log blockstore.Log
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
-		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, inmem.NopBaseReader{}),
+		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, testfakes.NopBaseReader{}),
 		Log:             log,
 		Spool:           spool,
 		Cache:           cache,
-		Uploader:        inmem.NopUploader{},
-		Deferred:        inmem.NopUploader{},
+		Uploader:        testfakes.NopUploader{},
+		Deferred:        testfakes.NopUploader{},
 		Remover:         rm,
-		Registrar:       inmem.NopUploader{},
+		Registrar:       testfakes.NopUploader{},
 		EncParams:       mem,
 		RegionKeys:      testRegionKeys(t),
 		TenantKeys:      testTenantKeys(),
@@ -115,6 +115,7 @@ func newRefTestBackendOver(t *testing.T, mem *inmem.MemStore, log blockstore.Log
 		opt(&deps)
 	}
 	b := New(deps)
+	mem.start(t, b)
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
@@ -189,12 +190,12 @@ func deleteObj(t *testing.T, b *Backend, key string) {
 	}
 }
 
-func claims(t *testing.T, mem *inmem.MemStore, digest []byte) int {
+func claims(t *testing.T, mem *testStore, digest []byte) int {
 	t.Helper()
-	// MemStore buckets carry no space (did.Undef), so claims recorded via
-	// the backend are keyed under did.Undef; count under the same key.
+	// MemStore buckets carry no space (mem.bk()), so claims recorded via
+	// the backend are keyed under mem.bk(); count under the same key.
 	// Space-keyed claim counting is covered by the live Postgres test.
-	n, err := mem.CountClaims(context.Background(), did.Undef, digest)
+	n, err := mem.CountClaims(context.Background(), mem.bk(), digest)
 	if err != nil {
 		t.Fatalf("CountClaims: %v", err)
 	}
@@ -399,7 +400,7 @@ func (f *failCommitRoot) CommitRoot(ctx context.Context, name string, expect, ne
 func TestCommitFailureWritesNoClaim(t *testing.T) {
 	reg := &failCommitRoot{}
 	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
-		d.Uploader = inmem.NopUploader{}
+		d.Uploader = testfakes.NopUploader{}
 		reg.Registry = d.Registry
 		d.Registry = reg
 	})
@@ -425,7 +426,7 @@ func TestCommitFailureWritesNoClaim(t *testing.T) {
 	if n := claims(t, mem, old); n != 1 {
 		t.Fatalf("claims on the first version after the failed overwrite = %d, want 1", n)
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("a failed overwrite recorded releases: %v", pending)
 	}
 	// A claim publishes its blob's intent; the failed write's blob was never
@@ -447,7 +448,7 @@ func TestCommitFailureWritesNoClaim(t *testing.T) {
 	if n := claims(t, mem, old); n != 0 {
 		t.Fatalf("claims on the superseded version = %d, want 0", n)
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 1 || string(pending[0].Digest) != string(old) {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 1 || string(pending[0].Digest) != string(old) {
 		t.Fatalf("releases after the retry = %v, want the superseded blob's", pending)
 	}
 }
@@ -473,7 +474,7 @@ func TestReleaseGraceRunsFromTheCommit(t *testing.T) {
 	const grace, stall = 150 * time.Millisecond, 250 * time.Millisecond
 	reg := &stallCommitRoot{delay: stall}
 	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
-		d.Uploader = inmem.NopUploader{}
+		d.Uploader = testfakes.NopUploader{}
 		d.ReleaseGrace = grace
 		reg.Registry = d.Registry
 		d.Registry = reg
@@ -485,7 +486,7 @@ func TestReleaseGraceRunsFromTheCommit(t *testing.T) {
 
 	start := time.Now()
 	putObj(t, b, key, []byte("second body"))
-	pending, err := mem.ListReleasesBySpace(ctx, did.Undef)
+	pending, err := mem.ListReleasesBySpace(ctx, mem.bk())
 	if err != nil || len(pending) != 1 || string(pending[0].Digest) != string(old) {
 		t.Fatalf("releases after the overwrite = %v (err %v), want the superseded blob's", pending, err)
 	}

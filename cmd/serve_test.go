@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/config"
+	"github.com/fil-forge/ingot/internal/pgtest"
 )
 
 // TestApp_GraphValidates ensures the fx graph is complete — every collaborator
@@ -22,15 +23,11 @@ import (
 // binding a listener or running migrations. Guards cmd/serve.go's provider
 // list from drifting away from what ServerModule needs.
 //
-// buildApp dials and pings Postgres before constructing the graph, so this
-// runs only when INGOT_TEST_DSN names a reachable database (same gate as
-// registry's live test). The always-on, DB-free graph validation lives in the
-// root package's TestModuleValidate_* (fx.ValidateApp over ingot.Module).
+// buildApp dials and pings Postgres before constructing the graph, so it gets
+// a database of its own. The DB-free graph validation lives in the root
+// package's TestModuleValidate_* (fx.ValidateApp over ingot.Module).
 func TestApp_GraphValidates(t *testing.T) {
-	dsn := os.Getenv("INGOT_TEST_DSN")
-	if dsn == "" {
-		t.Skip("set INGOT_TEST_DSN to run the buildApp graph test (buildApp pings Postgres)")
-	}
+	_, dsn := pgtest.NewWithDSN(t)
 
 	signer, err := ed25519.Generate()
 	if err != nil {

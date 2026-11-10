@@ -3,17 +3,13 @@ package registry_test
 import (
 	"errors"
 	"maps"
-	"os"
 	"slices"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multiformats/go-multihash"
-	"go.uber.org/zap/zaptest"
 
-	"github.com/fil-forge/ingot/inmem"
-	"github.com/fil-forge/ingot/migrations"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
 )
@@ -25,28 +21,9 @@ type partQueueStore interface {
 	registry.LocationStore
 }
 
-// TestPartQueueLive runs the acceptance-queue operations against the in-memory
-// store and, when INGOT_TEST_DSN is set, against Postgres.
-func TestPartQueueLive(t *testing.T) {
-	t.Run("inmem", func(t *testing.T) {
-		runPartQueueSuite(t, inmem.NewMemStore())
-	})
-	t.Run("postgres", func(t *testing.T) {
-		dsn := os.Getenv("INGOT_TEST_DSN")
-		if dsn == "" {
-			t.Skip("set INGOT_TEST_DSN to run the acceptance queue against Postgres")
-		}
-		ctx := t.Context()
-		pool, err := pgxpool.New(ctx, dsn)
-		if err != nil {
-			t.Fatalf("connect: %v", err)
-		}
-		t.Cleanup(pool.Close)
-		if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
-			t.Fatalf("migrations.Up: %v", err)
-		}
-		runPartQueueSuite(t, registry.NewPostgres(pool))
-	})
+// TestPartQueue runs the acceptance-queue operations against Postgres.
+func TestPartQueue(t *testing.T) {
+	runPartQueueSuite(t, registry.NewPostgres(pgtest.New(t)))
 }
 
 func runPartQueueSuite(t *testing.T, st partQueueStore) {
@@ -96,13 +73,11 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 		if err != nil || len(parts) != 1 || parts[0].State != registry.PartSpooled || !slices.Equal(parts[0].SpanLengths, []int64{1, 2}) {
 			t.Fatalf("ListParts = %+v, err %v; want one spooled part with sizes [1 2]", parts, err)
 		}
-		// Sizes must match the digests one for one. The in-memory store
-		// does not check this; the Postgres constraint does.
-		if _, ok := st.(*registry.Postgres); ok {
-			bad := registry.MultipartPart{UploadID: id, PartNumber: 9, ETagMD5: []byte{9}, Size: 1, BlobDigests: []multihash.Multihash{{0xd9}}, SpanLengths: []int64{1, 2}}
-			if _, err := st.PutPart(ctx, bad, nil); err == nil {
-				t.Fatal("PutPart with mismatched sizes was accepted")
-			}
+		// Sizes must match the digests one for one, which a constraint
+		// enforces.
+		bad := registry.MultipartPart{UploadID: id, PartNumber: 9, ETagMD5: []byte{9}, Size: 1, BlobDigests: []multihash.Multihash{{0xd9}}, SpanLengths: []int64{1, 2}}
+		if _, err := st.PutPart(ctx, bad, nil); err == nil {
+			t.Fatal("PutPart with mismatched sizes was accepted")
 		}
 	})
 

@@ -25,7 +25,7 @@ modules in; ingot is a standalone module and must build on its own `go.mod`:
 
 ```bash
 make build      # GOWORK=off go build ./...
-make test       # unit tests: GOWORK=off go test ./... (fast, no Docker)
+make test       # every package's tests, with Postgres and OpenBao in Docker
 make itest      # integration tests: boots the Forge stack in Docker (~6 min)
 make gen        # regenerate bucket/cbor_gen.go after changing bucket types
 GOWORK=off go vet ./...
@@ -35,13 +35,18 @@ GOWORK=off go build -o /tmp/ingot ./cmd/ingot               # the daemon binary
 
 **go directive: 1.26.4.**
 
-**The test pattern — unit first, integration when you're ready to wait.**
-`make test` runs library/unit tests in seconds with no Docker. `make itest`
+**The test pattern — the suite first, integration when you're ready to wait.**
+`make test` (`scripts/test.sh`) runs every package's tests in a minute or two.
+They need Postgres, and the region-key provider's need OpenBao: it starts both
+in Docker unless `INGOT_TEST_DSN` and `INGOT_TEST_BAO_ADDR` name running ones,
+and a test fails, rather than skips, without them. `internal/pgtest` gives
+each test a database of its own, copied from a migrated template, so tests
+share nothing; `internal/testfakes` stands in for the network. `make itest`
 runs `itest/` (build tag `itest`): it boots the full smelt Forge stack in
 Docker, mounts THIS working tree's binary over the published ingot image, and
 validates the real network path — including the curated S3 conformance
 partition (`itest/versity_*_test.go`); see `itest/README.md`. CI mirrors the
-same ordering: the `itest` job only runs after the unit job passes
+same ordering: the `itest` job only runs after the `test` job passes
 (`.github/workflows/go-test.yml`).
 
 ## Dependency stack
@@ -144,8 +149,8 @@ Internal:
   object-count changes a commit queues in its own transaction
   (`registry.WithTasks`); `queue-shard` (`s3frontend/shardqueue.go`), a
   cached blob's move into the cache and its eviction at `CacheTTL`, renewed
-  by reads. Live tests need `INGOT_TEST_DSN`; each uses its own
-  schema and truncates nothing.
+  by reads. Its own tests each use a schema of their own
+  (`taskrunnertest`), so the runner tests need no Ingot tables.
 - **`uploader/`** — `forge.go`/`blob.go`: `Forge` behind `Uploader`
   (`SubmitShard`), `BodyUploader`/`DeferredBodyUploader` (`UploadBlob`,
   `ConcludeBlobs`, `AbortBlob`), `StreamingBodyUploader` (`StartBlob`,
@@ -193,8 +198,9 @@ Internal:
   a body of declared length), `cbor_gen.go`.
 - **`mst/`** — the forked MST (deps: go-cid, blockstore, ucantone/did — trees
   carry their bucket's space for network-backed reads).
-- **`inmem/`** — in-memory fakes (`MemStore`, `NopBaseReader`, `NopUploader`);
-  test-only.
+- **`internal/pgtest`** — a fresh, migrated Postgres database per test;
+  **`internal/testfakes`** — the network's stand-ins (`NopBaseReader`,
+  `NopUploader`, a bucket `Authority` in place of hilt). Both test-only.
 - **`cars/`**, **`migrations/`**,
   **`internal/{reqscope,ucanexec,fasthttputil,cors,build}`**, **`gen/`**,
   **`testing/`** — CAR codec, goose SQL (`ingot` schema), request-scoped ctx
@@ -233,10 +239,10 @@ Internal:
 | `versitygw/backend.Backend` | `s3frontend.Backend` | (same) |
 | versitygw `auth.IAMService` + `middlewares.RequestIAMService` | `iam.Service` (versitygw's root account is disabled; every key resolves here) | (same; hilt-issued credentials) |
 | `blockstore.Log` | `logstore.Manager` (one `Store` per bucket) | in-memory fake |
-| `blockstore.BlockReader` | `blockstore.Forge` (in `Cached`) | `inmem.NopBaseReader` |
-| `registry.Registry` + the store seams + `logstore.Meta` | `*registry.Postgres` (all of them) | `inmem.MemStore` |
+| `blockstore.BlockReader` | `blockstore.Forge` (in `Cached`) | `testfakes.NopBaseReader` |
+| `registry.Registry` + the store seams + `logstore.Meta` | `*registry.Postgres` (all of them) | (same, on a database per test) |
 | `locator.Locator` | `registry.LocalLocator` | (indexer-backed locator exists, unwired) |
-| `uploader.{Uploader,BodyUploader,DeferredBodyUploader,BlobRemover}` | `uploader.Forge` | `inmem.NopUploader` |
+| `uploader.{Uploader,BodyUploader,DeferredBodyUploader,BlobRemover}` | `uploader.Forge` | `testfakes.NopUploader` |
 
 ## fx module
 
@@ -297,9 +303,9 @@ route table.
 There is no in-memory ingot: the deployment under test is always the real
 forge-mode daemon. Two tiers:
 
-- **`make test` — unit** (seconds, no Docker): library/unit tests across the
-  packages, plus the thin S3-client glue in `testing/` (`Config`/`NewS3Conf`,
-  roundtrip helpers).
+- **`make test`** (a minute or two, Postgres and OpenBao in Docker): every
+  package's tests, the registry on Postgres and the network faked, plus the
+  thin S3-client glue in `testing/` (`Config`/`NewS3Conf`, roundtrip helpers).
 - **`make itest` — integration** (`itest/`, build tag `itest`, Docker):
   boots the smelt Forge stack with THIS working tree's binary mounted over
   the published image.

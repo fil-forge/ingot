@@ -334,12 +334,12 @@ The queue gauges are read from Postgres each time the exporter collects. Without
 
 ## Testing handlers
 
-`taskrunnertest.NewEnv` creates a fresh schema in the database named by `INGOT_TEST_DSN` and drops it when the test ends, so tests never touch other data. Without the variable, the test is skipped.
+`taskrunnertest.NewEnv` creates a fresh schema in the database named by `INGOT_TEST_DSN` and drops it when the test ends, so tests never touch other data. Without the variable, the test fails; `make test` starts a Postgres and sets it.
 
 `taskrunnertest.CheckOwnWrites` catches a handler that reads its own task's writes. It runs a task twice, once with writes held until the commit, as in production, and once with each write applied as it is made, and fails the test if the results or the state left behind differ.
 
 ```go
-func TestCommitReadsBeforeWriting_Live(t *testing.T) {
+func TestCommitReadsBeforeWriting(t *testing.T) {
 	taskrunnertest.CheckOwnWrites(t, taskrunnertest.Case{
 		Queues: []taskrunner.QueueOptions{{Name: "queue-bucket"}, {Name: "queue-space-shard"}},
 		Setup: func(ctx context.Context, env taskrunnertest.Env, r *taskrunner.Runner) error {
