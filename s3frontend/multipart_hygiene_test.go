@@ -925,22 +925,6 @@ func (f *failEnqueueReleases) QueueReleases(ctx context.Context, space did.DID, 
 	return f.BlobRefStore.QueueReleases(ctx, space, digests, notBefore, release)
 }
 
-// failCompleteSession is a multipart store whose next `fails` completion
-// latches fail after the object has committed, stranding the session in
-// 'completing'.
-type failCompleteSession struct {
-	registry.MultipartStore
-	fails int
-}
-
-func (f *failCompleteSession) CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error) {
-	if f.fails > 0 {
-		f.fails--
-		return false, errors.New("sessions table unavailable")
-	}
-	return f.MultipartStore.CompleteSession(ctx, uploadID, etag, versionID)
-}
-
 // failDeleteSession is a multipart store whose next `fails` session deletes
 // fail, after the releases for its parts have been recorded.
 type failDeleteSession struct {
@@ -1398,51 +1382,6 @@ func TestReapAfterDeletedObjectReleased(t *testing.T) {
 	}
 }
 
-// TestCompletingSessionWhoseLatchFailedKeepsCommittedBlobs: the object
-// commits, but the completing→completed latch fails, so the session is
-// reaped through the abort path after its object was deleted. Its blobs'
-// intents were published by their claims, so the reap leaves them to the
-// object's own releases, which remove each blob once and then drop its
-// intent and cached copy.
-func TestCompletingSessionWhoseLatchFailedKeepsCommittedBlobs(t *testing.T) {
-	rm := &recordingRemover{}
-	mp := &failCompleteSession{}
-	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
-		mp.MultipartStore = d.Multipart
-		d.Multipart = mp
-		d.Remover = rm
-	})
-	ctx := context.Background()
-	key := "latch-failed"
-	uploadID, parts := completeTwoParts(t, b, key)
-	mp.fails = 1
-	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
-	if mp.fails > 0 {
-		t.Fatal("the latch never failed")
-	}
-	if sess, err := mem.GetSession(ctx, uploadID); err != nil || sess.State != registry.SessionCompleting {
-		t.Fatalf("session after the failed latch = %v/%v, want stranded completing", sess, err)
-	}
-	winners := blobDigestsOf(t, b, key, "")
-	deleteObj(t, b, key)
-
-	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
-		t.Fatalf("sweep: cleaned=%d err=%v", n, err)
-	}
-	if _, err := mem.GetSession(ctx, uploadID); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("stranded session survived the sweep (err=%v)", err)
-	}
-	drainReleases(t, b)
-	for _, d := range winners {
-		if rm.removedDigests()[string(d)] != 1 {
-			t.Fatalf("committed blob %x removed %d times, want once", d, rm.removedDigests()[string(d)])
-		}
-		assertLocalCopyReleased(t, b, mem, d)
-	}
-}
-
 // TestAbortRecordsBlobAnotherAbortingSessionReferences: two sessions share a
 // part blob and both are being torn down. Skipping the blob because the other
 // session's part still references it would let both skip it, and both would
@@ -1573,7 +1512,7 @@ func TestSweepReleasesSessionThatOutlivedItsBucket(t *testing.T) {
 	}
 
 	// The bucket row goes while the session stands.
-	if err := mem.Delete(ctx, bucket); err != nil {
+	if err := mem.Delete(ctx, bucket, space); err != nil {
 		t.Fatalf("delete bucket row: %v", err)
 	}
 	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
@@ -1625,7 +1564,7 @@ func TestRecreatedBucketDisownsItsPredecessorsUploads(t *testing.T) {
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
 
 	// Same name, new space.
-	if err := mem.Delete(ctx, bucket); err != nil {
+	if err := mem.Delete(ctx, bucket, oldSpace); err != nil {
 		t.Fatalf("delete bucket row: %v", err)
 	}
 	if err := mem.Create(ctx, bucket, newSpace, registry.CreateState{}); err != nil {

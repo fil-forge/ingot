@@ -13,6 +13,7 @@ import (
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // VersioningState is a bucket's S3 versioning configuration. Buckets start
@@ -128,30 +129,33 @@ type Registry interface {
 	// Get returns the state of a bucket, or ErrNotFound.
 	Get(ctx context.Context, name string) (*State, error)
 
-	// Delete removes a bucket. Returns ErrNotFound if absent.
-	Delete(ctx context.Context, name string) error
+	// Delete removes bucket name while it lives in space, so a delete never
+	// removes another bucket recreated under the name. Returns ErrNotFound
+	// if absent.
+	Delete(ctx context.Context, name string, space did.DID) error
 
-	// CASRoot atomically advances the bucket root from expect to next.
-	// Returns ErrConflict if the current root does not equal expect.
-	CASRoot(ctx context.Context, name string, expect, next cid.Cid) error
+	// RootCommitWrites returns the writes that advance the bucket root
+	// from expect to next with the rows the commit owes: its upload
+	// registrations, the new generation's blob claims, the discarded
+	// generations' claim drops, the journaled catalog blocks (RootCommit)
+	// and the catalog blocks it made garbage. A queue-bucket.commit writes
+	// them with its outcome, so none can describe a version the catalog
+	// never published, and no published version lacks them. A claim whose
+	// pending reference has gone fails it with ErrReferenceExpired.
+	RootCommitWrites(ctx context.Context, name string, expect, next cid.Cid, c RootCommit, gc []cid.Cid) (CommitWrites, error)
 
-	// EmptyRoot swaps the bucket root from expect to the empty tree, as
-	// CASRoot does, and in the same transaction clears forge_root_cid and
-	// drops the bucket's journaled catalog blocks: nothing the empty tree
-	// reaches needs them. DeleteBucket's first write.
+	// EmptyRoot swaps the bucket root from expect to the empty tree, and in
+	// the same transaction clears forge_root_cid and drops the bucket's
+	// journaled catalog blocks: nothing the empty tree reaches needs them.
+	// A root other than expect is ErrConflict. DeleteBucket's first write,
+	// made before it releases anything, so a delete that fails after it
+	// leaves a bucket that lists empty.
 	EmptyRoot(ctx context.Context, name string, expect cid.Cid) error
 
-	// CommitRoot is CASRoot plus the rows the commit owes, all in one
-	// transaction: the upload registrations, the new generation's blob
-	// claims, the discarded generations' claim drops and the journaled
-	// catalog blocks (RootCommit). They belong with the swap: a
-	// registration or claim without its commit would describe a version
-	// the catalog never published, and a commit without them would leave
-	// the version uncounted and its blobs unclaimed, with nothing left to
-	// say so. A claim whose pending reference has expired
-	// (ErrReferenceExpired) fails the commit, and the root does not advance. Passing an empty
-	// RootCommit is exactly CASRoot.
-	CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c RootCommit) error
+	// PendingRefsHeld reports whether every one of refs is still a pending
+	// reference, for a commit to refuse a change whose reference has gone
+	// before it writes anything.
+	PendingRefsHeld(ctx context.Context, refs []taskrunner.TaskID) (bool, error)
 
 	// CatalogJournalStats reports how much the catalog journal holds: the
 	// blocks commits journaled whose segments have not shipped yet.
@@ -162,14 +166,6 @@ type Registry interface {
 	// the recovery loop: anything reachable from Root but not from
 	// ForgeRoot needs to be re-submitted on startup.
 	SetForgeRoot(ctx context.Context, name string, root cid.Cid) error
-
-	// SetVersioning updates the bucket's versioning state. Only Enabled and
-	// Suspended are settable. Returns ErrNotFound if the bucket is absent.
-	SetVersioning(ctx context.Context, name string, v VersioningState) error
-
-	// SetObjectLockConfig stores the bucket's object-lock configuration
-	// document verbatim. Returns ErrNotFound if the bucket is absent.
-	SetObjectLockConfig(ctx context.Context, name string, cfg []byte) error
 
 	// SetBucketTagging stores the bucket's tag set, replacing any previous
 	// one; nil clears it. Returns ErrNotFound if the bucket is absent.
@@ -204,7 +200,8 @@ var (
 	ErrConflict         = errors.New("registry: root cas conflict")
 )
 
-// RootCommit is what a root swap carries besides the root (Registry.CommitRoot):
+// RootCommit is what a root's advance carries besides the root
+// (Registry.RootCommitWrites):
 // the rows that must exist exactly when the version does.
 type RootCommit struct {
 	// Registrations are the upload registrations the commit queues, as

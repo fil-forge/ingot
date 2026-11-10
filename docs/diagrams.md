@@ -18,7 +18,7 @@ change to the diagrams to re-check. The maintenance rule lives in
 | `context` | [System context](#system-context-services-and-contracts) | every service ingot talks to, and the contract on each edge | here |
 | `packages` | [Package map](#package-map-and-interface-seams) | internal packages and the interface seams between them | here |
 | `block-routes` | [Two block routes](#two-block-routes-body-blobs-and-catalog-blocks) | how body blobs and catalog blocks travel to Forge by different paths | here |
-| `put` | [PutObject](#putobject-stream-and-upload-off-the-lock-commit-under-it) | the write path: off-lock ingest and upload, locked commit | here |
+| `put` | [PutObject](#putobject-stream-and-upload-in-the-request-commit-on-the-bucket-queue) | the write path: ingest and upload in the request, commit on the bucket queue | here |
 | `get` | [GetObject](#getobject-version-resolution-local-tiers-network-retrieval) | version resolution, tier fallthrough, network retrieval | here |
 | `multipart` | [Multipart upload](#multipart-upload-park-on-write-accept-in-the-background) | park at UploadPart, accept in the background, Complete's wait, abort unwind | here |
 | `part-states` | [Part states](#part-states-the-acceptance-queue) | the part rows as the upload's accept queue | here |
@@ -194,9 +194,9 @@ flowchart TB
     end
 
     subgraph catr["the catalog route (dag-cbor blocks, asynchronous ship)"]
-        commit["commit: manifest + MST splice into OpStaging,<br/>one fsynced AppendBatch into the bucket's log,<br/>guarded root swap journaling the new blocks<br/>in Postgres (catalog_journal), 200 to the client"]
+        commit["queue-bucket.commit: manifest + MST splice into OpStaging,<br/>one fsynced AppendBatch into the bucket's log,<br/>guarded root advance journaling the new blocks<br/>in Postgres (catalog_journal), 200 to the client"]
         seal["open segment seals at SealBytes / SealAge<br/>(CAR + .idx + .ops)"]
-        ship["background ship: /blob/add the sealed CAR,<br/>PUT, conclude, accept"]
+        ship["queue-bucket.ship: /blob/add the sealed CAR,<br/>PUT, conclude, accept"]
         incl["blob_locations (the CAR) + shard_inclusions<br/>(inner byte ranges), then the guarded<br/>forge_root_cid advance, the segment's journal<br/>rows deleted, and retention"]
         commit --> seal --> ship --> incl
     end
@@ -252,11 +252,13 @@ Sources: `s3frontend/object.go` (ingestBody), `s3frontend/stream.go`,
 `blockstore/staging.go`, `logstore/`, `uploader/forge.go`, `uploader/blob.go`,
 `server.go` (newBucketFlushFunc). Review when these change.
 
-## PutObject: stream and upload off the lock, commit under it
+## PutObject: stream and upload in the request, commit on the bucket queue
 
-All network I/O runs outside the per-bucket lock; the critical section is a
-manifest write, an MST splice, one fsynced `AppendBatch`, and a guarded root
-swap. A `200` means the body is durable and accepted on the network, not
+All network I/O runs in the request, before the commit. The commit is a
+`queue-bucket.commit` task on the bucket's subject, run sync for the request,
+so one change to a bucket runs at a time. It is a manifest write, an MST
+splice, one fsynced `AppendBatch`, and a guarded root advance written with
+the task. A `200` means the body is durable and accepted on the network, not
 merely buffered.
 
 ```mermaid
@@ -268,10 +270,11 @@ sequenceDiagram
     participant R as registry<br/>(Postgres)
     participant U as sprue
     participant P as piri
+    participant Q as queue-bucket.commit<br/>(the bucket's subject)
     participant TX as bucketop.Tx
     participant L as logstore.Manager
 
-    Note over C,L: off the lock: ingest, hash, encrypt, stream each blob to its provider
+    Note over C,L: in the request: ingest, hash, encrypt, stream each blob to its provider
     C->>B: PutObject(bucket, key, body)
     B->>R: reg.Get(bucket), precondition pre-check
     B->>B: tenant recipient: resolve the tenant's #35;wrap key<br/>(tenant DID from the request, did:plc doc via the cached PLC resolver)#59;<br/>no recipient → the write fails
@@ -304,14 +307,14 @@ sequenceDiagram
         B->>BC: Adopt: the .tmp-* file goes under the digest, before the 200#59;<br/>queue-shard.cache dates it and schedules its queue-shard.evict
     end
     Note over B,U: StartBlob also captures the request proof store, if borrowable,<br/>as the space's ship authority (captureShipProofs, 1h TTL)
-    Note over B,L: under the per-bucket lock: commitVersion via Coordinator.WithTx
-    B->>TX: Begin (lock, snapshot root)
-    TX->>R: AllocVersionSeq (a multipart Complete in an Enabled bucket<br/>reserved its seq before the lock: see the multipart diagram)
-    TX->>TX: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match under the lock,<br/>MST splice (new nodes into staging)
-    Note over TX: uploader.CaptureShipAuthority: every commit captures the request<br/>proof store, if borrowable and it holds a /blob/add chain, as the<br/>space's ship authority, so a write with no body (a delete, a tag<br/>change) leaves one for its segment's ship
-    TX->>L: AppendBatch(catalog blocks, OpRoot) with fsync
-    TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>the batch's catalog blocks journaled under its segment (catalog_journal,<br/>skipped once the segment has shipped), blob_refs gains this version, each claim<br/>taking over the write's pending reference (row deleted, expiry cancelled#59;<br/>an expired one refuses the commit: SlowDown), superseded version rows removed,<br/>a queue-space-shard.release task, due after the grace, per digest whose<br/>claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (queue-space-upload tasks)
-    TX-->>B: committed, lock released
+    B->>Q: run sync: Put(key, manifest, blobs, pending references, If-Match/If-None-Match)<br/>+ the captured release and /upload/add, /upload/remove proofs
+    Q->>TX: Begin (snapshot root)
+    TX->>R: AllocVersionSeq (a multipart Complete in an Enabled bucket<br/>reserved its seq before the commit: see the multipart diagram)
+    TX->>TX: applyPut: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match against the current version,<br/>MST splice (new nodes into staging), advance the working root
+    Note over TX: uploader.CaptureShipAuthority: every append captures the request<br/>proof store, if borrowable and it holds a /blob/add chain, as the<br/>space's ship authority, so a write with no body<br/>(a delete, a tag change) leaves one for its segment's ship
+    TX->>L: Tx.Append: AppendBatch(catalog blocks, OpRoot) with fsync
+    Q->>R: RootCommitWrites, written with the task's own commit:<br/>the batch's catalog blocks journaled under its segment (catalog_journal,<br/>skipped once the segment has shipped), the root's advance (guarded: it must<br/>find the root it started from), blob_refs gains this version, each claim<br/>taking over the write's pending reference (row deleted, expiry cancelled#59;<br/>an expired one fails the change: SlowDown), superseded version rows removed,<br/>a queue-space-shard.release task, due after the grace, per digest whose<br/>claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (queue-space-upload tasks)
+    Q-->>B: the change's result (version id, seq)
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
     Note over B,U: a task runner worker runs each queue-space-shard.release once its grace passes:<br/>crypto-shred (its blob_encryption_params row deleted), then /blob/remove
 ```
@@ -335,7 +338,7 @@ sequenceDiagram
   storage shape is the [version tree](#per-key-version-storage-manifest-arm-leaf-arm-prev-tree).
 - The claim ledger and the zero-claims release are the
   [blob lifecycle](#blob-lifecycle-uploading-parked-accepted-released).
-- `CopyObject` runs the same `commitVersion`. Within one space its manifest
+- `CopyObject` commits the same Put change. Within one space its manifest
   pins the source's digests: no stream, no upload, claims incremented. Each
   source blob first takes a pending reference through a copy-mode
   `queue-space-shard.add`, which fails the copy with NoSuchKey unless the
@@ -360,7 +363,7 @@ sequenceDiagram
   durable and the response must say so, so a failure logs and the count
   under-reports rather than failing a write that succeeded.
 - The write does **not** call the upload service. It queues the change as a
-  `queue-space-upload` task in the same transaction as the root CAS, and a
+  `queue-space-upload` task in the same transaction as the root's advance, and a
   worker sends it. The count is reporting data, so a Sprue round trip does not
   belong in a PUT, and a Sprue outage delays the count instead of failing
   writes or losing it.
@@ -394,7 +397,8 @@ Sources: `s3frontend/object.go` (PutObject, ingestBody, concludeBody),
 `s3frontend/shardref.go` (addBlob, runAdd, runExpire), `s3frontend/stream.go` (WriteSizedBlob), `s3frontend/localblobs.go`
 (cacheWritten), `blockstore/blobcache.go`, `bucket/sized.go`, `uploader/stream.go`,
 `s3frontend/copy.go` (CopyObject, copySourceBucket),
-`s3frontend/version.go` (commitVersion, enqueueRegistration),
+`s3frontend/version.go` (applyPut), `s3frontend/bucketqueue.go` (commit, runCommit, register),
+`registry/bucketcommit.go` (RootCommitWrites),
 `s3frontend/uploadqueue.go` (the queue-space-upload handlers), `bucketop/bucketop.go`,
 `blockstore/staging.go`, `uploader/blob.go`, `uploader/forge.go`,
 `uploader/upload.go`. Review when these change.
@@ -499,7 +503,7 @@ sequenceDiagram
     participant R as registry<br/>(sessions, parts, parks, intents)
     participant U as sprue
     participant P as piri
-    participant TX as bucketop.Tx
+    participant Q as queue-bucket.commit<br/>(the bucket's subject)
 
     C->>B: CreateMultipartUpload
     B->>R: CreateSession(open) with headers + checksum algorithm
@@ -545,7 +549,7 @@ sequenceDiagram
         B->>R: LatchSession(open to completing), single winner
         B->>R: ListPartTrees#59; re-hash over budget: 400 InvalidPartLayout,<br/>the deferred revert reopens the session
         alt versioning Enabled, nothing reported yet
-            B->>R: reserveVersion: AllocVersionSeq off the lock, mint the versionId
+            B->>R: reserveVersion: AllocVersionSeq before the commit, mint the versionId
             B-->>C: report it: versitygw commits the 200 with x-amz-version-id<br/>and x-amz-server-side-encryption
         else
             B-->>C: report no version id: the 200 commits with x-amz-server-side-encryption only
@@ -560,8 +564,8 @@ sequenceDiagram
         else a named part not accepted with the blobs the request validated
             B-->>C: InvalidPart in the 200's body#59; the deferred revert reopens the session<br/>for the client to upload the part again
         else every named part accepted
-            B->>TX: commitVersionAt under what was reported (see the PutObject diagram)#59;<br/>refused (errReservationSuperseded) if the key gained a later seq,<br/>or the versioning no longer fits the report#59; the claims land<br/>in the root swap's transaction, set-based
-            B->>R: LatchSession(completing to completed), best-effort
+            B->>Q: run sync: Put under what was reported (see the PutObject diagram),<br/>with the session, its reserved version and If-Match/If-None-Match#59;<br/>refused (errReservationSuperseded) if the key gained a later seq,<br/>or the versioning no longer fits the report#59; the claims land<br/>with the root's advance, set-based
+            Q->>R: with the task's commit: the session moves completing to completed<br/>(guarded: a teardown that latched it away first fails the change with NoSuchUpload)
             B-->>C: the result ends the body: ETag = md5-of-part-md5s + "-N"
         end
     end
@@ -610,7 +614,7 @@ Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 
 Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
 acceptRequested, enqueuePartReleases, SweepStaleMultipartSessions),
-`s3frontend/version.go` (reserveVersion, commitVersionAt),
+`s3frontend/version.go` (reserveVersion, applyPut), `s3frontend/bucketqueue.go` (putPreCheck),
 `s3frontend/acceptor.go` (runAccept, acceptBatch), `registry/accept.go`,
 `s3frontend/stream.go`,
 `s3frontend/shardref.go` (addBlob, runAdd, dropRefsNow),
@@ -666,8 +670,9 @@ stateDiagram-v2
     [*] --> open : CreateSession
     open --> completing : Complete wins the latch
     completing --> open : pre-commit failure (deferred revert)
-    completing --> completed : commit ok (best-effort stamp)
+    completing --> completed : queue-bucket.commit, in the version's transaction (guarded)
     open --> aborting : Abort, DeleteBucket implicit abort, or sweeper
+    completing --> aborting : DeleteBucket or sweeper teardown
     aborting --> [*] : enqueuePartReleases, then DeleteSession (parts cascade)
     completed --> [*] : sweeper past TTL
 ```
@@ -680,13 +685,19 @@ stateDiagram-v2
   have gone out. A winner that fails reopens the session, and the waiting
   Complete may then take the latch; in an Enabled bucket its commit is
   refused, since it reported no id, and the client's retry reports one.
+- The Complete's `queue-bucket.commit` moves the session from `completing`
+  to `completed` in the same transaction as the version, and only while it
+  is still `completing`. A teardown that latched it to `aborting` first
+  makes the change fail with `NoSuchUpload`, so no manifest commits over
+  blobs the teardown released.
 - `ListParts` and `Abort` reject any non-`open` session as `NoSuchUpload`;
   `Complete` alone accepts `completed`, for idempotency.
 - The sweeper also reaps rows stuck in `completing` or `aborting` past the
   TTL.
 
-Sources: `s3frontend/multipart.go`, `registry/stores_postgres.go`
-(LatchSession). Review when these change.
+Sources: `s3frontend/multipart.go`, `s3frontend/bucketqueue.go`
+(putPreCheck), `registry/bucketcommit.go` (CompletedSession),
+`registry/stores_postgres.go` (LatchSession). Review when these change.
 
 ## Blob lifecycle: uploading, parked, accepted, released
 
@@ -713,14 +724,14 @@ flowchart TB
     accepted -->|"queue-space-shard.release (never committed):<br/>/blob/remove;<br/>rows deleted in the task's commit;<br/>cached copy evicted"| gone
     published -->|"queue-space-shard.release (committed):<br/>/blob/remove;<br/>rows deleted in the task's commit;<br/>cached copy evicted"| gone
 
-    accepted -->|"commit: the claim, in the root swap's transaction"| published
+    accepted -->|"queue-bucket.commit: the claim, with the root's advance"| published
 
     accepted -.->|"queue-shard.evict at the TTL,<br/>or SweepLocalBlobs over budget;<br/>state unchanged"| evicted[["cached file evicted"]]
     published -.->|"queue-shard.evict at the TTL,<br/>or SweepLocalBlobs over budget;<br/>state unchanged"| evicted
     W -->|"each blob's queue-space-shard.add"| pend["blob_pending_refs row<br/>(the write's pending reference, 24 h)"]
-    pend -->|"commit: the claim takes it over<br/>(row deleted, expiry cancelled)"| refs
+    pend -->|"queue-bucket.commit: the claim takes it over<br/>(row deleted, expiry cancelled)"| refs
     pend -->|"queue-space-shard.expire at the deadline:<br/>row dropped; nothing else referencing<br/>the blob queues its release, due at once"| gone
-    published -->|"commit: the root swap's transaction adds this version's claim"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
+    published -->|"queue-bucket.commit: the root's advance adds this version's claim"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
     refs -->|"version delete or overwrite removes its row"| zero{"no claim left<br/>for (space, digest)?"}
     zero -->|yes| rel["queue-space-shard.release queued in the same transaction,<br/>due after release_grace<br/>(the published → deleted edge runs it,<br/>stale if CountReferences finds any reference)"]
     zero -->|no| keep["blob retained<br/>(still referenced)"]
@@ -841,21 +852,22 @@ value union §2.1, prev tree §2.2, token §3, write rule §5, deletes §7);
 manifest figure this complements.
 
 Sources: `bucket/leaf.go`, `bucket/manifest.go`, `s3frontend/version.go`
-(mintVersionID, revSeqKey, commitVersion, deleteVersionScoped). Review when
+(mintVersionID, revSeqKey, applyPut, applyDeleteVersion). Review when
 `bucket/` types change (and re-run `make gen`).
 
 ## Catalog GC candidates: what gets remembered for removal
 
 `gc_candidates` is the memory of the catalog collector to come: every write
-that supersedes a catalog block records that block's CID here, inside the
-commit critical section, so nothing the tree sheds is ever forgotten. Nothing
+that supersedes a catalog block records that block's CID here, with the
+`queue-bucket.commit` that sheds it, so nothing the tree sheds is ever
+forgotten. Nothing
 consumes the table yet.
 
 ```mermaid
 flowchart TB
-    cv["commitVersion<br/>every version-creating write: PutObject, CopyObject,<br/>CompleteMultipartUpload, delete-marker insertion"]
-    dok["deleteObjectKey<br/>DELETE without versionId, unversioned bucket"]
-    dvs["deleteVersionScoped<br/>DELETE with versionId"]
+    cv["applyPut (a Put change)<br/>every version-creating write: PutObject, CopyObject,<br/>CompleteMultipartUpload, delete-marker insertion"]
+    dok["applyDeleteKey (a Delete change)<br/>DELETE without versionId, unversioned bucket"]
+    dvs["applyDeleteVersion (a Delete change)<br/>DELETE with versionId"]
 
     gc[("gc_candidates<br/>(cid, bucket, created_at)")]
 
@@ -871,9 +883,10 @@ flowchart TB
     class sweep external
 ```
 
-- Recording is mandatory, never best-effort: the inserts run inside the
-  per-bucket commit closure, so a failed insert fails the whole write before
-  the root swap.
+- Recording is mandatory, never best-effort: the inserts are written with the
+  root's advance in the task's commit, so a failed insert fails the whole
+  commit and the root does not move. A change that fails on its own terms
+  drops the candidates it recorded along with the rest of its work.
 - A retained supersession queues only the replaced **leaf block**; the old
   manifest is not queued because it lives on as a prev-tree entry. Only
   blocks nothing references anymore land here.
@@ -889,9 +902,11 @@ flowchart TB
 Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer),
 [`s3-versioning.md`](./s3-versioning.md) §7.
 
-Sources: `s3frontend/version.go` (commitVersion supersession,
-deleteVersionScoped), `s3frontend/object.go` (deleteObjectKey),
-`registry/stores_postgres.go` (AddGCCandidate). Review when these change.
+Sources: `s3frontend/version.go` (applyPut supersession,
+applyDeleteVersion), `s3frontend/object.go` (applyDeleteKey),
+`s3frontend/objectlock.go` (applySetAttributes), `bucketop/bucketop.go`
+(AddGCCandidate, Mark, Restore), `registry/bucketcommit.go`
+(RootCommitWrites). Review when these change.
 
 ## Principals and proof stores
 
@@ -926,8 +941,8 @@ flowchart TB
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
     walk -->|"reqscope.ProofStore<br/>on the walk's ctx"| reads
     kp -->|"captureShipProofs<br/>at StartBlob,<br/>borrowable stores only"| ship
-    kp -->|"CaptureShipAuthority<br/>at every bucketop commit,<br/>borrowable stores only"| commit
-    commit --> catship["async catalog ship"]
+    kp -->|"CaptureShipAuthority<br/>at every queue-bucket.commit append,<br/>borrowable stores only"| commit
+    commit --> catship["queue-bucket.ship"]
     ship -->|"no commit capture<br/>holding a chain"| catship
     kp -->|"CaptureAuthority when a write<br/>queues a release"| relargs["queue-space-shard.release args:<br/>/blob/remove and /blob/abort chains"]
     ship --> async["releases, aborts and<br/>registration renewals; DeleteBucket aborts"]
@@ -1242,29 +1257,33 @@ Sources: `migrations/sql/*.sql`. Review whenever a migration is added.
 
 Teardown crosses every seam in order: prove the bucket empty, commit its
 root empty, unwind in-flight multipart, quiesce the log, release every
-network registration, then delete at hilt and locally.
+network registration, then delete at hilt and locally. It runs as a
+`queue-bucket.delete` task on the bucket's subject, sync for the request, so
+no commit or ship of the bucket runs beside it.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor C as S3 client
     participant B as s3frontend.Backend
+    participant Q as queue-bucket.delete<br/>(the bucket's subject)
     participant R as registry<br/>(Postgres)
     participant L as logstore.Manager
     participant U as sprue
     participant H as hilt
 
     C->>B: DeleteBucket
-    Note over B,R: the whole operation runs under the per-bucket lock
+    B->>Q: run sync, the signed S3 request in the caller's context (never stored)
+    Note over Q,H: the steps below run in the task#59; a delete resumed without<br/>its caller fails without acting
     B->>R: reg.Get
     B->>B: MST emptiness walk<br/>(ErrBucketNotEmpty, or the versioned variant)
-    B->>R: EmptyRoot (one tx: root → empty, forge root cleared,<br/>the bucket's catalog_journal rows dropped)
+    B->>R: EmptyRoot (one tx, ahead of the task's own commit: root → empty,<br/>forge root cleared, the bucket's catalog_journal rows dropped)
     Note over B,R: nothing the bucket reads is released below
-    loop each open multipart session
-        B->>U: abortOpenSession: /blob/abort parked blobs
+    loop each multipart session (in-flight uploads do not block the delete, as on AWS)
+        B->>U: open: abortOpenSession (/blob/abort parked blobs)#59;<br/>completed: reaped#59; completing or aborting: latched, then reaped
         Note over B,U: the request's own proofs sign the release legs<br/>(s3:DeleteBucket delegates blob.Abort + blob.Remove)
     end
-    B->>L: QuiesceBucketLog (stop flushes, wait for in-flight ship)
+    B->>L: QuiesceBucketLog (seal the open segment, close the store)#59;<br/>no ship is in flight, since ships share the subject
     loop ReleaseRetiredSegments: each retired segment
         L->>U: /blob/remove its CAR + index blob
         L->>R: DeleteSegment (its row, once both are released)
@@ -1274,8 +1293,8 @@ sequenceDiagram
         B->>U: /blob/remove (release the space's registration)
     end
     B->>R: drainSpaceReleases: Expedite the space's pending queue-space-shard.release<br/>tasks (subject space/*), run them inline (/blob/remove each)#59;<br/>a release still waiting fails the delete for the client to retry
-    B->>U: DrainSpaceRegistrations: send the space's queued<br/>/upload/add and /upload/remove changes
-    B->>H: /s3/bucket/delete (hilt refuses while registrations remain)
+    B->>U: DrainSpaceRegistrations: send the space's pending queue-space-upload changes
+    B->>H: /s3/bucket/delete with the signed S3 request (hilt refuses while registrations remain)
     B->>R: reg.Delete (the local row, its catalog_journal rows cascading)
     B->>L: RemoveBucketLog, best-effort<br/>(directory + segment rows)
     B-->>C: 204
@@ -1291,10 +1310,12 @@ sequenceDiagram
   The quiesce leaves the last segment sealed and unshipped until that next
   write; its journal rows went with the root.
 
-Sources: `s3frontend/bucket.go` (DeleteBucket), `s3frontend/multipart.go`
-(abortOpenSession), `s3frontend/releasequeue.go` (drainSpaceReleases),
-`s3frontend/uploadqueue.go` (DrainSpaceRegistrations), `logstore/manager.go`.
-Review when these change.
+Sources: `s3frontend/bucket.go` (DeleteBucket, runDeleteBucket),
+`s3frontend/bucketqueue.go` (bucketSpec), `s3frontend/multipart.go`
+(abortOpenSession, reapCompletedSession, reapAbortingSession),
+`s3frontend/releasequeue.go` (drainSpaceReleases),
+`s3frontend/uploadqueue.go` (DrainSpaceRegistrations),
+`logstore/manager.go`. Review when these change.
 
 ## Package-to-diagram map
 
@@ -1311,7 +1332,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `s3frontend/shardref.go` | put, multipart, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |
-| `s3frontend/uploadsweep.go` | put, delete-bucket |
+| `s3frontend/bucketqueue.go`, `bucketchanges.go`, `bucketadmin.go`, `bucketship.go` | put, multipart, gc-candidates, delete-bucket, logstore-pipeline |
 | `bucketop/` | put, get, delete-bucket, packages, principals |
 | `blockstore/` | get, packages, block-routes; `forge.go` also context, principals |
 | `registry/` | schema, get, blob-lifecycle, logstore-pipeline |

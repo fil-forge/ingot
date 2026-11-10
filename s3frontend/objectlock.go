@@ -13,7 +13,6 @@ import (
 	"github.com/ipfs/go-cid"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
-	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
 )
@@ -197,8 +196,9 @@ func (b *Backend) GetObjectLegalHold(ctx context.Context, bucket, object, versio
 // mutateVersionLock runs a per-version state write for the lock methods:
 // mutateVersionState with the lock-enabled gate required. The tagging twin
 // is mutateVersionTags (objecttag.go).
-func (b *Backend) mutateVersionLock(ctx context.Context, bucketName, key, versionID string, mutate func(*msbucket.VersionState)) error {
-	return b.mutateVersionState(ctx, bucketName, key, versionID, true, mutate)
+func (b *Backend) mutateVersionLock(ctx context.Context, bucketName, key string, set *SetAttributesChange) error {
+	set.RequireLock = true
+	return b.mutateVersionState(ctx, bucketName, key, set)
 }
 
 // PutObjectRetention stores the controller's retention document on the
@@ -206,9 +206,7 @@ func (b *Backend) mutateVersionLock(ctx context.Context, bucketName, key, versio
 // COMPLIANCE never weakened, governance bypass) ran in the controller before
 // this is called.
 func (b *Backend) PutObjectRetention(ctx context.Context, bucket, object, versionId string, retention []byte) error {
-	return b.mutateVersionLock(ctx, bucket, object, versionId, func(vs *msbucket.VersionState) {
-		vs.Retention = retention
-	})
+	return b.mutateVersionLock(ctx, bucket, object, &SetAttributesChange{VersionID: versionId, SetRetention: true, Retention: retention})
 }
 
 // PutObjectLegalHold stores the version's legal-hold status.
@@ -217,13 +215,11 @@ func (b *Backend) PutObjectLegalHold(ctx context.Context, bucket, object, versio
 	if status {
 		hold = msbucket.LegalHoldOn
 	}
-	return b.mutateVersionLock(ctx, bucket, object, versionId, func(vs *msbucket.VersionState) {
-		vs.LegalHold = hold
-	})
+	return b.mutateVersionLock(ctx, bucket, object, &SetAttributesChange{VersionID: versionId, SetLegalHold: true, LegalHold: hold})
 }
 
 // mutateVersionState runs one per-version state write (§6): the check order
-// under the per-bucket commit lock, a read-modify-write merge of the target
+// in the bucket's commit, a read-modify-write merge of the target
 // version's state block (mutate owns its fields and every other field is
 // carried, §4.1 rule 3), and the leaf/state-tree/top-MST splice. A
 // manifest-arm key upgrades to a leaf on its first state write (§4.1 rule 1);
@@ -233,8 +229,38 @@ func (b *Backend) PutObjectLegalHold(ctx context.Context, bucket, object, versio
 // entirely inside the commit (a missing bucket surfaces through
 // mapCommitError); key existence outranks lock-enabled, which outranks the
 // versionId grammar, matching posix and the pinning conformance cases.
-func (b *Backend) mutateVersionState(ctx context.Context, bucketName, key, versionID string, requireLock bool, mutate func(*msbucket.VersionState)) error {
-	err := b.txns.WithTx(ctx, bucketName, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
+func (b *Backend) mutateVersionState(ctx context.Context, bucketName, key string, set *SetAttributesChange) error {
+	st, err := b.reg.Get(ctx, bucketName)
+	if errors.Is(err, registry.ErrNotFound) {
+		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+	}
+	if err != nil {
+		return fmt.Errorf("s3frontend: put object state: %w", err)
+	}
+	_, _, err = b.commitOne(ctx, st, KeyChange{Key: key, SetAttributes: set}, "put object lock state")
+	return err
+}
+
+// applySetAttributes is the state write mutateVersionState commits: it sets
+// the fields set names on the version's state block, carrying the rest.
+func (b *Backend) applySetAttributes(ctx context.Context, sc *commitScope, key string, set *SetAttributesChange) (cid.Cid, error) {
+	tx := sc.tx
+	versionID, requireLock := set.VersionID, set.RequireLock
+	mutate := func(vs *msbucket.VersionState) {
+		if set.SetRetention {
+			vs.Retention = set.Retention
+		}
+		if set.SetLegalHold {
+			vs.LegalHold = set.LegalHold
+		}
+		if set.SetTags {
+			vs.Tags = set.Tags
+			if len(vs.Tags) == 0 {
+				vs.Tags = nil
+			}
+		}
+	}
+	return func() (cid.Cid, error) {
 		st := tx.State()
 		if !st.Root.Defined() {
 			return cid.Undef, s3err.GetAPIError(s3err.ErrNoSuchKey)
@@ -363,9 +389,7 @@ func (b *Backend) mutateVersionState(ctx context.Context, bucketName, key, versi
 			if !oldStateCid.Defined() {
 				return cid.Undef, nil // nothing stored, nothing to store
 			}
-			if err := b.gc.AddGCCandidate(ctx, oldStateCid.Bytes(), st.Name); err != nil {
-				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
-			}
+			tx.AddGCCandidate(oldStateCid)
 			var err error
 			if stateTree, err = stateTree.Delete(ctx, revSeqKey(targetSeq)); err != nil {
 				return cid.Undef, fmt.Errorf("state delete: %w", err)
@@ -392,9 +416,7 @@ func (b *Backend) mutateVersionState(ctx context.Context, bucketName, key, versi
 				stateTree = mst.NewEmptyMST(tx, st.Space)
 			}
 			if oldStateCid.Defined() {
-				if err := b.gc.AddGCCandidate(ctx, oldStateCid.Bytes(), st.Name); err != nil {
-					return cid.Undef, fmt.Errorf("gc candidate: %w", err)
-				}
+				tx.AddGCCandidate(oldStateCid)
 				stateTree, err = stateTree.Update(ctx, revSeqKey(targetSeq), newStateCid)
 			} else {
 				stateTree, err = stateTree.Add(ctx, revSeqKey(targetSeq), newStateCid, -1)
@@ -412,9 +434,7 @@ func (b *Backend) mutateVersionState(ctx context.Context, bucketName, key, versi
 		// Rewrite the leaf (the replaced value block is superseded) and
 		// splice the top MST. Invariant 5 is untouched: no manifest and no
 		// prev entry was rewritten.
-		if err := b.gc.AddGCCandidate(ctx, valCid.Bytes(), st.Name); err != nil {
-			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
-		}
+		tx.AddGCCandidate(valCid)
 		newValCid, err := tx.Put(ctx, &msbucket.EnvelopedLeaf{Leaf: &leaf})
 		if err != nil {
 			return cid.Undef, fmt.Errorf("leaf put: %w", err)
@@ -424,11 +444,7 @@ func (b *Backend) mutateVersionState(ctx context.Context, bucketName, key, versi
 			return cid.Undef, fmt.Errorf("mst update: %w", err)
 		}
 		return t2.GetPointer(ctx, tx)
-	})
-	if err != nil {
-		return mapCommitError(err, "put object lock state")
-	}
-	return nil
+	}()
 }
 
 // stateHeaderFields returns the state-derived response fields for a resolved

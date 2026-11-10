@@ -42,9 +42,9 @@ func (r *recordingShips) CaptureShipAuthority(ctx context.Context, space did.DID
 	r.captured = append(r.captured, capture{space: space, store: store})
 }
 
-// TestCommitCapturesShipAuthority checks that a commit hands its request to
-// Ships under the bucket's space, so a write that uploads no body still
-// leaves the authority its segment's ship needs.
+// TestCommitCapturesShipAuthority checks that a commit's append hands its
+// request to Ships under the bucket's space, so a write that uploads no body
+// still leaves the authority its segment's ship needs.
 func TestCommitCapturesShipAuthority(t *testing.T) {
 	ctx := context.Background()
 	mem := registry.NewPostgres(pgtest.New(t))
@@ -77,8 +77,9 @@ func TestCommitCapturesShipAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatalf("multihash: %v", err)
 	}
-	if err := tx.Commit(reqCtx, cid.NewCidV1(cid.DagCBOR, mh)); err != nil {
-		t.Fatalf("Commit: %v", err)
+	tx.Advance(cid.NewCidV1(cid.DagCBOR, mh))
+	if _, ok, err := tx.Append(reqCtx); err != nil || !ok {
+		t.Fatalf("Append = %v, %v", ok, err)
 	}
 
 	ships.mu.Lock()

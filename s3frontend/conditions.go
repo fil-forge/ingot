@@ -83,9 +83,10 @@ func isNoSuchKey(err error) bool {
 	return errors.Is(err, s3err.GetAPIError(s3err.ErrNoSuchKey))
 }
 
-// mapCommitError maps an error from a bucketop.WithTx commit closure to the
-// S3-facing error: a missing bucket becomes NoSuchBucket, a versitygw API error
-// (e.g. a precondition failure raised inside the closure) is surfaced verbatim
+// mapCommitError maps an error from a bucket commit, or from one of its
+// changes, to the S3-facing error: a missing bucket becomes NoSuchBucket, a
+// versitygw API error (e.g. a precondition failure raised by a change) is
+// surfaced verbatim
 // so its HTTP status is preserved, and anything else is wrapped with op for the
 // server log.
 func mapCommitError(err error, op string) error {

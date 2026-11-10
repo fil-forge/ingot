@@ -94,7 +94,7 @@ type Log interface {
 }
 
 // Appended is one committed batch as the log took it: the catalog blocks and
-// the segment they went into. The root swap journals the blocks in Postgres
+// the segment they went into. The commit journals the blocks in Postgres
 // under that segment until it ships (registry.RootCommit.Journal), so a copy
 // of Postgres holds every block the host's disk alone would otherwise hold.
 type Appended struct {

@@ -101,7 +101,25 @@ type Backend struct {
 	releases *taskrunner.Runner
 	// accepts runs the queue-multipart-upload-shard tasks
 	// (RegisterAcceptTasks).
-	accepts      *taskrunner.Runner
+	accepts *taskrunner.Runner
+	// buckets runs the queue-bucket tasks (RegisterBucketTasks).
+	buckets *taskrunner.Runner
+	// shipMu guards shipReady and earlyShips: the ships the catalog log
+	// reported before the ship handler was registered, which registering it
+	// queues.
+	shipMu     sync.Mutex
+	shipReady  bool
+	earlyShips []string
+	// shipOwed are the buckets whose ship could not be queued, which
+	// retryOwedShips queues once it can; shipRetrying is set while it runs,
+	// and shipStop, closed by Drain, ends it. shipMu guards them too.
+	shipOwed map[string]bool
+	// shipAwaiting are the buckets whose ship found no authority to send
+	// with, which the bucket's next commit queues again (awaitShipAuthority).
+	shipAwaiting map[string]bool
+	shipRetrying bool
+	shipStop     chan struct{}
+	shipStopped  bool
 	releaseGrace time.Duration
 	// releaseRetry is the queue-space-shard.release retry policy; tests
 	// shorten it.
@@ -371,12 +389,12 @@ func (*Backend) Shutdown() {}
 // invariants need verifying before the listener accepts traffic.
 func (b *Backend) Recover(_ context.Context) error { return nil }
 
-// Drain shuts the log down via the Coordinator: seals the open
-// segment, drains the flush queue, and updates per-bucket
-// forge_root_cid for every op_root that landed in a flushed
-// segment. After Drain returns cleanly, no acked write is
-// unrepresented in Postgres.
+// Drain shuts the log down via the Coordinator: it seals each bucket's
+// open segment, which ships from the bucket's queue once the log is open
+// again. After Drain returns cleanly, no acked write is unrepresented in
+// Postgres.
 func (b *Backend) Drain(ctx context.Context) error {
+	b.stopShipRetries()
 	if b.txns == nil {
 		return nil
 	}

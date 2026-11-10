@@ -531,6 +531,10 @@ const releaseWorkers = 8
 // once. Each concludes up to a batch of blobs per round trip.
 const acceptWorkers = 4
 
+// bucketWorkers is how many buckets' catalog ships one instance runs at
+// once. Commits and the other bucket changes run in their requests.
+const bucketWorkers = 2
+
 // provideTaskRunner builds the runner for ingot's durable task queues, over
 // the host's pool. The backend registers its handlers (Server.New); the
 // migration hook creates its tables and the server starts and stops it.
@@ -543,10 +547,13 @@ func provideTaskRunner(pool *pgxpool.Pool, id identity.Identity, logger *zap.Log
 	return taskrunner.New(pool, taskrunner.Options{
 		Schema: taskSchema,
 		Node:   id.DID().String(),
+		// In the RFC's queue order: a task may run sync children only on
+		// the queues after its own.
 		Queues: []taskrunner.QueueOptions{
+			{Name: registry.AcceptQueue, Workers: acceptWorkers},
+			{Name: registry.BucketQueue, Workers: bucketWorkers},
 			{Name: registry.UploadQueue, Workers: uploadRegistrationWorkers},
 			{Name: registry.ReleaseQueue, Workers: releaseWorkers},
-			{Name: registry.AcceptQueue, Workers: acceptWorkers},
 			{Name: s3frontend.ShardQueue, Workers: shardWorkers},
 		},
 		Logger: logger.Named("tasks"),

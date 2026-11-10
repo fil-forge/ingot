@@ -426,13 +426,13 @@ type releaseBeforeCommit struct {
 	start func()
 }
 
-func (r *releaseBeforeCommit) CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c registry.RootCommit) error {
+func (r *releaseBeforeCommit) RootCommitWrites(ctx context.Context, name string, expect, next cid.Cid, c registry.RootCommit, gc []cid.Cid) (registry.CommitWrites, error) {
 	if r.start != nil {
 		start := r.start
 		r.start = nil
 		start()
 	}
-	return r.Registry.CommitRoot(ctx, name, expect, next, c)
+	return r.Registry.RootCommitWrites(ctx, name, expect, next, c, gc)
 }
 
 // TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease: a streamed blob
