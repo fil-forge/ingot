@@ -1,0 +1,143 @@
+package preload
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+)
+
+// isolateAWSConfig points the SDK at no shared config and placeholder
+// credentials, so a test sees nothing of the machine it runs on.
+func isolateAWSConfig(t *testing.T) {
+	t.Helper()
+	none := filepath.Join(t.TempDir(), "none")
+	t.Setenv("AWS_CONFIG_FILE", none)
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", none)
+	t.Setenv("AWS_PROFILE", "")
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	t.Setenv("AWS_ENDPOINT_URL", "")
+	t.Setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+}
+
+// packServerShape is an S3 endpoint that fails the test unless each PUT has
+// the shape the pack server's: path-style, create-only, with the body's
+// SHA-256 and no other checksum.
+type packServerShape struct {
+	t          *testing.T
+	mu         sync.Mutex
+	bucket     string
+	created    bool
+	encryption string
+	objects    map[string]bool
+}
+
+func (s *packServerShape) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.t.Errorf("read body: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	bucketPath := "/" + s.bucket
+	switch {
+	case r.Method == http.MethodPut && r.URL.Path == bucketPath && r.URL.Query().Has("encryption"):
+		s.encryption = string(body)
+	case r.Method == http.MethodPut && r.URL.Path == bucketPath:
+		if s.created {
+			writeS3Error(w, http.StatusConflict, "BucketAlreadyOwnedByYou")
+			return
+		}
+		s.created = true
+	case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, bucketPath+"/"):
+		key := strings.TrimPrefix(r.URL.Path, bucketPath+"/")
+		if got := r.Header.Get("If-None-Match"); got != "*" {
+			s.t.Errorf("PUT %s: If-None-Match %q, want *", key, got)
+		}
+		sum := sha256.Sum256(body)
+		if got, want := r.Header.Get("X-Amz-Checksum-Sha256"), base64.StdEncoding.EncodeToString(sum[:]); got != want {
+			s.t.Errorf("PUT %s: x-amz-checksum-sha256 %q, want %q", key, got, want)
+		}
+		for name := range r.Header {
+			lower := strings.ToLower(name)
+			if (strings.HasPrefix(lower, "x-amz-checksum-") && lower != "x-amz-checksum-sha256") || lower == "x-amz-trailer" {
+				s.t.Errorf("PUT %s: unexpected header %s", key, name)
+			}
+		}
+		if s.objects[key] {
+			writeS3Error(w, http.StatusPreconditionFailed, "PreconditionFailed")
+			return
+		}
+		s.objects[key] = true
+		w.Header().Set("ETag", `"etag"`)
+	default:
+		s.t.Errorf("unexpected request %s %s", r.Method, r.URL)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func writeS3Error(w http.ResponseWriter, status int, code string) {
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(status)
+	io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>`+code+`</Code><Message>m</Message></Error>`)
+}
+
+func TestClientSendsThePackServersRequests(t *testing.T) {
+	isolateAWSConfig(t)
+	cfg := testConfig(t, 1, 5)
+	cfg.KeyPrefix = "site-a/"
+	cfg.RealEvery = 2
+	cfg.RealMinSize, cfg.RealMaxSize = 3<<20, 3<<20
+	srv := &packServerShape{t: t, bucket: cfg.Buckets[0], objects: map[string]bool{
+		BulkKey(cfg.KeyPrefix, cfg.Seed, cfg.Buckets[0], 1): true,
+	}}
+	hs := httptest.NewServer(srv)
+	defer hs.Close()
+
+	client, err := NewClient(t.Context(), ClientConfig{Endpoint: hs.URL, Region: "us-east-1", Conns: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := Load(t.Context(), client, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Five bulk and two real objects, one bulk key already taken.
+	if r.Total.Written != 6 || r.Total.Existed != 1 || r.Total.Real != 2 {
+		t.Fatalf("totals %+v", r.Total)
+	}
+	if !strings.Contains(srv.encryption, "<SSEAlgorithm>none</SSEAlgorithm>") {
+		t.Fatalf("encryption request %q does not set none", srv.encryption)
+	}
+
+	// A load from a fresh state finds the bucket its own and every key taken.
+	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+	r, err = Load(t.Context(), client, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Total.Written != 0 || r.Total.Existed != 7 {
+		t.Fatalf("second load totals %+v", r.Total)
+	}
+}
+
+func TestNewClientNeedsRegionAndEndpoint(t *testing.T) {
+	isolateAWSConfig(t)
+	if _, err := NewClient(t.Context(), ClientConfig{Endpoint: "http://127.0.0.1:1"}); err == nil || !strings.Contains(err.Error(), "region") {
+		t.Fatalf("no region: %v", err)
+	}
+	if _, err := NewClient(t.Context(), ClientConfig{Region: "us-east-1"}); err == nil || !strings.Contains(err.Error(), "endpoint") {
+		t.Fatalf("no endpoint: %v", err)
+	}
+}

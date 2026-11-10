@@ -290,6 +290,26 @@ were kept (migration `00033`): those rows were deleted, so their CARs, still on
 Forge, count nowhere, not even as unmeasured. Read such a bucket's figures as a
 floor, or reset its data.
 
+### Loading a catalog to estate scale
+
+`ingot-preload` (`cmd/ingot-preload`) fills a gateway's buckets through its S3
+API, to measure the catalog at sizes no test reaches by accident. It is a plain
+S3 client, with its access key and region taken from the AWS SDK's usual
+sources (smelt's `make s3-key` writes a profile it can use):
+
+```bash
+go run ./cmd/ingot-preload load --profile smelt --buckets 150 --until 600000 --real-every 30000
+```
+
+Most objects are zero-byte, which runs the whole commit, seal and ship without
+uploading a blob. One object per `--real-every` has a pseudo-random body of a
+pack's size, for timing reads and deletes. Keys and PUTs are shaped as the pack
+server writes them: 64 hex digits after an optional prefix, create-only, with
+the body's SHA-256. New buckets get the `none` default encryption, which needs
+`encryption.allow_none`. Progress is saved in a state file, so a second `load`
+with a higher `--until` carries on from the first, and reports go to stdout and,
+as JSON lines, to a metrics file.
+
 ## Build & test
 
 ```bash

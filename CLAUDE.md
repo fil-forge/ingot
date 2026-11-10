@@ -106,6 +106,13 @@ Internal:
   `logstore.WalkCatalog`, which reads segments retired from disk from Forge
   with an access key from the environment, as JSON, for benchmark runs);
   `deps.go` (agent identity from the PEM key + optional did:web, pgx pool).
+- **`cmd/ingot-preload/`** + **`internal/preload`** — a separate binary, a
+  plain S3 client that loads a gateway's catalog to estate scale for
+  measuring it: zero-byte bulk objects plus a few pack-sized ones with
+  deterministic pseudo-random bodies, keys and PUTs shaped as the pack
+  server's (create-only, `x-amz-checksum-sha256`), progress in a state file it
+  resumes from, reports as JSON lines. `internal/preload` imports nothing else
+  from ingot.
 - **`s3frontend/`** — versitygw `backend.Backend`: `object.go`
   (Put/Get/Head/Delete/List), `version.go` (resolveVersion, reading the
   per-key version tree), `bucketqueue.go` (the requests' commits through
