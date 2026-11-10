@@ -2,6 +2,7 @@ package iam
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
@@ -37,6 +38,9 @@ type KeyProofs struct {
 	mu      sync.Mutex
 	byKey   *gocache.Cache // access-key DID string → *DelegationCache
 	revoked *gocache.Cache // revoked delegation CID string → struct{}
+	// Stores can outlive the registry (for example an uploader capture).
+	// Advancing generation invalidates all of them without enumerating holders.
+	generation atomic.Uint64
 }
 
 // keyProofsIdleTTL is how long a key's cache survives with no access before
@@ -71,6 +75,8 @@ func (k *KeyProofs) For(key did.DID) *DelegationCache {
 		return dc
 	}
 	dc := NewDelegationCache(k.revoked)
+	dc.generation = &k.generation
+	dc.capturedGeneration = k.generation.Load()
 	k.byKey.Set(id, dc, gocache.DefaultExpiration)
 	return dc
 }
@@ -81,17 +87,16 @@ func (k *KeyProofs) Deposit(key did.DID, dlgs ...ucan.Delegation) {
 	k.For(key).Add(dlgs...)
 }
 
-// ClearAll drops every per-key proof store, keeping the record of
-// revoked CIDs, and returns how many live stores it dropped. A caller already
-// holding a dropped store, such as an in-flight request or the uploader's
-// captured ship authority, can still use it. Unlike after InvalidateHolders,
-// its chains can still use a delegation whose revocation was missed, since
-// that CID was never recorded; the uploader's captures last until their own
-// TTL runs out.
+// ClearAll invalidates every existing per-key proof store, including holders
+// whose registry entry has expired, while keeping the record of revoked CIDs.
+// A late response cannot refill an old generation. The next For creates a
+// fresh store that Hilt must authorize. The result counts live registry entries,
+// not all external holders invalidated by the generation change.
 func (k *KeyProofs) ClearAll() int {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	n := len(k.byKey.Items()) // Items skips expired stores the janitor hasn't swept
+	k.generation.Add(1)
 	k.byKey.Flush()
 	return n
 }

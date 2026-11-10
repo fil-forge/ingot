@@ -963,7 +963,7 @@ flowchart TB
     hilt -->|"the same, for a listing the<br/>command signs with an access key"| walk
 
     subgraph stores["proof stores"]
-        kp["iam.KeyProofs: one DelegationCache<br/>per access key, 24h idle eviction;<br/>also the key's effective S3 action set per bucket"]
+        kp["iam.KeyProofs: one DelegationCache<br/>per access key, 24h idle eviction;<br/>generation reset invalidates held stores too;<br/>also the key's effective S3 action set per bucket"]
         ship["uploader.Forge shipProofs:<br/>per-space store, 1h TTL"]
         commit["uploader.Forge commitProofs:<br/>per-space store, 1h TTL"]
         static["AuthServiceProofs:<br/>static container from config"]
@@ -979,7 +979,7 @@ flowchart TB
     commit --> catship["queue-bucket.ship"]
     ship -->|"no commit capture<br/>holding a chain"| catship
     kp -->|"CaptureAuthority when a write<br/>queues a release"| relargs["queue-space-shard.release args:<br/>/blob/remove and /blob/abort chains"]
-    ship --> async["releases, aborts and<br/>registration renewals"]
+    ship -->|"background only;<br/>request with missing store fails closed"| async["releases, aborts and<br/>registration renewals"]
     relargs -->|"read first"| async
     static --> hc["hilt client:<br/>every /s3/* invocation"]
 
@@ -1001,6 +1001,16 @@ flowchart TB
 - A revocation drops the key's store from `KeyProofs`, but a captured store
   stays in use: no chain it assembles uses a delegation the revocation named,
   so the spaces its other grants cover keep shipping.
+- A revocation-cursor reset is broader: `KeyProofs.ClearAll` advances a shared
+  generation, so every old key store stops supplying chains and permission sets,
+  including pointers held by the uploader or already evicted from the registry.
+  Late responses cannot refill an old generation; the next request gets a new
+  store and must obtain current authority. Independently captured tenant cleanup
+  grants remain separate from these key-store caches.
+- A request that still carries its S3 request marker but has lost or masked its
+  proof store cannot fall back to either per-space uploader capture. An explicit
+  request/task store takes precedence; background work still needs a valid chain
+  for its actual command before any network call is made.
 - Every write captures the ship authority when it commits, so a segment,
   sealed seconds after its writes, ships under a fresh capture. That capture
   is kept apart from the upload's: hilt grants each catalog-changing
