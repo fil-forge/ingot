@@ -102,9 +102,9 @@ func TestExtents_DeleteReleasesEveryBlob(t *testing.T) {
 	}
 }
 
-// TestExtents_CopyWritesItsOwnExtents: a copy into another bucket of the
-// same space claims every blob again and reads back through extents its own
-// commit wrote into that bucket's catalog.
+// TestExtents_CopyWritesItsOwnExtents: a copy into another bucket, so another
+// space, claims each of its blobs in that space and reads back through
+// extents its own commit wrote into that bucket's catalog.
 func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 	// One log per bucket, as in production, so dropping the source bucket's
 	// catalog drops every block only it holds.
@@ -116,9 +116,9 @@ func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = logs.Close(ctx) })
 	b, mem, _ := newRefTestBackendOver(t, mem, logs, extentBlobSize)
-	space, tenant := testutil.RandomDID(t), testutil.RandomDID(t)
+	tenant := testutil.RandomDID(t)
 	for _, name := range []string{"src", "dst"} {
-		if err := mem.Create(ctx, name, space, registry.CreateState{Tenant: tenant}); err != nil {
+		if err := mem.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: tenant}); err != nil {
 			t.Fatalf("create bucket %s: %v", name, err)
 		}
 	}
@@ -133,8 +133,8 @@ func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 	}
 	rv := assertExtentsIn(t, b, dstBucket, dst, 1)
 	for _, d := range storedBlobs(t, b, rv).DigestList() {
-		if n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil); n != 2 {
-			t.Fatalf("blob %x: %d claims, want 2 (source and copy)", d, n)
+		if n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil); n != 1 {
+			t.Fatalf("blob %x: %d claims in the copy's space, want the copy's", d, n)
 		}
 	}
 	// The source bucket's catalog goes, as DeleteBucket removes it: the copy

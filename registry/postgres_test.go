@@ -1108,72 +1108,21 @@ func TestCommitRootWithoutTasksRefusesRegistrations(t *testing.T) {
 	}
 }
 
-// TestConcurrentCommitClaims runs two commits claiming the same thousands
-// of digests at once, many times over, one listing them in reverse, and
-// checks neither fails nor loses a claim. Each writer commits to a bucket of
-// its own: the root swap serialises the writers of one bucket.
-func TestConcurrentCommitClaims(t *testing.T) {
+// TestABucketIsItsOwnSpace: a second bucket in a space another holds is
+// refused, and not as the name clash ErrExists reports.
+func TestABucketIsItsOwnSpace(t *testing.T) {
 	ctx := context.Background()
-	pool := pgtest.New(t)
-	r := registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool)))
-	space := testutil.RandomDID(t)
-
-	buckets := []string{"concurrent-claims-w0-" + space.String()[len(space.String())-8:], "concurrent-claims-w1-" + space.String()[len(space.String())-8:]}
-	for _, name := range buckets {
-		if err := r.Create(ctx, name, space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-			t.Fatalf("create bucket %q: %v", name, err)
-		}
+	r := registry.NewPostgres(pgtest.New(t))
+	space, tenant := testutil.RandomDID(t), testutil.RandomDID(t)
+	if err := r.Create(ctx, "first", space, registry.CreateState{Tenant: tenant}); err != nil {
+		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		for _, name := range buckets {
-			_ = r.Delete(context.Background(), name, space)
-		}
-	})
-
-	const n = 2000
-	digests := make([]multihash.Multihash, n)
-	for i := range digests {
-		d, err := multihash.Sum([]byte(fmt.Sprintf("concurrent-claims-%s-%d", space, i)), multihash.SHA2_256, -1)
-		if err != nil {
-			t.Fatalf("multihash: %v", err)
-		}
-		digests[i] = d
-		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
-			t.Fatalf("PutLocation: %v", err)
-		}
+	if err := r.Create(ctx, "first", testutil.RandomDID(t), registry.CreateState{Tenant: tenant}); !errors.Is(err, registry.ErrExists) {
+		t.Fatalf("a second bucket named first: %v, want ErrExists", err)
 	}
-	claims := func(bucket, version string, reversed bool) []registry.BlobClaim {
-		out := make([]registry.BlobClaim, n)
-		for i, d := range digests {
-			j := i
-			if reversed {
-				j = n - 1 - i
-			}
-			out[j] = registry.BlobClaim{Digest: d, Bucket: bucket, ObjectKey: "k", VersionID: version, Space: space}
-		}
-		return out
-	}
-
-	for round := 0; round < 10; round++ {
-		errs := make(chan error, 2)
-		for w := 0; w < 2; w++ {
-			go func(bucket, version string, reversed bool) {
-				st, err := r.Get(ctx, bucket)
-				if err != nil {
-					errs <- err
-					return
-				}
-				errs <- r.CommitRoot(ctx, bucket, st.Root, liveCid(t, bucket+version), registry.RootCommit{Claims: claims(bucket, version, reversed)})
-			}(buckets[w], fmt.Sprintf("r%d-w%d", round, w), w == 1)
-		}
-		for w := 0; w < 2; w++ {
-			if err := <-errs; err != nil {
-				t.Fatalf("round %d: commit: %v", round, err)
-			}
-		}
-	}
-	if c, err := r.CountReferences(ctx, space, digests[0], uuid.Nil); err != nil || c != 20 {
-		t.Fatalf("claims on the first digest = %d, %v; want 20", c, err)
+	err := r.Create(ctx, "second", space, registry.CreateState{Tenant: tenant})
+	if err == nil || errors.Is(err, registry.ErrExists) {
+		t.Fatalf("a second bucket in first's space: %v, want a refusal other than ErrExists", err)
 	}
 }
 

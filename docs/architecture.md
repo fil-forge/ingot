@@ -762,7 +762,7 @@ CREATE TABLE ingot.buckets (
     root_cid           bytea,                            -- committed MST root (locally durable)
     forge_root_cid     bytea,                            -- MST root durable on Forge (lags root_cid)
     created_at         timestamptz NOT NULL DEFAULT now(),
-    space              text NOT NULL,                    -- Forge space DID (minted by Hilt)
+    space              text NOT NULL,                    -- Forge space DID (minted by Hilt, one per bucket)
     tenant             text NOT NULL CHECK (tenant <> ''), -- owning tenant DID; copy paths refuse a foreign source
     versioning         text NOT NULL DEFAULT 'unversioned'
                            CHECK (versioning IN ('unversioned','enabled','suspended')),
@@ -774,7 +774,10 @@ CREATE TABLE ingot.buckets (
                                                          -- default encryption; NULL = unconfigured (encrypts)
     closing            boolean NOT NULL DEFAULT false    -- set by DeleteBucket's queue-bucket.close (§7.3)
 );
-CREATE INDEX buckets_space_idx ON ingot.buckets (space);
+-- A bucket is its own space: the commits that drop a space's claims are one
+-- bucket's, which run one at a time, so a release queued only once no claim
+-- is left misses none.
+CREATE UNIQUE INDEX buckets_space_key ON ingot.buckets (space);
 
 -- The catalog log's segment lifecycle (owned by logstore; see logstore/README.md).
 -- seq is drawn from the shared ingot.segment_seq sequence. state holds only
@@ -810,7 +813,6 @@ CREATE TABLE ingot.segment_op_roots (
     root_cid   bytea  NOT NULL,
     PRIMARY KEY (seq, seq_within)
 );
-CREATE INDEX segment_op_roots_bucket_seq_idx ON ingot.segment_op_roots (bucket, seq);
 
 -- The catalog journal: a copy of every catalog block a commit appended to the
 -- log, written in the root advance's transaction and deleted in the one that stamps
@@ -889,7 +891,6 @@ CREATE TABLE ingot.blob_locations (
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (space, digest)
 );
-CREATE INDEX blob_locations_digest_idx ON ingot.blob_locations (digest);
 
 -- FEE encryption parameters of each encrypted body blob: exactly the inputs a
 -- range read's decryptor needs, so it can decrypt any span without fetching the

@@ -1124,7 +1124,7 @@ erDiagram
         text name PK
         bytea root_cid "committed MST root"
         bytea forge_root_cid "root durable on Forge"
-        text space "Forge space DID"
+        text space UK "Forge space DID, one per bucket"
         text tenant "owning tenant DID"
         text versioning "unversioned, enabled, suspended"
         text encryption "AES256, none; NULL = unconfigured, encrypts"

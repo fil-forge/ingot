@@ -75,9 +75,11 @@ func (r *Postgres) Create(ctx context.Context, name string, space did.DID, init 
 		name, space.String(), init.Tenant.String(), string(v), init.ObjectLockConfig)
 	if err != nil {
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
+		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation && pgErr.ConstraintName == "buckets_pkey" {
 			return ErrExists
 		}
+		// Another bucket holding the space breaks the rule that a bucket is
+		// its own space (buckets_space_key), which no client can cause.
 		return fmt.Errorf("registry: create %q: %w", name, err)
 	}
 	return nil

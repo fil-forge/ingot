@@ -73,8 +73,25 @@ ALTER TABLE ingot.multipart_sessions
 -- upload gets in while its uploads are aborted.
 ALTER TABLE ingot.buckets ADD COLUMN closing boolean NOT NULL DEFAULT false;
 
+-- Indexes no query reads: every lookup of a blob's location names its space,
+-- and a segment's op-roots are read by the segment.
+DROP INDEX ingot.blob_locations_digest_idx;
+DROP INDEX ingot.segment_op_roots_bucket_seq_idx;
+
+-- A bucket is its own space: Hilt mints one per bucket at create, so no two
+-- buckets share one. The commits that drop a space's claims are therefore one
+-- bucket's commits, which run one at a time, and a release queued only when
+-- no claim is left relies on that. The index replaces the plain one no query
+-- read.
+DROP INDEX ingot.buckets_space_idx;
+CREATE UNIQUE INDEX buckets_space_key ON ingot.buckets (space);
+
 -- +goose Down
 -- In reverse order of the Up statements.
+DROP INDEX ingot.buckets_space_key;
+CREATE INDEX buckets_space_idx ON ingot.buckets (space);
+CREATE INDEX segment_op_roots_bucket_seq_idx ON ingot.segment_op_roots (bucket, seq);
+CREATE INDEX blob_locations_digest_idx ON ingot.blob_locations (digest);
 ALTER TABLE ingot.buckets DROP COLUMN closing;
 ALTER TABLE ingot.multipart_sessions
     DROP CONSTRAINT multipart_sessions_state_check,
