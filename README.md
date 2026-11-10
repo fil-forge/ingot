@@ -163,28 +163,22 @@ must be on one filesystem (`serve` checks this at startup):
 
 A cached copy is not needed, so it goes:
 
+- when its time to live runs out: `cache_ttl` (default `1h`) after it was
+  cached or last read;
 - when a deleted or overwritten object's release runs (`release_grace`,
   default 60s, after its last reference drops). The release also removes the
   provider's copy, so a GET still streaming the old object once the grace
   has passed fails when it reaches a blob it has not yet opened:
   `release_grace` bounds how long such a read may take;
 - with `local_blob_max_bytes` set, when a sweeper, checking every 30 seconds,
-  finds the two directories over the budget and evicts cached bodies, oldest
-  first, down to 90% of the budget. Later reads of an evicted body go to the
-  provider and take provider-read latency.
+  finds the two directories over the budget and evicts cached bodies, the
+  least recently cached or read first, down to 90% of the budget, however
+  much of their time to live is left.
 
-Two windows keep cached bodies local while the budget allows:
-`cache_min_residency` (default `10m`) passes over bodies whose upload
-changed state that recently (for a committed object, its commit), so a
-client reading back what it just wrote reads from disk, and
-`cache_read_retention` (default `1h`) passes over bodies read from the cache
-that recently (remembered in memory for up to 65,536 bodies, and forgotten
-on restart). If usage is still over budget after that, the sweeper evicts
-inside the windows, since a full disk fails every write, but only down to
-the budget: first bodies inside `cache_min_residency` that no one has read
-recently, then, only if that is not enough, recently read ones too. It warns
-at most once an hour when it does; the `budget_forced` removals count each
-time. `0s` turns either window off.
+Later reads of an evicted body go to the provider and take provider-read
+latency. A read from the cache extends the body's time to live only once
+less than half of it is left, so most reads cost nothing. Each time to live
+is a task in Postgres, so it survives a restart.
 
 A multipart part's copy goes from the spool as soon as the part parks on its
 provider, so Complete relies on the provider keeping the parked allocation
@@ -204,19 +198,15 @@ released or evicted. With or without a
 budget, the sweeper also deletes, at startup and then hourly, unfinished
 `.tmp-*` writes in either directory and spool files with no upload intent,
 once they are older than `local_blob_orphan_age` (default `24h`, at least
-`1h`). Once at each startup, `serve` also deletes the copies of objects
-deleted by a version of ingot that kept them.
+`1h`).
 
 **Sizing.** The filesystem needs room for:
 
 - `local_blob_max_bytes`, plus 10% headroom that must exceed the ingest rate
-  × 30 seconds (60 GB at 2 GB/s). To evict outside `cache_min_residency`,
-  the budget must also exceed the ingest rate × the window (1.2 TB at 2 GB/s
-  for the default `10m`); below that, sweeps evict inside the window, and
-  warn at most once an hour. Likewise, to keep recently read bodies, it must
-  exceed the bodies read within `cache_read_retention` (up to 65,536 of them,
-  each up to `max_blob_size`); a read working set bigger than the budget is
-  evicted inside the window every sweep;
+  × 30 seconds (60 GB at 2 GB/s). To keep bodies for their whole
+  `cache_ttl`, the budget must also exceed the bodies written or read within
+  it (7.2 TB at 2 GB/s of ingest for the default `1h`); below that, sweeps
+  evict bodies before their time runs out;
 - the spool's bodies in flight, when they outgrow the budget: each
   concurrent PUT or UploadPart writes its body as it streams, and a part can
   be up to 5 GiB. The budget counts those bytes as they land, so the sweeper
@@ -240,7 +230,7 @@ deleted by a version of ingot that kept them.
 | `ingot.local_blobs.usage` | Bytes held, by `dir`: `spool` (writes in progress and bodies awaiting upload, which eviction cannot touch) or `cache` |
 | `ingot.local_blobs.budget` | `local_blob_max_bytes` (0: no budget) |
 | `ingot.local_blobs.stalled_bytes` | Bytes of bodies whose upload has stalled, by `state`: intents still `spooled` or `uploading` an hour after their last state change, which nothing reclaims yet for a failed PUT (a multipart part's go with its session). `spooled` bodies never left this node; `uploading` ones may have reached their provider. Growth means uploads are failing |
-| `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `parked`, `accepted` (with `cache_writes: false`), `budget`, `budget_forced` (inside a retention window), `orphan` |
+| `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `parked`, `accepted` (with `cache_writes: false`), `expired` (its `cache_ttl` ran out), `budget`, `orphan` |
 | `ingot.local_blobs.reads` | Body-blob reads, by `tier`: `local` or `network` (the local hit ratio) |
 
 Multipart uploads' parts are accepted in the background while the client

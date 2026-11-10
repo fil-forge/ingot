@@ -24,14 +24,13 @@ import (
 // is undecided and unbuilt, not ruled out.
 //
 // Like the Spool, it holds no policy: it knows a blob only as bytes under a
-// digest, and the S3 layer decides what to remove. Besides the files and their
-// byte count, it remembers in memory when each blob was last read from it,
-// which the S3 layer's eviction consults. At most one BlobCache may use a
-// directory at a time. Its directory must be on the Spool's filesystem, so
-// Take is a rename.
+// digest, and the S3 layer decides what to remove and when. It tells the S3
+// layer about each read it serves (OnRead), which extends the blob's time in
+// the cache. At most one BlobCache may use a directory at a time. Its
+// directory must be on the Spool's filesystem, so Take is a rename.
 type BlobCache struct {
 	*blobDir
-	reads *recencyMap
+	onRead func(context.Context, mh.Multihash)
 }
 
 // NewBlobCache opens (creating if needed) a cache rooted at dir and counts its
@@ -44,43 +43,64 @@ func NewBlobCache(dir string) (*BlobCache, error) {
 	if err := d.count(func(BlobFile) {}); err != nil {
 		return nil, err
 	}
-	return &BlobCache{blobDir: d, reads: newRecencyMap(recencyCapacity)}, nil
+	return &BlobCache{blobDir: d}, nil
 }
 
-// LastRead reports when the blob with the given digest was last served from
-// the cache by this process, if it is still remembered.
-func (c *BlobCache) LastRead(digest mh.Multihash) (time.Time, bool) {
-	return c.reads.get(string(digest))
+// OnRead sets fn to be called with each blob the cache serves, in the
+// reader's goroutine, before the read returns. Call it before the cache
+// serves any read.
+func (c *BlobCache) OnRead(fn func(ctx context.Context, digest mh.Multihash)) {
+	c.onRead = fn
 }
 
-// OpenBlob streams the cached blob, or returns ErrNotFound, and records the
-// read.
+// read reports a blob the cache served.
+func (c *BlobCache) read(ctx context.Context, digest mh.Multihash) {
+	if c.onRead != nil {
+		c.onRead(ctx, digest)
+	}
+}
+
+// OpenBlob streams the cached blob, or returns ErrNotFound.
 func (c *BlobCache) OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash) (io.ReadCloser, error) {
 	rc, err := c.blobDir.OpenBlob(ctx, space, digest)
 	if err == nil {
-		c.reads.touch(string(digest), time.Now())
+		c.read(ctx, digest)
 	}
 	return rc, err
 }
 
 // OpenBlobRange streams stored bytes [start, end] of the cached blob, or
-// returns ErrNotFound, and records the read.
+// returns ErrNotFound.
 func (c *BlobCache) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, error) {
 	rc, err := c.blobDir.OpenBlobRange(ctx, space, digest, start, end)
 	if err == nil {
-		c.reads.touch(string(digest), time.Now())
+		c.read(ctx, digest)
 	}
 	return rc, err
 }
 
 // GetBlock reads the cached blob stored under cid's multihash, or returns
-// ErrNotFound, and records the read.
+// ErrNotFound.
 func (c *BlobCache) GetBlock(ctx context.Context, space did.DID, k cid.Cid) (block.Block, error) {
 	b, err := c.blobDir.GetBlock(ctx, space, k)
 	if err == nil {
-		c.reads.touch(string(k.Hash()), time.Now())
+		c.read(ctx, k.Hash())
 	}
 	return b, err
+}
+
+// Touch sets the cached blob's modification time to at, which orders the
+// budget pass's evictions, oldest first. It reports whether the blob is
+// cached.
+func (c *BlobCache) Touch(digest mh.Multihash, at time.Time) (bool, error) {
+	err := os.Chtimes(c.Path(digest), at, at)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("blockstore: cache touch: %w", err)
+	}
+	return true, nil
 }
 
 // CheckTake confirms that Take can move blobs from spool into the cache, which
@@ -103,18 +123,6 @@ func (c *BlobCache) CheckTake(spool *Spool) error {
 		return fmt.Errorf("blockstore: cache probe: %w", err)
 	}
 	return nil
-}
-
-// Remove deletes the cached blob, as blobDir.Remove does, and forgets when it
-// was last read. A read that opened the file before the removal can record
-// itself after it; that entry holds an LRU slot until it ages out, and keeps
-// the blob a little longer only if the same digest is cached again.
-func (c *BlobCache) Remove(digest mh.Multihash) (int64, error) {
-	freed, err := c.blobDir.Remove(digest)
-	if err == nil {
-		c.reads.forget(string(digest))
-	}
-	return freed, err
 }
 
 // Usage returns the byte count of the cache's blob files.

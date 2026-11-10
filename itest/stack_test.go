@@ -183,8 +183,8 @@ func withMultipartTTLConfig() stack.Option {
 }
 
 // withLocalBlobBudgetConfig mounts testdata/config-localblobbudget.yaml — a
-// 4 MiB local_blob_max_bytes with the residency and read-retention windows
-// off, so the local blob sweeper evicts within a test's budget. Dedicated
+// 4 MiB local_blob_max_bytes, so the local blob sweeper evicts within a test's
+// budget. Dedicated
 // stacks only: other tests read envelopes back from local disk.
 func withLocalBlobBudgetConfig() stack.Option {
 	return stack.WithServiceConfig("ingot", "testdata/config-localblobbudget.yaml")

@@ -99,9 +99,9 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"bad release_grace", func(c *Config) { c.ReleaseGrace = "soon" }, "parse release_grace"},
 		{"bad complete_multipart_keepalive", func(c *Config) { c.CompleteMultipartKeepalive = "soon" }, "parse complete_multipart_keepalive"},
 		{"negative local_blob_max_bytes", func(c *Config) { c.LocalBlobMaxBytes = -1 }, "local_blob_max_bytes -1: must not be negative"},
-		{"bad cache_min_residency", func(c *Config) { c.CacheMinResidency = "soon" }, "parse cache_min_residency"},
-		{"negative cache_min_residency", func(c *Config) { c.CacheMinResidency = "-1m" }, `cache_min_residency "-1m": must not be negative`},
-		{"negative cache_read_retention", func(c *Config) { c.CacheReadRetention = "-1m" }, `cache_read_retention "-1m": must not be negative`},
+		{"bad cache_ttl", func(c *Config) { c.CacheTTL = "soon" }, "parse cache_ttl"},
+		{"negative cache_ttl", func(c *Config) { c.CacheTTL = "-1m" }, `cache_ttl "-1m": must not be negative`},
+		{"zero cache_ttl", func(c *Config) { c.CacheTTL = "0s" }, `cache_ttl "0s": must be positive`},
 		{"bad local_blob_orphan_age", func(c *Config) { c.LocalBlobOrphanAge = "soon" }, "parse local_blob_orphan_age"},
 		{"short local_blob_orphan_age", func(c *Config) { c.LocalBlobOrphanAge = "59m" }, `local_blob_orphan_age "59m": must be at least 1h`},
 		{"bad cors origin", func(c *Config) { c.CORSAllowedOrigins = []string{"app.example"} }, "cors_allowed_origins"},
@@ -136,10 +136,9 @@ func TestValidate_RequiredFields(t *testing.T) {
 // localBlobKnobs is the local blob storage subset of ServerConfig, for
 // comparing it whole.
 type localBlobKnobs struct {
-	MaxBytes      int64
-	MinResidency  time.Duration
-	ReadRetention time.Duration
-	OrphanAge     time.Duration
+	MaxBytes  int64
+	TTL       time.Duration
+	OrphanAge time.Duration
 }
 
 func TestServerConfig_LocalBlobKnobs(t *testing.T) {
@@ -151,17 +150,16 @@ func TestServerConfig_LocalBlobKnobs(t *testing.T) {
 		{
 			name:   "defaults",
 			mutate: func(*Config) {},
-			want:   localBlobKnobs{MaxBytes: 0, MinResidency: 10 * time.Minute, ReadRetention: time.Hour, OrphanAge: 24 * time.Hour},
+			want:   localBlobKnobs{MaxBytes: 0, TTL: time.Hour, OrphanAge: 24 * time.Hour},
 		},
 		{
 			name: "explicit values",
 			mutate: func(c *Config) {
 				c.LocalBlobMaxBytes = 1 << 40
-				c.CacheMinResidency = "0s"
-				c.CacheReadRetention = "15m"
+				c.CacheTTL = "15m"
 				c.LocalBlobOrphanAge = "2h"
 			},
-			want: localBlobKnobs{MaxBytes: 1 << 40, MinResidency: 0, ReadRetention: 15 * time.Minute, OrphanAge: 2 * time.Hour},
+			want: localBlobKnobs{MaxBytes: 1 << 40, TTL: 15 * time.Minute, OrphanAge: 2 * time.Hour},
 		},
 	}
 	for _, tc := range cases {
@@ -172,7 +170,7 @@ func TestServerConfig_LocalBlobKnobs(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ServerConfig: %v", err)
 			}
-			got := localBlobKnobs{sc.LocalBlobMaxBytes, sc.CacheMinResidency, sc.CacheReadRetention, sc.LocalBlobOrphanAge}
+			got := localBlobKnobs{sc.LocalBlobMaxBytes, sc.CacheTTL, sc.LocalBlobOrphanAge}
 			if got != tc.want {
 				t.Fatalf("local blob knobs = %+v, want %+v", got, tc.want)
 			}
