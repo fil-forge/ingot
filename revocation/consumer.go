@@ -25,23 +25,23 @@
 // Restoring the service's database from a backup older than the consumer's
 // cursor (Swarf's README, "Moving the database"), or restarting a service
 // that keeps its records in memory, leaves the cursor ahead of the firehose's
-// head, and the service refuses it. The consumer logs an error, reads the
-// head, saves it and streams after it. Revocations recorded since the restore
-// and before that head are never delivered, and nothing says which keys they
-// named, so a key one of them named keeps working from cache until its cached
-// authorization expires. Retrying the refused cursor instead would skip more:
-// the service accepts it once new records pass it, skipping every record in
-// between.
+// head, and the service refuses it. The consumer logs an error and reads the
+// head. Revocations recorded since the restore and before that head are never
+// delivered, and nothing says which keys they named, so the consumer clears
+// every access key's caches: each key's next request goes to Hilt, which
+// refuses a deleted key. Then it saves the head and streams after it.
+// Retrying the refused cursor instead would skip records: the service accepts
+// it once new records pass it, skipping every record in between.
 //
 // If new records pass the cursor before the consumer reconnects, the service
 // accepts it and nothing reports the gap. So after restoring the service's
 // database from a backup, or restarting a service that keeps its records in
-// memory, restart ingot once the service is serving again, and restart it
-// again whenever it logs a refused cursor, including right after that first
-// restart: the restarted consumer reads the head only once the gateway is
-// already serving, so it can skip records written after the restart. A
-// restart empties every cache, so each key named by a record skipped before it
-// goes to Hilt on its next request.
+// memory, restart ingot once the service is serving again. The restart empties
+// every cache. If the restarted consumer's cursor is then refused, it reads the
+// head only once the gateway is already serving, so it can skip records written
+// after the restart, but the clear after that read empties every cache again.
+// Either way, each key named by a skipped record goes to Hilt on its next
+// request.
 //
 // One case survives a restart: a Hilt write that published its revocations,
 // then failed to commit. Hilt keeps serving the revoked delegations until a
@@ -50,7 +50,8 @@
 // them again. The retry republishes a byte-identical revocation, which the
 // service deduplicates, so the firehose never reports it again, and the key
 // keeps working from cache until its cached authorization expires. Every
-// restart has this gap, not only one after a refused cursor.
+// restart has this gap. So does the clear after a refused cursor: it keeps
+// that record, but a revocation skipped in the gap never reached it.
 //
 // The gateway keeps serving while the service is unreachable (reconnect with
 // capped backoff); in the worst case cache entries age out on their own TTLs,
@@ -81,11 +82,14 @@ type Source interface {
 	StreamAfter(ctx context.Context, after swarfclient.Cursor) iter.Seq2[swarfclient.Event, error]
 }
 
-// Invalidator applies one revocation to local authorization state
-// (iam.Revoker satisfies it), returning the access keys whose caches it
-// cleared. Must be idempotent: reconnects may re-deliver records.
+// Invalidator applies revocations to local authorization state (iam.Revoker
+// satisfies it). Revoke applies one, returning the access keys whose caches
+// it cleared, and must be idempotent: reconnects may re-deliver records.
+// ClearAll clears every access key's caches, for when revocations were missed
+// and there is no telling which keys they named.
 type Invalidator interface {
 	Revoke(revoked cid.Cid) []did.DID
+	ClearAll() int
 }
 
 // Compile-time assertion: the real swarf client satisfies Source.
@@ -192,7 +196,7 @@ func (c *Consumer) Run(ctx context.Context) {
 			if errors.Is(err, swarfclient.ErrCursorRefused) {
 				c.logger.Error("revocation: cursor refused",
 					zap.String("cursor", position.Token),
-					zap.String("action", "starting over at the firehose head; restart ingot to drop authorization cached for keys whose revocations were skipped"),
+					zap.String("action", "starting over at the firehose head and clearing every access key's caches"),
 					zap.Error(err))
 				refused = true
 				break
@@ -228,6 +232,10 @@ func (c *Consumer) Run(ctx context.Context) {
 			if !ok {
 				return
 			}
+			// Cleared only now: a revocation recorded before the head is never
+			// delivered, so authorization cached before reading it can't be
+			// trusted.
+			c.inv.ClearAll()
 			restart := registry.RevocationCursor{Token: string(head)}
 			position = restart
 			// The saver persists it, so a restart doesn't return to the
