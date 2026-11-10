@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // S3 is the part of the S3 API a load uses. *s3.Client implements it.
@@ -111,6 +112,11 @@ const (
 	OpPutReal = "put_real"
 )
 
+// ErrStateNotSaved marks a load's error when its final progress could not be
+// written to the state file: a later load resumes from the previous
+// checkpoint instead.
+var ErrStateNotSaved = errors.New("progress not saved")
+
 // emptySHA256 is the base64 SHA-256 of an empty body.
 var emptySHA256 = func() string {
 	sum := sha256.Sum256(nil)
@@ -134,6 +140,9 @@ func Load(ctx context.Context, client S3, cfg Config) (*Report, error) {
 	if err := l.setupBuckets(ctx); err != nil {
 		return nil, err
 	}
+	// Rates count from here, not from before the buckets were set up.
+	l.start = time.Now()
+	l.lastReport = l.start
 
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -160,6 +169,9 @@ func Load(ctx context.Context, client S3, cfg Config) (*Report, error) {
 	bg.Wait()
 
 	saveErr := l.checkpoint()
+	if saveErr != nil {
+		saveErr = fmt.Errorf("%w: %w", ErrStateNotSaved, saveErr)
+	}
 	final := l.report(true)
 	if err := context.Cause(runCtx); err != nil {
 		if saveErr != nil {
@@ -349,6 +361,15 @@ func classify(err error) outcome {
 	if err == nil {
 		return stored
 	}
+	// No response: the SDK reports a send that failed, a dropped connection
+	// included, as a RequestSendError, and an attempt whose context ended,
+	// its timeout included, as a CanceledError. Both arrive inside a
+	// response error whose status is 0, so they are matched first.
+	var sendErr *smithyhttp.RequestSendError
+	var canceled *smithy.CanceledError
+	if errors.As(err, &sendErr) || errors.As(err, &canceled) {
+		return retry
+	}
 	var re interface{ HTTPStatusCode() int }
 	if errors.As(err, &re) {
 		switch code := re.HTTPStatusCode(); {
@@ -360,7 +381,7 @@ func classify(err error) outcome {
 			return fatal
 		}
 	}
-	// No response: a dropped connection or a timeout.
+	// Anything else came without a response.
 	return retry
 }
 

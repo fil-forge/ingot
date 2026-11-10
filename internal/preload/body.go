@@ -18,13 +18,13 @@ const bodyChunk = 1 << 20
 // against a ranged read without being held in memory. Its bytes do not
 // compress, as a pack's encrypted bytes do not.
 //
-// A Body is an io.ReadSeeker and an io.ReaderAt. It is not safe for
-// concurrent use.
+// A Body is an io.ReadSeeker and an io.ReaderAt. ReadAt may be called
+// concurrently, as io.ReaderAt allows; Read and Seek may not.
 type Body struct {
 	seed  [32]byte
 	size  int64
 	off   int64
-	chunk int64 // the chunk buf holds, or -1
+	chunk int64 // the chunk Read's buf holds, or -1
 	buf   []byte
 }
 
@@ -36,24 +36,37 @@ func NewBody(seed [32]byte, size int64) *Body {
 // Size returns the body's length in bytes.
 func (b *Body) Size() int64 { return b.size }
 
-// Read reads the body from its current offset.
+// Read reads the body from its current offset, up to the end of the chunk
+// it is in. It keeps that chunk, so a sequential read generates each chunk
+// once.
 func (b *Body) Read(p []byte) (int, error) {
-	n, err := b.ReadAt(p, b.off)
+	if b.off >= b.size {
+		return 0, io.EOF
+	}
+	c := b.off / bodyChunk
+	if b.chunk != c {
+		b.buf = b.generate(c, b.chunkLen(c), b.buf)
+		b.chunk = c
+	}
+	n := copy(p, b.buf[b.off-c*bodyChunk:])
 	b.off += int64(n)
-	return n, err
+	return n, nil
 }
 
-// ReadAt reads len(p) bytes of the body starting at off.
+// ReadAt reads len(p) bytes of the body starting at off. It keeps no state,
+// generating each chunk it touches as far as the range needs.
 func (b *Body) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, errors.New("preload: negative offset")
 	}
 	n := 0
+	var buf []byte
 	for n < len(p) && off < b.size {
 		c := off / bodyChunk
-		b.fill(c)
 		start := off - c*bodyChunk
-		k := copy(p[n:], b.buf[start:])
+		end := min(start+int64(len(p)-n), b.chunkLen(c))
+		buf = b.generate(c, end, buf)
+		k := copy(p[n:], buf[start:end])
 		n += k
 		off += int64(k)
 	}
@@ -99,16 +112,19 @@ func (b *Body) SHA256() ([sha256.Size]byte, error) {
 	return sum, err
 }
 
-// fill makes buf hold chunk c, truncated to the body's end.
-func (b *Body) fill(c int64) {
-	if b.chunk == c {
-		return
+// chunkLen returns the length of chunk c, the last one cut at the body's
+// end.
+func (b *Body) chunkLen(c int64) int64 {
+	return min(int64(bodyChunk), b.size-c*bodyChunk)
+}
+
+// generate returns the first n bytes of chunk c, in buf when it is large
+// enough.
+func (b *Body) generate(c, n int64, buf []byte) []byte {
+	if int64(cap(buf)) < n {
+		buf = make([]byte, n, bodyChunk)
 	}
-	n := min(int64(bodyChunk), b.size-c*bodyChunk)
-	if cap(b.buf) < bodyChunk {
-		b.buf = make([]byte, bodyChunk)
-	}
-	b.buf = b.buf[:n]
+	buf = buf[:n]
 	h := sha256.New()
 	h.Write(b.seed[:])
 	var idx [8]byte
@@ -117,6 +133,6 @@ func (b *Body) fill(c int64) {
 	var s [32]byte
 	h.Sum(s[:0])
 	// ChaCha8.Read never fails.
-	_, _ = rand.NewChaCha8(s).Read(b.buf)
-	b.chunk = c
+	_, _ = rand.NewChaCha8(s).Read(buf)
+	return buf
 }

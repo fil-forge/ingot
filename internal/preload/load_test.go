@@ -3,6 +3,7 @@ package preload
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -189,6 +190,25 @@ func TestLoadResumesAfterInterrupt(t *testing.T) {
 	}
 	if r.Total.Existed != unrecorded {
 		t.Fatalf("resumed load found %d keys taken, want the %d written but not recorded", r.Total.Existed, unrecorded)
+	}
+}
+
+// An interrupted load whose final save fails says so, so the command does
+// not report the progress as saved.
+func TestLoadReportsAFailedFinalSave(t *testing.T) {
+	f := newFakeS3()
+	cfg := testConfig(t, 1, 100)
+	ctx, cancel := context.WithCancel(t.Context())
+	f.after = func(stored int) {
+		if stored == 20 {
+			// The state file's directory goes, so the final write fails.
+			os.RemoveAll(filepath.Dir(cfg.StatePath))
+			cancel()
+		}
+	}
+	_, err := Load(ctx, f, cfg)
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, ErrStateNotSaved) {
+		t.Fatalf("load returned %v, want the interrupt and ErrStateNotSaved", err)
 	}
 }
 

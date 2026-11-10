@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // isolateAWSConfig points the SDK at no shared config and placeholder
@@ -37,9 +38,17 @@ type packServerShape struct {
 	created    bool
 	encryption string
 	objects    map[string]bool
+	// intercept, when set, sees each object PUT first; returning true
+	// means it has answered the request (or dropped it).
+	intercept func(key string, w http.ResponseWriter, r *http.Request) bool
 }
 
 func (s *packServerShape) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if prefix := "/" + s.bucket + "/"; s.intercept != nil && r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, prefix) {
+		if s.intercept(strings.TrimPrefix(r.URL.Path, prefix), w, r) {
+			return
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	body, err := io.ReadAll(r.Body)
@@ -129,6 +138,57 @@ func TestClientSendsThePackServersRequests(t *testing.T) {
 	}
 	if r.Total.Written != 0 || r.Total.Existed != 7 {
 		t.Fatalf("second load totals %+v", r.Total)
+	}
+}
+
+// TestClientRetriesWhenNoResponseComes runs a load through the real SDK
+// client while the server, once, gives a PUT no response: it holds the
+// request past the attempt's timeout, or drops the connection. Either way
+// the PUT is retried and the load completes.
+func TestClientRetriesWhenNoResponseComes(t *testing.T) {
+	for name, noResponse := range map[string]func(w http.ResponseWriter, r *http.Request){
+		"attempt times out": func(_ http.ResponseWriter, r *http.Request) {
+			io.Copy(io.Discard, r.Body)
+			<-r.Context().Done()
+		},
+		"connection dropped": func(w http.ResponseWriter, _ *http.Request) {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				conn.Close()
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			isolateAWSConfig(t)
+			cfg := testConfig(t, 1, 5)
+			cfg.AttemptTimeout = 300 * time.Millisecond
+			victim := BulkKey(cfg.KeyPrefix, cfg.Seed, cfg.Buckets[0], 2)
+			var once sync.Once
+			srv := &packServerShape{t: t, bucket: cfg.Buckets[0], objects: map[string]bool{}}
+			srv.intercept = func(key string, w http.ResponseWriter, r *http.Request) bool {
+				hit := false
+				if key == victim {
+					once.Do(func() { hit = true })
+				}
+				if hit {
+					noResponse(w, r)
+				}
+				return hit
+			}
+			hs := httptest.NewServer(srv)
+			defer hs.Close()
+			client, err := NewClient(t.Context(), ClientConfig{Endpoint: hs.URL, Region: "us-east-1", Conns: 4})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := Load(t.Context(), client, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.Total.Errors != 1 || r.Total.Written != 5 {
+				t.Fatalf("totals %+v, want the PUT with no response retried once", r.Total)
+			}
+		})
 	}
 }
 

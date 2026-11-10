@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -116,6 +117,22 @@ func TestBody(t *testing.T) {
 			t.Fatalf("ReadAt at %d differs from the sequential read", off)
 		}
 	}
+
+	// ReadAt may run in parallel, as io.ReaderAt allows.
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Go(func() {
+			off := int64(i) * (size / 8)
+			p := make([]byte, 4096)
+			if _, err := b.ReadAt(p, off); err != nil {
+				t.Errorf("parallel ReadAt at %d: %v", off, err)
+			}
+			if !bytes.Equal(p, all[off:off+4096]) {
+				t.Errorf("parallel ReadAt at %d differs from the sequential read", off)
+			}
+		})
+	}
+	wg.Wait()
 
 	if _, err := b.Seek(-10, io.SeekEnd); err != nil {
 		t.Fatal(err)

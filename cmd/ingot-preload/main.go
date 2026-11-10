@@ -98,7 +98,7 @@ raise --until to load past a test point. A report goes to stdout and to the
 				return err
 			}
 			_, err = preload.Load(cmd.Context(), s3c, cfg)
-			if errors.Is(err, context.Canceled) {
+			if errors.Is(err, context.Canceled) && !errors.Is(err, preload.ErrStateNotSaved) {
 				return fmt.Errorf("interrupted; progress saved in %s", cfg.StatePath)
 			}
 			return err
