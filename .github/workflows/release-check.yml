@@ -2,7 +2,7 @@ name: Release Checker
 
 # Validates version.json bumps on PRs (semver, not already released).
 on:
-  pull_request_target:
+  pull_request:
     paths: [ 'version.json' ]
     types: [ opened, synchronize, reopened, labeled, unlabeled ]
   workflow_dispatch:
