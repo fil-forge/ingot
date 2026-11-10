@@ -9,7 +9,7 @@ import (
 // Each test's database is migrated and its own.
 func TestNewGivesEachTestAMigratedDatabase(t *testing.T) {
 	a, b := pgtest.New(t), pgtest.New(t)
-	if _, err := a.Exec(t.Context(), `INSERT INTO ingot.revocation_cursor (recorded_at, revoke) VALUES (now(), '\x01')`); err != nil {
+	if _, err := a.Exec(t.Context(), `INSERT INTO ingot.revocation_cursor (token) VALUES ('1')`); err != nil {
 		t.Fatalf("migrated tables: %v", err)
 	}
 	var n int

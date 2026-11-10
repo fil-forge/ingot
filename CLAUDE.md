@@ -223,8 +223,11 @@ Internal:
 - **`revocation/`** — the Swarf firehose consumer (optional,
   `revocation_service_url`/`_did`): streams UCAN revocations, records each
   revoked CID and clears the affected access key's iam caches via
-  `iam.Revoker`; resumes from the
-  `registry.RevocationCursorStore` cursor (no cursor → subscribe from now).
+  `iam.Revoker`; resumes after the Swarf cursor token in the
+  `registry.RevocationCursorStore` cursor (no cursor → Swarf's head, read from
+  its own database and saved before the stream opens; a cursor Swarf refuses
+  → its head again, after clearing every access key's iam caches with
+  `iam.Revoker.ClearAll`).
 - **`tokenstore/`** — carried-from-guppy delegation store (`tokens.cbor`);
   empty, read only by the dormant login paths.
 - **`regionkey/`** — the region CEK wrap (`Provider`): `openbao` (the

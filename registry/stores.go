@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
-	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/taskrunner"
@@ -515,20 +514,19 @@ type CatalogUsageStore interface {
 }
 
 // RevocationCursor is the single row of ingot.revocation_cursor: the resume
-// point in the revocation service's firehose. RecordedAt is the recorded_at
-// of the last processed revocation record — the service's own timeline, so a
-// reconnect's `since` cursor is immune to clock skew between ingot and the
-// service. Revoke is the CID of the delegation that record revoked, kept for
-// observability.
+// point in the revocation service's firehose. Token is the service's opaque
+// cursor, which the consumer resumes after: the last processed revocation
+// record's, or the firehose's head, which the consumer saves before its first
+// record and when the service refuses its cursor.
 type RevocationCursor struct {
-	RecordedAt time.Time
-	Revoke     cid.Cid
+	Token string
 }
 
 // RevocationCursorStore persists the firehose cursor across disconnects and
 // restarts. With no cursor stored (GetRevocationCursor → ErrNotFound) the
-// consumer connects from "now": nothing revoked before the process first
-// subscribed can be sitting in its in-memory caches.
+// consumer saves the head of the firehose as the service sees it and starts
+// there: nothing revoked before the process first subscribed can be sitting
+// in its in-memory caches.
 type RevocationCursorStore interface {
 	// GetRevocationCursor returns ErrNotFound when no cursor has been stored.
 	GetRevocationCursor(ctx context.Context) (*RevocationCursor, error)
