@@ -4,8 +4,13 @@
 # (the parent go.work declares a go version above the installed toolchain), so
 # every go invocation here forces GOWORK=off.
 
-# Force the workspace off for every recipe (see CLAUDE.md "Build, test, run").
+# Force the workspace off for every recipe (see CLAUDE.md "Build, test, run"),
+# unless the repo root holds a go.work of its own. That file is gitignored and
+# always deliberate: libforge's go-workspace-test.yml synthesizes one over the
+# sibling repos that share a PR's branch name, then runs `make test` against it.
+ifeq ($(wildcard go.work),)
 export GOWORK := off
+endif
 
 GO ?= go
 

@@ -21,7 +21,10 @@ for the as-built diagrams.
 
 **Critical: use `GOWORK=off`** (or the Makefile, which sets it). The workspace
 `go.work` at `…/fil-forge/go.work` exists for cross-repo work and drags sibling
-modules in; ingot is a standalone module and must build on its own `go.mod`:
+modules in; ingot is a standalone module and must build on its own `go.mod`.
+The one exception is a gitignored `go.work` in ingot's own root: the Makefile
+then leaves the workspace on, because libforge's `go-workspace-test.yml`
+synthesizes that file over matching sibling branches and runs `make test`:
 
 ```bash
 make build      # GOWORK=off go build ./...
