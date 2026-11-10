@@ -345,7 +345,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		// stranded and completed ones reaped — recording their part blobs'
 		// releases before asking hilt to delete the space, which refuses
 		// while the space still holds blob registrations. A session whose
-		// releases cannot be recorded fails the delete: its part rows are
+		// releases cannot be queued fails the delete: its part rows are
 		// the only index to its blobs, and with the bucket row gone the
 		// sweeper would have no space to record them against.
 		//
@@ -376,7 +376,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 				ok = b.reapAbortingSession(ctx, s)
 			}
 			if !ok {
-				return fmt.Errorf("s3frontend: delete bucket: multipart session %s: releases not recorded; retry", s.UploadID)
+				return fmt.Errorf("s3frontend: delete bucket: multipart session %s: releases not queued; retry", s.UploadID)
 			}
 		}
 		if len(sessions) > 0 {

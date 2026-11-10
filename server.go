@@ -105,9 +105,9 @@ type ServerDeps struct {
 	// Parks persists deferred-accept park state between UploadPart and
 	// Complete/Abort.
 	Parks registry.ParkStore
-	// PendingReleases is the deferred blob-release queue drained by the
-	// release sweeper. Typically the same instance as Registry.
-	PendingReleases registry.PendingReleaseStore
+	// Claims counts the claims on a blob, which its release rechecks.
+	// Typically the same instance as Registry.
+	Claims registry.BlobRefStore
 
 	// EncParams is the per-blob FEE encryption-parameter table the decrypting
 	// read path consults; RegionKeys unwraps its region-wrapped CEKs. Both
@@ -226,28 +226,28 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		logger.Warn("local blob read metric not created", zap.Error(err))
 	}
 	backend := s3frontend.New(s3frontend.Deps{
-		Authority:       deps.Authority,
-		Registry:        deps.Registry,
-		Intents:         deps.Intents,
-		Locations:       deps.Locations,
-		GC:              deps.GC,
-		Multipart:       deps.Multipart,
-		Parks:           deps.Parks,
-		Reads:           bs,
-		Log:             log,
-		Spool:           spool,
-		Cache:           cache,
-		Ships:           deps.Uploader,
-		Uploader:        deps.BodyUploader,
-		Deferred:        deps.Deferred,
-		Remover:         deps.Remover,
-		Streaming:       deps.Streaming,
-		Registrar:       deps.Registrar,
-		EncParams:       deps.EncParams,
-		RegionKeys:      deps.RegionKeys,
-		TenantKeys:      deps.TenantKeys,
-		PendingReleases: deps.PendingReleases,
-		ReleaseGrace:    cfg.ReleaseGrace,
+		Authority:    deps.Authority,
+		Registry:     deps.Registry,
+		Intents:      deps.Intents,
+		Locations:    deps.Locations,
+		GC:           deps.GC,
+		Multipart:    deps.Multipart,
+		Parks:        deps.Parks,
+		Reads:        bs,
+		Log:          log,
+		Spool:        spool,
+		Cache:        cache,
+		Ships:        deps.Uploader,
+		Uploader:     deps.BodyUploader,
+		Deferred:     deps.Deferred,
+		Remover:      deps.Remover,
+		Streaming:    deps.Streaming,
+		Registrar:    deps.Registrar,
+		EncParams:    deps.EncParams,
+		RegionKeys:   deps.RegionKeys,
+		TenantKeys:   deps.TenantKeys,
+		Claims:       deps.Claims,
+		ReleaseGrace: cfg.ReleaseGrace,
 
 		LocalBlobMaxBytes:  cfg.LocalBlobMaxBytes,
 		CacheTTL:           cfg.CacheTTL,
@@ -271,6 +271,11 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		_ = backend.CloseMetrics()
 		_ = log.Close(ctx)
 		return nil, fmt.Errorf("ingot: register shard tasks: %w", err)
+	}
+	if err := backend.RegisterReleaseTasks(deps.Tasks); err != nil {
+		_ = backend.CloseMetrics()
+		_ = log.Close(ctx)
+		return nil, fmt.Errorf("ingot: register release tasks: %w", err)
 	}
 
 	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, logger)
@@ -319,7 +324,6 @@ func (s *Server) Start(ctx context.Context) error {
 	}()
 	s.sweepCtx, s.sweepCancel = context.WithCancel(context.Background())
 	s.startMultipartSweeper()
-	s.startReleaseSweeper()
 	s.startLocalBlobSweeper()
 	s.startAcceptSweeper()
 	s.startCatalogUsageSweeper()
@@ -408,42 +412,6 @@ func (s *Server) startAcceptSweeper() {
 				return
 			case <-ticker.C:
 				sweep()
-			}
-		}
-	})
-}
-
-// startReleaseSweeper spawns the deferred-release sweeper: release intents
-// past their not_before (last-claim drop + ReleaseGrace) are executed —
-// claim-count recheck, crypto-shred, location delete, network remove — with
-// failures retried next tick. The interval floor keeps a tiny test grace
-// from spinning a sub-second ticker.
-func (s *Server) startReleaseSweeper() {
-	interval := s.cfg.ReleaseGrace / 2
-	if interval > 10*time.Minute {
-		interval = 10 * time.Minute
-	}
-	if interval < time.Second {
-		interval = time.Second
-	}
-	s.goSweep(func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-s.sweepCtx.Done():
-				return
-			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(s.sweepCtx, time.Minute)
-				ctx, span := tracing.Start(ctx, "sweep.releases")
-				n, err := s.backend.SweepPendingReleases(ctx)
-				s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
-				cancel()
-				if err != nil && s.sweepCtx.Err() == nil {
-					s.logger.Warn("release sweep", zap.Error(err))
-				} else if n > 0 {
-					s.logger.Info("release sweep executed deferred releases", zap.Int("count", n))
-				}
 			}
 		}
 	})
@@ -855,8 +823,8 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	if deps.Multipart == nil {
 		return errors.New("ingot: ServerDeps.Multipart is required")
 	}
-	if deps.PendingReleases == nil {
-		return errors.New("ingot: ServerDeps.PendingReleases is required")
+	if deps.Claims == nil {
+		return errors.New("ingot: ServerDeps.Claims is required")
 	}
 	if deps.Remover == nil {
 		return errors.New("ingot: ServerDeps.Remover is required")

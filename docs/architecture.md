@@ -485,13 +485,14 @@ The acceptor is not behind the latch: an abort, a session expiry or a part re-up
 blob while the acceptor is concluding it. The provider settles the order. A released allocation
 refuses the later accept, and an accepted blob refuses the later abort, so the release removes it
 as accepted. Ingot records an acceptance only while the park row it concluded stands, matched by
-its `/blob/add` task, swapping the park for the location in one transaction; the release drops the
-park before anything else, so a location is never written for a blob a release has taken, nor
-over a later park of the same bytes. The acceptor never cancels a release: a part holding a blob
-with a release record goes to Complete, whose commit claims the blob. Nor does a release run
-against a conclude in flight, since the upload service registers an accepted blob only when it
-answers, after a remove sent meanwhile: a teardown waits for the upload's acceptor to finish its
-pass, and any other release defers to the release sweeper while its blob is being concluded.
+its `/blob/add` task, swapping the park for the location in one transaction; the release deletes
+the park and location rows together in its commit, so a location is never written for a blob a
+release has taken, nor over a later park of the same bytes. The acceptor never cancels a release:
+a part holding a blob with a `queue-space-shard.release` task pending or running goes to Complete,
+whose commit claims the blob. Nor does a release run against a conclude in flight, since the
+upload service registers an accepted blob only when it answers, after a remove sent meanwhile: a
+teardown waits for the upload's acceptor to finish its pass, and any other release defers while
+its blob is being concluded and is retried by the task runner after.
 
 ### 7.4 Read (`GetObject`)
 
@@ -936,24 +937,6 @@ CREATE TABLE ingot.blob_parks (
     PRIMARY KEY (space, digest)
 );
 
--- Deferred blob release (§6): written in the same transaction as the claim drop
--- that leaves a blob unreferenced, and executed by a sweeper after not_before.
--- Executing it deletes the blob_encryption_params row (the crypto-shred) and the
--- blob_locations row, and removes the blob from its provider; the row goes only
--- once all three succeed. started_at is set under the claim-key lock once the
--- release owns the blob, so a write reusing the digest cancels an unstarted
--- release or waits out a started one.
-CREATE TABLE ingot.blob_release_intents (
-    space      text   NOT NULL,
-    digest     bytea  NOT NULL,                          -- ciphertext blob multihash, as in blob_refs
-    not_before timestamptz NOT NULL,                     -- earliest execution (claim drop + grace)
-    created_at timestamptz NOT NULL DEFAULT now(),
-    started_at timestamptz,
-    PRIMARY KEY (space, digest)
-);
-CREATE INDEX blob_release_intents_due_idx ON ingot.blob_release_intents (not_before);
-CREATE INDEX blob_release_intents_digest_idx ON ingot.blob_release_intents (digest);
-
 -- Superseded MST node CIDs, recorded on overwrite/delete (§4, §9). Write-only
 -- this iteration — no catalog GC yet; a future collector consumes it.
 CREATE TABLE ingot.gc_candidates (
@@ -981,8 +964,9 @@ references a `segments.seq` by value, deliberately. `blob_refs`, `segments`,
 `blob_locations` on `(space, digest)` with deliberately no FK. `revocation_cursor` stands alone.
 The reference count for a blob is `count(*) from blob_refs where space = ? and digest = ?`;
 reaching zero triggers `remove(digest)` ([§6](#6-the-forgechain-layer)), through a
-`blob_release_intents` row. `upload_intents` and `blob_parks` are keyed by `(space, digest)`, like
-every other blob table — the disk-side and park-side indexes, shared across whatever objects of the
+`queue-space-shard.release` task on the task runner, subject `<space>/<hex digest>`, queued in the
+same transaction and due after the release grace. `upload_intents` and `blob_parks` are keyed by
+`(space, digest)`, like every other blob table — the disk-side and park-side indexes, shared across whatever objects of the
 space reference the same bytes. The spool file itself is one per digest, shared across spaces, and
 goes with the last intent for it.
 
@@ -1089,22 +1073,27 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
 - **Indexer retraction on delete** is unimplemented (no-op). `ListParts` and
   `ListMultipartUploads` are implemented (paginated, prefix/delimiter/marker semantics;
   in-flight sessions only).
-- **Multipart hygiene.** Abort, part re-upload and Complete (for parts omitted from its list) record
-  a release for each now-unreferenced part blob (guarded against content-addressed sharing with
-  other sessions and committed objects). The release shreds the blob's key, unwinds it on the
-  network as its state requires, then removes its local copy and intent. A background sweeper aborts
+- **Multipart hygiene.** Abort, part re-upload and Complete (for parts omitted from its list) queue
+  a `queue-space-shard.release` task, due at once, for each now-unreferenced part blob (guarded
+  against content-addressed sharing with other sessions and committed objects), and run those
+  releases inline, for up to 10 s, before answering. The release shreds the blob's key, unwinds it
+  on the network as its state requires, then removes its local copy and intent; the task runner
+  retries a release that fails, with no attempt limit, backing off from 1 s to 5 min. A background sweeper aborts
   open sessions older than `multipart_session_ttl` (default 7d) and reaps terminal session rows. A
   successful Complete retains its session in state `completed` so a duplicate Complete is idempotent
   per S3. `DeleteBucket` implicitly aborts the bucket's in-flight sessions before the space delete
   (upstream's conformance teardown never aborts them); `s3:DeleteBucket` delegates `blob.Abort` and
-  `blob.Remove`, so the abort and every other release leg signs with the request's own proofs. The
-  network-side `/blob/abort` unwind remains a parking-flow concern (above).
+  `blob.Remove`, so the abort and every other release leg signs with the request's own proofs; each
+  release task carries the proof chains captured from the request that queued it. `DeleteBucket`
+  also brings the space's pending releases forward, runs them inline, and fails for the client to
+  retry while one still waits. The network-side `/blob/abort` unwind remains a parking-flow concern (above).
 
 ### Reference index and root commit
 
 Reference-index mutations (`blob_refs`) and the catalog/root commit are one transaction: the new
-version's claims, the discarded versions' claim drops, and the release records those drops produce
-are written by the same Postgres transaction as the guarded root swap (`registry.CommitRoot`). A
+version's claims, the discarded versions' claim drops, and the `queue-space-shard.release` tasks
+those drops queue are written by the same Postgres transaction as the guarded root swap (`registry.CommitRoot`). A
 commit that fails writes none of them, and no crash can leave a published version unclaimed or a
-discarded one claimed. A claim the swap refuses (a started release holds the digest, or a pinned
+discarded one claimed. The claims cancel any pending release of their digests in the same
+transaction. A claim the swap refuses (a release of the digest is running, or a pinned
 source is gone) fails the commit, and the root stays where it was.

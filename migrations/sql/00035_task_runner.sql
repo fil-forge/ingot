@@ -21,8 +21,23 @@ ALTER TABLE ingot.upload_intents DROP COLUMN evicted_at;
 DROP INDEX ingot.blob_parks_add_task;
 DROP TABLE ingot.blob_streams;
 
+-- A blob's release is a queue-space-shard.release task, queued in the
+-- transaction that drops its last claim, so its record table is gone.
+DROP TABLE ingot.blob_release_intents;
+
 -- +goose Down
 -- In reverse order of the Up statements.
+CREATE TABLE ingot.blob_release_intents (
+    space      text        NOT NULL,
+    digest     bytea       NOT NULL,
+    not_before timestamptz NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    started_at timestamptz,
+    PRIMARY KEY (space, digest)
+);
+CREATE INDEX blob_release_intents_due_idx ON ingot.blob_release_intents (not_before);
+CREATE INDEX blob_release_intents_digest_idx ON ingot.blob_release_intents (digest);
+
 CREATE TABLE ingot.blob_streams (
     add_task   bytea PRIMARY KEY,
     space      text        NOT NULL,

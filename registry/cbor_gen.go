@@ -246,3 +246,163 @@ func (t *UploadTask) UnmarshalCBOR(r io.Reader) (err error) {
 
 	return nil
 }
+func (t *ReleaseTask) MarshalCBOR(w io.Writer) error {
+	if t == nil {
+		_, err := w.Write(cbg.CborNull)
+		return err
+	}
+
+	cw := cbg.NewCborWriter(w)
+
+	if _, err := cw.Write([]byte{162}); err != nil {
+		return err
+	}
+
+	// t.AbortProofs ([]uint8) (slice)
+	if len("AbortProofs") > 1000000 {
+		return xerrors.Errorf("Value in field \"AbortProofs\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("AbortProofs"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("AbortProofs")); err != nil {
+		return err
+	}
+
+	if len(t.AbortProofs) > 2097152 {
+		return xerrors.Errorf("Byte array in field t.AbortProofs was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.AbortProofs))); err != nil {
+		return err
+	}
+
+	if _, err := cw.Write(t.AbortProofs); err != nil {
+		return err
+	}
+
+	// t.RemoveProofs ([]uint8) (slice)
+	if len("RemoveProofs") > 1000000 {
+		return xerrors.Errorf("Value in field \"RemoveProofs\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("RemoveProofs"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("RemoveProofs")); err != nil {
+		return err
+	}
+
+	if len(t.RemoveProofs) > 2097152 {
+		return xerrors.Errorf("Byte array in field t.RemoveProofs was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.RemoveProofs))); err != nil {
+		return err
+	}
+
+	if _, err := cw.Write(t.RemoveProofs); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (t *ReleaseTask) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = ReleaseTask{}
+
+	cr := cbg.NewCborReader(r)
+
+	maj, extra, err := cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}()
+
+	if maj != cbg.MajMap {
+		return fmt.Errorf("cbor input should be of type map")
+	}
+
+	if extra > cbg.MaxLength {
+		return fmt.Errorf("ReleaseTask: map struct too large (%d)", extra)
+	}
+
+	n := extra
+
+	nameBuf := make([]byte, 12)
+	for i := uint64(0); i < n; i++ {
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
+		}
+
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
+		// t.AbortProofs ([]uint8) (slice)
+		case "AbortProofs":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+
+			if extra > 2097152 {
+				return fmt.Errorf("t.AbortProofs: byte array too large (%d)", extra)
+			}
+			if maj != cbg.MajByteString {
+				return fmt.Errorf("expected byte array")
+			}
+
+			if extra > 0 {
+				t.AbortProofs = make([]uint8, extra)
+			}
+
+			if _, err := io.ReadFull(cr, t.AbortProofs); err != nil {
+				return err
+			}
+
+			// t.RemoveProofs ([]uint8) (slice)
+		case "RemoveProofs":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+
+			if extra > 2097152 {
+				return fmt.Errorf("t.RemoveProofs: byte array too large (%d)", extra)
+			}
+			if maj != cbg.MajByteString {
+				return fmt.Errorf("expected byte array")
+			}
+
+			if extra > 0 {
+				t.RemoveProofs = make([]uint8, extra)
+			}
+
+			if _, err := io.ReadFull(cr, t.RemoveProofs); err != nil {
+				return err
+			}
+
+		default:
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}

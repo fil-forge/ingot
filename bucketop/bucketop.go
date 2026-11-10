@@ -281,13 +281,14 @@ func (tx *Tx) PinBlobs(claims []registry.BlobClaim) {
 }
 
 // DropClaims records the claims of a discarded generation for this commit
-// to remove. A drop of the space's last claim on a digest records the
-// blob's release in the same transaction, due grace after the commit: the
-// grace is measured when the swap commits, not here, so the fsync and any
-// lock wait between do not eat into it.
-func (tx *Tx) DropClaims(drops []registry.ClaimDrop, grace time.Duration) {
+// to remove. A drop of the space's last claim on a digest queues the blob's
+// release in the same transaction, due grace after the commit and carrying
+// release's authority: the grace is measured when the swap commits, not here,
+// so the fsync and any lock wait between do not eat into it.
+func (tx *Tx) DropClaims(drops []registry.ClaimDrop, grace time.Duration, release registry.ReleaseTask) {
 	tx.commit.Drops = append(tx.commit.Drops, drops...)
 	tx.commit.ReleaseGrace = grace
+	tx.commit.Release = release
 }
 
 // Compile-time assertions: Tx is the canonical handle through which

@@ -78,8 +78,11 @@ type ShardCacheTask struct {
 // ShardEvictTask is a queue-shard.evict task's arguments.
 type ShardEvictTask struct {
 	// Budget marks an eviction the budget pass runs, which counts its own
-	// removals. Without it the copy's time to live ran out.
+	// removals.
 	Budget bool
+	// Released marks an eviction a blob's release queues, the blob being gone
+	// from its space. Without either, the copy's time to live ran out.
+	Released bool
 }
 
 // RegisterShardTasks registers the queue-shard handlers with r, and keeps r
@@ -225,7 +228,10 @@ func (b *Backend) runShardEvict(ctx context.Context, _ *taskrunner.Exec, t taskr
 	if err != nil {
 		return nil, err
 	}
-	if !args.Budget {
+	switch {
+	case args.Released:
+		b.localBlobMetrics.removedFile(ctx, removedReleased, freed)
+	case !args.Budget:
 		b.localBlobMetrics.removedFile(ctx, removedExpired, freed)
 	}
 	return binary.AppendVarint(nil, freed), nil

@@ -45,7 +45,8 @@ the MST, fsync one `AppendBatch` of the new catalog blocks, and
 compare-and-swap the bucket root in Postgres, with the reference index
 (`blob_refs`) written in the swap's transaction: the version's claims land,
 superseded versions' claims drop, and a blob whose claim count reaches zero
-gets its release record. The full trace is the
+gets a `queue-space-shard.release` task on the task runner, queued in the
+same transaction and due after the release grace. The full trace is the
 [PutObject diagram](./docs/diagrams.md#putobject-spool-and-upload-off-the-lock-commit-under-it).
 
 **Every body blob is encrypted at ingest** (the FilOne encryption design's
@@ -177,8 +178,9 @@ after a backoff (1 s, doubling to 30 s), and still accepts every other part
 of its batch, so one bad blob cannot hold its neighbours back on every retry; a pass that runs past `acceptPassTimeout` (2 min) fails
 the same way, since the Forge client sets no timeout of its own. The
 acceptor stops for a session that is no longer open or completing. It never
-takes a blob over from its release: a part holding a blob with a release
-record (started or not), or one with neither a park nor a location, goes
+takes a blob over from its release: a part holding a blob with a
+`queue-space-shard.release` task pending or running, or one with neither a
+park nor a location, goes
 back to `spooled`, which is Complete's to finish. At start and every 30 s the
 accept sweeper nudges the acceptor of every open or completing upload with
 parked parts, so work a stopped process left, or a nudge that went missing,
@@ -206,9 +208,9 @@ write lock. A park of the same bytes recorded since by another write names
 another allocation, and stays for its own conclude. An abort, a session expiry or a part re-upload
 can release a blob while it is being concluded, and the provider settles the
 order: a released allocation refuses the accept, and an accepted blob
-refuses the abort, so the release removes it instead. The release drops the
-park row before the location row, so a conclude that finishes after it
-finds no park and records nothing; a location written then would let a
+refuses the abort, so the release removes it instead. The release deletes
+the park and location rows together in its commit, so a conclude that
+finishes after it finds no park and records nothing; a location written then would let a
 later write of the same bytes reuse a blob that is gone. Two uploads in one
 space holding the same bytes share a park, and both acceptors may conclude
 it: a repeated conclude is harmless upstream, the first record swaps the
@@ -220,12 +222,12 @@ nothing to remove; the registration then lands with nothing left to remove
 it, and the blob stays stored. So no release runs against a conclude in
 flight. A session teardown (abort, expiry, DeleteBucket), once it has latched
 the session out of `open` and `completing`, waits for the pass the upload's
-acceptor has in flight, if any, before it records any release
+acceptor has in flight, if any, before it queues any release
 (`quiesceAcceptor`); an acceptor backing off between passes is not waited
 for, since its next pass sees the latch and concludes nothing. Any other
 release, such as a superseded part's, defers while a conclude of its blob is
-in flight in this process (`markConcluding`) and runs from the release
-sweeper after. A conclude that failed or timed out may still be running at
+in flight in this process (`markConcluding`), and the task runner retries it
+after. A conclude that failed or timed out may still be running at
 the upload service, so its blobs stay marked for `failedConcludeHold` (2
 min) after it returns.
 
@@ -248,47 +250,55 @@ transaction, a few statements however many blobs there are
 (`registry.CommitRoot`).
 
 Every session teardown (abort, expiry, the completed-session reap, a
-superseded part, the parts a Complete omitted) records a deferred release
-for each blob of the session that is not still live in it *before* it
-deletes the session row. Whether the blob is in fact free to go is decided
-when the release runs, never at teardown: a digest claimed by a committed
-object drops its record, and one a part of an in-flight session still
-references waits. Deciding at teardown would race another teardown sharing
-the blob. A committed blob is recognisable for good: its first reference
-claim marks its upload intent `published` in the same transaction, so the
-reap of a retained session, completed or stranded, leaves such blobs to the
-object path's own releases whatever has become of the object. A blob with no
-intent at all is one a release already took, intent and record together: a
-reap that still holds its part rows leaves it alone rather than recording it
-again, since the second record would find neither rows nor intent and ask
-the network to remove a blob that may never have reached it.
+superseded part, the parts a Complete omitted) queues a
+`queue-space-shard.release` task, due at once, for each blob of the session
+that is not still live in it *before* it deletes the session row. Whether
+the blob is in fact free to go is decided when the release runs, never at
+teardown: a release of a digest claimed by a committed object does nothing,
+and one a part of an in-flight session still references waits. Deciding at
+teardown would race another teardown sharing the blob. A committed blob is
+recognisable for good: its first reference claim marks its upload intent
+`published` in the same transaction, so the reap of a retained session,
+completed or stranded, leaves such blobs to the object path's own releases
+whatever has become of the object. A blob with no intent at all is one a
+release already took, intent and all: a reap that still holds its part rows
+leaves it alone rather than queueing it again, since the second release
+would find neither rows nor intent and ask the network to remove a blob that
+may never have reached it.
 The part rows are the only index to the blobs and cascade away with the
-session, so the record is what makes the teardown recoverable: a failure
-before it leaves the session for the sweeper, a failure after it leaves
-records the release sweeper retries. The release runs from the record and
-reads the blob's state from its rows rather than its intent. A location row
-means accepted and the space's claim is removed; a park row alone means
-parked and the allocation is aborted, or removed instead when the provider
-refuses the abort because the blob was accepted after all (a conclude ran
-and ingot never learned of it). Neither row is ambiguous on its own: a blob
-uploaded and accepted at Complete whose location then failed to record has
-none either. The intent settles it. Every upload marks the intent
-`uploading` before its first network call, so a blob still `spooled` never
-left this node and is cleaned up locally, while any other state gets a
-network remove, which the upload service treats as success for a blob it
-never registered. The distinction matters for the retry: a blob that never
+session, so the queued task is what makes the teardown recoverable: a
+failure before it leaves the session for the multipart sweeper, and a
+failure after it leaves tasks the runner retries, with no attempt limit and
+a backoff from 1 s doubling to 5 min. Once the session row is gone, the
+teardown runs those releases inline, within 10 s (`releaseNow`), so an Abort
+has released its parked blobs on their providers before it answers;
+whatever is left runs on the runner's workers. Each release carries its
+own authority: the `/blob/remove` and `/blob/abort` proof chains captured
+from the request that queued it, since it runs after that request has gone. The release reads the blob's
+state from its rows rather than its intent. A location row means accepted
+and the space's claim is removed; a park row alone means parked and the
+allocation is aborted, or removed instead when the provider refuses the
+abort because the blob was accepted after all (a conclude ran and ingot
+never learned of it). Neither row is ambiguous on its own: a blob uploaded
+and accepted at Complete whose location then failed to record has none
+either. The intent settles it. Every upload marks the intent `uploading`
+before its first network call, so a blob still `spooled` never left this
+node and is cleaned up locally, while any other state gets a network
+remove, which the upload service treats as success for a blob it never
+registered. The distinction matters for the retry: a blob that never
 uploaded captured no authority a background remove could use, and a remove
-attempted for it would fail on every retry and pin the record forever.
-The crypto-shred goes first, the network step next, and the location and
-park rows only once the network holds nothing, so a retry sees the same
-state. Every release then removes the local copy and upload intent, the
-intent in the same transaction as the release record: for a blob that was
-never committed, the intent is the only evidence of how far the blob ever
-got, and a record outliving it would owe a network remove nothing can
-authorize. A record
-whose digest a part of an in-flight session still references waits: that
-session's Complete turns the reference into a claim, which makes the record
-stale, and its abort records a release of its own.
+attempted for it would fail on every retry and keep the task retrying
+forever. The crypto-shred goes first and the network step next. After the
+network step nothing can fail but the commit: the location, park and upload
+intent rows are deleted by writes committed with the task's outcome, so a
+retry sees the same state. For a blob that was never committed, the intent
+is the only evidence of how far the blob ever got, and a release outliving
+it would owe a network remove nothing can authorize. The spool copy is
+removed directly and the cached copy through a `queue-shard.evict` task,
+unless another space still holds an intent for the digest.
+A release whose digest a part of an in-flight session still references
+waits: that session's Complete turns the reference into a claim, which
+makes the release stale, and its abort queues a release of its own.
 
 ## Local blob storage
 
@@ -428,44 +438,47 @@ hold one digest. Every blob table is therefore keyed by `(space, digest)`,
 the upload intent and the park included: each space uploads, parks, claims
 and releases its own copy, and the one spool file between them goes with the
 last intent for it. Within a space, a write of bytes whose previous object
-was deleted meets that object's release: the release takes the blob under
-its claim-key lock and marks its record started
-(`blob_release_intents.started_at`) before it removes anything, and a write
-that finds the blob already located takes the same lock first, cancelling a
-record not yet started (its own commit would have made it stale) or waiting
-out a started one and then uploading afresh. The write settles the release
+was deleted meets that object's `queue-space-shard.release` task. Its
+subject is the space and the digest, and the task's lease serializes it
+with every other task on that subject. A
+write about to reuse the blob cancels a pending release (its own commit
+would have made it stale) or waits out a running one, within 30 s, and then
+uploads afresh; past that bound it fails with SlowDown for the client to
+retry. A multipart part write waits out a running release the same way but
+leaves a pending one standing, since its part row defers that release for
+as long as the row stands. The write settles the release
 before every upload, park or conclude, located or not, since a release can
 have dropped the location already, or be removing a blob that never had
 one; a streamed blob settles at its conclude and, after a waited-out
-release, is given up and uploaded again from its spool file. A release
-that starts after the settle and before the commit refuses the claim
-(`registry.ErrReleaseInProgress`), and the write fails with SlowDown for the
+release, is given up and uploaded again from its spool file. A commit
+claiming the blob cancels a release queued after the settle in the commit's
+own transaction, and refuses the claim while one runs
+(`registry.ErrReleaseInProgress`); the write fails with SlowDown for the
 client to retry. Each spool file is published already held for the write's
 space (`blockstore.Spool.WriteBlobHeld`), under the directory lock, until
 its upload has read it: a release leaves a file held by its own space, and
 the intent with it, for the write waiting on it; a file held only by
 another space it leaves too, while its own intent goes; and the cache move
-waits for a held file as well. A release runs only through its record:
-Complete no longer runs an orphan's release unrecorded when recording it
-fails, and leaves it to the reap. A record a start finds stale is deleted
-by that start, under the lock, and no caller deletes a record by key
-afterwards, since the key may by then name a replacement enqueued by a drop
-of the new claim. Writes of one digest to one space take turns at the
+waits for a held file as well. A release runs only as a task: Complete
+leaves an orphan whose release it failed to queue to the reap. A release
+that finds a claim on its blob is stale and does nothing. Writes of one
+digest to one space take turns at the
 upload within a process (`Backend.blobKeys`), so the second finds the first's
 location or park; across instances a park already recorded wins, and the
-loser gives up its allocation. Of two spaces releasing the same digest at
-once, each leaving the file for the other's intent, the one whose intent
-delete finds none left removes the file. The streamed paths follow the
+loser gives up its allocation. A release leaves the file while another
+space still holds an intent for the digest; a file that two spaces'
+releases at once both leave is reclaimed by the cache's time to live or the
+orphan pass. The streamed paths follow the
 same rule as the rest: a streamed blob concludes, or a streamed part is
 recorded, under the key lock, after a settle and a look at the rows, and
 a location or park another write recorded meanwhile makes the stream
 surplus, given up and reused. The last guard is the claim itself: a
 committed body blob is located by its commit, so the root swap refuses,
-under the claim-key lock, a claim on a digest the space has no location
+in its transaction, a claim on a digest the space has no location
 for (`registry.RootCommit.Claims`), which is
 one whose release ran to completion between the write's settle and its
 commit; the write fails with SlowDown for the client to retry. A release
-not yet started defers while a write of its space holds the digest.
+defers while a write of its space holds the spool file.
 
 ## Identity & auth
 
