@@ -38,7 +38,9 @@ CREATE TABLE %[1]s (
 	replaceable boolean NOT NULL DEFAULT false,
 	attempts    integer NOT NULL DEFAULT 0,
 	-- retry_at holds a retry that holds its subject (RetryPolicy.HoldsSubject).
-	retry_at    timestamptz
+	retry_at    timestamptz,
+	-- node, when set, is the only instance that may run the task.
+	node        text
 );
 CREATE INDEX %[3]s ON %[1]s (subject, seq) WHERE state = 'pending';
 `+dueIndex(q)+`
