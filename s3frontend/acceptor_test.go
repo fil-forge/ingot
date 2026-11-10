@@ -452,6 +452,7 @@ func TestCompleteOverTheWaitBudgetReopensTheUpload(t *testing.T) {
 	if err := <-background; err != nil {
 		t.Fatalf("background accept: %v", err)
 	}
+	acceptWaitBudget = saved
 	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
 		t.Fatalf("retry Complete: %v", err)
 	}
