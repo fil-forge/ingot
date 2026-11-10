@@ -1041,8 +1041,6 @@ CREATE TABLE ingot.gc_candidates (
 CREATE TABLE ingot.revocation_cursor (
     id          boolean PRIMARY KEY DEFAULT true CHECK (id), -- single-row latch
     token       text NOT NULL,                           -- the service's cursor the next reconnect resumes after
-    recorded_at timestamptz,                             -- the last record's; NULL for a head saved before the first record
-    revoke      bytea,                                   -- the last record's revoked delegation CID, for observability
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 ```

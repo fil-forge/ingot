@@ -3,20 +3,20 @@
 -- event's id, which the consumer resumes after with
 -- GET /revocations/after/{token}. Swarf no longer serves the time query a row
 -- from before tokens resumed with, so those rows go, and the consumer starts
--- at the firehose's head. A head the consumer saves before its first record
--- has no record to describe, so recorded_at and revoke, which describe the
--- last processed record for observability, are NULL until one arrives.
+-- at the firehose's head. recorded_at, that query's resume point, goes too,
+-- and so does revoke: nothing read it, and the consumer logs each record it
+-- processes. updated_at still says when the cursor last moved.
 DELETE FROM ingot.revocation_cursor;
 ALTER TABLE ingot.revocation_cursor
     ADD COLUMN token text NOT NULL,
-    ALTER COLUMN recorded_at DROP NOT NULL,
-    ALTER COLUMN revoke DROP NOT NULL;
+    DROP COLUMN recorded_at,
+    DROP COLUMN revoke;
 
 -- +goose Down
--- A row without a record cannot satisfy the old NOT NULLs, and the old
--- consumer has no use for a token: start it over at its own "now".
+-- The old consumer has no use for a token, and the dropped columns have
+-- nothing to restore: start it over at its own "now".
 DELETE FROM ingot.revocation_cursor;
 ALTER TABLE ingot.revocation_cursor
     DROP COLUMN token,
-    ALTER COLUMN recorded_at SET NOT NULL,
-    ALTER COLUMN revoke SET NOT NULL;
+    ADD COLUMN recorded_at timestamptz NOT NULL,
+    ADD COLUMN revoke bytea NOT NULL;

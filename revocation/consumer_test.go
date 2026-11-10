@@ -199,11 +199,7 @@ func TestConsumerStartsAtTheHeadWithNoCursor(t *testing.T) {
 func TestConsumerResumesAfterStoredCursor(t *testing.T) {
 	ctx := context.Background()
 	store := registry.NewPostgres(pgtest.New(t))
-	require.NoError(t, store.PutRevocationCursor(ctx, registry.RevocationCursor{
-		Token:      "cursor-earlier",
-		RecordedAt: time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC),
-		Revoke:     testCid(t, "earlier"),
-	}))
+	require.NoError(t, store.PutRevocationCursor(ctx, registry.RevocationCursor{Token: "cursor-earlier"}))
 
 	src := &fakeSource{}
 	c := revocation.NewConsumer(src, store, &fakeInvalidator{})
@@ -298,11 +294,7 @@ func TestConsumerRetriesAFailedHeadSave(t *testing.T) {
 func storedCursor(t *testing.T) *registry.Postgres {
 	t.Helper()
 	store := registry.NewPostgres(pgtest.New(t))
-	require.NoError(t, store.PutRevocationCursor(context.Background(), registry.RevocationCursor{
-		Token:      "cursor-moved",
-		RecordedAt: time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC),
-		Revoke:     testCid(t, "earlier"),
-	}))
+	require.NoError(t, store.PutRevocationCursor(context.Background(), registry.RevocationCursor{Token: "cursor-moved"}))
 	return store
 }
 
@@ -402,12 +394,8 @@ func TestConsumerInvalidatesAndPersistsCursor(t *testing.T) {
 
 	waitFor(t, func() bool {
 		cur, err := store.GetRevocationCursor(ctx)
-		return err == nil && cur.Revoke.Equals(rec2.Revocation.Revoke)
+		return err == nil && cur.Token == string(rec2.Cursor)
 	})
-	cur, err := store.GetRevocationCursor(ctx)
-	require.NoError(t, err)
-	require.Equal(t, string(rec2.Cursor), cur.Token, "cursor is the last record's token")
-	require.True(t, cur.RecordedAt.Equal(at2), "cursor records the last record's recorded_at")
 }
 
 // recordingCursorStore records every cursor it is asked to save. Like the
@@ -502,11 +490,7 @@ func TestConsumerSavesOnlyTheLastPositionWhenStoppedBeforeTheInterval(t *testing
 	stop()
 
 	last := recs[len(recs)-1]
-	require.Equal(t, []registry.RevocationCursor{{
-		Token:      string(last.Cursor),
-		RecordedAt: last.Revocation.RecordedAt.Time(),
-		Revoke:     last.Revocation.Revoke,
-	}}, store.calls())
+	require.Equal(t, []registry.RevocationCursor{{Token: string(last.Cursor)}}, store.calls())
 }
 
 func TestConsumerSavesNothingMoreWhileTheFeedIsIdle(t *testing.T) {
