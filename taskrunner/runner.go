@@ -1,6 +1,7 @@
 package taskrunner
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -104,6 +105,14 @@ type QueueOptions struct {
 	// Workers is the most async tasks of the queue this process runs at once.
 	// Zero runs none, leaving the queue's async tasks to other processes.
 	Workers int
+	// Retention is how long a task that succeeded, expired, was cancelled or
+	// was resubmitted is kept after it finished. Defaults to 24 hours, and
+	// must not be negative.
+	Retention time.Duration
+	// FailedRetention is how long a failed task is kept after it failed, for
+	// inspection and replay. Zero keeps it until it is resubmitted, and it
+	// must not be negative.
+	FailedRetention time.Duration
 }
 
 // Options configures a Runner.
@@ -121,6 +130,9 @@ type Options struct {
 	// longest a waiter goes between checks of a task in another process.
 	// Defaults to 1 second.
 	PollInterval time.Duration
+	// RetentionInterval is how often finished tasks past their queue's
+	// retention are deleted. Defaults to 1 minute.
+	RetentionInterval time.Duration
 	// DrainLimit is the most handler runs a worker makes on one subject
 	// before releasing its lease. A batch is one run, whatever its size.
 	// Defaults to 100.
@@ -157,6 +169,10 @@ var (
 	ErrConflict = errors.New("a conditional write affected no rows")
 	// ErrNotFound is returned by Wait for a task its queue does not hold.
 	ErrNotFound = errors.New("task not found")
+	// ErrSyncTask is returned by Resubmit for a task that ran sync: its
+	// caller has had its failure, and a handler written for a caller may
+	// depend on what only the caller holds.
+	ErrSyncTask = errors.New("a sync task cannot be resubmitted")
 	// ErrOtherNode is returned when a sync task is placed on another
 	// instance, which is the only one that may run it.
 	ErrOtherNode = errors.New("task is placed on another instance")
@@ -225,7 +241,10 @@ type queue struct {
 	tasks   string
 	leases  string
 	workers int
-	poke    chan struct{}
+	// retention and failedRetention are QueueOptions' namesakes.
+	retention       time.Duration
+	failedRetention time.Duration
+	poke            chan struct{}
 	// inflight is the set of subjects this process's workers have taken or
 	// are about to take, guarded by Runner.mu.
 	inflight map[string]bool
@@ -256,6 +275,9 @@ func New(db DB, opts Options) (*Runner, error) {
 	}
 	if opts.PollInterval <= 0 {
 		opts.PollInterval = time.Second
+	}
+	if opts.RetentionInterval <= 0 {
+		opts.RetentionInterval = time.Minute
 	}
 	if opts.DrainLimit <= 0 {
 		opts.DrainLimit = 100
@@ -294,16 +316,22 @@ func New(db DB, opts Options) (*Runner, error) {
 		if _, dup := r.byName[qo.Name]; dup {
 			return nil, fmt.Errorf("task runner: queue %q listed twice", qo.Name)
 		}
+		// A negative age would put the prune's cutoff in the future.
+		if qo.Retention < 0 || qo.FailedRetention < 0 {
+			return nil, fmt.Errorf("task runner: queue %q has a negative retention", qo.Name)
+		}
 		table := strings.ReplaceAll(qo.Name, "-", "_")
 		q := &queue{
-			name:     qo.Name,
-			idx:      i,
-			table:    table,
-			tasks:    pgx.Identifier{opts.Schema, table + "_tasks"}.Sanitize(),
-			leases:   pgx.Identifier{opts.Schema, table + "_leases"}.Sanitize(),
-			workers:  qo.Workers,
-			poke:     make(chan struct{}, 1),
-			inflight: map[string]bool{},
+			name:            qo.Name,
+			idx:             i,
+			table:           table,
+			tasks:           pgx.Identifier{opts.Schema, table + "_tasks"}.Sanitize(),
+			leases:          pgx.Identifier{opts.Schema, table + "_leases"}.Sanitize(),
+			workers:         qo.Workers,
+			retention:       cmp.Or(qo.Retention, 24*time.Hour),
+			failedRetention: qo.FailedRetention,
+			poke:            make(chan struct{}, 1),
+			inflight:        map[string]bool{},
 		}
 		r.order = append(r.order, q)
 		r.byName[q.name] = q
@@ -386,6 +414,8 @@ func (r *Runner) Start(ctx context.Context) error {
 			go r.pollLoop(r.ctx, q)
 		}
 	}
+	r.wg.Add(1)
+	go r.retentionLoop(r.ctx)
 	r.stopRenew = stopRenew
 	// Metrics never stop the runner: a failure to register leaves the
 	// gauges unreported.
@@ -662,8 +692,10 @@ func (r *Runner) drainSync(ctx context.Context, q *queue, h *hold, upTo int64, t
 }
 
 // Wait waits for a task to finish and returns its result. A failed task
-// returns a *HandlerError, an expired one ErrExpired and a cancelled one
-// ErrCancelled. A task dropped by a replacement is not found.
+// returns a *HandlerError, as does one since resubmitted under a new ID; an
+// expired one returns ErrExpired and a cancelled one ErrCancelled. A task
+// dropped by a replacement, or deleted past its queue's retention, is not
+// found.
 func (r *Runner) Wait(ctx context.Context, queueName string, id TaskID) ([]byte, error) {
 	q, ok := r.byName[queueName]
 	if !ok {
@@ -709,7 +741,7 @@ func (r *Runner) outcome(ctx context.Context, q *queue, id TaskID) (res []byte, 
 	switch state {
 	case "succeeded":
 		return res, nil, true
-	case "failed":
+	case "failed", "resubmitted":
 		m := ""
 		if msg != nil {
 			m = *msg
