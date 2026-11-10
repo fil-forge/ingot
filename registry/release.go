@@ -37,7 +37,8 @@ func ReleaseSubject(space did.DID, digest multihash.Multihash) string {
 	return space.String() + "/" + hex.EncodeToString(digest)
 }
 
-// SpaceReleases is the subject pattern matching every release in space, for
+// SpaceReleases is the subject pattern matching every task on the release
+// queue in space, its releases and its blobs' accepts, for
 // taskrunner.Runner.Expedite.
 func SpaceReleases(space did.DID) string {
 	return space.String() + "/*"

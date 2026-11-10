@@ -1207,10 +1207,12 @@ func (b *Backend) acceptAndWait(ctx context.Context, uploadID string, space did.
 
 // awaitBlobAccepts waits, until expires, for the pending accepts of the
 // blobs of parts in space, making each due now first: a sync no-op on a
-// blob's subject runs once the tasks due before it there have run. Each
-// blob's accepts are brought forward by its subject, which also stops their
-// being replaced, so one another upload submits meanwhile is added behind
-// the no-op and leaves the accepts ahead of it where they are.
+// blob's subject runs once the tasks due before it there have run. The
+// space's accepts are brought forward by their subjects in one statement,
+// which also stops their being replaced, so one another upload submits
+// meanwhile is added behind the no-op and leaves the accepts ahead of it
+// where they are. Other uploads' accepts in the space are due now already,
+// so bringing them forward too changes nothing for them.
 func (b *Backend) awaitBlobAccepts(ctx context.Context, space did.DID, parts []registry.MultipartPart, expires time.Time) error {
 	seen := map[string]bool{}
 	var subjects []string
@@ -1223,12 +1225,12 @@ func (b *Backend) awaitBlobAccepts(ctx context.Context, space did.DID, parts []r
 			}
 		}
 	}
+	due, err := b.releases.Expedite(ctx, registry.ReleaseQueue, registry.SpaceReleases(space), registry.BlobAcceptAction)
+	if err != nil {
+		return fmt.Errorf("bring the blobs' accepts forward: %w", err)
+	}
 	var waiting []string
 	for _, subject := range subjects {
-		due, err := b.releases.Expedite(ctx, registry.ReleaseQueue, subject, registry.BlobAcceptAction)
-		if err != nil {
-			return fmt.Errorf("bring the blobs' accepts forward: %w", err)
-		}
 		if len(due[subject]) > 0 {
 			waiting = append(waiting, subject)
 		}
