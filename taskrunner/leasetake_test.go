@@ -168,6 +168,9 @@ func TestALeaseTakeOutlivesItsCallersDeadline(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Run = %v, want its ctx's context.DeadlineExceeded", err)
 	}
+	if db.takes.Load() == 0 {
+		t.Fatal("Run's deadline passed before it tried to take the lease; the test needs a longer deadline")
+	}
 	select {
 	case <-db.landed:
 	case <-time.After(5 * time.Second):

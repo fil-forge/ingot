@@ -431,7 +431,8 @@ func (r *Runner) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop cancels the workers and the Run calls in progress, and waits for them.
+// Stop cancels the workers and the Run calls in progress, and waits for them,
+// including any lease take they have in flight, for up to the lease TTL.
 // A Stop that returns early because ctx ended leaves the shutdown running: a
 // later Stop waits for it, and Start fails until it has finished.
 // A task interrupted by Stop stays pending and is resumed by the next process
@@ -766,7 +767,9 @@ func (r *Runner) submit(ctx context.Context, db execer, s Spec) (TaskID, error) 
 // one.
 //
 // If ctx ends first, Run returns ctx's error and the task stays submitted,
-// for a worker to run later unless its Expires passes first. Give a sync task
+// for a worker to run later unless its Expires passes first. A lease take in
+// flight when ctx ends finishes first, for up to the lease TTL, so that it
+// leaves no lease behind. Give a sync task
 // an Expires, or a ctx with a deadline, whenever a caller that has given up
 // must not see the task take effect later.
 func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {

@@ -71,6 +71,10 @@ type freeSub struct {
 // the age of the tree holding it. Both results are nil when the holder's age
 // could not be read.
 func (r *Runner) tryLease(ctx context.Context, q *queue, subject string, age treeAge) (*hold, *treeAge, error) {
+	// A caller that has already gone needs no lease.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	token := uuid.New()
 	var taken, tookOver bool
 	var holderCreated *time.Time
@@ -78,8 +82,9 @@ func (r *Runner) tryLease(ctx context.Context, q *queue, subject string, age tre
 	// The take runs past ctx's end, so that its caller learns whether it took
 	// the lease: cut off by ctx, it can take the lease on the server and
 	// still fail here, leaving a lease no hold records, which nothing would
-	// renew or release. The lease's own TTL bounds it instead; a lease left
-	// by that bound has all but expired by the time the take gives up.
+	// renew or release. The lease's own TTL bounds it instead. A lease left
+	// by that bound expires a TTL after its statement started, which is soon
+	// after the take gives up unless the take waited long for a connection.
 	takeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.opts.LeaseTTL)
 	defer cancel()
 	err := r.db.QueryRow(takeCtx, `
@@ -103,7 +108,9 @@ SELECT false, false, tree_created, tree_id FROM `+q.leases+`
 		// The holder committed after this statement's snapshot was taken.
 		return nil, nil, nil
 	case err != nil:
-		// The take may still have reached the database.
+		// The take may still have reached the database, unless it failed
+		// with its connection, which leaves one still running there to
+		// expire on its own.
 		r.dropUntracked(ctx, q, subject, token)
 		return nil, nil, fmt.Errorf("take lease %s/%s: %w", q.name, subject, err)
 	}
@@ -140,14 +147,22 @@ func (r *Runner) setAge(ctx context.Context, h *hold, age treeAge) error {
 }
 
 // dropUntracked deletes the lease a failed take may have written under token,
-// which only that take knows. Like release, it runs after ctx has ended; if it
-// fails too, the lease expires on its own.
+// which only that take knows, and wakes this process's waiters on the subject
+// if there was one. It runs past ctx's end, for at most the lease TTL, by
+// which time any lease the take wrote has expired anyway; if it fails, the
+// lease expires on its own.
 func (r *Runner) dropUntracked(ctx context.Context, q *queue, subject string, token uuid.UUID) {
-	ctx = context.WithoutCancel(ctx)
-	if _, err := r.db.Exec(ctx, `DELETE FROM `+q.leases+` WHERE subject = $1 AND owner = $2`,
-		subject, token); err != nil {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.opts.LeaseTTL)
+	defer cancel()
+	tag, err := r.db.Exec(ctx, `DELETE FROM `+q.leases+` WHERE subject = $1 AND owner = $2`,
+		subject, token)
+	if err != nil {
 		r.log.Warn("drop a lease a failed take may have written; it expires on its own",
 			zapSubject(q.name, subject), zapErr(err))
+		return
+	}
+	if tag.RowsAffected() > 0 {
+		r.wakeFreed(subjectKey{q.name, subject})
 	}
 }
 
@@ -160,12 +175,17 @@ func (r *Runner) release(ctx context.Context, h *hold) {
 		r.log.Warn("release lease; it expires on its own",
 			zapSubject(h.q.name, h.subject), zapErr(err))
 	}
+	r.wakeFreed(h.key())
+}
+
+// wakeFreed wakes this process's waiters on key's lease being released.
+func (r *Runner) wakeFreed(key subjectKey) {
 	r.mu.Lock()
-	if sub, ok := r.freed[h.key()]; ok {
+	defer r.mu.Unlock()
+	if sub, ok := r.freed[key]; ok {
 		close(sub.ch)
-		delete(r.freed, h.key())
+		delete(r.freed, key)
 	}
-	r.mu.Unlock()
 }
 
 // forget stops renewing h, leaving its row to expire.
