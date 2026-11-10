@@ -104,27 +104,6 @@ func IsPermanent(err error) bool {
 	return errors.As(err, &p)
 }
 
-// Defer marks a handler's error as a deferral: the attempt found it must wait
-// and did nothing, so its retry waits like any delayed task, holding up none
-// of the tasks behind it, even under a policy that holds the subject.
-func Defer(err error) error {
-	if err == nil {
-		return nil
-	}
-	return &deferralError{err}
-}
-
-type deferralError struct{ err error }
-
-func (e *deferralError) Error() string { return e.err.Error() }
-func (e *deferralError) Unwrap() error { return e.err }
-
-// isDeferral reports whether err was marked with Defer.
-func isDeferral(err error) bool {
-	var d *deferralError
-	return errors.As(err, &d)
-}
-
 // ErrCancelled is returned by Wait for a task that was cancelled before it
 // started.
 var ErrCancelled = errors.New("task cancelled")
@@ -488,11 +467,11 @@ func (f *failures) record(ctx context.Context, tx pgx.Tx, h *hold, a *action, ta
 			f.failed = append(f.failed, t)
 		} else {
 			// A retry that holds its subject waits in retry_at, which keeps
-			// the tasks behind it waiting too; otherwise, or after a
-			// deferral, it waits in not_before like any delayed task. A task
-			// that has run is no longer replaceable (see insertSpec).
+			// the tasks behind it waiting too; otherwise it waits in
+			// not_before like any delayed task. A task that has run is no
+			// longer replaceable (see insertSpec).
 			col := "not_before"
-			if p.HoldsSubject && !isDeferral(herr) {
+			if p.HoldsSubject {
 				col = "retry_at"
 			}
 			sql = `UPDATE ` + h.q.tasks + ` SET attempts = attempts + 1, error = $2, started = NULL,

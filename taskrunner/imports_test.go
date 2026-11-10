@@ -13,7 +13,7 @@ import (
 // The runner must stay releasable as a library, so it and its test helpers
 // import nothing else from Ingot.
 func TestImportsNothingFromIngot(t *testing.T) {
-	for _, dir := range []string{".", "taskrunnertest"} {
+	for _, dir := range []string{".", "taskrunnertest", "internal/testhook"} {
 		files, err := filepath.Glob(filepath.Join(dir, "*.go"))
 		if err != nil {
 			t.Fatal(err)

@@ -4,467 +4,289 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
+	"strconv"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
+	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
 	"go.opentelemetry.io/otel/attribute"
-	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/forgeclient"
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/ingot/uploader"
 )
 
 // A multipart upload's blobs are accepted on Forge while the client is still
-// uploading, so Complete has only the last few parts left to wait for. The
-// part rows are the queue: UploadPart moves a part to 'parked' once its blobs
-// are parked and nudges the upload's acceptor, which concludes the upload's
-// parked parts in batches and moves them to 'accepted'.
-//
-// Each upload has at most one acceptor, a goroutine that runs while there is
-// work and exits when a pass finds none, so a large upload never delays a
-// small one's accepts. Ownership is in-process: Ingot runs as one instance.
-// Running several would need a lease on the session row, so that one
-// instance's acceptor owns an upload at a time.
+// uploading, so Complete has only the last few parts left to accept. The part
+// rows are the queue: UploadPart records a part 'parked', its blobs parked
+// before the row, and queues the upload's queue-multipart-upload-shard.accept
+// in the same transaction. The accept concludes the upload's parked parts in
+// batches and marks them 'accepted'. It runs on the upload's own subject, apart
+// from the upload's other work, and stays consistent with it through the part
+// rows: a part is marked accepted only while its row is unchanged. A release
+// of a blob a dropped part named can race the conclude of that blob; the
+// upload service decides which wins, since a released allocation refuses the
+// accept and an accepted blob refuses the abort, which the release then
+// removes instead.
 
-// acceptBatchBlobs caps the blobs one acceptor pass concludes: one
-// /ucan/conclude's worth. A part is never split across passes, so a pass
-// takes at least one part however many blobs it has.
+// acceptBatchBlobs caps the blobs one batch concludes: one /ucan/conclude's
+// worth. A part is never split across batches, so a batch takes at least one
+// part however many blobs it has.
 var acceptBatchBlobs = forgeclient.MaxConcludeReceipts
 
-// acceptPassTimeout bounds one acceptor pass. The Forge client sets no
+// acceptBatchTimeout bounds one batch's conclude. The Forge client sets no
 // timeout of its own, so without it a conclude whose answer never came would
-// hold the acceptor in one pass for good. A pass that runs out fails like any
-// other and is retried; accepts the upload service ran before the timeout are
-// concluded again on the retry, which it treats as a repeat. A full pass
-// takes well under a minute. Package-level so tests can shrink it.
-var acceptPassTimeout = 2 * time.Minute
+// hold the upload's accept for good. A batch that runs out fails the task;
+// accepts the upload service ran before the timeout are concluded again on
+// the retry, which it treats as a repeat. Package-level so tests can shrink
+// it.
+var acceptBatchTimeout = 2 * time.Minute
 
-// acceptBackoffFirst and acceptBackoffMax bound the wait between an
-// acceptor's failed pass and its retry. Package-level so tests can shrink
-// them.
-var (
-	acceptBackoffFirst = time.Second
-	acceptBackoffMax   = 30 * time.Second
-)
+// acceptRetry retries a failed background accept a few times. A later part's
+// accept, or the one Complete runs, concludes whatever is left.
+var acceptRetry = taskrunner.RetryPolicy{First: 5 * time.Second, Max: time.Minute, Multiplier: 2, Attempts: 5}
 
-// acceptors is the Backend's set of running acceptors, by upload ID.
-type acceptors struct {
-	mu sync.Mutex
-	// ctx is the acceptors' lifetime, set by StartAcceptors: nil before it,
-	// and once it is done no acceptor starts.
-	ctx context.Context
-	// closed is set by WaitAcceptors, so no acceptor starts behind its wait.
-	closed  bool
-	wg      sync.WaitGroup
-	running map[string]*acceptor
-}
+// acceptFlush is the queue's sync no-op: running it on an upload's subject
+// waits for the upload's running accept to finish, and leaves a pending one
+// standing.
+const acceptFlush = "flush"
 
-// acceptor is one upload's running acceptor. Its fields are guarded by
-// acceptors.mu.
-type acceptor struct {
-	// more is set by a nudge, or by a pass that did work, so the loop makes
-	// another pass before it exits.
-	more bool
-	// lastErr is the last pass's error, nil once a pass succeeds.
-	lastErr error
-	// waiters are signalled with the outcome of the next pass that fails,
-	// or with nil when the acceptor exits with nothing left to do.
-	waiters []chan error
-	// passWaiters are signalled with the outcome of the next pass, whatever
-	// it is, or with nil when the acceptor exits.
-	passWaiters []chan error
-	// inPass is closed when the pass in flight ends; nil between passes,
-	// including while the acceptor backs off after a failure.
-	inPass chan struct{}
-}
-
-// signal hands err to every waiter and forgets them.
-func (a *acceptor) signal(err error) {
-	for _, w := range a.waiters {
-		w <- err
-	}
-	a.waiters = nil
-}
-
-// signalPass hands a pass's outcome to every pass waiter and forgets them.
-func (a *acceptor) signalPass(err error) {
-	for _, w := range a.passWaiters {
-		w <- err
-	}
-	a.passWaiters = nil
-}
-
-// StartAcceptors lets acceptors run until ctx is done. Before it is called a
-// nudge does nothing; the restart sweep (NudgeParkedUploads) picks up the
-// parts that queued meanwhile.
-func (b *Backend) StartAcceptors(ctx context.Context) {
-	b.acceptors.mu.Lock()
-	defer b.acceptors.mu.Unlock()
-	b.acceptors.ctx = ctx
-}
-
-// WaitAcceptors stops new acceptors from starting and waits for the running
-// ones to exit. Call it once the context given to StartAcceptors is done.
-func (b *Backend) WaitAcceptors() {
-	b.acceptors.mu.Lock()
-	b.acceptors.closed = true
-	b.acceptors.mu.Unlock()
-	b.acceptors.wg.Wait()
-}
-
-// NudgeParkedUploads nudges the acceptor of every open or completing upload
-// with parked parts, and returns how many it nudged. It is the restart sweep:
-// the part rows are the queue, so nothing is lost when a process stops with
-// work outstanding or a nudge goes missing. It also measures how long the
-// oldest parked part has waited, for the ingot.multipart.parked_age gauge.
-func (b *Backend) NudgeParkedUploads(ctx context.Context) (int, error) {
-	oldest, found, err := b.multipart.OldestParkedPart(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("s3frontend: oldest parked part: %w", err)
-	}
-	var age int64
-	if found {
-		age = int64(max(time.Since(oldest), 0) / time.Second)
-	}
-	b.parkedAgeSeconds.Store(age)
-	b.parkedAgeKnown.Store(true)
-
-	ids, err := b.multipart.ListUploadsWithParkedParts(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("s3frontend: list uploads with parked parts: %w", err)
-	}
-	for _, id := range ids {
-		b.nudgeAcceptor(id)
-	}
-	return len(ids), nil
-}
-
-// nudgeAcceptor starts uploadID's acceptor, or asks the running one for
-// another pass.
-func (b *Backend) nudgeAcceptor(uploadID string) {
-	b.acceptors.mu.Lock()
-	defer b.acceptors.mu.Unlock()
-	b.nudgeLocked(uploadID)
-}
-
-// nudgeLocked is nudgeAcceptor with acceptors.mu held. It returns the
-// upload's acceptor, nil when acceptors are not running.
-func (b *Backend) nudgeLocked(uploadID string) *acceptor {
-	m := &b.acceptors
-	if m.ctx == nil || m.ctx.Err() != nil || m.closed {
-		return nil
-	}
-	if a, ok := m.running[uploadID]; ok {
-		a.more = true
-		return a
-	}
-	if m.running == nil {
-		m.running = map[string]*acceptor{}
-	}
-	a := &acceptor{more: true}
-	m.running[uploadID] = a
-	m.wg.Add(1)
-	go func(ctx context.Context) {
-		defer m.wg.Done()
-		b.runAcceptor(ctx, uploadID, a)
-	}(m.ctx)
-	return a
-}
-
-// blobMarks counts, by blobKey, the operations of one kind this process has
-// in flight on each blob (Backend.concluding).
-type blobMarks struct {
-	mu sync.Mutex
-	n  map[string]int
-}
-
-// mark marks digests in space until the returned func is first called.
-func (m *blobMarks) mark(space did.DID, digests ...mh.Multihash) func() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.n == nil {
-		m.n = map[string]int{}
-	}
-	for _, d := range digests {
-		m.n[blobKey(space, d)]++
-	}
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			m.mu.Lock()
-			defer m.mu.Unlock()
-			for _, d := range digests {
-				k := blobKey(space, d)
-				if m.n[k]--; m.n[k] <= 0 {
-					delete(m.n, k)
-				}
-			}
-		})
-	}
-}
-
-// marked reports whether digest in space is marked.
-func (m *blobMarks) marked(space did.DID, digest mh.Multihash) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.n[blobKey(space, digest)] > 0
-}
-
-// markConcluding marks digests as being concluded in space until the
-// returned func is first called. A release that has not started defers while
-// its blob is marked (runRelease): the upload service registers a blob it
-// accepts before it answers the conclude, so a remove sent before that
-// answer finds nothing to remove, and the registration then lands with
-// nothing left to remove it. The mark is taken before the caller checks
-// for pending releases, and a release checks the mark before it acts, so
-// either the conclude finds the release and leaves the blob, or the release
-// finds the mark and waits.
-func (b *Backend) markConcluding(space did.DID, digests []mh.Multihash) func() {
-	return b.concluding.mark(space, digests...)
-}
-
-// isConcluding reports whether a conclusion of digest in space is in flight.
-func (b *Backend) isConcluding(space did.DID, digest mh.Multihash) bool {
-	return b.concluding.marked(space, digest)
-}
-
-// errAcceptorsNotRunning is drainAcceptor's answer before StartAcceptors, or
-// once the acceptors have stopped.
-var errAcceptorsNotRunning = errors.New("acceptors are not running")
-
-// drainAcceptor nudges uploadID's acceptor and waits until it has nothing
-// left to do, its next pass fails, or ctx ends. An acceptor backing off after
-// a failure returns that failure at once rather than waiting out the backoff.
-// A nil result says only that the acceptor stopped; the part states are the
-// answer to what was accepted.
-func (b *Backend) drainAcceptor(ctx context.Context, uploadID string) error {
-	b.acceptors.mu.Lock()
-	a := b.nudgeLocked(uploadID)
-	if a == nil {
-		b.acceptors.mu.Unlock()
-		return errAcceptorsNotRunning
-	}
-	if a.lastErr != nil {
-		err := a.lastErr
-		b.acceptors.mu.Unlock()
+// RegisterAcceptTasks registers the queue-multipart-upload-shard handlers
+// with r. Call it before r starts.
+func (b *Backend) RegisterAcceptTasks(r *taskrunner.Runner) error {
+	b.accepts = r
+	if err := r.Handle(registry.AcceptQueue, registry.AcceptAction, b.runAccept, taskrunner.WithRetry(acceptRetry)); err != nil {
 		return err
 	}
-	done := make(chan error, 1)
-	a.waiters = append(a.waiters, done)
-	b.acceptors.mu.Unlock()
-
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		// The acceptor signals into a buffered channel, so leaving the
-		// waiter behind costs nothing.
-		return ctx.Err()
-	}
+	return r.Handle(registry.AcceptQueue, acceptFlush, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, nil
+	})
 }
 
-// awaitPass nudges uploadID's acceptor and waits for its next pass to end,
-// returning that pass's error, or nil when the acceptor exits with nothing
-// left to do. An acceptor backing off after a failure returns that failure
-// at once rather than waiting out the backoff.
-func (b *Backend) awaitPass(ctx context.Context, uploadID string) error {
-	b.acceptors.mu.Lock()
-	a := b.nudgeLocked(uploadID)
-	if a == nil {
-		b.acceptors.mu.Unlock()
-		return errAcceptorsNotRunning
-	}
-	if a.lastErr != nil {
-		err := a.lastErr
-		b.acceptors.mu.Unlock()
-		return err
-	}
-	done := make(chan error, 1)
-	a.passWaiters = append(a.passWaiters, done)
-	b.acceptors.mu.Unlock()
-
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// quiesceAcceptor waits for the pass uploadID's acceptor has in flight, if
-// any, to end. A session teardown calls it once it has latched the session
-// out of 'open' and 'completing', and before it records any release: the
-// acceptor's next pass sees the latch and concludes nothing, so only the
-// pass in flight matters. It may have concluded a blob the upload service is
-// still accepting, and the service registers the blob before it answers: a
-// release run sooner could remove the blob before that registration lands
-// and leave the blob registered and stored, with nothing left to remove it.
-// An acceptor between passes, backing off after a failure, is not waited
-// for. The wait is bounded by acceptPassTimeout.
-func (b *Backend) quiesceAcceptor(ctx context.Context, uploadID string) error {
-	b.acceptors.mu.Lock()
-	var inPass chan struct{}
-	if a, ok := b.acceptors.running[uploadID]; ok {
-		inPass = a.inPass
-	}
-	b.acceptors.mu.Unlock()
-	if inPass == nil {
-		return nil
-	}
-	select {
-	case <-inPass:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// runAcceptor is uploadID's acceptor: it makes passes while there is work,
-// backs off after a failed pass, and exits once a pass finds nothing to do or
-// ctx is done.
-func (b *Backend) runAcceptor(ctx context.Context, uploadID string, a *acceptor) {
-	m := &b.acceptors
-	backoff := acceptBackoffFirst
-	for {
-		m.mu.Lock()
-		if !a.more || ctx.Err() != nil {
-			delete(m.running, uploadID)
-			a.signal(nil)
-			a.signalPass(nil)
-			m.mu.Unlock()
-			return
-		}
-		a.more = false
-		a.inPass = make(chan struct{})
-		m.mu.Unlock()
-
-		passCtx, cancel := context.WithTimeout(ctx, acceptPassTimeout)
-		did, err := b.acceptPass(passCtx, uploadID)
-		cancel()
-
-		m.mu.Lock()
-		close(a.inPass)
-		a.inPass = nil
-		m.mu.Unlock()
-
-		if did || err != nil {
-			b.multipartMetrics.pass(ctx, err)
-		}
-
-		m.mu.Lock()
-		a.lastErr = err
-		a.signalPass(err)
+// awaitRunningAccept waits for uploadID's running accept, if any, to finish.
+// A session teardown calls it once it has latched the session out of 'open'
+// and 'completing', and before it records any release: an accept that starts
+// after the latch concludes nothing, so only one already running matters. It
+// may have concluded a blob the upload service is still accepting, and the
+// service registers the blob before it answers: a release run sooner could
+// remove the blob before that registration lands, and leave the blob
+// registered and stored with nothing left to remove it. The upload's queued
+// accepts, and the flushes of earlier teardowns that gave up, are cancelled
+// first: the flush would otherwise wait for a worker to run each. The wait is
+// bounded by acceptWaitBudget; past it the teardown fails, for its caller to
+// retry.
+func (b *Backend) awaitRunningAccept(ctx context.Context, uploadID string) error {
+	for _, action := range []string{registry.AcceptAction, acceptFlush} {
+		queued, err := b.accepts.Pending(ctx, registry.AcceptQueue, []string{uploadID}, action)
 		if err != nil {
-			// Retried after the backoff; the parts stay parked meanwhile.
-			a.more = true
-			a.signal(err)
-		} else if did {
-			a.more = true
+			return fmt.Errorf("find the upload's queued %s: %w", action, err)
 		}
-		m.mu.Unlock()
-
-		if err == nil {
-			backoff = acceptBackoffFirst
-			continue
+		// Cancel leaves one that has started, which the flush waits for.
+		if err := b.accepts.Cancel(ctx, registry.AcceptQueue, queued[uploadID]...); err != nil {
+			return fmt.Errorf("cancel the upload's queued %s: %w", action, err)
 		}
-		if ctx.Err() == nil {
-			b.logger.Warn("multipart accept pass failed; retrying",
-				zap.String("upload_id", uploadID), zap.Duration("backoff", backoff), zap.Error(err))
-		}
-		select {
-		case <-ctx.Done():
-		case <-time.After(backoff):
-		}
-		backoff = min(backoff*2, acceptBackoffMax)
 	}
+	expires := time.Now().Add(acceptWaitBudget)
+	_, err := b.accepts.Run(ctx, taskrunner.Spec{Queue: registry.AcceptQueue, Subject: uploadID, Action: acceptFlush, Expires: &expires})
+	if errors.Is(err, taskrunner.ErrExpired) {
+		return fmt.Errorf("the upload's running accept did not finish in time; retry")
+	}
+	return err
 }
 
-// acceptPass accepts one batch of uploadID's parked parts and reports whether
-// it found any. A session that is gone, or no longer open or completing, has
-// nothing to accept: an aborting session releases its parts instead, and a
-// completed one accepted them all.
-func (b *Backend) acceptPass(ctx context.Context, uploadID string) (did bool, err error) {
+// runAccept is queue-multipart-upload-shard.accept: it concludes the upload's
+// parked parts, or those of them the task names, in part order and in
+// batches, including parts parked while it runs that sort after the batch it
+// is on, and records them accepted with its commit. A session that is gone,
+// or no longer open or completing, has nothing to accept: an aborting
+// session releases its parts instead, and a completed one accepted them all.
+// A failed batch fails the task, which records nothing. Its result is the
+// number of parts it found ready to mark accepted.
+func (b *Backend) runAccept(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
+	uploadID := t.Subject
+	args, err := registry.AcceptTaskFrom(t)
+	if err != nil {
+		return nil, taskrunner.Permanent(err)
+	}
+	var only map[int]bool
+	if len(args.Parts) > 0 {
+		only = make(map[int]bool, len(args.Parts))
+		for _, n := range args.Parts {
+			only[int(n)] = true
+		}
+	}
 	sess, err := b.multipart.GetSession(ctx, uploadID)
 	if errors.Is(err, registry.ErrNotFound) {
-		return false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("get session: %w", err)
+		return nil, fmt.Errorf("get session: %w", err)
 	}
 	if sess.State != registry.SessionOpen && sess.State != registry.SessionCompleting {
-		return false, nil
-	}
-	queued, err := b.multipart.ListParkedParts(ctx, uploadID, acceptBatchBlobs)
-	if err != nil {
-		return false, fmt.Errorf("list parked parts: %w", err)
-	}
-	if len(queued) == 0 {
-		return false, nil
+		return nil, nil
 	}
 
-	ctx, span := tracing.Start(ctx, "multipart.accept_pass")
-	defer func() { tracing.End(span, err) }()
-
-	var batch []registry.MultipartPart
-	var digests []mh.Multihash
-	for _, p := range queued {
-		if len(batch) > 0 && len(digests)+len(p.BlobDigests) > acceptBatchBlobs {
+	// Each digest once across the task: parts can share a blob, and the
+	// first batch's writes are not committed when a later one runs.
+	done := map[string]bool{}
+	accepted, after := 0, 0
+	for {
+		queued, err := b.multipart.ListParkedParts(ctx, uploadID, after, acceptBatchBlobs)
+		if err != nil {
+			return nil, fmt.Errorf("list parked parts: %w", err)
+		}
+		if len(queued) == 0 {
 			break
 		}
-		batch = append(batch, p)
-		digests = append(digests, p.BlobDigests...)
+		var batch []registry.MultipartPart
+		blobs := 0
+		for _, p := range queued {
+			if len(batch) > 0 && blobs+len(p.BlobDigests) > acceptBatchBlobs {
+				break
+			}
+			after = p.PartNumber
+			if only != nil && !only[p.PartNumber] {
+				continue
+			}
+			batch = append(batch, p)
+			blobs += len(p.BlobDigests)
+		}
+		if len(batch) == 0 {
+			continue
+		}
+		n, err := b.acceptBatch(ctx, ex, sess.Space, batch, done)
+		b.multipartMetrics.pass(ctx, err)
+		if err != nil {
+			return nil, err
+		}
+		accepted += n
 	}
-	span.SetAttributes(attribute.Int("ingot.parts", len(batch)), attribute.Int("ingot.blobs.total", len(digests)))
+	return []byte(strconv.Itoa(accepted)), nil
+}
 
-	out, err := b.acceptParked(ctx, sess.Space, digests, acceptInBackground)
-	if !out.settled {
-		// Failed before every blob was classified: nothing is known to be
-		// accepted.
-		return false, err
-	}
-	// A part holding a blob the acceptor left is not its to finish, and goes
-	// back to 'written': a blob with neither a park nor a location has gone
-	// from its provider, and Complete refuses the part (InvalidPart) so the
-	// client uploads it again; one with a pending release is settled by
-	// Complete's commit, which claims it. A part
-	// holding a blob whose conclude failed stays parked for the retry. Every
-	// other part is accepted, even in a pass that failed: one blob's failure
-	// says nothing about its neighbours, and holding them back would keep
-	// every part batched with a failing blob parked on every retry. The
-	// moves are guarded by the part's digests, so a part a later upload
-	// replaced, or a session's teardown deleted, is left as it is and its
-	// release runs.
-	missing, unaccepted := digestSet(out.left), digestSet(out.failed)
-	var accepted, unfinished []registry.MultipartPart
+// acceptBatch concludes the parked blobs of batch, adds the writes that
+// record them and mark the parts accepted, and returns how many parts it
+// found ready to mark. A blob already located needs nothing concluded (a dedup); a parked
+// one concludes its deferred /http/put receipt, firing /blob/accept. A blob
+// with neither has been released, which only a part replaced or dropped
+// since the listing allows, and its part is left. done holds the digests
+// earlier batches recorded, and gains this batch's.
+func (b *Backend) acceptBatch(ctx context.Context, ex *taskrunner.Exec, space did.DID, batch []registry.MultipartPart, done map[string]bool) (_ int, err error) {
+	total := 0
 	for _, p := range batch {
-		leftOut, failedOut := false, false
-		for _, d := range p.BlobDigests {
-			if _, ok := missing[string(d)]; ok {
-				leftOut = true
+		total += len(p.BlobDigests)
+	}
+	ctx, span := tracing.Start(ctx, "blobs.conclude",
+		attribute.Int("ingot.parts", len(batch)),
+		attribute.Int("ingot.blobs.total", total),
+	)
+	defer func() { tracing.End(span, err) }()
+
+	var writes []registry.Statement
+	var toConclude []uploader.UploadedBlob
+	gone := map[string]bool{}
+	for _, p := range batch {
+		for _, digest := range p.BlobDigests {
+			k := string(digest)
+			if done[k] || gone[k] {
+				continue
 			}
-			if _, ok := unaccepted[string(d)]; ok {
-				failedOut = true
+			if loc, err := b.locations.GetLocation(ctx, space, digest); err == nil && loc != nil {
+				done[k] = true
+				writes = append(writes, registry.LocatedBlob(space, digest)...)
+				continue
+			} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
+				return 0, fmt.Errorf("lookup location: %w", err)
 			}
-		}
-		switch {
-		case leftOut:
-			unfinished = append(unfinished, p)
-		case !failedOut:
-			accepted = append(accepted, p)
+			park, err := b.parks.GetPark(ctx, space, digest)
+			if errors.Is(err, registry.ErrNotFound) {
+				gone[k] = true
+				continue
+			}
+			if err != nil {
+				return 0, fmt.Errorf("lookup park: %w", err)
+			}
+			blob, err := parkedBlob(digest, park)
+			if err != nil {
+				return 0, err
+			}
+			done[k] = true
+			toConclude = append(toConclude, blob)
 		}
 	}
-	if len(unfinished) > 0 {
-		b.logger.Info("multipart accept: parts left for Complete (a blob unparked or being released)",
-			zap.String("upload_id", uploadID), zap.Int("parts", len(unfinished)))
-		if _, merr := b.multipart.MoveParts(ctx, unfinished, registry.PartParked, registry.PartWritten); merr != nil {
-			return false, errors.Join(err, fmt.Errorf("return parts to written: %w", merr))
+	span.SetAttributes(
+		attribute.Int("ingot.blobs.concluded", len(toConclude)),
+		attribute.Int("ingot.blobs.unparked", len(gone)),
+	)
+
+	if len(toConclude) > 0 {
+		cctx, cancel := context.WithTimeout(ctx, acceptBatchTimeout)
+		// Every parked blob goes to the upload service in one exchange (the
+		// client splits only past its batch cap), so thousands of parts cost
+		// a couple of round trips rather than one per part.
+		locations, err := b.deferred.ConcludeBlobs(cctx, space, toConclude)
+		cancel()
+		if err != nil {
+			return 0, fmt.Errorf("conclude blobs: %w", err)
+		}
+		for i, blob := range toConclude {
+			if i >= len(locations) || locations[i] == nil {
+				return 0, fmt.Errorf("conclude blobs: blob %x returned no location", blob.Digest)
+			}
+			loc := locations[i]
+			writes = append(writes, registry.ConcludedBlob(space, blob.Digest, blob.AddTask.Bytes(), registry.BlobLocation{
+				Provider: loc.Provider,
+				URL:      loc.URL,
+				Size:     loc.Size,
+			})...)
 		}
 	}
-	if _, merr := b.multipart.MoveParts(ctx, accepted, registry.PartParked, registry.PartAccepted); merr != nil {
-		return false, errors.Join(err, fmt.Errorf("mark parts accepted: %w", merr))
+
+	// The writes mark a part accepted only once its blobs are located, so a
+	// part whose park was taken while it concluded stays parked.
+	marked := 0
+	for _, p := range batch {
+		if !anyIn(p.BlobDigests, gone) {
+			writes = append(writes, registry.AcceptedPart(space, p))
+			marked++
+		}
 	}
-	return true, err
+	for _, st := range writes {
+		if err := ex.Write(ctx, st.SQL, st.Args...); err != nil {
+			return 0, err
+		}
+	}
+	return marked, nil
+}
+
+// parkedBlob is the blob a park left on its provider, ready to conclude.
+func parkedBlob(digest mh.Multihash, park *registry.BlobPark) (uploader.UploadedBlob, error) {
+	addTask, err := cid.Cast(park.AddTask)
+	if err != nil {
+		return uploader.UploadedBlob{}, fmt.Errorf("decode park add task: %w", err)
+	}
+	acceptTask, err := cid.Cast(park.AcceptTask)
+	if err != nil {
+		return uploader.UploadedBlob{}, fmt.Errorf("decode park accept task: %w", err)
+	}
+	return uploader.UploadedBlob{
+		Digest:        digest,
+		Size:          park.Size,
+		AddTask:       addTask,
+		AcceptTask:    acceptTask,
+		PutInvocation: park.PutInvocation,
+	}, nil
+}
+
+// anyIn reports whether any of digests is in set.
+func anyIn(digests []mh.Multihash, set map[string]bool) bool {
+	for _, d := range digests {
+		if set[string(d)] {
+			return true
+		}
+	}
+	return false
 }

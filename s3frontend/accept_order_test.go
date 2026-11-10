@@ -2,13 +2,34 @@ package s3frontend
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/registry"
 )
+
+// failOnceMarkAccepted is an intent store whose next transition to accepted
+// fails, after the location for that blob has already been recorded.
+type failOnceMarkAccepted struct {
+	registry.IntentStore
+	armed   bool
+	refused multihash.Multihash
+}
+
+func (f *failOnceMarkAccepted) SetIntentState(ctx context.Context, space did.DID, digest multihash.Multihash, state string) error {
+	if f.armed && state == registry.IntentAccepted {
+		f.armed = false
+		f.refused = digest
+		return errors.New("intents table unavailable")
+	}
+	return f.IntentStore.SetIntentState(ctx, space, digest, state)
+}
 
 // TestUploadBlobRecordsLocationBeforeAccepted: a by-digest upload that the
 // provider accepts records the location before marking the intent accepted.
