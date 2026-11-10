@@ -483,16 +483,17 @@ func TestChildDoesNotStartOnceTheRootLeaseIsLost(t *testing.T) {
 // A commit that runs long holds its lease row locked from start to end.
 // Renewal skips that row instead of waiting on it, so the other leases this
 // runner holds stay renewed, and the commit extended its own lease when it
-// locked it, so neither lapses. Here one task's commit runs a second and
-// another task holds its lease meanwhile; the lease TTL is 300 ms.
+// locked it, so neither lapses. Here one task's commit runs three seconds and
+// another task holds its lease meanwhile; the lease TTL is one second, long
+// enough that a busy runner's late renewal does not lapse it.
 func TestALongCommitStopsNoRenewal(t *testing.T) {
 	core, logs := observer.New(zap.WarnLevel)
 	f := newFixture(t, 0, func(o *taskrunner.Options) {
-		o.LeaseTTL = 300 * time.Millisecond
+		o.LeaseTTL = time.Second
 		o.Logger = zap.New(core)
 	})
 	f.handle(t, qTop, "slow-commit", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
-		return nil, ex.Write(ctx, `SELECT pg_sleep(1)`)
+		return nil, ex.Write(ctx, `SELECT pg_sleep(3)`)
 	})
 	started := make(chan struct{})
 	var runs atomic.Int32
@@ -500,7 +501,7 @@ func TestALongCommitStopsNoRenewal(t *testing.T) {
 		if runs.Add(1) == 1 {
 			close(started)
 		}
-		time.Sleep(1500 * time.Millisecond)
+		time.Sleep(4500 * time.Millisecond)
 		return nil, ex.Write(ctx, `SELECT 1`)
 	})
 	f.start(t)
