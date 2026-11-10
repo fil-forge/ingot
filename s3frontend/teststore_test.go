@@ -61,8 +61,8 @@ func newTestStore(t testing.TB) *testStore {
 // newTestStoreWithLease is newTestStore with the task runner's leases lasting
 // ttl. Renewal runs every third of the TTL, and a lease it finds expired is
 // lost, so a test that holds one through minutes of work under the race
-// detector needs longer than the default to survive a late renewal. Tests
-// that wait out a lease left to expire need it short.
+// detector needs longer than newTestStore's one second to survive a late
+// renewal. Tests that wait out a lease left to expire need it short.
 func newTestStoreWithLease(t testing.TB, ttl time.Duration) *testStore {
 	t.Helper()
 	pool := pgtest.New(t)

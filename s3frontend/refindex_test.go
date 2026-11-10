@@ -56,7 +56,9 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *testStore, *r
 	return newRefTestBackendOn(t, newTestStore(t), maxBlob...)
 }
 
-// newRefTestBackendOn is newRefTestBackend over a given store.
+// newRefTestBackendOn is newRefTestBackend over a given store, which must be
+// fresh: the backend starts the store's runner with its handlers and creates
+// bucket "bk" in it.
 func newRefTestBackendOn(t *testing.T, mem *testStore, maxBlob ...int64) (*Backend, *testStore, *recordingRemover) {
 	t.Helper()
 	var mbs int64
