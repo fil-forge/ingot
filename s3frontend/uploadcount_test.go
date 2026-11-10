@@ -35,17 +35,8 @@ type recordingRegistrar struct {
 	mu        sync.Mutex
 	added     []cid.Cid
 	retracted []cid.Cid
-	// batches records the size of each round trip, so a test can assert the
-	// sweep spends one call on many changes rather than one per change.
-	batches []int
 	// gate, when set, holds every RegisterUploads call until it is closed.
 	gate chan struct{}
-}
-
-func (r *recordingRegistrar) roundTrips() []int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]int(nil), r.batches...)
 }
 
 func (r *recordingRegistrar) CaptureAuthority(_ context.Context, _ did.DID, _ ucan.Command) ([]byte, error) {
@@ -63,7 +54,6 @@ func (r *recordingRegistrar) RegisterUploads(_ context.Context, changes []upload
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.batches = append(r.batches, len(changes))
 	for _, ch := range changes {
 		r.added = append(r.added, ch.Root)
 	}
@@ -73,7 +63,6 @@ func (r *recordingRegistrar) RegisterUploads(_ context.Context, changes []upload
 func (r *recordingRegistrar) RetractUploads(_ context.Context, changes []uploader.QueuedUpload) ([]error, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.batches = append(r.batches, len(changes))
 	for _, ch := range changes {
 		r.retracted = append(r.retracted, ch.Root)
 	}
