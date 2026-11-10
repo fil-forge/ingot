@@ -17,6 +17,7 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 )
@@ -285,7 +286,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 			return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy source blobs: %w", err)
 		}
 		if refs, err = b.pinBlobs(ctx, bucketState, blobs); err != nil {
-			if errors.Is(err, errBlobGone) {
+			if errors.Is(err, spaceshardqueue.ErrBlobGone) {
 				return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
 			}
 			return s3response.CopyObjectOutput{}, err
@@ -369,7 +370,7 @@ func (b *Backend) pinBlobs(ctx context.Context, bucket *registry.State, blobs ms
 		if _, ok := refs[k]; ok {
 			continue
 		}
-		ref, err := b.addBlob(ctx, bucket.Space, bucket.Name, blob.Digest, 0, addCopy, nil, release)
+		ref, err := b.addBlob(ctx, bucket.Space, bucket.Name, blob.Digest, 0, spaceshardqueue.Copy, nil, release)
 		if err != nil {
 			return nil, err
 		}

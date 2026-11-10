@@ -145,14 +145,18 @@ func (b *Backend) runCreateUpload(ctx context.Context, ex *taskrunner.Exec, t ta
 	return nil, nil
 }
 
+// addPartWaitLimit bounds how long an add-part waits for the upload's other
+// changes before it is refused.
+const addPartWaitLimit = 30 * time.Second
+
 // addPart runs part's queue-multipart-upload.add-part, and returns the
 // blobs of the part it replaced that it queued releases for. One waiting
 // behind a Complete or another upload of the upload's parts past
-// addWaitLimit is refused with SlowDown, which the client retries.
+// addPartWaitLimit is refused with SlowDown, which the client retries.
 func (b *Backend) addPart(ctx context.Context, part registry.MultipartPart, tree *registry.PartTree, release registry.ReleaseTask) ([]mh.Multihash, error) {
 	call := &addPartCall{part: part, tree: tree, release: release}
 	spec := uploadSpec(part.UploadID, registry.MultipartAddPartAction, nil)
-	expires := time.Now().Add(addWaitLimit)
+	expires := time.Now().Add(addPartWaitLimit)
 	spec.Expires = &expires
 	if _, err := b.uploads.Run(context.WithValue(ctx, addPartKey{}, call), spec); err != nil {
 		if errors.Is(err, taskrunner.ErrExpired) {
@@ -201,7 +205,7 @@ func (b *Backend) abortUpload(ctx context.Context, sess registry.MultipartSessio
 	if _, err := b.uploads.Run(context.WithValue(ctx, abortKey{}, call), uploadSpec(sess.UploadID, registry.MultipartAbortAction, buf.Bytes())); err != nil {
 		return err
 	}
-	b.releaseNow(ctx, sess.Space, call.released)
+	b.blobs.ReleaseNow(ctx, sess.Space, call.released)
 	return nil
 }
 

@@ -258,7 +258,7 @@ Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer)
 [`logstore/README.md`](../logstore/README.md).
 
 Sources: `s3frontend/object.go` (ingestBody), `s3frontend/stream.go`,
-`s3frontend/shardref.go` (runAdd), `s3frontend/bucketqueue.go` (runCommit),
+`queue/spaceshardqueue/spaceshardqueue.go` (runAdd), `s3frontend/bucketqueue.go` (runCommit),
 `s3frontend/bucketship.go` (runShip),
 `bucket/sized.go`, `blockstore/blobcache.go`,
 `blockstore/staging.go`, `logstore/`, `uploader/forge.go`, `uploader/blob.go`,
@@ -406,7 +406,7 @@ sequenceDiagram
 Cross-references: [`architecture.md` §7.1](./architecture.md#71-write-single-shot-putobject).
 
 Sources: `s3frontend/object.go` (PutObject, ingestBody, concludeBody),
-`s3frontend/shardref.go` (addBlob, runAdd, runExpire), `s3frontend/stream.go` (WriteSizedBlob), `queue/shardqueue/shardqueue.go`
+`queue/spaceshardqueue/spaceshardqueue.go` (Add, runAdd, runExpire), `s3frontend/stream.go` (WriteSizedBlob), `queue/shardqueue/shardqueue.go`
 (Cache), `blockstore/blobcache.go`, `bucket/sized.go`, `uploader/stream.go`,
 `s3frontend/copy.go` (CopyObject, copySourceBucket),
 `s3frontend/version.go` (applyPut), `s3frontend/bucketqueue.go` (commit, runCommit, register),
@@ -644,10 +644,10 @@ acceptRequested, sessionReleases), `s3frontend/multipartqueue.go`
 (runCreateUpload, runAddPart, runAbort, runReap), `registry/multipartqueue.go`
 (PartWrites, CompletedSession),
 `s3frontend/version.go` (reserveVersion, applyPut), `s3frontend/bucketqueue.go` (putPreCheck),
-`s3frontend/acceptor.go` (runAccept, runBlobAccept), `registry/accept.go`,
+`s3frontend/acceptor.go` (runAccept), `queue/spaceshardqueue/spaceshardqueue.go` (runAccept), `registry/accept.go`,
 `s3frontend/stream.go`,
-`s3frontend/shardref.go` (addBlob, runAdd, dropRefsNow),
-`s3frontend/releasequeue.go` (runRelease, releaseNow),
+`queue/spaceshardqueue/spaceshardqueue.go` (Add, runAdd, DropRefsNow),
+`queue/spaceshardqueue/spaceshardqueue.go` (runRelease, ReleaseNow),
 `s3frontend/uploadpartcopy.go`, `registry/stores.go`. Review when these change.
 
 ## Part states: the acceptance queue
@@ -813,8 +813,8 @@ Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
 (queue-shard.cache, queue-shard.evict),
 `s3frontend/multipart.go`
 (parkBlobs, sessionReleases),
-`s3frontend/acceptor.go`, `registry/accept.go`, `s3frontend/releasequeue.go`
-(runRelease), `s3frontend/shardref.go` (runAdd, runExpire),
+`s3frontend/acceptor.go`, `registry/accept.go`, `queue/spaceshardqueue/spaceshardqueue.go`
+(runRelease, runAdd, runExpire),
 `registry/stores_postgres.go` (CountReferences, PendingRefByExpiry),
 `registry/bucketcommit.go` (claimWrites, dropWrites), `registry/multipartqueue.go`
 (refWrites),
@@ -1041,7 +1041,7 @@ Sources: `iam/service.go`, `iam/keyproofs.go`, `iam/proofcache.go`,
 `internal/reqscope/reqscope.go`, `cmd/catalog.go` (forgeSegments),
 `uploader/forge.go` (shipProofs, captureShipProofs, CaptureShipAuthority),
 `uploader/stream.go` (StartBlob), `bucketop/bucketop.go` (Tx.Append),
-`s3frontend/releasequeue.go` (releaseAuthority), `internal/authority/authority.go`,
+`s3frontend/releaseauthority.go` (releaseAuthority), `internal/authority/authority.go`,
 `module.go`, `config/config.go` (auth_service fields).
 Review when these change.
 
@@ -1333,7 +1333,7 @@ sequenceDiagram
     loop each digest
         Q->>U: /blob/remove (release the space's registration)
     end
-    Q->>R: drainSpaceReleases: lend the request's authority for the space, Expedite its pending<br/>queue-space-shard.release tasks (subject space/*) and wait for the workers to run them (/blob/remove each)#59;<br/>a release still waiting fails the delete for the client to retry
+    Q->>R: DrainSpace: lend the request's authority for the space, Expedite its pending<br/>queue-space-shard.release tasks (subject space/*) and wait for the workers to run them (/blob/remove each)#59;<br/>a release still waiting fails the delete for the client to retry
     Q->>U: Drain: send the space's pending queue-space-upload changes,<br/>then resend its failed retractions with the request's authority
     Q->>H: /s3/bucket/delete with the signed S3 request (hilt refuses while registrations remain)#59;<br/>a refusal clears the closing mark, not found finishes the delete,<br/>a failed call leaves the bucket closing for a retry
     Q->>L: RemoveBucketLog, best-effort (directory + segment rows), while the row holds the name:<br/>the log is the name's, and a bucket created under it later runs under its own space
@@ -1356,7 +1356,7 @@ Sources: `s3frontend/bucket.go` (DeleteBucket, runDeleteBucket),
 `s3frontend/bucketadmin.go` (runCloseBucket, runAdmitUpload),
 `s3frontend/bucketqueue.go` (bucketSpec), `s3frontend/multipartqueue.go`
 (abortUpload, runAbort, reapNow, runReap),
-`s3frontend/releasequeue.go` (drainSpaceReleases),
+`queue/spaceshardqueue/spaceshardqueue.go` (DrainSpace),
 `queue/spaceuploadqueue/spaceuploadqueue.go` (Drain),
 `logstore/manager.go`. Review when these change.
 
@@ -1371,8 +1371,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `s3frontend/version.go` | put, get, multipart, blob-lifecycle, version-tree, gc-candidates |
 | `s3frontend/multipart.go`, `multipartqueue.go`, `registry/multipartqueue.go` | multipart, part-states, multipart-states, blob-lifecycle, delete-bucket |
 | `s3frontend/acceptor.go`, `registry/accept.go` | multipart, part-states, blob-lifecycle |
-| `s3frontend/releasequeue.go` | put, multipart, part-states, blob-lifecycle, delete-bucket |
-| `s3frontend/shardref.go` | put, multipart, blob-lifecycle |
+| `queue/spaceshardqueue/spaceshardqueue.go` | put, multipart, part-states, blob-lifecycle, delete-bucket |
 | `queue/spaceuploadqueue/spaceuploadqueue.go` | put, delete-bucket |
 | `queue/shardqueue/shardqueue.go`, `s3frontend/localblob_sweep.go` | put, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |

@@ -504,7 +504,7 @@ and releases its own copy, and the one cached file between them goes with
 the last intent for it.
 
 **References.** Within a space, a write's use of a blob is a pending
-reference (`s3frontend/shardref.go`), taken by a sync
+reference (`queue/spaceshardqueue`), taken by a sync
 `queue-space-shard.add` task on the blob's release subject, the space and
 the digest. The subject's lease serializes the add with the blob's
 `queue-space-shard.release`, so the two never overlap. It runs in one of

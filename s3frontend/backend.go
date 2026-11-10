@@ -47,6 +47,7 @@ import (
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/authority"
 	"github.com/fil-forge/ingot/queue/shardqueue"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
@@ -87,12 +88,13 @@ type Backend struct {
 	encParams registry.EncryptionParamsStore
 	// streaming sends each body blob to its provider as the body arrives.
 	streaming uploader.StreamingBodyUploader
-	// claims counts a blob's claims for a release's recheck; releases runs
-	// the queue-space-shard tasks; releaseGrace is how
-	// far past the last-claim drop each release is due (readers holding the
-	// prior catalog root get at least this long to finish their prefetch).
-	claims   registry.BlobRefStore
-	releases *taskrunner.Runner
+	// claims counts a blob's claims; releaseGrace is how far past the
+	// last-claim drop each release is due (readers holding the prior catalog
+	// root get at least this long to finish their prefetch).
+	claims registry.BlobRefStore
+	// blobs runs the tasks on one blob in one space: a write's references,
+	// its accept, its release.
+	blobs *spaceshardqueue.Queue
 	// buckets runs the queue-bucket tasks.
 	buckets *taskrunner.Runner
 	// uploads runs the queue-multipart-upload tasks.
@@ -116,9 +118,6 @@ type Backend struct {
 	shipStop     chan struct{}
 	shipStopped  bool
 	releaseGrace time.Duration
-	// releaseRetry is the queue-space-shard.release retry policy; tests
-	// shorten it.
-	releaseRetry taskrunner.RetryPolicy
 	// Local blob sweeper knobs (see Deps). localBlobSweepMu serialises
 	// SweepLocalBlobs; lastOrphanPass is when its orphan pass last ran.
 	localBlobMaxBytes  int64
@@ -303,9 +302,8 @@ type Deps struct {
 	// Logger is optional; defaults to zap.NewNop().
 	Logger *zap.Logger
 
-	// releaseRetry replaces the queue-space-shard.release retry policy, for
-	// tests; zero keeps the default.
-	releaseRetry taskrunner.RetryPolicy
+	// tuneBlobs adjusts the queue-space-shard dependencies, for tests.
+	tuneBlobs func(*spaceshardqueue.Deps)
 }
 
 // Compile-time assertion that Backend satisfies versitygw's interface.
@@ -358,7 +356,6 @@ func New(d Deps) (*Backend, error) {
 		regionKeys:   d.RegionKeys,
 		tenantKeys:   d.TenantKeys,
 		claims:       d.Claims,
-		releaseRetry: cmp.Or(d.releaseRetry, releaseRetry),
 		releaseGrace: d.ReleaseGrace,
 		multipartTTL: d.MultipartSessionTTL,
 
@@ -386,6 +383,26 @@ func New(d Deps) (*Backend, error) {
 		b.counts, err = spaceuploadqueue.New(d.Tasks, spaceuploadqueue.Deps{Registrar: d.Registrar, Authority: b.proofs, Logger: logger})
 	}
 	if err == nil {
+		bd := spaceshardqueue.Deps{
+			Intents:   d.Intents,
+			Parks:     d.Parks,
+			Claims:    d.Claims,
+			Locations: d.Locations,
+			EncParams: d.EncParams,
+			Remover:   d.Remover,
+			Deferred:  d.Deferred,
+			Streaming: d.Streaming,
+			Shards:    b.shards,
+			Authority: b.proofs,
+			Concluded: b.multipartMetrics.pass,
+			Logger:    logger,
+		}
+		if d.tuneBlobs != nil {
+			d.tuneBlobs(&bd)
+		}
+		b.blobs, err = spaceshardqueue.New(d.Tasks, bd)
+	}
+	if err == nil {
 		err = b.registerTasks(d.Tasks)
 	}
 	if err != nil {
@@ -400,7 +417,6 @@ func (b *Backend) registerTasks(r *taskrunner.Runner) error {
 	for _, register := range []func(*taskrunner.Runner) error{
 		b.registerMultipartTasks,
 		b.registerBucketTasks,
-		b.registerReleaseTasks,
 		b.registerAcceptTasks,
 	} {
 		if err := register(r); err != nil {

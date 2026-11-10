@@ -153,7 +153,10 @@ Internal:
   with what its handlers need, registering them in its `New`, with typed
   calls for its sync tasks and specs for the async ones other queues spawn:
   `shardqueue` (`queue-shard`, the cache's copies), `spaceuploadqueue`
-  (`queue-space-upload`, the object-count changes). The other queues'
+  (`queue-space-upload`, the object-count changes), `spaceshardqueue`
+  (`queue-space-shard`, the tasks on one blob in one space). Its name,
+  subjects and release arguments are in `registry`, which queues releases
+  with bucket commits and part writes. The other queues'
   handlers are in `s3frontend`.
 - **`taskrunner/`** — durable task queues in Postgres (one tasks table and
   one leases table per queue), serialized per (queue, subject) by a lease
@@ -189,8 +192,7 @@ Internal:
   digest: a cached blob's time to live, `queue-shard.cache` scheduling its
   `queue-shard.evict` at `CacheTTL`, run again by reads with under half
   left, and the budget pass's evictions as sync `queue-shard.evict`s;
-  `queue-space-shard` (`s3frontend/releasequeue.go`,
-  `shardref.go`, `acceptor.go`), subject space/hex digest: a blob's release,
+  `queue-space-shard` (`queue/spaceshardqueue`), subject space/hex digest: a blob's release,
   a parked blob's `queue-space-shard.accept` (its conclude), a write's sync
   `queue-space-shard.add` (its pending reference, in `blob_pending_refs`)
   and the reference's `queue-space-shard.expire` at 24 h. Its own tests each use a schema of their own
