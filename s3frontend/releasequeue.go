@@ -1,9 +1,7 @@
 package s3frontend
 
 import (
-	"bytes"
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -205,17 +203,11 @@ func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrun
 	// A copy both spaces' releases leave at once is reclaimed by the cache's
 	// time to live.
 	if others == 0 {
-		var evict bytes.Buffer
-		if err := (&ShardEvictTask{Released: true}).MarshalCBOR(&evict); err != nil {
+		evict, err := b.shards.ReleasedSpec(digest)
+		if err != nil {
 			return nil, err
 		}
-		if _, err := ex.Submit(ctx, taskrunner.Spec{
-			Queue:   ShardQueue,
-			Subject: hex.EncodeToString(digest),
-			Action:  shardEvict,
-			Args:    evict.Bytes(),
-			Node:    b.shardNode(),
-		}); err != nil {
+		if _, err := ex.Submit(ctx, evict); err != nil {
 			return nil, err
 		}
 	}

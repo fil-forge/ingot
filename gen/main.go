@@ -8,6 +8,7 @@ package main
 
 import (
 	"github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
 	cbg "github.com/whyrusleeping/cbor-gen"
@@ -37,9 +38,13 @@ func main() {
 	); err != nil {
 		panic(err)
 	}
+	if err := cfg.WriteMapEncodersToFile("../queue/shardqueue/cbor_gen.go", "shardqueue",
+		shardqueue.CacheTask{},
+		shardqueue.EvictTask{},
+	); err != nil {
+		panic(err)
+	}
 	if err := cfg.WriteMapEncodersToFile("../s3frontend/cbor_gen.go", "s3frontend",
-		s3frontend.ShardCacheTask{},
-		s3frontend.ShardEvictTask{},
 		s3frontend.ShardAddTask{},
 		s3frontend.BucketCommitTask{},
 		s3frontend.KeyChange{},

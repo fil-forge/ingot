@@ -406,8 +406,8 @@ sequenceDiagram
 Cross-references: [`architecture.md` §7.1](./architecture.md#71-write-single-shot-putobject).
 
 Sources: `s3frontend/object.go` (PutObject, ingestBody, concludeBody),
-`s3frontend/shardref.go` (addBlob, runAdd, runExpire), `s3frontend/stream.go` (WriteSizedBlob), `s3frontend/localblobs.go`
-(cacheWritten), `blockstore/blobcache.go`, `bucket/sized.go`, `uploader/stream.go`,
+`s3frontend/shardref.go` (addBlob, runAdd, runExpire), `s3frontend/stream.go` (WriteSizedBlob), `queue/shardqueue/shardqueue.go`
+(Cache), `blockstore/blobcache.go`, `bucket/sized.go`, `uploader/stream.go`,
 `s3frontend/copy.go` (CopyObject, copySourceBucket),
 `s3frontend/version.go` (applyPut), `s3frontend/bucketqueue.go` (commit, runCommit, register),
 `registry/bucketcommit.go` (RootCommitWrites),
@@ -808,8 +808,8 @@ Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 
 Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
 (ingestBody, addClaims, dropClaims), `s3frontend/localblob_sweep.go` (SweepLocalBlobs),
-`s3frontend/stream.go` (WriteSizedBlob), `s3frontend/localblobs.go` (cacheWritten),
-`blockstore/blobcache.go` (CreateTemp, Adopt), `s3frontend/shardqueue.go`
+`s3frontend/stream.go` (WriteSizedBlob), `queue/shardqueue/shardqueue.go` (Cache),
+`blockstore/blobcache.go` (CreateTemp, Adopt), `queue/shardqueue/shardqueue.go`
 (queue-shard.cache, queue-shard.evict),
 `s3frontend/multipart.go`
 (parkBlobs, sessionReleases),
@@ -1374,7 +1374,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `s3frontend/releasequeue.go` | put, multipart, part-states, blob-lifecycle, delete-bucket |
 | `s3frontend/shardref.go` | put, multipart, blob-lifecycle |
 | `s3frontend/uploadqueue.go` | put, delete-bucket |
-| `s3frontend/shardqueue.go`, `localblobs.go`, `localblob_sweep.go` | put, blob-lifecycle |
+| `queue/shardqueue/shardqueue.go`, `s3frontend/localblob_sweep.go` | put, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |
 | `s3frontend/bucketqueue.go`, `bucketchanges.go`, `bucketadmin.go`, `bucketship.go` | put, multipart, gc-candidates, delete-bucket, logstore-pipeline |

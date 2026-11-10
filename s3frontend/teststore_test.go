@@ -20,6 +20,7 @@ import (
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/internal/testfakes"
+	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
@@ -79,7 +80,7 @@ func newTestStoreWithLease(t testing.TB, ttl time.Duration) *testStore {
 			{Name: registry.BucketQueue, Workers: 2},
 			{Name: registry.UploadQueue, Workers: 2},
 			{Name: registry.ReleaseQueue, Workers: 2},
-			{Name: ShardQueue, Workers: 2},
+			{Name: shardqueue.Name, Workers: 2},
 		},
 		LeaseTTL:     ttl,
 		PollInterval: 10 * time.Millisecond,
@@ -108,7 +109,7 @@ func (s *testStore) newBackend(t testing.TB, deps Deps) *Backend {
 		t.Fatalf("backend: %v", err)
 	}
 	b.acceptDelay = time.Hour
-	if err := s.tasks.Handle(ShardQueue, shardFlush, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+	if err := s.tasks.Handle(shardqueue.Name, shardFlush, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
 		return nil, nil
 	}); err != nil {
 		t.Fatalf("register shard flush: %v", err)
@@ -132,7 +133,7 @@ const shardFlush = "flush"
 func settleCache(t testing.TB, b *Backend, digests ...multihash.Multihash) {
 	t.Helper()
 	for _, d := range digests {
-		if _, err := b.shards.Run(t.Context(), taskrunner.Spec{Queue: ShardQueue, Subject: hex.EncodeToString(d), Action: shardFlush}); err != nil {
+		if _, err := storeFor(b).tasks.Run(t.Context(), taskrunner.Spec{Queue: shardqueue.Name, Subject: hex.EncodeToString(d), Action: shardFlush}); err != nil {
 			t.Fatalf("settle the cache tasks of %x: %v", d, err)
 		}
 	}

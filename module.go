@@ -68,10 +68,10 @@ import (
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/migrations"
+	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/revocation"
-	"github.com/fil-forge/ingot/s3frontend"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/tokenstore"
@@ -556,7 +556,7 @@ func provideTaskRunner(pool *pgxpool.Pool, id identity.Identity, logger *zap.Log
 			{Name: registry.BucketQueue, Workers: bucketWorkers},
 			{Name: registry.UploadQueue, Workers: uploadRegistrationWorkers},
 			{Name: registry.ReleaseQueue, Workers: releaseWorkers},
-			{Name: s3frontend.ShardQueue, Workers: shardWorkers},
+			{Name: shardqueue.Name, Workers: shardWorkers},
 		},
 		Logger: logger.Named("tasks"),
 	})
