@@ -298,7 +298,7 @@ S3 client, with its access key and region taken from the AWS SDK's usual
 sources (smelt's `make s3-key` writes a profile it can use):
 
 ```bash
-GOWORK=off go run ./cmd/ingot-preload load --profile smelt \
+GOWORK=off go run ./cmd/ingot-preload load --profile smelt --encryption "" \
   --buckets 3 --until 2000 --real-every 500 --real-min-mib 16 --real-max-mib 32
 ```
 
@@ -307,10 +307,12 @@ uploading a blob. One object per `--real-every` has a pseudo-random body of a
 pack's size, for timing reads and deletes. Keys and PUTs are shaped as the pack
 server writes them: 64 hex digits after an optional prefix, create-only, with
 the body's SHA-256. New buckets get the `none` default encryption, which needs
-`encryption.allow_none`; smelt's ingot leaves it off, so set
-`INGOT_ENCRYPTION_ALLOW_NONE=true` there or pass `--encryption ""`. Progress is
-saved in a state file, so a second `load` with a higher `--until` carries on
-from the first, and reports go to stdout and, as JSON lines, to a metrics file.
+`encryption.allow_none`. smelt's ingot doesn't allow it, so the example passes
+`--encryption ""` and keeps ingot's default; to try `none` on smelt, add
+`encryption: {allow_none: true}` to its `systems/ingot/config/config.yaml` and
+recreate ingot. Progress is saved in a state file, so a second `load` with a
+higher `--until` carries on from the first, and reports go to stdout and, as
+JSON lines, to a metrics file.
 
 Real objects at their default size add up. At estate scale, `--buckets 150
 --until 600000 --real-every 30000` writes 20 per bucket, about 540 GiB of

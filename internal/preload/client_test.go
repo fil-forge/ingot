@@ -192,6 +192,66 @@ func TestClientRetriesWhenNoResponseComes(t *testing.T) {
 	}
 }
 
+// TestClientResendsACutOffRealBody cuts off a real object's PUT part way
+// through its body, by holding it past the attempt's timeout or by dropping
+// the connection. The retry must send the whole body again from its start,
+// which the server checks against the PUT's SHA-256.
+func TestClientResendsACutOffRealBody(t *testing.T) {
+	const (
+		timeout = 300 * time.Millisecond
+		cutAt   = 1<<20 + 17
+	)
+	for name, cutOff := range map[string]func(w http.ResponseWriter, r *http.Request){
+		"attempt times out": func(_ http.ResponseWriter, r *http.Request) {
+			io.CopyN(io.Discard, r.Body, cutAt)
+			// The server notices the client leave only once it reads the
+			// body, so it waits out the timeout first.
+			time.Sleep(2 * timeout)
+			io.Copy(io.Discard, r.Body)
+		},
+		"connection dropped": func(w http.ResponseWriter, r *http.Request) {
+			io.CopyN(io.Discard, r.Body, cutAt)
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				conn.Close()
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			isolateAWSConfig(t)
+			cfg := testConfig(t, 1, 5)
+			cfg.AttemptTimeout = timeout
+			cfg.RealEvery = 5
+			cfg.RealMinSize, cfg.RealMaxSize = 3<<20+5, 3<<20+5
+			var once sync.Once
+			srv := &packServerShape{t: t, bucket: cfg.Buckets[0], objects: map[string]bool{}}
+			srv.intercept = func(_ string, w http.ResponseWriter, r *http.Request) bool {
+				hit := false
+				if r.ContentLength > 0 {
+					once.Do(func() { hit = true })
+				}
+				if hit {
+					cutOff(w, r)
+				}
+				return hit
+			}
+			hs := httptest.NewServer(srv)
+			defer hs.Close()
+			client, err := NewClient(t.Context(), ClientConfig{Endpoint: hs.URL, Region: "us-east-1", Conns: 4})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := Load(t.Context(), client, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.Total.Errors != 1 || r.Total.Real != 1 || r.Total.Written != 6 {
+				t.Fatalf("totals %+v, want the cut-off real PUT sent again once", r.Total)
+			}
+		})
+	}
+}
+
 func TestNewClientNeedsRegionAndEndpoint(t *testing.T) {
 	isolateAWSConfig(t)
 	if _, err := NewClient(t.Context(), ClientConfig{Endpoint: "http://127.0.0.1:1"}); err == nil || !strings.Contains(err.Error(), "region") {

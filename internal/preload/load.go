@@ -126,8 +126,10 @@ var emptySHA256 = func() string {
 // Load writes cfg.Buckets' objects until each holds cfg.Until bulk objects
 // and the real objects due by then, resuming from and recording progress in
 // cfg.StatePath. It returns the final report. When ctx ends first, Load
-// records the progress made and returns ctx's error; a later Load picks up
-// from there.
+// records the progress made and returns ctx's cause (context.Cause); a later
+// Load picks up from there. When that final record cannot be written, the
+// error also carries ErrStateNotSaved, and a later Load resumes from the
+// previous checkpoint.
 func Load(ctx context.Context, client S3, cfg Config) (*Report, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("preload: %w", err)
