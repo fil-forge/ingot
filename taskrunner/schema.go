@@ -17,7 +17,9 @@ var queueSchema = []func(q *queue) string{
 CREATE TABLE %[1]s (
 	seq        bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
 	id         uuid PRIMARY KEY,
-	subject    text NOT NULL,
+	-- Subjects are identifiers compared byte by byte, so the pending index
+	-- serves Expedite's prefix match.
+	subject    text COLLATE "C" NOT NULL,
 	action     text NOT NULL,
 	created    timestamptz NOT NULL DEFAULT clock_timestamp(),
 	not_before timestamptz,
@@ -49,7 +51,8 @@ CREATE UNIQUE INDEX %[4]s ON %[1]s (subject, action)
 CREATE INDEX %[5]s ON %[1]s (subject, seq) WHERE state = 'failed';
 CREATE INDEX %[6]s ON %[1]s (finished) WHERE state <> 'pending';
 CREATE TABLE %[2]s (
-	subject      text PRIMARY KEY,
+	-- Compared byte by byte, as the tasks' subjects are.
+	subject      text COLLATE "C" PRIMARY KEY,
 	owner        uuid NOT NULL,
 	expires      timestamptz NOT NULL,
 	tree_created timestamptz NOT NULL,
