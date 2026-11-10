@@ -117,9 +117,8 @@ Internal:
   (`queue-bucket.ship`, queued on each seal), `multipart.go`,
   `multipartqueue.go` (`queue-multipart-upload`: every change to an upload,
   on the upload ID's subject), `acceptor.go`
-  (`queue-multipart-upload-shard.accept`, queueing a
-  `queue-space-shard.accept` per parked blob, which concludes it while the
-  client uploads), `bucket.go` (`queue-bucket.delete`), `listversions.go`,
+  (`queue-multipart-upload.accept`, queueing a `queue-space-shard.accept` per
+  parked blob, which concludes it while the client uploads), `bucket.go` (`queue-bucket.delete`), `listversions.go`,
   `backend.go`, `stream.go` (each body blob streams to its
   provider as the body arrives, teeing an object's bytes into the cache; a
   failed stream fails the request and aborts its allocation, and an
@@ -170,14 +169,12 @@ Internal:
   held and applied straight away (`CheckOwnWrites`). The daemon runs one
   runner (`provideTaskRunner` in `module.go`) over the `ingot` schema; its
   tables are migrated in the migration hook, and `Server` starts and stops
-  it. Queues in order: `queue-multipart-upload`,
-  `queue-multipart-upload-shard` (accept), `queue-bucket`,
+  it. Queues in order: `queue-multipart-upload`, `queue-bucket`,
   `queue-space-upload`, `queue-space-shard`, `queue-shard`.
   `queue-multipart-upload` (`s3frontend/multipartqueue.go`), subject the
-  upload ID: an upload's create, add-part, complete, abort and reap, one at
-  a time; `queue-multipart-upload-shard` (`s3frontend/acceptor.go`), subject
-  the upload ID: the upload's accept, which queues a `queue-space-shard.accept`
-  for each blob of its parked parts;
+  upload ID: an upload's create, add-part, accept, complete, abort and reap,
+  one at a time, the accept (`s3frontend/acceptor.go`) queuing a
+  `queue-space-shard.accept` for each blob of the upload's parked parts;
   `queue-bucket` (`s3frontend/bucketqueue.go`), subject the bucket's space
   DID: every change to a bucket, placed on the instance holding its catalog
   log; `queue-space-upload` (`s3frontend/uploadqueue.go`), the

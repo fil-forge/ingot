@@ -598,6 +598,78 @@ func (r *Runner) SubmitAllTx(ctx context.Context, tx pgx.Tx, specs []Spec) ([]Ta
 	return ids, nil
 }
 
+// SubmitAll adds async tasks and commits them straight away, in one
+// transaction with one statement for each queue they are on however many
+// there are, and returns their IDs in the order of specs. Of two replacements
+// in specs with the same subject and action, the one with the later NotBefore
+// is kept, as it would be had they been submitted one by one, and both are
+// given its ID.
+func (r *Runner) SubmitAll(ctx context.Context, specs []Spec) ([]TaskID, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("submit %d tasks: %w", len(specs), err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var spawned []*queue
+	ids, err := r.submitAll(specs, func(q *queue, sql string, args []any) error {
+		if _, err := tx.Exec(ctx, sql, args...); err != nil {
+			return fmt.Errorf("submit %s tasks: %w", q.name, err)
+		}
+		spawned = append(spawned, q)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("submit %d tasks: %w", len(specs), err)
+	}
+	for _, q := range spawned {
+		r.pokeQueue(q)
+	}
+	return ids, nil
+}
+
+// submitAll checks specs and hands exec the statement for each queue they
+// are on, in the order the queues first appear, and returns the tasks' IDs in
+// the order of specs.
+func (r *Runner) submitAll(specs []Spec, exec func(q *queue, sql string, args []any) error) ([]TaskID, error) {
+	var order []*queue
+	byQueue := map[*queue][]int{}
+	for i, s := range specs {
+		q, err := r.checkSpec(s)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := byQueue[q]; !ok {
+			order = append(order, q)
+		}
+		byQueue[q] = append(byQueue[q], i)
+	}
+	ids := make([]TaskID, len(specs))
+	for _, q := range order {
+		idx := byQueue[q]
+		group := make([]Spec, len(idx))
+		for j, i := range idx {
+			group[j] = specs[i]
+		}
+		gids, sql, args, err := insertSpecs(q, group)
+		if err != nil {
+			return nil, err
+		}
+		if err := exec(q, sql, args); err != nil {
+			return nil, err
+		}
+		for j, i := range idx {
+			ids[i] = gids[j]
+		}
+	}
+	return ids, nil
+}
+
 // insertSpecs returns the IDs of specs, async tasks of queue q, in their
 // order, and the one statement that adds them. Of two replacements in specs
 // with the same subject and action, the one with the later NotBefore is

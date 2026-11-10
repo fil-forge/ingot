@@ -198,6 +198,8 @@ A task without `Replace` is never a replacement and leaves pending ones alone. A
 ids, err := r.SubmitAllTx(ctx, tx, specs)
 ```
 
+`SubmitAll` does the same outside a transaction of yours, for tasks of any queues, one statement per queue, committed together straight away.
+
 ## Cancelling
 
 A pending task that has not started can be cancelled by queue and ID, and many at once in one statement. Cancelling a task that has started, finished or been cancelled does nothing, so a task that can be cancelled must still check its own preconditions when it runs.

@@ -14,7 +14,8 @@ import (
 )
 
 // MultipartQueue is the task queue a multipart upload's changes run on: its
-// creation, its parts, its Complete and its Abort. Its subject is the upload
+// creation, its parts, the scheduling of their accepts, its Complete and its
+// Abort. Its subject is the upload
 // ID, so one change to an upload runs at a time. It is first in the queue
 // order: a create runs queue-bucket.admit-upload as a child, and a Complete
 // runs queue-bucket.commit as one.
@@ -24,6 +25,7 @@ const MultipartQueue = "queue-multipart-upload"
 const (
 	MultipartCreateAction   = "create"
 	MultipartAddPartAction  = "add-part"
+	MultipartAcceptAction   = "accept"
 	MultipartCompleteAction = "complete"
 	MultipartAbortAction    = "abort"
 	MultipartReapAction     = "reap"
@@ -158,7 +160,6 @@ func (r *Postgres) PartWrites(ctx context.Context, p MultipartPart, tree *PartTr
 			[]any{p.UploadID, p.PartNumber},
 		})
 	}
-	w.Spawns = append(w.Spawns, AcceptSpec(p.UploadID))
 	// The replaced row's blobs this part does not name lose their last part
 	// reference with this write; their releases are queued with it, due now
 	// (a part blob was never readable through the catalog, so no reader

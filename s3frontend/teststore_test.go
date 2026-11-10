@@ -62,13 +62,11 @@ func newTestStore(t testing.TB) *testStore {
 		// queues after its own.
 		Queues: []taskrunner.QueueOptions{
 			// Uploads' changes run sync, in their requests; the workers run
-			// the auto-aborts and reaps.
+			// the auto-aborts and reaps, and the accepts UploadPart queues,
+			// which tests delay (Backend.acceptDelay) so that only they run
+			// one (runAccepts) or Complete does. The blobs' accepts an
+			// upload's accept queues run on queue-space-shard's workers.
 			{Name: registry.MultipartQueue, Workers: 2},
-			// No workers: an upload's accept runs when a test runs it
-			// (runAccepts) or Complete does, which cancels the one UploadPart
-			// queued and runs its own. The blobs' accepts it queues run on
-			// queue-space-shard's workers.
-			{Name: registry.AcceptQueue},
 			// Commits run sync, in the request; the workers run ships.
 			{Name: registry.BucketQueue, Workers: 2},
 			{Name: registry.UploadQueue, Workers: 2},
@@ -93,8 +91,9 @@ func newTestStore(t testing.TB) *testStore {
 // first backend built over the store runs its tasks; a later one shares them.
 func (s *testStore) start(t testing.TB, b *Backend) {
 	t.Helper()
+	b.acceptDelay = time.Hour
 	if s.started {
-		b.tasks, b.shards, b.releases, b.accepts, b.buckets, b.uploads = s.tasks, s.tasks, s.tasks, s.tasks, s.tasks, s.tasks
+		b.tasks, b.shards, b.releases, b.buckets, b.uploads = s.tasks, s.tasks, s.tasks, s.tasks, s.tasks
 		b.cache.OnRead(b.renewCached)
 		return
 	}

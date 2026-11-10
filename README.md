@@ -225,7 +225,7 @@ every one it finds.
 
 Multipart uploads' parts are accepted while the client uploads them, each
 blob by a `queue-space-shard.accept` task the upload's
-`queue-multipart-upload-shard.accept` queues (see DESIGN_NOTES), and report:
+`queue-multipart-upload.accept` queues (see DESIGN_NOTES), and report:
 
 | Metric | Meaning |
 | -- | -- |

@@ -164,9 +164,10 @@ func (b *Backend) addPart(ctx context.Context, part registry.MultipartPart, tree
 }
 
 // runAddPart is queue-multipart-upload.add-part: it records the part, taking
-// its blobs' pending references over, queues the upload's accept, and queues
-// the releases of the blobs the part it replaces named and it does not
-// (registry.Postgres.PartWrites). An upload no longer open refuses it.
+// its blobs' pending references over, and queues the releases of the blobs
+// the part it replaces named and it does not (registry.Postgres.PartWrites),
+// and the upload's queue-multipart-upload.accept, due after acceptDelay. An
+// upload no longer open refuses it.
 func (b *Backend) runAddPart(ctx context.Context, ex *taskrunner.Exec, _ taskrunner.Task) ([]byte, error) {
 	call, _ := ctx.Value(addPartKey{}).(*addPartCall)
 	if call == nil {
@@ -181,6 +182,7 @@ func (b *Backend) runAddPart(ctx context.Context, ex *taskrunner.Exec, _ taskrun
 	case err != nil:
 		return nil, err
 	}
+	w.Spawns = append(w.Spawns, registry.AcceptSpec(call.part.UploadID, time.Now().Add(b.acceptDelay)))
 	if err := applyCommitWrites(ctx, ex, w); err != nil {
 		return nil, err
 	}

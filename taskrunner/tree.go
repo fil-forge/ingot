@@ -136,41 +136,18 @@ func (ex *Exec) Submit(ctx context.Context, s Spec) (TaskID, error) {
 // action, the one with the later NotBefore is kept, as it would be had they
 // been submitted one by one, and both are given its ID.
 func (ex *Exec) SubmitAll(ctx context.Context, specs []Spec) ([]TaskID, error) {
-	var order []*queue
-	byQueue := map[*queue][]int{}
-	for i, s := range specs {
-		q, err := ex.tr.r.checkSpec(s)
-		if err != nil {
-			return nil, err
-		}
+	for _, s := range specs {
 		if slices.Contains(ex.path, actionKey{s.Queue, s.Action}) {
 			return nil, fmt.Errorf("%s.%s: %w", s.Queue, s.Action, ErrRecursion)
 		}
-		if _, ok := byQueue[q]; !ok {
-			order = append(order, q)
-		}
-		byQueue[q] = append(byQueue[q], i)
 	}
-	ids := make([]TaskID, len(specs))
-	for _, q := range order {
-		idx := byQueue[q]
-		group := make([]Spec, len(idx))
-		for j, i := range idx {
-			group[j] = specs[i]
-		}
-		gids, sql, args, err := insertSpecs(q, group)
-		if err != nil {
-			return nil, err
-		}
+	return ex.tr.r.submitAll(specs, func(q *queue, sql string, args []any) error {
 		if err := ex.tr.add(ctx, write{sql: sql, args: args}); err != nil {
-			return nil, err
+			return err
 		}
 		ex.tr.spawned[q] = true
-		for j, i := range idx {
-			ids[i] = gids[j]
-		}
-	}
-	return ids, nil
+		return nil
+	})
 }
 
 // Run runs a sync child inline, once its subject's lease is taken, and

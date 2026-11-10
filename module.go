@@ -528,13 +528,10 @@ const shardWorkers = 4
 // service.
 const releaseWorkers = 8
 
-// multipartWorkers is how many multipart uploads' auto-aborts and reaps one
-// instance runs at once. Their other changes run in their requests.
-const multipartWorkers = 2
-
-// acceptWorkers is how many multipart uploads' accepts one instance runs at
-// once. Each only queues its parked blobs' accepts, with no round trip.
-const acceptWorkers = 4
+// multipartWorkers is how many multipart uploads' accepts, auto-aborts and
+// reaps one instance runs at once. Their other changes run in their requests.
+// An accept only queues its parked blobs' accepts, with no round trip.
+const multipartWorkers = 4
 
 // bucketWorkers is how many buckets' catalog ships one instance runs at
 // once. Commits and the other bucket changes run in their requests.
@@ -556,7 +553,6 @@ func provideTaskRunner(pool *pgxpool.Pool, id identity.Identity, logger *zap.Log
 		// the queues after its own.
 		Queues: []taskrunner.QueueOptions{
 			{Name: registry.MultipartQueue, Workers: multipartWorkers},
-			{Name: registry.AcceptQueue, Workers: acceptWorkers},
 			{Name: registry.BucketQueue, Workers: bucketWorkers},
 			{Name: registry.UploadQueue, Workers: uploadRegistrationWorkers},
 			{Name: registry.ReleaseQueue, Workers: releaseWorkers},

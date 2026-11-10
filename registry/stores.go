@@ -54,8 +54,9 @@ const (
 )
 
 // multipart_parts.state values (§7.2). The part rows are the upload's
-// acceptance queue: queue-multipart-upload-shard.accept concludes 'parked'
-// parts while the upload is open, and Complete requires every part it names
+// acceptance queue: the queue-space-shard.accept of each of their blobs,
+// queued by queue-multipart-upload.accept, concludes 'parked' parts while the
+// upload is open, and Complete requires every part it names
 // to be 'accepted'.
 const (
 	// PartParked: every blob has a park (or a location), ready to conclude.

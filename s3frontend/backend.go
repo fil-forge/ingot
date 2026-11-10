@@ -99,14 +99,14 @@ type Backend struct {
 	// prior catalog root get at least this long to finish their prefetch).
 	claims   registry.BlobRefStore
 	releases *taskrunner.Runner
-	// accepts runs the queue-multipart-upload-shard tasks
-	// (RegisterAcceptTasks).
-	accepts *taskrunner.Runner
 	// buckets runs the queue-bucket tasks (RegisterBucketTasks).
 	buckets *taskrunner.Runner
 	// uploads runs the queue-multipart-upload tasks
 	// (RegisterMultipartTasks).
 	uploads *taskrunner.Runner
+	// acceptDelay is how long after a part lands its upload's accept is due:
+	// none, but tests delay it so that only they run it.
+	acceptDelay time.Duration
 	// multipartTTL is how long an upload stays open before its auto-abort,
 	// and a completed one is kept (Deps.MultipartSessionTTL).
 	multipartTTL time.Duration
