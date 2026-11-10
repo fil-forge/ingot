@@ -30,7 +30,11 @@ func TestGetBucketCors(t *testing.T) {
 		if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 			t.Fatalf("create bucket: %v", err)
 		}
-		return New(Deps{Registry: mem, CORS: corsCfg})
+		b, err := New(Deps{Tasks: mem.tasks, Registry: mem, CORS: corsCfg})
+		if err != nil {
+			t.Fatalf("backend: %v", err)
+		}
+		return b
 	}
 
 	// The document must survive New's marshalling into something

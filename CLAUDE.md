@@ -250,6 +250,10 @@ Internal:
 - **`internal/pgtest`** — a fresh, migrated Postgres database per test;
   **`internal/testfakes`** — the network's stand-ins (`NopBaseReader`,
   `NopUploader`, a bucket `Authority` in place of hilt). Both test-only.
+- **`internal/authority`** — the authority queued tasks make their network
+  calls with (`Resolver`): a store a request lends for the space while it
+  waits on them, then the chain the task carries, then the space's captured
+  ship authority.
 - **`cars/`**, **`migrations/`**,
   **`internal/{reqscope,ucanexec,fasthttputil,cors,build}`**, **`gen/`**,
   **`testing/`** — CAR codec, goose SQL (`ingot` schema), request-scoped ctx

@@ -439,7 +439,7 @@ func (b *Backend) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t tas
 		// workers that run them, and the object-count changes below, read
 		// this request's authority, lent for the space while it waits: what
 		// the tasks captured may have lapsed.
-		defer b.lendAuthority(ctx, st.Space)()
+		defer b.proofs.Lend(ctx, st.Space)()
 		if err := b.drainSpaceReleases(ctx, st.Space); err != nil {
 			return fmt.Errorf("s3frontend: delete bucket: %w", err)
 		}

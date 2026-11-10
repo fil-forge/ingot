@@ -33,20 +33,9 @@ type BucketShipper interface {
 	ShipBucket(ctx context.Context, bucket string) error
 }
 
-// registerShip registers queue-bucket.ship, and queues the ships the log
-// reported before the handler existed.
+// registerShip registers queue-bucket.ship.
 func (b *Backend) registerShip(r *taskrunner.Runner) error {
-	if err := r.Handle(registry.BucketQueue, registry.BucketShipAction, b.runShip, taskrunner.WithRetry(shipRetry)); err != nil {
-		return err
-	}
-	b.shipMu.Lock()
-	early := b.earlyShips
-	b.earlyShips, b.shipReady = nil, true
-	b.shipMu.Unlock()
-	for _, bucket := range early {
-		b.QueueShip(bucket)
-	}
-	return nil
+	return r.Handle(registry.BucketQueue, registry.BucketShipAction, b.runShip, taskrunner.WithRetry(shipRetry))
 }
 
 // QueueShip queues a ship of bucket's sealed catalog segments, due now, as
@@ -55,13 +44,6 @@ func (b *Backend) registerShip(r *taskrunner.Runner) error {
 // with backoff until it is (retryOwedShips): an idle bucket has no next seal
 // to queue one.
 func (b *Backend) QueueShip(bucket string) {
-	b.shipMu.Lock()
-	if !b.shipReady {
-		b.earlyShips = append(b.earlyShips, bucket)
-		b.shipMu.Unlock()
-		return
-	}
-	b.shipMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := b.queueShip(ctx, bucket); err != nil {

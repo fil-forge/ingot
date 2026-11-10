@@ -115,8 +115,7 @@ func newRefTestBackendOver(t *testing.T, mem *testStore, log blockstore.Log, mbs
 		opt(&deps)
 	}
 	withStreaming(t, &deps, dir)
-	b := New(deps)
-	mem.start(t, b)
+	b := mem.newBackend(t, deps)
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}

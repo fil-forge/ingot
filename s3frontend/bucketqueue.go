@@ -33,9 +33,9 @@ import (
 // itself; the rest still apply. The slow part of a write, streaming its body
 // and taking its references, happens in the request beforehand.
 
-// RegisterBucketTasks registers the queue-bucket handlers with r. Call it
+// registerBucketTasks registers the queue-bucket handlers with r. Call it
 // before r starts.
-func (b *Backend) RegisterBucketTasks(r *taskrunner.Runner) error {
+func (b *Backend) registerBucketTasks(r *taskrunner.Runner) error {
 	b.buckets = r
 	if err := r.Handle(registry.BucketQueue, registry.BucketCommitAction, b.runCommit); err != nil {
 		return err
@@ -71,10 +71,10 @@ func (b *Backend) commit(ctx context.Context, st *registry.State, changes ...Key
 func (b *Backend) commitWith(ctx context.Context, run syncRunner, st *registry.State, changes ...KeyChange) (commitOutcome, error) {
 	args := BucketCommitTask{Bucket: st.Name, Changes: changes, Release: b.releaseAuthority(ctx, st.Space)}
 	var err error
-	if args.RegisterAdd, err = b.registrar.CaptureAuthority(ctx, st.Space, uploadcmds.Add.Command); err != nil {
+	if args.RegisterAdd, err = b.proofs.Capture(ctx, st.Space, uploadcmds.Add.Command); err != nil {
 		b.logger.Debug("commit: no /upload/add authority to queue registrations with", zap.Stringer("space", st.Space), zap.Error(err))
 	}
-	if args.RegisterRemove, err = b.registrar.CaptureAuthority(ctx, st.Space, uploadcmds.Remove.Command); err != nil {
+	if args.RegisterRemove, err = b.proofs.Capture(ctx, st.Space, uploadcmds.Remove.Command); err != nil {
 		b.logger.Debug("commit: no /upload/remove authority to queue retractions with", zap.Stringer("space", st.Space), zap.Error(err))
 	}
 	var buf bytes.Buffer

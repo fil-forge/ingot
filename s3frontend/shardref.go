@@ -109,7 +109,7 @@ func decodeAddResult(b []byte) (addResult, error) {
 }
 
 // registerShardRefTasks registers the add and expire handlers on the release
-// queue (see RegisterReleaseTasks).
+// queue (see registerReleaseTasks).
 func (b *Backend) registerShardRefTasks(r *taskrunner.Runner) error {
 	if err := r.Handle(registry.ReleaseQueue, registry.AddAction, b.runAdd); err != nil {
 		return err

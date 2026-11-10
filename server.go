@@ -212,7 +212,8 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	if err := bs.CountBlobReads(otel.Meter("github.com/fil-forge/ingot/blockstore")); err != nil {
 		logger.Warn("local blob read metric not created", zap.Error(err))
 	}
-	backend := s3frontend.New(s3frontend.Deps{
+	backend, err := s3frontend.New(s3frontend.Deps{
+		Tasks:        deps.Tasks,
 		Authority:    deps.Authority,
 		Registry:     deps.Registry,
 		Intents:      deps.Intents,
@@ -249,37 +250,11 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Logger:              logger,
 	})
 
-	if err := backend.RegisterUploadTasks(deps.Tasks); err != nil {
-		_ = backend.CloseMetrics()
+	if err != nil {
 		_ = log.Close(ctx)
-		return nil, fmt.Errorf("ingot: register upload tasks: %w", err)
-	}
-	if err := backend.RegisterShardTasks(deps.Tasks); err != nil {
-		_ = backend.CloseMetrics()
-		_ = log.Close(ctx)
-		return nil, fmt.Errorf("ingot: register shard tasks: %w", err)
-	}
-	if err := backend.RegisterMultipartTasks(deps.Tasks); err != nil {
-		_ = backend.CloseMetrics()
-		_ = log.Close(ctx)
-		return nil, fmt.Errorf("ingot: register multipart tasks: %w", err)
-	}
-	if err := backend.RegisterBucketTasks(deps.Tasks); err != nil {
-		_ = backend.CloseMetrics()
-		_ = log.Close(ctx)
-		return nil, fmt.Errorf("ingot: register bucket tasks: %w", err)
+		return nil, fmt.Errorf("ingot: %w", err)
 	}
 	ships.attach(backend)
-	if err := backend.RegisterReleaseTasks(deps.Tasks); err != nil {
-		_ = backend.CloseMetrics()
-		_ = log.Close(ctx)
-		return nil, fmt.Errorf("ingot: register release tasks: %w", err)
-	}
-	if err := backend.RegisterAcceptTasks(deps.Tasks); err != nil {
-		_ = backend.CloseMetrics()
-		_ = log.Close(ctx)
-		return nil, fmt.Errorf("ingot: register accept tasks: %w", err)
-	}
 
 	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, logger)
 	if err != nil {

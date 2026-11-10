@@ -82,9 +82,9 @@ type ShardEvictTask struct {
 	Released bool
 }
 
-// RegisterShardTasks registers the queue-shard handlers with r, and keeps r
+// registerShardTasks registers the queue-shard handlers with r, and keeps r
 // for submitting them. Call it before r starts.
-func (b *Backend) RegisterShardTasks(r *taskrunner.Runner) error {
+func (b *Backend) registerShardTasks(r *taskrunner.Runner) error {
 	b.shards = r
 	if err := r.Handle(ShardQueue, shardCache, b.handleShardCache, taskrunner.WithRetry(shardCacheRetry)); err != nil {
 		return err
@@ -92,7 +92,9 @@ func (b *Backend) RegisterShardTasks(r *taskrunner.Runner) error {
 	if err := r.Handle(ShardQueue, shardEvict, b.runShardEvict, taskrunner.WithRetry(shardEvictRetry)); err != nil {
 		return err
 	}
-	b.cache.OnRead(b.renewCached)
+	if b.cache != nil {
+		b.cache.OnRead(b.renewCached)
+	}
 	return nil
 }
 

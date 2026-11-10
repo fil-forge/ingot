@@ -19,6 +19,7 @@ import (
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // policyAuthority answers PolicyDocument with a canned result or error and
@@ -52,7 +53,21 @@ func policyBackend(t *testing.T, authority bucketauthority.BucketAuthority) *s3f
 	t.Helper()
 	reg := registry.NewPostgres(pgtest.New(t))
 	require.NoError(t, reg.Create(t.Context(), "photos", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}))
-	return s3frontend.New(s3frontend.Deps{Registry: reg, Authority: authority})
+	// The policy calls queue nothing, so the runner is never started.
+	tasks, err := taskrunner.New(nil, taskrunner.Options{
+		Schema: "ingot",
+		Queues: []taskrunner.QueueOptions{
+			{Name: registry.MultipartQueue},
+			{Name: registry.BucketQueue},
+			{Name: registry.UploadQueue},
+			{Name: registry.ReleaseQueue},
+			{Name: s3frontend.ShardQueue},
+		},
+	})
+	require.NoError(t, err)
+	b, err := s3frontend.New(s3frontend.Deps{Tasks: tasks, Registry: reg, Authority: authority})
+	require.NoError(t, err)
+	return b
 }
 
 // requireS3Error asserts err is the S3 error code, as versitygw's

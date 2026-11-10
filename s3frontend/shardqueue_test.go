@@ -18,6 +18,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 )
@@ -33,8 +34,15 @@ func newShardFixture(t *testing.T, ttl time.Duration) *shardFixture {
 	t.Helper()
 	env := taskrunnertest.NewEnv(t)
 	r, err := taskrunner.New(env.DB, taskrunner.Options{
-		Schema:       env.Schema,
-		Queues:       []taskrunner.QueueOptions{{Name: ShardQueue, Workers: 2}},
+		Schema: env.Schema,
+		// New registers every queue's handlers; only queue-shard runs any.
+		Queues: []taskrunner.QueueOptions{
+			{Name: registry.MultipartQueue},
+			{Name: registry.BucketQueue},
+			{Name: registry.UploadQueue},
+			{Name: registry.ReleaseQueue},
+			{Name: ShardQueue, Workers: 2},
+		},
 		Node:         "did:web:ingot.test",
 		LeaseTTL:     time.Second,
 		PollInterval: 20 * time.Millisecond,
@@ -44,8 +52,8 @@ func newShardFixture(t *testing.T, ttl time.Duration) *shardFixture {
 	dir := t.TempDir()
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
 	require.NoError(t, err)
-	b := New(Deps{Cache: cache, Intents: newTestStore(t), CacheTTL: ttl, Logger: zaptest.NewLogger(t)})
-	require.NoError(t, b.RegisterShardTasks(r))
+	b, err := New(Deps{Tasks: r, Cache: cache, Intents: newTestStore(t), CacheTTL: ttl, Logger: zaptest.NewLogger(t)})
+	require.NoError(t, err)
 	require.NoError(t, r.Migrate(context.Background()))
 	require.NoError(t, r.Start(context.Background()))
 	t.Cleanup(func() { _ = r.Stop(context.Background()) })
