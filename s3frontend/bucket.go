@@ -420,7 +420,11 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		// releases sit in the deferred queue behind the reader grace, and
 		// hilt refuses to delete a space that still holds registrations.
 		// The bucket is provably empty here and its deletion explicit, so
-		// no grace is owed — execute the space's pending releases now.
+		// no grace is owed — execute the space's pending releases now. The
+		// workers that run them, and the object-count changes below, read
+		// this request's authority, lent for the space while it waits: what
+		// the tasks captured may have lapsed.
+		defer b.lendAuthority(ctx, st.Space)()
 		if err := b.drainSpaceReleases(ctx, st.Space); err != nil {
 			return fmt.Errorf("s3frontend: delete bucket: %w", err)
 		}

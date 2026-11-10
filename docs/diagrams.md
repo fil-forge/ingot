@@ -285,19 +285,22 @@ sequenceDiagram
             B->>BC: CreateTemp: tee the same bytes into a .tmp-* file<br/>(none with cache_writes: false#59; a failed copy is dropped, the PUT goes on)
         end
         Note over B,P: a failed PUT fails the request: the allocation is aborted<br/>(within 10 s) and the client retries#59; so does UnsupportedDigestCode
-        B->>B: mark (space, digest) as a write in flight (Backend.writing)
     end
-    B->>R: PutIntent(digest, stored size, uploading) +<br/>PutEncryptionParams(region-wrapped CEK, FEE geometry) per blob
-    loop each blob (concludeBody → concludeStreamed, under the (space, digest) lock)
+    B->>R: PutEncryptionParams(region-wrapped CEK, FEE geometry) per blob
+    loop each blob (concludeBody → addBlob)
+        Note over B,R: a sync queue-space-shard.add on the blob's release subject (space/hex digest),<br/>after any release ahead of it, within 30 s (else SlowDown)#59; it also takes the (space, digest) lock
         alt blob_locations already has (space, digest)
-            B->>U: /blob/abort the surplus allocation
-            B->>R: SetIntentState(accepted)<br/>(never hits for fresh writes — every envelope digest is new)
+            B->>R: PutIntent(accepted)<br/>(never hits for fresh writes — every envelope digest is new)
         else conclude
+            B->>R: PutIntent(stored size, uploading)
             B->>U: /ucan/conclude the put receipt, reporting the digest
             U-->>B: accept receipt + /assert/location commitment
             B->>R: PutLocation, then SetIntentState(accepted)
         end
-        Note over B: the write's mark on the blob ends
+        B->>R: in the add's commit: the write's pending reference (blob_pending_refs)<br/>+ a queue-space-shard.expire due in 24 h
+        opt the space held the blob already
+            B->>U: /blob/abort the surplus allocation
+        end
         B->>BC: Adopt: the .tmp-* file goes under the digest, before the 200#59;<br/>queue-shard.cache dates it and schedules its queue-shard.evict
     end
     Note over B,U: StartBlob also captures the request proof store, if borrowable,<br/>as the space's ship authority (captureShipProofs, 1h TTL)
@@ -307,7 +310,7 @@ sequenceDiagram
     TX->>TX: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match under the lock,<br/>MST splice (new nodes into staging)
     Note over TX: uploader.CaptureShipAuthority: every commit captures the request<br/>proof store, if borrowable and it holds a /blob/add chain, as the<br/>space's ship authority, so a write with no body (a delete, a tag<br/>change) leaves one for its segment's ship
     TX->>L: AppendBatch(catalog blocks, OpRoot) with fsync
-    TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>the batch's catalog blocks journaled under its segment (catalog_journal,<br/>skipped once the segment has shipped), blob_refs gains this version,<br/>superseded version rows removed, pending releases of claimed digests cancelled,<br/>a queue-space-shard.release task, due after the grace, per digest whose<br/>claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (queue-space-upload tasks)
+    TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>the batch's catalog blocks journaled under its segment (catalog_journal,<br/>skipped once the segment has shipped), blob_refs gains this version, each claim<br/>taking over the write's pending reference (row deleted, expiry cancelled#59;<br/>an expired one refuses the commit: SlowDown), superseded version rows removed,<br/>a queue-space-shard.release task, due after the grace, per digest whose<br/>claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (queue-space-upload tasks)
     TX-->>B: committed, lock released
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
     Note over B,U: a task runner worker runs each queue-space-shard.release once its grace passes:<br/>crypto-shred (its blob_encryption_params row deleted), then /blob/remove
@@ -333,7 +336,12 @@ sequenceDiagram
 - The claim ledger and the zero-claims release are the
   [blob lifecycle](#blob-lifecycle-uploading-parked-accepted-released).
 - `CopyObject` runs the same `commitVersion`. Within one space its manifest
-  pins the source's digests: no stream, no upload, claims incremented. Across
+  pins the source's digests: no stream, no upload, claims incremented. Each
+  source blob first takes a pending reference through a copy-mode
+  `queue-space-shard.add`, which fails the copy with NoSuchKey unless the
+  space has the blob located, and the copy's claims take them over; a source
+  deleted and released after the adds leaves the copy's blobs referenced,
+  and the copy commits. Across
   spaces (every bucket has its own) the CEK wrap bound to (space, digest)
   rules out sharing, so the source's plaintext streams through the decrypting
   read path into `ingestBody` and the copy gets its own blobs and claims. A
@@ -382,8 +390,8 @@ sequenceDiagram
 
 Cross-references: [`architecture.md` §7.1](./architecture.md#71-write-single-shot-putobject).
 
-Sources: `s3frontend/object.go` (PutObject, ingestBody, concludeBody,
-concludeStreamed), `s3frontend/stream.go` (WriteSizedBlob), `s3frontend/localblobs.go`
+Sources: `s3frontend/object.go` (PutObject, ingestBody, concludeBody),
+`s3frontend/shardref.go` (addBlob, runAdd, runExpire), `s3frontend/stream.go` (WriteSizedBlob), `s3frontend/localblobs.go`
 (cacheWritten), `blockstore/blobcache.go`, `bucket/sized.go`, `uploader/stream.go`,
 `s3frontend/copy.go` (CopyObject, copySourceBucket),
 `s3frontend/version.go` (commitVersion, enqueueRegistration),
@@ -501,25 +509,26 @@ sequenceDiagram
         B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412)#59;<br/>the body is the source's plaintext range through the decrypting reader
     end
     B->>B: ingestPart: splitBody<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope streamed to piri under its ciphertext<br/>digest + params row, as in the PutObject diagram#59; no local copy)
-    B->>R: PutPart(written, span_lengths): open sessions only, the row held FOR SHARE<br/>against a concurrent latch#59; writes of one part number serialised on an advisory lock#59;<br/>a queue-space-shard.release task, due now, for each blob the replaced row named and<br/>this part does not, in the same transaction, returned to run#59; a refused part queues its blobs' releases
-    loop each part blob (parkBlobs → recordStreamedPark, under the (space, digest) lock)
+    loop each part blob (parkBlobs → addBlob: a sync queue-space-shard.add on the blob's release subject)
         alt blob_locations already has the digest
-            B->>U: /blob/abort the surplus allocation
             B->>R: intent accepted (dedup, no park)
         else already parked (GetPark hit)
-            B->>U: /blob/abort the surplus allocation
-            B->>R: reuse the park
+            B->>R: reuse the park, intent parked
         else park
             B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked:<br/>the PUT already went to piri in splitBody
         end
-        Note over B: the write's mark on the blob ends
+        B->>R: in the add's commit: the write's pending reference + a queue-space-shard.expire due in 24 h
+        opt the space held the blob already
+            B->>U: /blob/abort the surplus allocation
+        end
     end
+    B->>R: PutPart(written, span_lengths, the adds' references): open sessions only, the row held<br/>FOR SHARE against a concurrent latch#59; writes of one part number serialised on an advisory lock#59;<br/>the references taken over (rows deleted, expiries cancelled) and a queue-space-shard.release<br/>task, due now, for each blob the replaced row named and this part does not, in the same<br/>transaction, returned to run#59; a refused part expires its references at once (dropRefsNow)
     B->>R: MoveParts(written to parked), guarded by the part's digests
-    opt no row moved: a later upload of the part number replaced it,<br/>or a teardown took the session, while the blobs were parking
-        B->>R: enqueuePartReleases of this part's blobs: a replacement of the replacer's task,<br/>which the park left standing (awaitRelease)#59; they run below rather than on a worker
+    opt no row moved: a later upload of the part number replaced it,<br/>or a teardown took the session, while the row was recorded
+        B->>R: enqueuePartReleases of this part's blobs: a no-op beside the replacer's<br/>standing releases#59; they run below rather than on a worker
     end
     B->>A: nudge (start the acceptor, or ask for another pass)
-    B->>U: releaseNow: the tasks above, due at once, run inline (/blob/abort of the parks#59;<br/>a blob another part or the session still names waits on that reference)
+    B->>U: releaseNow: the tasks above, due at once, run inline (/blob/abort of the parks#59;<br/>a blob another part or the session still names is stale for that reference)
     B-->>C: part ETag (part md5#59; for a copy, of the copied bytes)
     loop while a pass finds parked parts
         A->>R: GetSession (stop unless open or completing)#59; ListParkedParts
@@ -564,12 +573,12 @@ sequenceDiagram
 
 - A part re-upload and an abort queue a `queue-space-shard.release` task for
   every blob of theirs that is not still live in the session; the release
-  itself decides whether the blob is free to go — a claimed digest makes it
-  stale and it does nothing (`CountClaims`), and one a part of an in-flight
-  session references waits
-  (`CountLivePartRefs`, checked first: a Complete claims before it leaves
-  'completing'). A commit's claim publishes the blob's upload intent, so
-  the reap of a retained session releases only what was never committed.
+  itself decides whether the blob is free to go. Any reference in the space
+  (a claim, a write's pending reference, a part of an in-flight session,
+  counted in one statement by `CountReferences`) makes it stale and it does
+  nothing; the session's teardown queues it again. A commit's claim
+  publishes the blob's upload intent, so the reap of a retained session
+  releases only what was never committed.
 - A release can take a blob while the acceptor concludes it. The provider
   refuses whichever of accept and abort comes second, and the release deletes
   the park and location rows in its commit, so `ConcludePark` finds no park and the
@@ -583,15 +592,15 @@ sequenceDiagram
 - No release runs while its blob's conclude is in flight: sprue registers
   an accepted blob only when it answers, so an earlier remove would miss it.
   A teardown waits for the acceptor's pass in flight (`quiesceAcceptor`)
-  before it queues releases; any other release defers while the blob is
-  marked (`markConcluding`, held 2 min past a failed conclude), and the task
-  runner retries it.
+  before it queues releases; any other release that finds the blob marked
+  (`markConcluding`, held 2 min past a failed conclude) defers, retrying
+  without holding the blob's subject (`taskrunner.Defer`).
 - A part is written only while its session is open, in the statement that
   checks the state; a teardown that took the session refuses it, and the
-  upload queues releases for the blobs it had written.
-- A blob with neither a park nor a location at Complete is looked for again
-  under the blob's lock: an UploadPart still parking the blob when Complete
-  classified it holds that lock, and its park is then concluded. A blob still
+  upload expires its pending references at once, which releases the blobs
+  nothing else references (`dropRefsNow`).
+- A blob with neither a park nor a location at Complete is looked for once
+  more under the blob's lock. A blob still
   with neither has gone from its provider, and Complete answers
   `InvalidPart`; nothing keeps a part's bytes to upload them again.
 - Complete reports its response headers through versitygw's
@@ -605,11 +614,12 @@ Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 [§7.3](./architecture.md#73-the-session-latch-the-abortcomplete-race).
 
 Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
-recordStreamedPark, acceptRequested, acceptParked, recordConcluded,
+acceptRequested, acceptParked, recordConcluded,
 concludeBlobs, enqueuePartReleases, SweepStaleMultipartSessions),
 `s3frontend/version.go` (reserveVersion, commitVersionAt),
 `s3frontend/acceptor.go`, `s3frontend/stream.go`,
-`s3frontend/releasequeue.go` (runRelease, settleRelease, awaitRelease, releaseNow),
+`s3frontend/shardref.go` (addBlob, runAdd, dropRefsNow),
+`s3frontend/releasequeue.go` (runRelease, releaseNow),
 `s3frontend/uploadpartcopy.go`, `registry/stores.go`,
 `server.go` (startMultipartSweeper, startAcceptSweeper). Review when these change.
 
@@ -621,7 +631,7 @@ never moves a row a later upload of the same part number replaced.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> written : PutPart (UploadPart, before its blobs park)
+    [*] --> written : PutPart (UploadPart, once its blobs are parked)
     written --> parked : every blob parked or located (MoveParts, then nudge)
     parked --> accepted : acceptor pass concludes and records the blobs
     parked --> written : acceptor finds a blob with a release pending or running, or neither park nor location
@@ -632,16 +642,16 @@ stateDiagram-v2
     accepted --> [*] : replaced (releases queued with the replacement),<br/>or the session's teardown cascades
 ```
 
-- `written` is the state of a part whose request is still parking its
-  blobs, or died doing so. The acceptor never takes it; Complete does, and
-  refuses one with a blob that never parked (`InvalidPart`), since nothing
-  keeps a part's bytes to upload them again.
-- A request whose `written` row is replaced while it parks moves no row to
-  `parked`. The releases the replacement queued stand: a part's park
-  leaves a pending release of its digest to the part row, which defers it
-  while the row stands and lets it run once the row is replaced, so the
-  blobs go even if the request dies there. The request runs them itself
-  when it can, rather than leave them to the runner's workers.
+- `written` is the state of a part whose request has recorded the row and
+  not yet moved it, or died in between, or one the acceptor left. The
+  acceptor never takes it; Complete does, and refuses one with a blob that
+  has neither a park nor a location (`InvalidPart`), since nothing keeps a
+  part's bytes to upload them again.
+- A request whose `written` row is replaced before it moves it moves no row
+  to `parked`. The releases the replacement queued stand, so the blobs go
+  even if the request dies there; each is stale while a part, a claim or a
+  pending reference in the space still names its blob. The request runs
+  them itself when it can, rather than leave them to the runner's workers.
 - Complete requires every part it names to be `accepted` before the commit:
   it waits until none of them is queued (parts it omits are not waited
   for), finishes `written` parts itself, and answers a part still `parked`
@@ -706,8 +716,8 @@ flowchart TB
         published([published])
     end
 
-    uploading -->|"single-shot write: conclude, accept,<br/>or a blob_locations hit (dedup, the stream aborted);<br/>an object's local copy is adopted into the cache"| accepted
-    uploading -->|"parkBlobs: the part streamed to its provider;<br/>blob_parks row written"| parked
+    uploading -->|"single-shot write's queue-space-shard.add: conclude, accept,<br/>or a blob_locations hit (dedup, the stream aborted);<br/>an object's local copy is adopted into the cache"| accepted
+    uploading -->|"part's queue-space-shard.add (parkBlobs):<br/>the part streamed to its provider;<br/>blob_parks row written"| parked
     parked -->|"acceptParked (the upload's acceptor, or Complete for a written part):<br/>/ucan/conclude; ConcludePark swaps the blob_parks row for blob_locations"| accepted
     uploading -->|"queue-space-shard.release: /blob/remove<br/>(idempotent: the accept may have landed, its location not);<br/>rows deleted in the task's commit"| gone([deleted])
     parked -->|"queue-space-shard.release: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>rows deleted in the task's commit"| gone
@@ -718,9 +728,12 @@ flowchart TB
 
     accepted -.->|"queue-shard.evict at the TTL,<br/>or SweepLocalBlobs over budget;<br/>state unchanged"| evicted[["cached file evicted"]]
     published -.->|"queue-shard.evict at the TTL,<br/>or SweepLocalBlobs over budget;<br/>state unchanged"| evicted
+    W -->|"each blob's queue-space-shard.add"| pend["blob_pending_refs row<br/>(the write's pending reference, 24 h)"]
+    pend -->|"commit: the claim takes it over<br/>(row deleted, expiry cancelled)"| refs
+    pend -->|"queue-space-shard.expire at the deadline:<br/>row dropped; nothing else referencing<br/>the blob queues its release, due at once"| gone
     published -->|"commit: the root swap's transaction adds this version's claim"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
-    refs -->|"version delete or overwrite removes its row"| zero{"CountClaims == 0<br/>for (space, digest)?"}
-    zero -->|yes| rel["queue-space-shard.release queued in the same transaction,<br/>due after release_grace<br/>(the published → deleted edge runs it)"]
+    refs -->|"version delete or overwrite removes its row"| zero{"no claim left<br/>for (space, digest)?"}
+    zero -->|yes| rel["queue-space-shard.release queued in the same transaction,<br/>due after release_grace<br/>(the published → deleted edge runs it,<br/>stale if CountReferences finds any reference)"]
     zero -->|no| keep["blob retained<br/>(still referenced)"]
 ```
 
@@ -753,12 +766,19 @@ flowchart TB
   transaction, so the digest keeps a claim throughout and no release is
   queued.
 - Parked-blob reclamation is guarded: a digest live in another session, part,
-  or committed object is left alone.
-- A same-space copy pins the source's body: its claims are pins
-  (`registry.RootCommit.Pins`), each written only while the space still
-  holds a claim on the digest, under its lock, so a copy racing the source's
-  delete and release fails with NoSuchKey instead of claiming a blob about
-  to go.
+  committed object or write's pending reference is left alone.
+- A write's pending reference is taken by its `queue-space-shard.add` on the
+  blob's release subject, which never overlaps a release of the blob. A
+  release that fails retries holding the subject, so an add behind it waits
+  and then finds the blob unlocated and concludes its own stream. A write of
+  a deleted object's bytes (plaintext bucket) while that object's release is
+  within its reader grace keeps the blob: the release finds the reference
+  and is stale.
+- A same-space copy takes a pending reference to each source blob through a
+  copy-mode `queue-space-shard.add`, which fails the copy with NoSuchKey
+  unless the space has the blob located; its claims take the references
+  over, so a source deleted and released after the adds leaves the copy's
+  blobs referenced.
 
 Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 [`s3-versioning.md`](./s3-versioning.md) §8.
@@ -771,7 +791,9 @@ Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
 `s3frontend/multipart.go`
 (parkBlobs, acceptParked, recordConcluded, concludeBlobs, enqueuePartReleases),
 `s3frontend/acceptor.go`, `s3frontend/releasequeue.go`
-(runRelease), `registry/release.go` (ReleasedRows, ReleasedIntent),
+(runRelease), `s3frontend/shardref.go` (runAdd, runExpire),
+`registry/stores_postgres.go` (CountReferences, takePendingRefs),
+`registry/release.go` (ReleasedRows, ReleasedIntent, PendingRef),
 `uploader/blob.go` (ConcludeBlobs,
 AbortBlob, RemoveBlob). Review when these change.
 
@@ -1108,6 +1130,13 @@ erDiagram
         text version_id PK
         text space "claim index (space, digest)"
     }
+    blob_pending_refs {
+        uuid add_task PK "the queue-space-shard.add that took it"
+        uuid expire_task UK "the queue-space-shard.expire due at the deadline"
+        text space
+        bytea digest
+        timestamptz deadline "24 h after the add"
+    }
     upload_intents {
         text space PK "the upload's space: one cached file, an intent per space"
         bytea digest PK
@@ -1199,7 +1228,9 @@ erDiagram
 
 - The five solid relationships are the schema's only real foreign keys;
   dashed ones are soft joins the code performs. `revocation_cursor` stands
-  alone.
+  alone. `blob_pending_refs` joins nothing: a release counts its rows with
+  the `blob_refs` claims and the in-flight sessions' parts by (space,
+  digest).
 - `catalog_journal` has no foreign key to `segments` on purpose: when a
   segment's CAR is missing from disk, recovery rebuilds its journaled blocks
   into new segments and moves the rows onto them, then deletes the lost row if
@@ -1288,6 +1319,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `s3frontend/multipart.go` | multipart, part-states, multipart-states, blob-lifecycle |
 | `s3frontend/acceptor.go` | multipart, part-states, blob-lifecycle |
 | `s3frontend/releasequeue.go` | put, multipart, part-states, blob-lifecycle, delete-bucket |
+| `s3frontend/shardref.go` | put, multipart, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |
 | `s3frontend/uploadsweep.go` | put, delete-bucket |

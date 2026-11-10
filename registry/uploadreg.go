@@ -102,5 +102,5 @@ func UploadRegistrationFromTask(t taskrunner.Task) (UploadRegistration, error) {
 type TaskSubmitter interface {
 	SubmitTx(ctx context.Context, tx pgx.Tx, s taskrunner.Spec) (taskrunner.TaskID, error)
 	SubmitAllTx(ctx context.Context, tx pgx.Tx, specs []taskrunner.Spec) ([]taskrunner.TaskID, error)
-	CancelPendingTx(ctx context.Context, tx pgx.Tx, queueName string, subjects []string, action string) (int, []string, error)
+	CancelTx(ctx context.Context, tx pgx.Tx, queueName string, ids ...taskrunner.TaskID) error
 }

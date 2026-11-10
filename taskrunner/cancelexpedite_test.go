@@ -11,119 +11,6 @@ import (
 	"github.com/fil-forge/ingot/taskrunner"
 )
 
-// CancelPending cancels a subject's unstarted tasks of one action, a retrying
-// one among them, and leaves other actions and subjects alone.
-func TestCancelPendingCancelsTheSubjectsUnstartedTasksOfAnAction(t *testing.T) {
-	f := newFixture(t, 1)
-	var retried atomic.Int32
-	if err := f.r.Handle(qTop, "release", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
-		retried.Add(1)
-		return nil, errors.New("unavailable")
-	}, taskrunner.WithRetry(taskrunner.RetryPolicy{First: time.Hour})); err != nil {
-		t.Fatal(err)
-	}
-	f.handle(t, qTop, "expire", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil })
-	f.start(t)
-	ctx := waitCtx(t)
-	later := time.Now().Add(time.Hour)
-	submit := func(subject, action string, at *time.Time) taskrunner.TaskID {
-		t.Helper()
-		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: subject, Action: action, NotBefore: at})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return id
-	}
-	retrying := submit("sp/d", "release", nil)
-	for retried.Load() == 0 {
-		time.Sleep(10 * time.Millisecond)
-	}
-	delayed := submit("sp/d", "release", &later)
-	otherAction := submit("sp/d", "expire", &later)
-	otherSubject := submit("sp/e", "release", &later)
-
-	n, running, err := f.r.CancelPending(ctx, qTop, []string{"sp/d"}, "release")
-	if err != nil || n != 2 || len(running) != 0 {
-		t.Fatalf("CancelPending = %d, %v, %v; want 2 cancelled, none running", n, running, err)
-	}
-	for _, id := range []taskrunner.TaskID{retrying, delayed} {
-		if _, err := f.r.Wait(ctx, qTop, id); !errors.Is(err, taskrunner.ErrCancelled) {
-			t.Errorf("Wait %s: %v, want ErrCancelled", id, err)
-		}
-	}
-	for _, id := range []taskrunner.TaskID{otherAction, otherSubject} {
-		if got := f.state(t, qTop, id); got != "pending" {
-			t.Errorf("task %s is %s, want left pending", id, got)
-		}
-	}
-}
-
-// CancelPending cannot cancel a task that is running, and says which subjects
-// have one, while it cancels the others' in the same call.
-func TestCancelPendingReportsARunningTask(t *testing.T) {
-	f := newFixture(t, 1)
-	started, release := make(chan struct{}), make(chan struct{})
-	f.handle(t, qTop, "release", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
-		close(started)
-		<-release
-		return nil, nil
-	})
-	f.start(t)
-	ctx := waitCtx(t)
-	id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "sp/d", Action: "release"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	<-started
-	later := time.Now().Add(time.Hour)
-	if _, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "sp/e", Action: "release", NotBefore: &later}); err != nil {
-		t.Fatal(err)
-	}
-	n, running, err := f.r.CancelPending(ctx, qTop, []string{"sp/e", "sp/d", "sp/f"}, "release")
-	close(release)
-	if err != nil || n != 1 || !slices.Equal(running, []string{"sp/d"}) {
-		t.Fatalf("CancelPending = %d, %v, %v; want sp/e's cancelled and sp/d running", n, running, err)
-	}
-	if _, err := f.r.Wait(ctx, qTop, id); err != nil {
-		t.Fatalf("the running task: %v, want it to finish", err)
-	}
-}
-
-// CancelPendingTx's cancel commits or rolls back with the caller's own writes.
-func TestCancelPendingTxRollsBackWithTheTransaction(t *testing.T) {
-	f := newFixture(t, 0)
-	f.handle(t, qTop, "release", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil })
-	f.migrate(t)
-	ctx := waitCtx(t)
-	later := time.Now().Add(time.Hour)
-	id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "sp/d", Action: "release", NotBefore: &later})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, commit := range []bool{false, true} {
-		tx, err := f.env.DB.Begin(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		n, _, err := f.r.CancelPendingTx(ctx, tx, qTop, []string{"sp/d"}, "release")
-		if err != nil || n != 1 {
-			t.Fatalf("CancelPendingTx = %d, %v; want 1 cancelled", n, err)
-		}
-		if commit {
-			err = tx.Commit(ctx)
-		} else {
-			err = tx.Rollback(ctx)
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := map[bool]string{false: "pending", true: "cancelled"}[commit]
-		if got := f.state(t, qTop, id); got != want {
-			t.Fatalf("after commit=%v the task is %s, want %s", commit, got, want)
-		}
-	}
-}
-
 // Expedite runs a group of subjects' delayed tasks of one action now, returns
 // every one of them, due already or not, and leaves other actions and other
 // subjects to their time.
@@ -327,46 +214,6 @@ func waitForALockWait(t *testing.T, f *fixture) {
 	t.Fatal("no statement waited for a lock")
 }
 
-// CancelPending reports a task as running when its claim commits while the
-// cancel is under way, rather than missing it in both answers.
-func TestCancelPendingSeesAClaimCommittedMeanwhile(t *testing.T) {
-	f := newFixture(t, 0)
-	f.handle(t, qTop, "release", f.put())
-	f.migrate(t)
-	ctx := waitCtx(t)
-	id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "sp/d", Action: "release"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// A worker's claim, held open until the cancel waits on it.
-	claim, err := f.env.DB.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = claim.Rollback(ctx) }()
-	if _, err := claim.Exec(ctx, `UPDATE `+f.env.Table(queueTable(qTop)+"_tasks")+` SET started = now() WHERE id = $1`, id); err != nil {
-		t.Fatal(err)
-	}
-	type result struct {
-		n       int
-		running []string
-		err     error
-	}
-	done := make(chan result, 1)
-	go func() {
-		n, running, err := f.r.CancelPending(ctx, qTop, []string{"sp/d"}, "release")
-		done <- result{n, running, err}
-	}()
-	waitForALockWait(t, f)
-	if err := claim.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	got := <-done
-	if got.err != nil || got.n != 0 || !slices.Equal(got.running, []string{"sp/d"}) {
-		t.Fatalf("CancelPending = %d, %v, %v; want none cancelled and sp/d running", got.n, got.running, got.err)
-	}
-}
-
 // Expedite returns a replacement that commits while it runs by the
 // replacement's own ID, so a caller waits on the task that will run.
 func TestExpediteReturnsAReplacementCommittedMeanwhile(t *testing.T) {
@@ -496,5 +343,44 @@ func TestExpediteKeepsARunningReplacementsID(t *testing.T) {
 	}
 	if got := f.state(t, qTop, id); got != "pending" {
 		t.Fatalf("the expedited task is %s, want pending", got)
+	}
+}
+
+// ExpediteTasks brings forward exactly the given tasks, and none of them can
+// be replaced afterwards, whether it was waiting or due already. Another task
+// of the same subject and action is left to its time.
+func TestExpediteTasksBringsForwardOnlyTheGivenTasks(t *testing.T) {
+	f := newFixture(t, 2)
+	f.handle(t, qTop, "release", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, nil
+	})
+	f.migrate(t)
+	ctx := waitCtx(t)
+	later, earlier := time.Now().Add(time.Hour), time.Now().Add(-time.Minute)
+	submit := func(subject string, at *time.Time, replace bool) taskrunner.TaskID {
+		t.Helper()
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: subject, Action: "release", NotBefore: at, Replace: replace})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	waiting := submit("sp/a", &later, true)
+	due := submit("sp/b", &earlier, true)
+	other := submit("sp/a", &later, false)
+
+	if err := f.r.ExpediteTasks(ctx, qTop, waiting, due); err != nil {
+		t.Fatal(err)
+	}
+	submit("sp/a", &later, true)
+	submit("sp/b", &later, true)
+	f.start(t)
+	for _, id := range []taskrunner.TaskID{waiting, due} {
+		if _, err := f.r.Wait(ctx, qTop, id); err != nil {
+			t.Fatalf("Wait %s: %v", id, err)
+		}
+	}
+	if got := f.state(t, qTop, other); got != "pending" {
+		t.Errorf("the other task is %s, want left to its time", got)
 	}
 }

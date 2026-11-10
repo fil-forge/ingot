@@ -628,7 +628,7 @@ func (r *Runner) SubmitAllTx(ctx context.Context, tx pgx.Tx, specs []Spec) ([]Ta
 	ON CONFLICT (subject, action) WHERE state = 'pending' AND replaceable AND started IS NULL
 	DO UPDATE SET id = EXCLUDED.id, seq = DEFAULT, created = EXCLUDED.created,
 		not_before = EXCLUDED.not_before, expires = EXCLUDED.expires, args = EXCLUDED.args,
-		node = EXCLUDED.node, attempts = 0, error = NULL, retry_at = NULL
+		node = EXCLUDED.node
 	WHERE t.not_before < EXCLUDED.not_before`,
 		cols.ids, cols.subjects, cols.actions, cols.notBefore, cols.expires, cols.args, cols.nodes, cols.replaceable); err != nil {
 		return nil, fmt.Errorf("submit %d %s tasks: %w", len(cols.ids), q.name, err)
@@ -656,8 +656,12 @@ func (r *Runner) submit(ctx context.Context, db execer, s Spec) (TaskID, error) 
 	return id, nil
 }
 
-// Run submits a sync task and runs it in the caller's goroutine once its
-// subject's lease is free, first running any older due tasks on the subject.
+// Run submits a sync task and runs it in the caller's goroutine once it is
+// the subject's oldest due task and the subject's lease is free. It runs no
+// other task: those due before it are left to the queue's workers, on this
+// instance or another, so its Expires bounds its whole wait. A queue no
+// instance has workers for runs a sync task only once nothing is due ahead
+// of it.
 //
 // It returns once the task has an outcome: its result, the handler's error,
 // or ErrExpired. A commit that fails is retried, holding the lease, until it
@@ -732,6 +736,10 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 				if err := r.waitTask(ctx, yield.id, key, r.opts.PollInterval); err != nil {
 					return nil, err
 				}
+			case errors.As(d.stop, new(*aheadError)):
+				// A task due ahead is a worker's to run: wake them, and wait
+				// for this task's turn below.
+				r.pokeQueue(q)
 			case ctx.Err() != nil:
 				return nil, ctx.Err()
 			default:

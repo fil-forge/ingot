@@ -31,9 +31,18 @@ type yieldError struct{ id TaskID }
 
 func (e *yieldError) Error() string { return fmt.Sprintf("left task %s to its waiting caller", e.id) }
 
+// aheadError stops a Run caller's drain at a task due before its own, which
+// the caller leaves to a worker: a caller runs only its own task, so it waits
+// for its turn no longer than its own Expires.
+type aheadError struct{ id TaskID }
+
+func (e *aheadError) Error() string { return fmt.Sprintf("left task %s to a worker", e.id) }
+
 // drain runs the subject's due tasks under h, oldest first, up to the task
 // with seq upTo. It stops early after running target, and before a sync task
 // other than target whose caller is waiting, which it leaves to the caller.
+// A Run caller's drain (target set) runs target alone: it stops before any
+// task due ahead of it, which it leaves to a worker.
 //
 // It makes at most DrainLimit handler runs, counting a batch as one.
 func (r *Runner) drain(ctx context.Context, q *queue, h *hold, upTo int64, target TaskID) drained {

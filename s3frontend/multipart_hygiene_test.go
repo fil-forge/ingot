@@ -55,7 +55,7 @@ func hygienePartDigests(t *testing.T, mem *testStore, uploadID string, n int) []
 	return nil
 }
 
-// drainReleases executes every due deferred release (unit backends run with
+// drainReleases executes every due release (unit backends run with
 // a zero release grace, so everything enqueued is immediately due).
 func drainReleases(t *testing.T, b *Backend) {
 	t.Helper()
@@ -307,13 +307,11 @@ func TestDrainSpaceReleasesIgnoresGrace(t *testing.T) {
 
 	putObj(t, b, "k1", data)
 	d := blobDigestOf(t, b, "k1", "")
+	// A live grace: the delete queues the blob's release an hour out, so
+	// neither a worker nor the ordinary sweep touches it.
+	b.releaseGrace = time.Hour
 	deleteObj(t, b, "k1")
 
-	// Simulate a live grace: push the intent's not_before into the future so
-	// the ordinary sweep would not touch it.
-	if err := mem.EnqueueRelease(ctx, mem.bk(), d, time.Now().Add(time.Hour)); err != nil {
-		t.Fatalf("EnqueueRelease (extend): %v", err)
-	}
 	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 0 {
 		t.Fatalf("sweep executed %d releases (err=%v), want 0 — intent should not be due", n, err)
 	}
@@ -1333,10 +1331,10 @@ func TestAbortReleasesFromRecordsWhenSessionDeleteFails(t *testing.T) {
 	}
 }
 
-// TestReleaseDefersWhileAnInFlightPartReferencesTheBlob: a release record
-// for a digest a part of an open session references waits, pushed behind the
-// records due now, and becomes stale once that session claims the blob.
-func TestReleaseDefersWhileAnInFlightPartReferencesTheBlob(t *testing.T) {
+// TestReleaseOfABlobAnInFlightPartReferencesIsStale: a release of a digest a
+// part of an open session references does nothing, since the part is a
+// reference, and the blob stays parked through the session's Complete.
+func TestReleaseOfABlobAnInFlightPartReferencesIsStale(t *testing.T) {
 	b, mem, pu := newParkingBackend(t)
 	ctx := context.Background()
 	key := "in-flight"
@@ -1351,7 +1349,6 @@ func TestReleaseDefersWhileAnInFlightPartReferencesTheBlob(t *testing.T) {
 		t.Fatalf("EnqueueRelease: %v", err)
 	}
 
-	before := time.Now()
 	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 0 {
 		t.Fatalf("sweep executed %d releases (err=%v), want 0: the part is in flight", n, err)
 	}
@@ -1361,24 +1358,13 @@ func TestReleaseDefersWhileAnInFlightPartReferencesTheBlob(t *testing.T) {
 	if pu.abortedDigests()[string(d)] {
 		t.Fatalf("in-flight part blob %x was aborted on the provider", d)
 	}
-	pending, err := mem.ListReleasesBySpace(ctx, mem.bk())
-	if err != nil || len(pending) != 1 {
-		t.Fatalf("pending releases = %d/%v, want the deferred record to stand", len(pending), err)
-	}
-	if !pending[0].NotBefore.After(before) {
-		t.Fatalf("deferred record not_before = %v, want pushed behind the records due now", pending[0].NotBefore)
+	if pending, err := mem.ListReleasesBySpace(ctx, mem.bk()); err != nil || len(pending) != 0 {
+		t.Fatalf("pending releases = %v/%v, want none: the release was stale", pending, err)
 	}
 
-	// The session claims the blob; the record is stale and goes.
 	one := int32(1)
 	if _, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}, nil); err != nil {
 		t.Fatalf("Complete: %v", err)
-	}
-	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
-		t.Fatalf("drainSpaceReleases: %v", err)
-	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
-		t.Fatalf("stale record survived the claim: %v", pending)
 	}
 	if _, err := mem.GetEncryptionParams(ctx, mem.bk(), d); err != nil {
 		t.Fatalf("claimed blob %x lost its enc-params row: %v", d, err)
@@ -1760,8 +1746,9 @@ func TestAbortRecordsBlobAnotherAbortingSessionReferences(t *testing.T) {
 }
 
 // TestReleaseWaitsForAnotherOpenSessionSharingTheBlob: the same shared blob,
-// but the other session is still open. The abort records the release and the
-// release waits, since that session means to claim the blob.
+// but the other session is still open. The abort's release is stale, since
+// that session's part references the blob, and that session's own abort
+// releases it.
 func TestReleaseWaitsForAnotherOpenSessionSharingTheBlob(t *testing.T) {
 	b, mem, pu := newParkingBackend(t)
 	ctx := context.Background()
@@ -1789,9 +1776,17 @@ func TestReleaseWaitsForAnotherOpenSessionSharingTheBlob(t *testing.T) {
 	if _, err := mem.ParkByDigest(ctx, d); err != nil {
 		t.Fatalf("park row for %x went while another open session references it: %v", d, err)
 	}
-	pending, _ := mem.ListReleasesBySpace(ctx, mem.bk())
-	if len(pending) != 1 || string(pending[0].Digest) != string(d) {
-		t.Fatalf("pending releases = %v, want the shared blob's record standing", pending)
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
+		t.Fatalf("pending releases = %v, want none: the release was stale", pending)
+	}
+	otherKey := "other"
+	otherID := other
+	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &otherKey, UploadId: &otherID}); err != nil {
+		t.Fatalf("Abort the other session: %v", err)
+	}
+	drainReleases(t, b)
+	if !pu.abortedDigests()[string(d)] {
+		t.Fatalf("shared blob %x was not released once no session referenced it", d)
 	}
 }
 
@@ -2138,10 +2133,11 @@ func (f *failPutPart) PutPart(ctx context.Context, p registry.MultipartPart, tre
 }
 
 // TestUploadPartFailedRowWriteReleasesItsBlobs: the part row write fails for
-// a reason other than the session being gone. No row points at the streamed
-// blobs, so the upload records their releases before failing, with the
-// request's authority, and the release removes them from the provider they
-// streamed to; the session stays open for the retry.
+// a reason other than the session being gone. No row takes the write's
+// references to the parked blobs over, so the upload expires them before
+// failing, and the releases that leaves abort the blobs on the provider they
+// streamed to, with the request's authority; the session stays open for the
+// retry.
 func TestUploadPartFailedRowWriteReleasesItsBlobs(t *testing.T) {
 	rm := &recordingRemover{}
 	mp := &failPutPart{fails: 1}
@@ -2168,8 +2164,8 @@ func TestUploadPartFailedRowWriteReleasesItsBlobs(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("cache holds %d blobs after the failed row write, want 0", len(entries))
 	}
-	if n := len(rm.removedDigests()); n != 1 {
-		t.Fatalf("RemoveBlob called for %d blobs, want the one that streamed", n)
+	if n := abortCount(b); n != 1 {
+		t.Fatalf("aborted %d parks, want the one that streamed", n)
 	}
 	if sess, err := mem.GetSession(ctx, uploadID); err != nil || sess.State != registry.SessionOpen {
 		t.Fatalf("session after the failed part = %v/%v, want still open", sess, err)
@@ -2195,11 +2191,10 @@ func (f *failShred) DeleteEncryptionParams(ctx context.Context, space did.DID, d
 	return f.EncryptionParamsStore.DeleteEncryptionParams(ctx, space, digest)
 }
 
-// TestReleaseKeepsIntentUntilLocalCleanupSucceeds: a release of a streamed
-// blob with no rows fails at its crypto-shred. The intent must survive that
-// attempt, or the retry would find neither rows nor
-// intent and could not tell the blob had left the node; the retry then
-// removes it from the provider and finishes the local cleanup.
+// TestReleaseKeepsIntentUntilLocalCleanupSucceeds: a release of a parked
+// part blob fails at its crypto-shred. The intent and the park must survive
+// that attempt; the retry then aborts the blob on the provider and finishes
+// the local cleanup.
 func TestReleaseKeepsIntentUntilLocalCleanupSucceeds(t *testing.T) {
 	rm := &recordingRemover{}
 	mp := &failPutPart{fails: 1}
@@ -2227,16 +2222,16 @@ func TestReleaseKeepsIntentUntilLocalCleanupSucceeds(t *testing.T) {
 		t.Fatalf("pending releases after the failed attempt = %d, want 1", len(pending))
 	}
 	d := pending[0].Digest
-	if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentUploading {
-		t.Fatalf("intent after the failed attempt = %v/%v, want kept as uploading", in, err)
+	if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentParked {
+		t.Fatalf("intent after the failed attempt = %v/%v, want kept as parked", in, err)
 	}
 
 	drainReleases(t, b)
 	if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("intent survived the retry (err=%v)", err)
 	}
-	if n := rm.removedDigests()[string(d)]; n != 1 {
-		t.Fatalf("RemoveBlob called %d times for the streamed blob, want 1", n)
+	if !abortedOn(b, d) {
+		t.Fatalf("the parked blob %x was not aborted", d)
 	}
 }
 
@@ -2315,8 +2310,9 @@ func fileExists(path string) bool {
 
 // TestSupersedeRecordsReleaseOfSharedBlob: in a session storing parts as
 // received, two parts of identical bytes share one blob. Re-uploading one of
-// them records a release for the shared blob all the same; the release waits
-// while the other part still names it, and runs once the session ends.
+// them queues a release for the shared blob all the same; the release is
+// stale while the other part still names it, and the session's end queues it
+// again.
 // Skipping the record because a sibling names the digest would race a
 // concurrent re-upload of that sibling, leaving the blob with no record.
 func TestSupersedeRecordsReleaseOfSharedBlob(t *testing.T) {
@@ -2340,11 +2336,8 @@ func TestSupersedeRecordsReleaseOfSharedBlob(t *testing.T) {
 	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)+100), nil); err != nil {
 		t.Fatalf("UploadPart (supersede): %v", err)
 	}
-	pending, err := mem.ListReleasesBySpace(ctx, mem.bk())
-	if err != nil || len(pending) != 1 || string(pending[0].Digest) != string(shared) {
-		t.Fatalf("releases after the supersede = %v (err %v), want one record for the shared blob %x", pending, err, shared)
-	}
-	// Part 2 still names the blob: the record waits and the blob stays.
+	// Part 2 still names the blob: the release, run as the supersede
+	// returns, is stale, and the blob stays.
 	drainReleases(t, b)
 	if _, err := mem.ParkByDigest(ctx, shared); err != nil {
 		t.Fatalf("shared blob's park taken while part 2 names it: %v", err)
@@ -2352,13 +2345,11 @@ func TestSupersedeRecordsReleaseOfSharedBlob(t *testing.T) {
 	if pu.abortedDigests()[string(shared)] {
 		t.Fatalf("shared blob %x aborted on the provider while part 2 names it", shared)
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 1 {
-		t.Fatalf("deferred record did not survive the sweep: %v", pending)
+	if pending, err := mem.ListReleasesBySpace(ctx, mem.bk()); err != nil || len(pending) != 0 {
+		t.Fatalf("releases after the supersede = %v (err %v), want none: stale", pending, err)
 	}
 
-	// The session ends: nothing names the blob and the release runs (the
-	// deferral pushed the record behind the records due now, so it is
-	// drained regardless of grace, as the sweeper will once it is due).
+	// The session ends: nothing names the blob and the release runs.
 	bucket := "bk"
 	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
 		t.Fatalf("Abort: %v", err)
@@ -2603,73 +2594,28 @@ func TestReplacedWhileParkingReleasesItsBlobs(t *testing.T) {
 	}
 }
 
-// TestReplacedWhileParkingKeepsTheRecordWhenTheWriteDies: as above, but the
-// first upload fails after its park, before it could run the releases (its
-// own re-record fails, as a process exit there would). The records the
-// replacement wrote were left standing by the park, so the sweeper releases
-// the first upload's blobs regardless.
-func TestReplacedWhileParkingKeepsTheRecordWhenTheWriteDies(t *testing.T) {
-	pu := &parkingUploader{}
-	mp := &afterPutPart{}
-	rel := &failEnqueueReleases{}
-	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
-		mp.MultipartStore = d.Multipart
-		d.Multipart = mp
-		rel.BlobRefStore = d.Claims
-		d.Claims = rel
-	})
-	ctx := context.Background()
-	key := "replaced-while-parking-dies"
-	uploadID := mpCreate(t, b, key, "", "")
-
-	var first []multihash.Multihash
-	mp.hook = func() {
-		first = hygienePartDigests(t, mem, uploadID, 1)
-		if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)+100), nil); err != nil {
-			t.Errorf("replacing UploadPart: %v", err)
-		}
-		rel.fails = 1 // the first upload's re-record, after its park
-	}
-	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err == nil {
-		t.Fatal("the replaced upload succeeded although it could not record its releases")
-	}
-	if len(first) == 0 {
-		t.Fatal("the hook did not run after the first part was recorded")
-	}
-
-	// The replacement's records survived the park.
-	recorded := map[string]bool{}
-	for _, pr := range mustPending(t, mem) {
-		recorded[string(pr.Digest)] = true
-	}
-	for _, d := range first {
-		if !recorded[string(d)] {
-			t.Fatalf("no release record for the replaced upload's blob %x after its park", d)
-		}
-		if _, err := mem.ParkByDigest(ctx, d); err != nil {
-			t.Fatalf("the replaced upload's blob %x is not parked: %v", d, err)
-		}
-	}
-	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
-		t.Fatalf("drainSpaceReleases: %v", err)
-	}
-	for _, d := range first {
-		if !pu.abortedDigests()[string(d)] {
-			t.Fatalf("replaced upload's blob %x was not released", d)
-		}
-	}
-	for _, d := range hygienePartDigests(t, mem, uploadID, 1) {
-		if pu.abortedDigests()[string(d)] {
-			t.Fatalf("the replacement's blob %x was released", d)
-		}
-	}
+// expiringPutPart is a multipart store whose PutPart finds a reference of the
+// part's already expired, as one past its deadline before the row lands does.
+type expiringPutPart struct {
+	registry.MultipartStore
 }
 
-func mustPending(t *testing.T, mem *testStore) []pendingRelease {
-	t.Helper()
-	pending, err := mem.ListReleasesBySpace(context.Background(), mem.bk())
-	if err != nil {
-		t.Fatalf("ListReleasesBySpace: %v", err)
+func (expiringPutPart) PutPart(context.Context, registry.MultipartPart, *registry.PartTree, registry.ReleaseTask) ([]multihash.Multihash, error) {
+	return nil, registry.ErrReferenceExpired
+}
+
+// TestUploadPartWithAnExpiredReferenceIsSlowDown: a part whose reference
+// expired before its row was recorded is refused with SlowDown, which the
+// client retries, as an object write in the same case is.
+func TestUploadPartWithAnExpiredReferenceIsSlowDown(t *testing.T) {
+	b, _ := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+		d.Multipart = expiringPutPart{d.Multipart}
+	})
+	key := "expired-ref"
+	uploadID := mpCreate(t, b, key, "", "")
+	_, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil)
+	var apiErr s3err.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" {
+		t.Fatalf("UploadPart with an expired reference: %v, want SlowDown", err)
 	}
-	return pending
 }

@@ -40,6 +40,7 @@ func main() {
 	if err := cfg.WriteMapEncodersToFile("../s3frontend/cbor_gen.go", "s3frontend",
 		s3frontend.ShardCacheTask{},
 		s3frontend.ShardEvictTask{},
+		s3frontend.ShardAddTask{},
 	); err != nil {
 		panic(err)
 	}

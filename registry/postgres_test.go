@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multiformats/go-multihash"
@@ -122,15 +123,15 @@ func TestPostgresStores(t *testing.T) {
 		add("b", "k2", space)
 		add("b", "k1", space) // ON CONFLICT DO NOTHING — does not inflate the count
 		add("b2", "k1", space2)
-		if n, _ := r.CountClaims(ctx, space, digest); n != 2 {
+		if n, _ := r.CountReferences(ctx, space, digest, uuid.Nil); n != 2 {
 			t.Fatalf("count space1 = %d, want 2", n)
 		}
-		if n, _ := r.CountClaims(ctx, space2, digest); n != 1 {
+		if n, _ := r.CountReferences(ctx, space2, digest, uuid.Nil); n != 1 {
 			t.Fatalf("count space2 = %d, want 1", n)
 		}
 		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "b", ObjectKey: "k1", VersionID: registry.NullVersionID, Space: space})
 		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "b", ObjectKey: "k2", VersionID: registry.NullVersionID, Space: space})
-		if n, _ := r.CountClaims(ctx, space, digest); n != 0 {
+		if n, _ := r.CountReferences(ctx, space, digest, uuid.Nil); n != 0 {
 			t.Fatalf("count after release = %d, want 0", n)
 		}
 
@@ -158,59 +159,59 @@ func TestPostgresStores(t *testing.T) {
 		mustClaim(t, r, registry.BlobClaim{Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Bucket: "b", ObjectKey: "kn", VersionID: registry.NullVersionID, Space: space})
 	})
 
-	t.Run("pin claims require an existing claim, all or nothing", func(t *testing.T) {
+	t.Run("claims and parts take pending references over", func(t *testing.T) {
 		space := testutil.RandomDID(t)
-		d1 := multihash.Multihash([]byte{0x12, 0x20, 0xb1, 0x01})
-		d2 := multihash.Multihash([]byte{0x12, 0x20, 0xb1, 0x02})
-		pins := func(ds ...multihash.Multihash) []registry.BlobClaim {
-			var out []registry.BlobClaim
-			for _, d := range ds {
-				out = append(out, registry.BlobClaim{Digest: d, Bucket: "pb", ObjectKey: "copy", VersionID: "null#7", Space: space})
+		d := multihash.Multihash([]byte{0x12, 0x20, 0xb1, 0x01})
+		ref := func(t *testing.T) uuid.UUID {
+			t.Helper()
+			add, expire := uuid.New(), uuid.New()
+			st := registry.PendingRef(add, expire, space, d, time.Now().Add(time.Hour))
+			if _, err := pool.Exec(ctx, st.SQL, st.Args...); err != nil {
+				t.Fatalf("pending ref: %v", err)
 			}
-			return out
+			return add
 		}
-		// A refused pin fails the commit, and the root stays where it was.
+		count := func(t *testing.T, except uuid.UUID) int {
+			t.Helper()
+			n, err := r.CountReferences(ctx, space, d, except)
+			if err != nil {
+				t.Fatalf("CountReferences: %v", err)
+			}
+			return n
+		}
+		first, second := ref(t), ref(t)
+		if got := [2]int{count(t, uuid.Nil), count(t, first)}; got != [2]int{2, 1} {
+			t.Fatalf("[references, references but the first] = %v, want [2 1]", got)
+		}
+		// The claim takes the first reference over: still two references.
+		mustClaim(t, r, registry.BlobClaim{Digest: d, Bucket: "pb", ObjectKey: "k", VersionID: "null#1", Space: space, Ref: first})
+		if n := count(t, uuid.Nil); n != 2 {
+			t.Fatalf("references after the claim = %d, want 2 (the claim and the second reference)", n)
+		}
+		// A reference already taken over, or dropped, refuses the commit,
+		// and the root stays where it was.
 		before, _ := r.Get(ctx, "pb")
-		if err := pin(t, r, pins(d1)); !errors.Is(err, registry.ErrClaimGone) {
-			t.Fatalf("pin with no claim to attach to: err=%v, want ErrClaimGone", err)
+		err := claim(t, r, registry.BlobClaim{Digest: d, Bucket: "pb", ObjectKey: "k2", VersionID: "null#2", Space: space, Ref: first})
+		if !errors.Is(err, registry.ErrReferenceExpired) {
+			t.Fatalf("claim of a reference taken over: err=%v, want ErrReferenceExpired", err)
 		}
 		if after, _ := r.Get(ctx, "pb"); before != nil && !after.Root.Equals(before.Root) {
-			t.Fatalf("a refused pin advanced the root: %v -> %v", before.Root, after.Root)
+			t.Fatalf("a refused claim advanced the root: %v -> %v", before.Root, after.Root)
 		}
-		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: d1, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
-			t.Fatalf("PutLocation: %v", err)
+		// A part takes the second reference over in its own write.
+		seedBucket(t, "pp")
+		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: "refs-up", Bucket: "pp", ObjectKey: "o", Space: space}); err != nil {
+			t.Fatalf("CreateSession: %v", err)
 		}
-		mustClaim(t, r, registry.BlobClaim{Digest: d1, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space})
-		// d1 is claimed, d2 is not: nothing is recorded.
-		if err := pin(t, r, pins(d1, d2)); !errors.Is(err, registry.ErrClaimGone) {
-			t.Fatalf("pin with one unclaimed digest: err=%v, want ErrClaimGone", err)
+		t.Cleanup(func() { _ = r.DeleteSession(context.Background(), "refs-up") })
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "refs-up", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, Refs: []uuid.UUID{second}}, nil, registry.ReleaseTask{}); err != nil {
+			t.Fatalf("PutPart: %v", err)
 		}
-		if n, _ := r.CountClaims(ctx, space, d1); n != 1 {
-			t.Fatalf("refused pin left %d claims on d1, want the source's 1", n)
+		if n := count(t, uuid.Nil); n != 2 {
+			t.Fatalf("references after the part = %d, want 2 (the claim and the part)", n)
 		}
-		if err := pin(t, r, pins(d1)); err != nil {
-			t.Fatalf("pin beside a live claim: %v, want recorded", err)
-		}
-		if err := pin(t, r, pins(d1)); err != nil {
-			t.Fatalf("repeated pin: %v, want idempotent", err)
-		}
-		if n, _ := r.CountClaims(ctx, space, d1); n != 2 {
-			t.Fatalf("claims after pin = %d, want 2", n)
-		}
-		// A claim in another space does not qualify.
-		other := testutil.RandomDID(t)
-		if err := pin(t, r, []registry.BlobClaim{{Digest: d1, Bucket: "pb2", ObjectKey: "copy", VersionID: "null#1", Space: other}}); !errors.Is(err, registry.ErrClaimGone) {
-			t.Fatalf("pin against another space's claim: err=%v, want ErrClaimGone", err)
-		}
-		// Dropping the source's claim beside the pin records no release;
-		// dropping the pin too does.
-		drop(t, r, registry.ClaimDrop{Digest: d1, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space})
-		if releaseRecorded(t, pool, space, d1) {
-			t.Fatalf("drop of the source beside the pin recorded a release")
-		}
-		drop(t, r, registry.ClaimDrop{Digest: d1, Bucket: "pb", ObjectKey: "copy", VersionID: "null#7", Space: space})
-		if !releaseRecorded(t, pool, space, d1) {
-			t.Fatalf("drop of the last claim recorded no release")
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "refs-up", PartNumber: 2, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, Refs: []uuid.UUID{second}}, nil, registry.ReleaseTask{}); !errors.Is(err, registry.ErrReferenceExpired) {
+			t.Fatalf("part with a reference taken over: err=%v, want ErrReferenceExpired", err)
 		}
 	})
 
@@ -693,9 +694,9 @@ func TestPostgresStores(t *testing.T) {
 			t.Fatalf("CountPartRefs(unique, exclude owner) = %d, err %v (want 0)", n, err)
 		}
 
-		// CountLivePartRefs: parts of open sessions count.
-		if n, err := r.CountLivePartRefs(ctx, lsSpace, shared); err != nil || n != 2 {
-			t.Fatalf("CountLivePartRefs(shared) = %d, err %v (want 2)", n, err)
+		// CountReferences: parts of open sessions count.
+		if n, err := r.CountReferences(ctx, lsSpace, shared, uuid.Nil); err != nil || n != 2 {
+			t.Fatalf("CountReferences(shared) = %d, err %v (want 2)", n, err)
 		}
 
 		// 'completed' passes the widened state CHECK constraint, and the
@@ -715,14 +716,14 @@ func TestPostgresStores(t *testing.T) {
 		}
 		// A completed session's parts are no longer live; an aborting one's
 		// are not either.
-		if n, err := r.CountLivePartRefs(ctx, lsSpace, shared); err != nil || n != 1 {
-			t.Fatalf("CountLivePartRefs(shared) after ls-1 completed = %d, err %v (want 1)", n, err)
+		if n, err := r.CountReferences(ctx, lsSpace, shared, uuid.Nil); err != nil || n != 1 {
+			t.Fatalf("CountReferences(shared) after ls-1 completed = %d, err %v (want 1)", n, err)
 		}
 		if won, err := r.LatchSession(ctx, "ls-2", registry.SessionOpen, registry.SessionAborting); err != nil || !won {
 			t.Fatalf("latch ls-2 to aborting won=%v err=%v", won, err)
 		}
-		if n, err := r.CountLivePartRefs(ctx, lsSpace, shared); err != nil || n != 0 {
-			t.Fatalf("CountLivePartRefs(shared) after ls-2 aborting = %d, err %v (want 0)", n, err)
+		if n, err := r.CountReferences(ctx, lsSpace, shared, uuid.Nil); err != nil || n != 0 {
+			t.Fatalf("CountReferences(shared) after ls-2 aborting = %d, err %v (want 0)", n, err)
 		}
 
 		for _, id := range []string{"ls-1", "ls-2", "ls-3"} {
@@ -1124,11 +1125,9 @@ func TestCommitRootWithoutTasksRefusesRegistrations(t *testing.T) {
 }
 
 // TestConcurrentCommitClaims runs two commits claiming the same thousands
-// of digests at once, many times over, one listing them in reverse. A commit
-// takes a claim-key lock per digest, so the two take overlapping lock sets
-// and must take them in one order whatever order their claims arrive in, or
-// Postgres aborts one with a deadlock error. Each writer commits to a bucket
-// of its own: the root swap serialises the writers of one bucket.
+// of digests at once, many times over, one listing them in reverse, and
+// checks neither fails nor loses a claim. Each writer commits to a bucket of
+// its own: the root swap serialises the writers of one bucket.
 func TestConcurrentCommitClaims(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.New(t)
@@ -1189,16 +1188,16 @@ func TestConcurrentCommitClaims(t *testing.T) {
 			}
 		}
 	}
-	if c, err := r.CountClaims(ctx, space, digests[0]); err != nil || c != 20 {
+	if c, err := r.CountReferences(ctx, space, digests[0], uuid.Nil); err != nil || c != 20 {
 		t.Fatalf("claims on the first digest = %d, %v; want 20", c, err)
 	}
 }
 
 // TestReleaseGraceRunsFromTheSwap: a drop's release is due the grace
 // after the swap commits, not after its transaction began. A swap that
-// waited on a claim-key lock (here held by another transaction) owes a
-// reader that resolved the discarded version meanwhile the whole grace from
-// the commit.
+// waited on the bucket row (here held by another transaction) owes a reader
+// that resolved the discarded version meanwhile the whole grace from the
+// commit.
 func TestReleaseGraceRunsFromTheSwap(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.New(t)
@@ -1213,22 +1212,20 @@ func TestReleaseGraceRunsFromTheSwap(t *testing.T) {
 	mustClaim(t, r, c)
 	t.Cleanup(func() { _ = r.Delete(context.Background(), bucket) })
 
-	// Another transaction holds the digest's claim-key lock while the drop's
-	// commit begins and waits.
+	const grace, stall = time.Second, 300 * time.Millisecond
+	st, err := r.Get(ctx, bucket)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	// Another transaction holds the bucket row while the drop's commit
+	// begins and waits.
 	holder, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	defer holder.Rollback(ctx)
-	if _, err := holder.Exec(ctx,
-		`SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || encode($2, 'hex'), 0))`,
-		space.String(), []byte(d)); err != nil {
-		t.Fatalf("lock claim key: %v", err)
-	}
-	const grace, stall = time.Second, 300 * time.Millisecond
-	st, err := r.Get(ctx, bucket)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
+	if _, err := holder.Exec(ctx, `SELECT 1 FROM ingot.buckets WHERE name = $1 FOR UPDATE`, bucket); err != nil {
+		t.Fatalf("lock bucket row: %v", err)
 	}
 	start := time.Now()
 	done := make(chan error, 1)

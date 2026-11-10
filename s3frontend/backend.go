@@ -79,6 +79,9 @@ type Backend struct {
 	// the cache, and cacheTTL how long a renewal lasts.
 	shards   *taskrunner.Runner
 	renewals *recencyMap
+	// lent is the authority requests lend for their spaces while they wait
+	// on queued work (lendAuthority).
+	lent     lends
 	cacheTTL time.Duration
 	// uploadRetry is the queue-space-upload retry policy, and drainTimeout
 	// how long a bucket delete waits for its space's changes; tests shorten
@@ -117,10 +120,8 @@ type Backend struct {
 	// acceptors runs each multipart upload's acceptor (see acceptor.go).
 	acceptors acceptors
 	// concluding marks the conclusions in flight in this process (see
-	// markConcluding), and writing the blobs a write in flight has sent and
-	// not yet recorded as parked or accepted (see bodyWriter.hold).
+	// markConcluding).
 	concluding     blobMarks
-	writing        blobMarks
 	lastOrphanPass time.Time
 	// overBudgetWarned and timeLimitLogged are set once the sweeper has
 	// logged that usage is over budget with nothing left to evict, or that the

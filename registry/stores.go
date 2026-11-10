@@ -7,6 +7,8 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // This file defines the relational surface the upload/storage/delete
@@ -76,6 +78,10 @@ type BlobClaim struct {
 	ObjectKey string
 	VersionID string
 	Space     did.DID
+	// Ref is the write's pending reference the claim takes over: the ID of
+	// the queue-space-shard.add that took it. Not stored; zero for a claim
+	// that takes none over (see RootCommit.Claims).
+	Ref taskrunner.TaskID
 }
 
 // UploadIntent is one row of ingot.upload_intents: a blob Ingot wrote, with
@@ -249,6 +255,10 @@ type MultipartPart struct {
 	// State is one of the Part* values; empty records PartWritten.
 	State     string
 	CreatedAt time.Time
+	// Refs are the write's pending references to the part's blobs, which
+	// PutPart takes over: the IDs of the queue-space-shard.add tasks that
+	// took them. Not stored.
+	Refs []taskrunner.TaskID
 }
 
 // PartTree is the BLAKE3 tree material UploadPart records for one part: the
@@ -292,12 +302,25 @@ type PartTree struct {
 // BlobRefStore reads the reverse reference index (§5, §6). The index is
 // written by commits alone: a version's claims land and a discarded
 // version's claims drop in the root swap's transaction
-// (Registry.CommitRoot, RootCommit). CountClaims gates remove(digest):
+// (Registry.CommitRoot, RootCommit). CountReferences gates a blob's release:
 // physical reclamation when the count reaches zero.
 type BlobRefStore interface {
-	// CountClaims returns how many object versions in space still reference
-	// digest. Zero means the space's claim may be released.
-	CountClaims(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
+	// CountReferences returns how many references space holds to digest:
+	// the object versions that claim it, the writes' pending references
+	// other than except's (the add task ID that took one; zero for none),
+	// and the parts of its in-flight (open or completing) multipart
+	// sessions. Parts of completed and aborting sessions do not count: a
+	// completed session's winners hold claims and its orphans have releases
+	// of their own, and an aborting session is queueing releases for its
+	// parts. Zero means the blob may be released.
+	CountReferences(ctx context.Context, space did.DID, digest multihash.Multihash, except taskrunner.TaskID) (int, error)
+	// PendingRefByExpiry returns the add task ID of the pending reference
+	// whose queue-space-shard.expire is expire, or ErrNotFound once nothing
+	// holds it: a claim or a part row took it over, or it was dropped.
+	PendingRefByExpiry(ctx context.Context, expire taskrunner.TaskID) (taskrunner.TaskID, error)
+	// ExpiriesOf returns the queue-space-shard.expire task of each of refs
+	// that is still a pending reference, in no particular order.
+	ExpiriesOf(ctx context.Context, refs []taskrunner.TaskID) ([]taskrunner.TaskID, error)
 	// QueueReleases queues the release of each of digests in space, due at
 	// notBefore and carrying release's authority, in one transaction. A
 	// digest repeated is released once, and a release already pending keeps
@@ -500,15 +523,6 @@ type MultipartStore interface {
 	// digest — the shared-blob guard for abort/supersede cleanup
 	// (content-addressed part blobs may be deduped across sessions).
 	CountPartRefs(ctx context.Context, digest multihash.Multihash, excludeUploadID string) (int, error)
-	// CountLivePartRefs returns how many parts of space's in-flight sessions
-	// (open or completing) reference digest: the guard a deferred release
-	// checks before taking a blob a session still means to claim. Parts of
-	// completed and aborting sessions do not count — a completed session's
-	// winners hold claims and its orphans have releases of their own, and an
-	// aborting session is queueing releases for its parts. Another space's
-	// sessions do not count either: a release is one space's, and the same
-	// bytes in another space are that space's own blob.
-	CountLivePartRefs(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
 }
 
 // GCStore records superseded MST node CIDs (§4). Write-only this iteration.

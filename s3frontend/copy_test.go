@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"github.com/google/uuid"
 	"io"
 	"net/http"
 	"strings"
@@ -218,7 +219,7 @@ func TestCopyObject_CrossSpaceReingest(t *testing.T) {
 	srcDigests := map[string]bool{}
 	for _, ref := range storedBlobs(t, b, srcRv) {
 		srcDigests[string(ref.Digest)] = true
-		if n, _ := mem.CountClaims(ctx, srcSt.Space, ref.Digest); n != 1 {
+		if n, _ := mem.CountReferences(ctx, srcSt.Space, ref.Digest, uuid.Nil); n != 1 {
 			t.Fatalf("source blob claims = %d, want 1 (untouched)", n)
 		}
 	}
@@ -226,7 +227,7 @@ func TestCopyObject_CrossSpaceReingest(t *testing.T) {
 		if srcDigests[string(ref.Digest)] {
 			t.Fatalf("destination pins a source blob %x; a cross-space copy must re-ingest", ref.Digest)
 		}
-		if n, _ := mem.CountClaims(ctx, dstSt.Space, ref.Digest); n != 1 {
+		if n, _ := mem.CountReferences(ctx, dstSt.Space, ref.Digest, uuid.Nil); n != 1 {
 			t.Fatalf("destination blob claims = %d, want 1", n)
 		}
 	}
@@ -263,13 +264,12 @@ func (h *hookAllocSeq) AllocVersionSeq(ctx context.Context, name string) (uint64
 	return h.Registry.AllocVersionSeq(ctx, name)
 }
 
-// TestCopyObject_PinnedSourceReleasedBeforeCommitIsNoSuchKey: a same-space
-// copy pins the source's body. If the source is deleted and its blobs'
-// release runs after the copy resolved the source but before its commit,
-// the pin finds no claim to attach to and the copy fails with NoSuchKey
-// instead of committing a manifest over released blobs. Nothing is left
-// claimed or pending afterwards.
-func TestCopyObject_PinnedSourceReleasedBeforeCommitIsNoSuchKey(t *testing.T) {
+// TestCopyObject_PinnedSourceDeletedBeforeCommitKeepsItsBlobs: a same-space
+// copy takes a reference to each of the source's blobs before its commit. If
+// the source is deleted and its blobs' release runs after that and before the
+// commit, the release finds the copy's references and does nothing, and the
+// copy commits over blobs its provider still holds.
+func TestCopyObject_PinnedSourceDeletedBeforeCommitKeepsItsBlobs(t *testing.T) {
 	rm := &recordingRemover{}
 	reg := &hookAllocSeq{bucket: "dst"}
 	var b *Backend
@@ -286,7 +286,8 @@ func TestCopyObject_PinnedSourceReleasedBeforeCommitIsNoSuchKey(t *testing.T) {
 		}
 	}
 	srcBucket, srcKey := "src", "obj"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("pin me")), ContentLength: byteLen([]byte("pin me"))}); err != nil {
+	body := []byte("pin me")
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader(body), ContentLength: byteLen(body)}); err != nil {
 		t.Fatal(err)
 	}
 	srcRv, err := b.resolveVersion(ctx, "src", "obj", "")
@@ -302,44 +303,39 @@ func TestCopyObject_PinnedSourceReleasedBeforeCommitIsNoSuchKey(t *testing.T) {
 		drainReleases(t, b)
 	}
 	dstBucket, dstKey, source := "dst", "copied", "src/obj"
-	_, err = b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dstBucket, Key: &dstKey, CopySource: &source})
-	var apiErr s3err.APIError
-	if !errors.As(err, &apiErr) || apiErr.Code != "NoSuchKey" {
-		t.Fatalf("copy whose source was released before the commit: err = %v, want NoSuchKey", err)
+	if _, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dstBucket, Key: &dstKey, CopySource: &source}); err != nil {
+		t.Fatalf("copy whose source was deleted before its commit: %v", err)
 	}
 	if reg.hook != nil {
 		t.Fatal("the source was never deleted")
 	}
-	if _, err := b.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &dstBucket, Key: &dstKey}); err == nil {
-		t.Fatal("the copy committed a manifest over released blobs")
-	}
 	for _, d := range digests {
-		if n, _ := mem.CountClaims(ctx, space, d); n != 0 {
-			t.Fatalf("claims on released blob %x = %d, want 0 (a leaked pin)", d, n)
+		if n := rm.removedDigests()[string(d)]; n != 0 {
+			t.Fatalf("blob %x the copy references was removed %d times", d, n)
 		}
-		if rm.removedDigests()[string(d)] != 1 {
-			t.Fatalf("blob %x removed %d times, want once", d, rm.removedDigests()[string(d)])
+		if n, _ := mem.CountClaimRows(ctx, space, d); n != 1 {
+			t.Fatalf("claims on blob %x = %d, want the copy's", d, n)
 		}
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, space); len(pending) != 0 {
-		t.Fatalf("pending releases after the refused copy = %v, want none", pending)
+	if got := getFrom(t, b, "dst", "copied"); !bytes.Equal(got, body) {
+		t.Fatalf("the copy does not read back")
 	}
+}
 
-	// The same copy against a live source pins as before.
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("pin me")), ContentLength: byteLen([]byte("pin me"))}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dstBucket, Key: &dstKey, CopySource: &source}); err != nil {
-		t.Fatalf("copy of a live source: %v", err)
-	}
-	dstRv, err := b.resolveVersion(ctx, "dst", "copied", "")
+// TestPinBlobsRefusesABlobTheSpaceNoLongerHolds: a same-space copy's
+// reference to a source blob whose release has run, its location gone, fails
+// the copy.
+func TestPinBlobsRefusesABlobTheSpaceNoLongerHolds(t *testing.T) {
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{})
+	ctx := context.Background()
+	st, err := mem.Get(ctx, "bk")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, d := range storedBlobs(t, b, dstRv).DigestList() {
-		if n, _ := mem.CountClaims(ctx, space, d); n != 2 {
-			t.Fatalf("claims on pinned blob %x = %d, want 2 (source and copy)", d, n)
-		}
+	var blobs msbucket.BlobRefs
+	blobs.Append(mustSum([]byte("released")), 8)
+	if _, err := b.pinBlobs(ctx, st, blobs); !errors.Is(err, errBlobGone) {
+		t.Fatalf("pinBlobs of an unlocated blob: err = %v, want errBlobGone", err)
 	}
 }
 
@@ -439,12 +435,12 @@ func TestCopyObject_SourceWithoutChecksumGetsDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	data := []byte("legacy object")
-	body, blobs, err := b.ingestBody(ctx, st, bytes.NewReader(data), int64(len(data)), nil, false)
+	body, blobs, refs, err := b.ingestBody(ctx, st, bytes.NewReader(data), int64(len(data)), nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	legacy := &msbucket.ObjectManifest{Key: "legacy", Created: time.Now().Unix(), Body: body, ETag: hex.EncodeToString(body.MD5), ContentType: "application/octet-stream"}
-	if _, _, err := b.commitVersion(ctx, st, "legacy", legacy, blobs, nil, false, nil); err != nil {
+	if _, _, err := b.commitVersion(ctx, st, "legacy", legacy, blobs, nil, refs, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -472,7 +468,7 @@ func TestCopyObject_SourceOverCopyLimit(t *testing.T) {
 	}
 	huge := &msbucket.ObjectManifest{Key: "huge", Created: time.Now().Unix(), Body: msbucket.Body{Size: maxCopySize + 1}, ETag: "00000000000000000000000000000000"}
 	// No blobs: an empty list, so the commit has nothing to read or claim.
-	if _, _, err := b.commitVersion(ctx, st, "huge", huge, msbucket.BlobRefs{}, nil, false, nil); err != nil {
+	if _, _, err := b.commitVersion(ctx, st, "huge", huge, msbucket.BlobRefs{}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	bucket, key, source := "bk", "copied", "bk/huge"

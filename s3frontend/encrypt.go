@@ -69,12 +69,6 @@ type bodyWriter struct {
 	// cache, when set, takes a copy of each blob as it streams, which the
 	// write adopts once the provider holds the blob; nil keeps none.
 	cache *blockstore.BlobCache
-
-	// mark marks a blob this write has sent as a write in flight for its
-	// space (Backend.writing), and holds keeps the functions that end the
-	// marks, by string(digest).
-	mark  func(multihash.Multihash) func()
-	holds map[string]func()
 }
 
 // encWrite is one blob's write-side state, keyed by stored digest in
@@ -114,9 +108,8 @@ func (b *Backend) tenantRecipient(ctx context.Context) (fee.Recipient, error) {
 	return fee.NewECDHESRecipient([]byte(kid), pub), nil
 }
 
-// record wraps the blob's CEK and keeps its encryption state for splitBody,
-// and marks the blob as a write in flight. A plaintext blob has no CEK; its
-// stored size is all that is kept.
+// record wraps the blob's CEK and keeps its encryption state for splitBody.
+// A plaintext blob has no CEK; its stored size is all that is kept.
 func (w *bodyWriter) record(ctx context.Context, digest multihash.Multihash, cek []byte, res encWrite) error {
 	if _, ok := w.results[string(digest)]; ok {
 		// The same bytes twice in one body, which a body stored as received
@@ -136,12 +129,6 @@ func (w *bodyWriter) record(ctx context.Context, digest multihash.Multihash, cek
 		res.wrapped = wrapped
 	}
 	w.results[string(digest)] = res
-	if w.mark != nil {
-		if w.holds == nil {
-			w.holds = map[string]func(){}
-		}
-		w.holds[string(digest)] = w.mark(digest)
-	}
 	return nil
 }
 
@@ -192,14 +179,10 @@ func (w *bodyWriter) locals() map[string]*blockstore.TempBlob {
 	return out
 }
 
-// drop discards the cache copies and ends the marks, for a body that failed.
-// Its allocations are left for the provider to expire, as a request that
-// died leaves them.
+// drop discards the cache copies, for a body that failed. Its allocations
+// are left for the provider to expire, as a request that died leaves them.
 func (w *bodyWriter) drop() {
 	for _, res := range w.results {
 		res.local.Discard()
-	}
-	for _, unhold := range w.holds {
-		unhold()
 	}
 }

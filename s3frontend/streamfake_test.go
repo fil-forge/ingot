@@ -194,6 +194,22 @@ func abortedOn(b *Backend, digest multihash.Multihash) bool {
 	return a.aborted[string(digest)] > 0
 }
 
+// abortCount reports how many parks b's provider was asked to abort, through
+// the test's streaming adapter.
+func abortCount(b *Backend) int {
+	a, ok := b.deferred.(*streamingAdapter)
+	if !ok {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	n := 0
+	for _, c := range a.aborted {
+		n += c
+	}
+	return n
+}
+
 // streamingDir is where a test's adapter writes the bytes it hands its fake.
 func streamingDir(dir string) string { return filepath.Join(dir, "streams") }
 

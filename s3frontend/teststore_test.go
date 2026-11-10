@@ -3,6 +3,7 @@ package s3frontend
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -56,9 +57,7 @@ func newTestStore(t testing.TB) *testStore {
 		Schema: "ingot",
 		Queues: []taskrunner.QueueOptions{
 			{Name: registry.UploadQueue, Workers: 2},
-			// No workers: a release runs when a test sweeps (SweepPendingReleases)
-			// or an S3 verb runs it inline, as the tests expect.
-			{Name: registry.ReleaseQueue},
+			{Name: registry.ReleaseQueue, Workers: 2},
 			{Name: ShardQueue, Workers: 2},
 		},
 		LeaseTTL:     time.Second,
@@ -96,8 +95,8 @@ func (s *testStore) start(t testing.TB, b *Backend) {
 		t.Fatalf("register shard flush: %v", err)
 	}
 	// A failed release waits for the next sweep (SweepPendingReleases), not
-	// a delay, as the sweeper retried one at its next pass.
-	b.releaseRetry = taskrunner.RetryPolicy{First: time.Hour, Max: time.Hour}
+	// a delay, and holds its subject meanwhile, as in production.
+	b.releaseRetry = taskrunner.RetryPolicy{First: time.Hour, Max: time.Hour, HoldsSubject: true}
 	if err := b.RegisterReleaseTasks(s.tasks); err != nil {
 		t.Fatalf("register release tasks: %v", err)
 	}
@@ -207,6 +206,13 @@ func (s *testStore) spaceOf(ctx context.Context, table string, digest multihash.
 		return did.Parse(spaces[0])
 	}
 	return did.Undef, fmt.Errorf("digest %x has %s rows in %d spaces", digest, table, len(spaces))
+}
+
+// CountClaimRows returns how many object versions in space claim digest.
+func (s *testStore) CountClaimRows(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM ingot.blob_refs WHERE space = $1 AND digest = $2`, space, []byte(digest)).Scan(&n)
+	return n, err
 }
 
 // IntentByDigest returns the one intent for digest, in whichever space holds
@@ -352,7 +358,8 @@ func (s *testStore) ReleasingDigests(ctx context.Context, space did.DID, digests
 // stale release or a deferred one does not count. It runs the queue's no-op
 // on each subject with a release pending, which runs what is due there and
 // leaves what is not. A release waiting to retry is brought forward first, as
-// the sweeper retried a failed release at its next pass.
+// the sweeper retried a failed release at its next pass; one that fails again
+// is left waiting to retry.
 func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 	s := storeFor(b)
 	tasks, err := s.queued(ctx, registry.ReleaseQueue)
@@ -377,8 +384,12 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 			}
 		}
 	}
+	// A release that fails waits to retry holding its subject, so the
+	// no-op behind it cannot start: its flush expires, which is not the
+	// sweep's failure.
 	for _, subject := range subjects {
-		if err := b.flushRelease(ctx, subject, time.Now().Add(10*time.Second)); err != nil {
+		err := b.flushRelease(ctx, subject, time.Now().Add(2*time.Second))
+		if err != nil && !errors.Is(err, taskrunner.ErrExpired) && !errors.Is(err, context.DeadlineExceeded) {
 			return 0, err
 		}
 	}
