@@ -191,8 +191,8 @@ github.com/fil-forge/libforge v0.0.0-20261022121207-bcdd5eacc465 h1:y7EPy1Fbn/LW
 github.com/fil-forge/libforge v0.0.0-20261022121207-bcdd5eacc465/go.mod h1:ZtPwUgXm7gqQSmjmIcfMy5AwWpFIR02WMZvbgNOwi/4=
 github.com/fil-forge/smelt v0.0.0-20261021123053-359a84935c40 h1:Meq7loWqQvwCVtlUGP173VfULpOM33YtSyej5507USU=
 github.com/fil-forge/smelt v0.0.0-20261021123053-359a84935c40/go.mod h1:Zz67XgtRsLViFDCVMxpXwRcge9Y3dbUA9rvZqAF93vg=
-github.com/fil-forge/swarf v0.0.1-0.20260922133653-0b2e5b2e1c6c h1:uzLK4I8rD2SXBTeb/qOMbnfD/oAr2RoFVP730abzzyo=
-github.com/fil-forge/swarf v0.0.1-0.20260922133653-0b2e5b2e1c6c/go.mod h1:sSe3eJWknrWxnldIpU46aWI2Rvq9PwiA3nUiSFn9Rxk=
+github.com/fil-forge/swarf v0.0.1-0.20261105200428-4b21d0214d80 h1:Ceg1afUxLDvk+e2tjc6J+0663GCSZMhvQKAVP6TBSpU=
+github.com/fil-forge/swarf v0.0.1-0.20261105200428-4b21d0214d80/go.mod h1:bQHWuu146k3KZWpEWbj+jtgQMjzVUxb5TKO+YWprVTo=
 github.com/fil-forge/ucantone v0.0.0-20261103134646-342e8488c56a h1:RmV9ClZWftnSW5jDMC6Xtb55wNkdz2j07+pR6eiaQbg=
 github.com/fil-forge/ucantone v0.0.0-20261103134646-342e8488c56a/go.mod h1:430/+X2LtJhgc4yMsoRhMImJ4fdWDpaaubS3v55F6kA=
 github.com/fil-forge/versitygw v0.0.0-20261022150420-98421668449a h1:fvZ91kHBN7EUbwjjHYLTFMwWj8vQpSYB9ZDJDSYrzFg=
@@ -331,6 +331,8 @@ github.com/hashicorp/go-uuid v1.0.3 h1:2gKiV6YVmrJ1i2CKKa9obLvRieoRGviZFL26PcT/C
 github.com/hashicorp/go-uuid v1.0.3/go.mod h1:6SBZvOh/SIDV7/2o3Jml5SYk/TvGqwFJ/bN7x4byOro=
 github.com/hashicorp/go-version v1.9.0 h1:CeOIz6k+LoN3qX9Z0tyQrPtiB1DFYRPfCIBtaXPSCnA=
 github.com/hashicorp/go-version v1.9.0/go.mod h1:fltr4n8CU8Ke44wwGCBoEymUuxUHl09ZGVZPK5anwXA=
+github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs4luLUK2k=
+github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
 github.com/hashicorp/hcl v1.0.1-vault-7 h1:ag5OxFVy3QYTFTJODRzTKVZ6xvdfLLCA1cy/Y6xGI0I=
 github.com/hashicorp/hcl v1.0.1-vault-7/go.mod h1:XYhtn6ijBSAj6n4YqAaf7RBPS4I06AItNorpy+MoQNM=
 github.com/hashicorp/vault-client-go v0.4.3 h1:zG7STGVgn/VK6rnZc0k8PGbfv2x/sJExRKHSUg3ljWc=

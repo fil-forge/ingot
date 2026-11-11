@@ -258,8 +258,8 @@ Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer)
 [`logstore/README.md`](../logstore/README.md).
 
 Sources: `s3frontend/object.go` (ingestBody), `s3frontend/stream.go`,
-`s3frontend/shardref.go` (runAdd), `s3frontend/bucketqueue.go` (runCommit),
-`s3frontend/bucketship.go` (runShip),
+`queue/spaceshardqueue/spaceshardqueue.go` (runAdd), `queue/bucketqueue/bucketqueue.go` (runCommit),
+`queue/bucketqueue/ship.go` (runShip),
 `bucket/sized.go`, `blockstore/blobcache.go`,
 `blockstore/staging.go`, `logstore/`, `uploader/forge.go`, `uploader/blob.go`,
 `server.go` (newBucketFlushFunc). Review when these change.
@@ -303,7 +303,7 @@ sequenceDiagram
     end
     B->>R: PutEncryptionParams(region-wrapped CEK, FEE geometry) per blob
     loop each blob (concludeBody → addBlob)
-        Note over B,R: a sync queue-space-shard.add on the blob's release subject (space/hex digest),<br/>after any release ahead of it, within 30 s (else SlowDown)
+        Note over B,R: a sync queue-space-shard.add on the blob's subject (space/hex digest),<br/>after any release ahead of it, within 30 s (else SlowDown)
         alt blob_locations already has (space, digest)
             B->>R: PutIntent(accepted)<br/>(only a plaintext bucket's repeated bytes hit: every envelope digest is new)
         else conclude
@@ -406,12 +406,13 @@ sequenceDiagram
 Cross-references: [`architecture.md` §7.1](./architecture.md#71-write-single-shot-putobject).
 
 Sources: `s3frontend/object.go` (PutObject, ingestBody, concludeBody),
-`s3frontend/shardref.go` (addBlob, runAdd, runExpire), `s3frontend/stream.go` (WriteSizedBlob), `s3frontend/localblobs.go`
-(cacheWritten), `blockstore/blobcache.go`, `bucket/sized.go`, `uploader/stream.go`,
+`queue/spaceshardqueue/spaceshardqueue.go` (Add, runAdd, runExpire), `s3frontend/stream.go` (WriteSizedBlob), `queue/shardqueue/shardqueue.go`
+(Cache), `blockstore/blobcache.go`, `bucket/sized.go`, `uploader/stream.go`,
 `s3frontend/copy.go` (CopyObject, copySourceBucket),
-`s3frontend/version.go` (applyPut), `s3frontend/bucketqueue.go` (commit, runCommit, register),
+`queue/bucketqueue/version.go` (applyPut), `queue/bucketqueue/bucketqueue.go` (Commit, runCommit, register),
+`s3frontend/bucketqueue.go` (commit),
 `registry/bucketcommit.go` (RootCommitWrites),
-`s3frontend/uploadqueue.go` (the queue-space-upload handlers), `bucketop/bucketop.go`,
+`queue/spaceuploadqueue/spaceuploadqueue.go` (the queue-space-upload handlers), `bucketop/bucketop.go`,
 `blockstore/staging.go`, `uploader/blob.go`, `uploader/forge.go`,
 `uploader/upload.go`. Review when these change.
 
@@ -440,7 +441,7 @@ sequenceDiagram
     alt manifest-valued key
         Note over B,LY: the value block is the manifest<br/>(answers every versionId class)
     else leaf-valued key
-        Note over B,LY: Current for the head, otherwise seek the prev tree at<br/>revSeqKey(seq) and confirm the stored VersionID (see version-tree)
+        Note over B,LY: Current for the head, otherwise seek the prev tree at<br/>RevSeqKey(seq) and confirm the stored VersionID (see version-tree)
     end
     Note over B: delete marker: 404 NoSuchKey (current) or 405 (versioned),<br/>then preconditions and selectBytes (Range, or partNumber via Body.PartSizes)
     B->>R: bodyOpener: unless the manifest marks the body plaintext,<br/>blob_encryption_params + blob_locations for the blobs the range covers,<br/>one query each (a missing row fails the read)
@@ -530,7 +531,7 @@ sequenceDiagram
         B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412)#59;<br/>the body is the source's plaintext range through the decrypting reader
     end
     B->>B: ingestPart: splitBody<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope streamed to piri under its ciphertext<br/>digest + params row, as in the PutObject diagram#59; no local copy)
-    loop each part blob (parkBlobs → addBlob: a sync queue-space-shard.add on the blob's release subject)
+    loop each part blob (parkBlobs → addBlob: a sync queue-space-shard.add on the blob's subject)
         alt blob_locations already has the digest
             B->>R: intent accepted (dedup, no park)
         else already parked (GetPark hit)
@@ -561,7 +562,7 @@ sequenceDiagram
     S->>R: with the task's commit: park swapped for the location while the concluded park<br/>(by AddTask) stands#59; intent accepted (published stays)#59; a park beside a standing<br/>location dropped#59; the blob taken off its parts' lists of blobs still to accept, while it is located, and a part left with none accepted
     Note over S,R: a failed conclude fails the task and records nothing#59; the retry concludes again<br/>(a repeat to sprue)#59; 5 attempts from 5 s, doubling, up to 1 min
     C->>B: CompleteMultipartUpload(parts)
-    B->>M: run sync: queue-multipart-upload.complete, to start within replayWaitBudget (10 s)<br/>behind the upload's other changes, another Complete included
+    B->>M: run sync: queue-multipart-upload.complete, to start within the complete wait (10 s)<br/>behind the upload's other changes, another Complete included
     alt it did not start in time
         B-->>C: 409 OperationAborted
     else session already completed
@@ -578,7 +579,7 @@ sequenceDiagram
         end
         Note over B,C: from here the body is padded with a newline every<br/>complete_multipart_keepalive (5 s), and any error goes in the 200's body
         M->>R: manifest spans from each part's span_lengths<br/>(rows without them: intent size + FEE geometry)
-        M->>S: queue the accept of each blob of the named parts still parked, committed at once,<br/>then bring them forward and wait for them, within acceptWaitBudget (30 s) in all#59;<br/>their writes commit before Complete reads the parts and assembles the tree
+        M->>S: queue the accept of each blob of the named parts still parked, committed at once,<br/>then bring them forward and wait for them, within the accept wait (30 s) in all#59;<br/>their writes commit before Complete reads the parts and assembles the tree
         alt the accepts did not finish in time
             B-->>C: OperationAborted in the 200's body#59; the upload stays open
         else a named part still parked (its blob's accept failed)
@@ -639,15 +640,16 @@ sequenceDiagram
 Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 [§7.3](./architecture.md#73-one-change-per-upload-the-abortcomplete-race).
 
-Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
-acceptRequested, sessionReleases), `s3frontend/multipartqueue.go`
-(runCreateUpload, runAddPart, runAbort, runReap), `registry/multipartqueue.go`
-(PartWrites, CompletedSession),
-`s3frontend/version.go` (reserveVersion, applyPut), `s3frontend/bucketqueue.go` (putPreCheck),
-`s3frontend/acceptor.go` (runAccept, runBlobAccept), `registry/accept.go`,
+Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs),
+`queue/multipartqueue/multipartqueue.go` (runCreate, runAddPart, runAbort,
+sessionReleases, runReap), `queue/multipartqueue/complete.go` (complete),
+`queue/multipartqueue/accept.go` (runAccept, acceptRequested),
+`registry/multipartqueue.go` (PartWrites, CompletedSession),
+`queue/bucketqueue/version.go` (Reserve, applyPut), `queue/bucketqueue/bucketqueue.go` (putPreCheck),
+`queue/spaceshardqueue/spaceshardqueue.go` (runAccept), `registry/accept.go`,
 `s3frontend/stream.go`,
-`s3frontend/shardref.go` (addBlob, runAdd, dropRefsNow),
-`s3frontend/releasequeue.go` (runRelease, releaseNow),
+`queue/spaceshardqueue/spaceshardqueue.go` (Add, runAdd, DropRefsNow),
+`queue/spaceshardqueue/spaceshardqueue.go` (runRelease, ReleaseNow),
 `s3frontend/uploadpartcopy.go`, `registry/stores.go`. Review when these change.
 
 ## Part states: the acceptance queue
@@ -684,8 +686,8 @@ stateDiagram-v2
 
 Sources: `registry/stores.go` (Part* consts), `registry/stores_postgres.go`
 (ListParkedParts, OldestParkedPart), `registry/multipartqueue.go` (PartWrites),
-`registry/accept.go`, `s3frontend/acceptor.go`, `s3frontend/multipart.go`
-(ingestPart, acceptRequested), `migrations/sql/00030_part_accept_queue.sql`,
+`registry/accept.go`, `queue/multipartqueue/accept.go` (runAccept,
+acceptRequested), `s3frontend/multipart.go` (ingestPart), `migrations/sql/00030_part_accept_queue.sql`,
 `migrations/sql/00033_task_runner.sql`. Review when these change.
 
 ## Session states: open and completed
@@ -702,7 +704,7 @@ stateDiagram-v2
     completed --> [*] : queue-multipart-upload.reap (one session TTL out, or DeleteBucket)#59;<br/>releases nothing
 ```
 
-- A Complete waits up to 10 s (`replayWaitBudget`) for the upload's other
+- A Complete waits up to 10 s (the complete wait) for the upload's other
   changes, another Complete included, before it reports anything; past
   that it answers `OperationAborted`, a 409. A Complete that runs after
   another one committed replays the ETag and version id recorded on the
@@ -718,8 +720,8 @@ stateDiagram-v2
 - DeleteBucket aborts each open upload and reaps each completed one from
   the request, after `queue-bucket.close`.
 
-Sources: `s3frontend/multipart.go`, `s3frontend/multipartqueue.go`,
-`s3frontend/bucketqueue.go` (putPreCheck), `registry/multipartqueue.go`
+Sources: `s3frontend/multipart.go`, `queue/multipartqueue/`,
+`queue/bucketqueue/bucketqueue.go` (putPreCheck), `registry/multipartqueue.go`
 (CompletedSession, DeletedSession, ReapedSession). Review when these change.
 
 ## Blob lifecycle: uploading, parked, accepted, released
@@ -808,13 +810,13 @@ Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 
 Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
 (ingestBody, addClaims, dropClaims), `s3frontend/localblob_sweep.go` (SweepLocalBlobs),
-`s3frontend/stream.go` (WriteSizedBlob), `s3frontend/localblobs.go` (cacheWritten),
-`blockstore/blobcache.go` (CreateTemp, Adopt), `s3frontend/shardqueue.go`
+`s3frontend/stream.go` (WriteSizedBlob), `queue/shardqueue/shardqueue.go` (Cache),
+`blockstore/blobcache.go` (CreateTemp, Adopt), `queue/shardqueue/shardqueue.go`
 (queue-shard.cache, queue-shard.evict),
-`s3frontend/multipart.go`
-(parkBlobs, sessionReleases),
-`s3frontend/acceptor.go`, `registry/accept.go`, `s3frontend/releasequeue.go`
-(runRelease), `s3frontend/shardref.go` (runAdd, runExpire),
+`s3frontend/multipart.go` (parkBlobs),
+`queue/multipartqueue/multipartqueue.go` (sessionReleases),
+`queue/multipartqueue/accept.go`, `registry/accept.go`, `queue/spaceshardqueue/spaceshardqueue.go`
+(runRelease, runAdd, runExpire),
 `registry/stores_postgres.go` (CountReferences, PendingRefByExpiry),
 `registry/bucketcommit.go` (claimWrites, dropWrites), `registry/multipartqueue.go`
 (refWrites),
@@ -836,7 +838,7 @@ flowchart TB
     mans["arm /objectmanifest/1<br/>single-version key:<br/>the manifest itself, one-block read<br/>(/objectmanifest/0 decodes into it)"]
     leaf["arm /objectleaf/0<br/>ObjectLeaf"]
     cur["Current: VersionNode<br/>(Seq, VersionID, Manifest CID)"]
-    prev["Prev: per-key sub-MST of noncurrent versions<br/>keyed revSeqKey(seq): %016x of bit-inverted seq,<br/>so a forward walk is newest-first"]
+    prev["Prev: per-key sub-MST of noncurrent versions<br/>keyed RevSeqKey(seq): %016x of bit-inverted seq,<br/>so a forward walk is newest-first"]
     nulls["NullSeq: a noncurrent null<br/>version's seq (0 = none)"]
     em["EnvelopedManifest<br/>one per noncurrent version"]
     mf["ObjectManifest<br/>Seq, VersionID, DeleteMarker, ETag, headers,<br/>Body(Size, BLAKE3, TreeChunkLog, TreeBlocks,<br/>MD5, Blobs, PartSizes)"]
@@ -877,9 +879,9 @@ value union §2.1, prev tree §2.2, token §3, write rule §5, deletes §7);
 [`architecture.md` §4](./architecture.md#4-the-catalog-layer) keeps the ASCII
 manifest figure this complements.
 
-Sources: `bucket/leaf.go`, `bucket/manifest.go`, `s3frontend/version.go`
-(mintVersionID, revSeqKey, applyPut, applyDeleteVersion),
-`s3frontend/bucketadmin.go` (runSetVersioning). Review when
+Sources: `bucket/leaf.go`, `bucket/manifest.go`, `queue/bucketqueue/version.go`
+(mintVersionID, RevSeqKey, applyPut, applyDeleteVersion),
+`queue/bucketqueue/admin.go` (runSetVersioning). Review when
 `bucket/` types change (and re-run `make gen`).
 
 ## Catalog GC candidates: what gets remembered for removal
@@ -933,10 +935,10 @@ flowchart TB
 Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer),
 [`s3-versioning.md`](./s3-versioning.md) §7.
 
-Sources: `s3frontend/version.go` (applyPut supersession,
-applyDeleteVersion), `s3frontend/object.go` (applyDeleteKey),
-`s3frontend/objectlock.go` (applySetAttributes), `bucketop/bucketop.go`
-(AddGCCandidate, Mark, Restore), `s3frontend/version.go` (pruneVersionState),
+Sources: `queue/bucketqueue/version.go` (applyPut supersession,
+applyDeleteVersion, pruneVersionState), `queue/bucketqueue/claims.go`
+(applyDeleteKey), `queue/bucketqueue/objectlock.go` (applySetAttributes),
+`bucketop/bucketop.go` (AddGCCandidate, Mark, Restore),
 `registry/bucketcommit.go`
 (RootCommitWrites). Review when these change.
 
@@ -1041,7 +1043,7 @@ Sources: `iam/service.go`, `iam/keyproofs.go`, `iam/proofcache.go`,
 `internal/reqscope/reqscope.go`, `cmd/catalog.go` (forgeSegments),
 `uploader/forge.go` (shipProofs, captureShipProofs, CaptureShipAuthority),
 `uploader/stream.go` (StartBlob), `bucketop/bucketop.go` (Tx.Append),
-`s3frontend/releasequeue.go` (releaseAuthority, withReleaseAuthority),
+`s3frontend/releaseauthority.go` (releaseAuthority), `internal/authority/authority.go`,
 `module.go`, `config/config.go` (auth_service fields).
 Review when these change.
 
@@ -1251,7 +1253,7 @@ erDiagram
     }
     revocation_cursor {
         boolean id PK "single-row latch"
-        timestamptz recorded_at "resume point in the revocation stream"
+        text token "resume point: the service's cursor for the last record, or its head"
     }
 
     segments ||--o{ segment_op_roots : "ON DELETE CASCADE"
@@ -1333,8 +1335,8 @@ sequenceDiagram
     loop each digest
         Q->>U: /blob/remove (release the space's registration)
     end
-    Q->>R: drainSpaceReleases: lend the request's authority for the space, Expedite its pending<br/>queue-space-shard.release tasks (subject space/*) and wait for the workers to run them (/blob/remove each)#59;<br/>a release still waiting fails the delete for the client to retry
-    Q->>U: DrainSpaceRegistrations: send the space's pending queue-space-upload changes,<br/>then resend its failed retractions with the request's authority
+    Q->>R: DrainSpace: lend the request's authority for the space, Expedite its pending<br/>queue-space-shard.release tasks (subject space/*) and wait for the workers to run them (/blob/remove each)#59;<br/>a release still waiting fails the delete for the client to retry
+    Q->>U: Drain: send the space's pending queue-space-upload changes,<br/>then resend its failed retractions with the request's authority
     Q->>H: /s3/bucket/delete with the signed S3 request (hilt refuses while registrations remain)#59;<br/>a refusal clears the closing mark, not found finishes the delete,<br/>a failed call leaves the bucket closing for a retry
     Q->>L: RemoveBucketLog, best-effort (directory + segment rows), while the row holds the name:<br/>the log is the name's, and a bucket created under it later runs under its own space
     Q->>R: reg.Delete (the local row, its catalog_journal rows cascading)
@@ -1352,12 +1354,13 @@ sequenceDiagram
   The quiesce leaves the last segment sealed and unshipped until that next
   write; its journal rows went with the root.
 
-Sources: `s3frontend/bucket.go` (DeleteBucket, runDeleteBucket),
-`s3frontend/bucketadmin.go` (runCloseBucket, runAdmitUpload),
-`s3frontend/bucketqueue.go` (bucketSpec), `s3frontend/multipartqueue.go`
-(abortUpload, runAbort, reapNow, runReap),
-`s3frontend/releasequeue.go` (drainSpaceReleases),
-`s3frontend/uploadqueue.go` (DrainSpaceRegistrations),
+Sources: `s3frontend/bucket.go` (DeleteBucket),
+`queue/bucketqueue/delete.go` (runDeleteBucket),
+`queue/bucketqueue/admin.go` (runCloseBucket, runAdmitUpload, bucketSpec),
+`s3frontend/multipartqueue.go` (abortUpload),
+`queue/multipartqueue/multipartqueue.go` (runAbort, Reap, runReap),
+`queue/spaceshardqueue/spaceshardqueue.go` (DrainSpace),
+`queue/spaceuploadqueue/spaceuploadqueue.go` (Drain),
 `logstore/manager.go`. Review when these change.
 
 ## Package-to-diagram map
@@ -1368,16 +1371,16 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | Package / file | Diagrams to review |
 |---|---|
 | `s3frontend/object.go` | put, get, blob-lifecycle, version-tree, gc-candidates, delete-bucket |
-| `s3frontend/version.go` | put, get, multipart, blob-lifecycle, version-tree, gc-candidates |
-| `s3frontend/multipart.go`, `multipartqueue.go`, `registry/multipartqueue.go` | multipart, part-states, multipart-states, blob-lifecycle, delete-bucket |
-| `s3frontend/acceptor.go`, `registry/accept.go` | multipart, part-states, blob-lifecycle |
-| `s3frontend/releasequeue.go` | put, multipart, part-states, blob-lifecycle, delete-bucket |
-| `s3frontend/shardref.go` | put, multipart, blob-lifecycle |
-| `s3frontend/uploadqueue.go` | put, delete-bucket |
-| `s3frontend/shardqueue.go`, `localblobs.go`, `localblob_sweep.go` | put, blob-lifecycle |
+| `s3frontend/version.go` | get |
+| `queue/bucketqueue/` | put, multipart, blob-lifecycle, version-tree, gc-candidates, delete-bucket, logstore-pipeline |
+| `s3frontend/multipart.go`, `queue/multipartqueue/`, `registry/multipartqueue.go` | multipart, part-states, multipart-states, blob-lifecycle, delete-bucket |
+| `registry/accept.go` | multipart, part-states, blob-lifecycle |
+| `queue/spaceshardqueue/spaceshardqueue.go` | put, multipart, part-states, blob-lifecycle, delete-bucket |
+| `queue/spaceuploadqueue/spaceuploadqueue.go` | put, delete-bucket |
+| `queue/shardqueue/shardqueue.go`, `s3frontend/localblob_sweep.go` | put, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |
-| `s3frontend/bucketqueue.go`, `bucketchanges.go`, `bucketadmin.go`, `bucketship.go` | put, multipart, gc-candidates, delete-bucket, logstore-pipeline |
+| `s3frontend/bucketqueue.go`, `bucketadmin.go` | put, multipart, gc-candidates, delete-bucket |
 | `bucketop/` | put, get, delete-bucket, packages, principals |
 | `taskrunner/` | packages, put, multipart, multipart-states, delete-bucket |
 | `blockstore/` | get, packages, block-routes; `forge.go` also context, principals |

@@ -27,9 +27,10 @@
 package s3frontend
 
 import (
-	"cmp"
 	"context"
 	"encoding/xml"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,6 +44,12 @@ import (
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/bucketop"
+	"github.com/fil-forge/ingot/internal/authority"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
+	"github.com/fil-forge/ingot/queue/multipartqueue"
+	"github.com/fil-forge/ingot/queue/shardqueue"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
+	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
@@ -62,74 +69,27 @@ type Backend struct {
 	reg       registry.Registry
 	intents   registry.IntentStore
 	locations registry.LocationStore
-	gc        registry.GCStore
 	multipart registry.MultipartStore
 	txns      *bucketop.Coordinator
-	log       blockstore.Log
 	cache     *blockstore.BlobCache
 	deferred  uploader.DeferredBodyUploader
-	parks     registry.ParkStore
-	remover   uploader.BlobRemover
-	registrar uploader.UploadRegistrar
-	// tasks runs the queue-space-upload tasks (RegisterUploadTasks).
-	tasks *taskrunner.Runner
-	// shards runs the queue-shard tasks that keep the cache's copies
-	// (RegisterShardTasks). renewals is when this process last renewed each cached blob's time in
-	// the cache, and cacheTTL how long a renewal lasts.
-	shards   *taskrunner.Runner
-	renewals *recencyMap
-	// lent is the authority requests lend for their spaces while they wait
-	// on queued work (lendAuthority).
-	lent     lends
-	cacheTTL time.Duration
-	// uploadRetry is the queue-space-upload retry policy, and drainTimeout
-	// how long a bucket delete waits for its space's changes; tests shorten
-	// both.
-	uploadRetry  taskrunner.RetryPolicy
-	drainTimeout time.Duration
-	// failedPage overrides how many failed tasks a bucket delete's drain
-	// lists per query, for tests; zero takes uploadRegistrationBatch.
-	failedPage int
-	encParams  registry.EncryptionParamsStore
+	// shards keeps the cache's copies.
+	shards *shardqueue.Queue
+	// proofs finds the authority queued tasks make their network calls
+	// with, and holds what requests lend for their spaces while they wait on
+	// them.
+	proofs    *authority.Resolver
+	encParams registry.EncryptionParamsStore
 	// streaming sends each body blob to its provider as the body arrives.
 	streaming uploader.StreamingBodyUploader
-	// claims counts a blob's claims for a release's recheck; releases runs
-	// the queue-space-shard tasks (RegisterReleaseTasks); releaseGrace is how
-	// far past the last-claim drop each release is due (readers holding the
-	// prior catalog root get at least this long to finish their prefetch).
-	claims   registry.BlobRefStore
-	releases *taskrunner.Runner
-	// buckets runs the queue-bucket tasks (RegisterBucketTasks).
-	buckets *taskrunner.Runner
-	// uploads runs the queue-multipart-upload tasks
-	// (RegisterMultipartTasks).
-	uploads *taskrunner.Runner
-	// acceptDelay is how long after a part lands its upload's accept is due:
-	// none, but tests delay it so that only they run it.
-	acceptDelay time.Duration
-	// multipartTTL is how long an upload stays open before its auto-abort,
-	// and a completed one is kept (Deps.MultipartSessionTTL).
-	multipartTTL time.Duration
-	// shipMu guards shipReady and earlyShips: the ships the catalog log
-	// reported before the ship handler was registered, which registering it
-	// queues.
-	shipMu     sync.Mutex
-	shipReady  bool
-	earlyShips []string
-	// shipOwed are the buckets whose ship could not be queued, which
-	// retryOwedShips queues once it can; shipRetrying is set while it runs,
-	// and shipStop, closed by Drain, ends it. shipMu guards them too.
-	shipOwed map[string]bool
-	// shipAwaiting are the buckets whose ship found no authority to send
-	// with, which the bucket's next commit queues again (awaitShipAuthority).
-	shipAwaiting map[string]bool
-	shipRetrying bool
-	shipStop     chan struct{}
-	shipStopped  bool
-	releaseGrace time.Duration
-	// releaseRetry is the queue-space-shard.release retry policy; tests
-	// shorten it.
-	releaseRetry taskrunner.RetryPolicy
+	// blobs runs the tasks on one blob in one space: a write's references,
+	// its accept, its release.
+	blobs *spaceshardqueue.Queue
+	// buckets runs the queue-bucket tasks: every change to a bucket.
+	buckets *bucketqueue.Queue
+	// uploads runs the queue-multipart-upload tasks: every change to a
+	// multipart upload.
+	uploads *multipartqueue.Queue
 	// Local blob sweeper knobs (see Deps). localBlobSweepMu serialises
 	// SweepLocalBlobs; lastOrphanPass is when its orphan pass last ran.
 	localBlobMaxBytes  int64
@@ -176,7 +136,6 @@ type Backend struct {
 
 	maxBlobSize         int64
 	allowNoneEncryption bool
-	rehashBudget        int64
 	// cors is Deps.CORS marshalled once at construction — GetBucketCors
 	// is on the per-request path, so the document is built here rather
 	// than per call. It is the default for a bucket without a document of
@@ -186,6 +145,10 @@ type Backend struct {
 
 // Deps wires a Backend over ingot's domain primitives.
 type Deps struct {
+	// Tasks runs the backend's task queues; New registers their handlers on
+	// it, and the host starts it. Required.
+	Tasks *taskrunner.Runner
+
 	Authority bucketauthority.BucketAuthority
 	// Registry tracks per-bucket roots; IntentStore tracks each local blob's
 	// upload_intents lifecycle; LocationStore records where each accepted body
@@ -195,8 +158,6 @@ type Deps struct {
 	Intents   registry.IntentStore
 	Locations registry.LocationStore
 
-	// GC records superseded MST/manifest CIDs. Same instance as Registry.
-	GC        registry.GCStore
 	Multipart registry.MultipartStore
 
 	// Reads is the layered read tier (local blobs → log → forge). Log is the
@@ -265,7 +226,7 @@ type Deps struct {
 	LocalBlobMaxBytes int64
 	// CacheTTL is how long a blob stays in the cache after it was cached or
 	// last read, unless the budget pass evicts it first. Zero →
-	// DefaultCacheTTL.
+	// shardqueue.DefaultTTL.
 	CacheTTL time.Duration
 	// LocalBlobOrphanAge is the age at which SweepLocalBlobs deletes a .tmp-*
 	// file in the cache. Zero → DefaultLocalBlobOrphanAge.
@@ -297,7 +258,7 @@ type Deps struct {
 
 	// RehashBudget bounds the bytes CompleteMultipartUpload reads back to
 	// hash non-final parts whose assumed object offset was wrong (0 →
-	// DefaultRehashBudget); the final part is always re-hashed. A completion
+	// multipartqueue.DefaultRehashBudget); the final part is always re-hashed. A completion
 	// needing more is refused with InvalidPartLayout.
 	RehashBudget int64
 
@@ -309,13 +270,25 @@ type Deps struct {
 
 	// Logger is optional; defaults to zap.NewNop().
 	Logger *zap.Logger
+
+	// tuneBlobs adjusts the queue-space-shard dependencies, for tests.
+	tuneBlobs func(*spaceshardqueue.Deps)
+	// tuneBuckets adjusts the queue-bucket dependencies, for tests.
+	tuneBuckets func(*bucketqueue.Deps)
+	// tuneUploads adjusts the queue-multipart-upload dependencies, for
+	// tests.
+	tuneUploads func(*multipartqueue.Deps)
 }
 
 // Compile-time assertion that Backend satisfies versitygw's interface.
 var _ backend.Backend = (*Backend)(nil)
 
-// New constructs a Backend wired over ingot's domain primitives.
-func New(d Deps) *Backend {
+// New constructs a Backend wired over ingot's domain primitives, and
+// registers its task handlers on d.Tasks.
+func New(d Deps) (*Backend, error) {
+	if d.Tasks == nil {
+		return nil, errors.New("s3frontend: no task runner")
+	}
 	logger := d.Logger
 	if logger == nil {
 		logger = zap.NewNop()
@@ -337,41 +310,28 @@ func New(d Deps) *Backend {
 		localBlobOrphanAge = DefaultLocalBlobOrphanAge
 	}
 	b := &Backend{
-		authority:    d.Authority,
-		read:         d.Reads,
-		reg:          d.Registry,
-		intents:      d.Intents,
-		locations:    d.Locations,
-		gc:           d.GC,
-		multipart:    d.Multipart,
-		txns:         bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads, Ships: d.Ships}),
-		log:          d.Log,
-		cache:        d.Cache,
-		deferred:     d.Deferred,
-		parks:        d.Parks,
-		remover:      d.Remover,
-		streaming:    d.Streaming,
-		registrar:    d.Registrar,
-		uploadRetry:  uploadRegistrationRetry,
-		drainTimeout: uploadDrainTimeout,
-		encParams:    d.EncParams,
-		regionKeys:   d.RegionKeys,
-		tenantKeys:   d.TenantKeys,
-		claims:       d.Claims,
-		releaseRetry: releaseRetry,
-		releaseGrace: d.ReleaseGrace,
-		multipartTTL: d.MultipartSessionTTL,
+		authority:  d.Authority,
+		read:       d.Reads,
+		reg:        d.Registry,
+		intents:    d.Intents,
+		locations:  d.Locations,
+		multipart:  d.Multipart,
+		txns:       bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads, Ships: d.Ships}),
+		cache:      d.Cache,
+		deferred:   d.Deferred,
+		streaming:  d.Streaming,
+		proofs:     authority.New(d.Registrar),
+		encParams:  d.EncParams,
+		regionKeys: d.RegionKeys,
+		tenantKeys: d.TenantKeys,
 
 		localBlobMaxBytes:  d.LocalBlobMaxBytes,
-		cacheTTL:           cmp.Or(d.CacheTTL, DefaultCacheTTL),
-		renewals:           newRecencyMap(renewalCapacity),
 		localBlobOrphanAge: localBlobOrphanAge,
 		dropAcceptedBodies: d.DropAcceptedBodies,
 
 		logger:              logger,
 		maxBlobSize:         d.MaxBlobSize,
 		allowNoneEncryption: d.AllowNoneEncryption,
-		rehashBudget:        cmp.Or(d.RehashBudget, DefaultRehashBudget),
 		cors:                corsDoc,
 		catalogUsage:        d.CatalogUsage,
 	}
@@ -383,7 +343,78 @@ func New(d Deps) *Backend {
 	b.multipartMetrics, b.multipartGauges = newMultipartMetrics(mp, b, logger)
 	b.journalGauges = newJournalGauges(mp, b, logger)
 	b.catalogGauges = newCatalogUsageGauges(mp, b, logger)
-	return b
+	var counts *spaceuploadqueue.Queue
+	var err error
+	if b.shards, err = shardqueue.New(d.Tasks, shardqueue.Deps{Cache: d.Cache, TTL: d.CacheTTL, Removed: b.cacheRemoved, Logger: logger}); err == nil {
+		counts, err = spaceuploadqueue.New(d.Tasks, spaceuploadqueue.Deps{Registrar: d.Registrar, Authority: b.proofs, Logger: logger})
+	}
+	if err == nil {
+		bd := spaceshardqueue.Deps{
+			Intents:   d.Intents,
+			Parks:     d.Parks,
+			Claims:    d.Claims,
+			Locations: d.Locations,
+			EncParams: d.EncParams,
+			Remover:   d.Remover,
+			Deferred:  d.Deferred,
+			Streaming: d.Streaming,
+			Shards:    b.shards,
+			Authority: b.proofs,
+			Concluded: b.multipartMetrics.pass,
+			Logger:    logger,
+		}
+		if d.tuneBlobs != nil {
+			d.tuneBlobs(&bd)
+		}
+		b.blobs, err = spaceshardqueue.New(d.Tasks, bd)
+	}
+	if err == nil {
+		bd := bucketqueue.Deps{
+			Registry:     d.Registry,
+			Txns:         b.txns,
+			Read:         b.read,
+			Log:          d.Log,
+			Sessions:     d.Multipart,
+			Remover:      d.Remover,
+			Buckets:      d.Authority,
+			Authority:    b.proofs,
+			Blobs:        b.blobs,
+			Counts:       counts,
+			ReleaseGrace: d.ReleaseGrace,
+			Logger:       logger,
+		}
+		if d.tuneBuckets != nil {
+			d.tuneBuckets(&bd)
+		}
+		b.buckets, err = bucketqueue.New(d.Tasks, bd)
+	}
+	if err == nil {
+		ud := multipartqueue.Deps{
+			Registry:         d.Registry,
+			Multipart:        d.Multipart,
+			Intents:          d.Intents,
+			Parks:            d.Parks,
+			Read:             b.read,
+			Bodies:           uploadBodies{b},
+			Buckets:          b.buckets,
+			Blobs:            b.blobs,
+			Capture:          b.commitAuthority,
+			ReleaseGrace:     d.ReleaseGrace,
+			SessionTTL:       d.MultipartSessionTTL,
+			Limits:           &multipartqueue.Limits{RehashBudget: d.RehashBudget},
+			CompleteDeferred: b.multipartMetrics.completeDeferred,
+			Logger:           logger,
+		}
+		if d.tuneUploads != nil {
+			d.tuneUploads(&ud)
+		}
+		b.uploads, err = multipartqueue.New(d.Tasks, ud)
+	}
+	if err != nil {
+		_ = b.CloseMetrics()
+		return nil, fmt.Errorf("s3frontend: register tasks: %w", err)
+	}
+	return b, nil
 }
 
 // String identifies this backend in versitygw logs.
@@ -405,7 +436,7 @@ func (b *Backend) Recover(_ context.Context) error { return nil }
 // again. After Drain returns cleanly, no acked write is unrepresented in
 // Postgres.
 func (b *Backend) Drain(ctx context.Context) error {
-	b.stopShipRetries()
+	b.buckets.StopShips()
 	if b.txns == nil {
 		return nil
 	}

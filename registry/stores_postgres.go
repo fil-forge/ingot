@@ -9,7 +9,6 @@ import (
 
 	"github.com/fil-forge/ucantone/did"
 	"github.com/google/uuid"
-	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/multiformats/go-multihash"
@@ -25,7 +24,6 @@ var (
 	_ EncryptionParamsStore = (*Postgres)(nil)
 	_ InclusionStore        = (*Postgres)(nil)
 	_ MultipartStore        = (*Postgres)(nil)
-	_ GCStore               = (*Postgres)(nil)
 	_ CatalogUsageStore     = (*Postgres)(nil)
 	_ RevocationCursorStore = (*Postgres)(nil)
 )
@@ -76,34 +74,6 @@ const countReferencesSQL = `SELECT
 	+ (SELECT count(*) FROM ingot.multipart_parts p
 	     JOIN ingot.multipart_sessions s ON s.upload_id = p.upload_id
 	    WHERE p.blob_digests @> ARRAY[$2::bytea] AND s.space = $1 AND s.state = $4)`
-
-func (r *Postgres) QueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time, release ReleaseTask) error {
-	if len(digests) == 0 {
-		return nil
-	}
-	if r.tasks == nil {
-		return fmt.Errorf("registry: releases to queue but the registry has no task runner")
-	}
-	specs := make([]taskrunner.Spec, len(digests))
-	for i, d := range digests {
-		var err error
-		if specs[i], err = release.Spec(space, d, notBefore); err != nil {
-			return err
-		}
-	}
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("registry: queue releases: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := r.tasks.SubmitAllTx(ctx, tx, specs); err != nil {
-		return fmt.Errorf("registry: queue releases: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("registry: queue releases: commit: %w", err)
-	}
-	return nil
-}
 
 // IntentStore ================================================================
 
@@ -721,48 +691,29 @@ func (r *Postgres) CountPartRefs(ctx context.Context, digest multihash.Multihash
 	return n, nil
 }
 
-// GCStore ====================================================================
-
-func (r *Postgres) AddGCCandidate(ctx context.Context, cidBytes []byte, bucket string) error {
-	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.gc_candidates (cid, bucket) VALUES ($1, $2)
-		 ON CONFLICT (cid) DO NOTHING`,
-		cidBytes, nullString(bucket))
-	if err != nil {
-		return fmt.Errorf("registry: add gc candidate: %w", err)
-	}
-	return nil
-}
-
 // RevocationCursorStore ======================================================
 
 func (r *Postgres) GetRevocationCursor(ctx context.Context) (*RevocationCursor, error) {
 	var cur RevocationCursor
-	var revoke []byte
 	err := r.pool.QueryRow(ctx,
-		`SELECT recorded_at, revoke FROM ingot.revocation_cursor WHERE id`).
-		Scan(&cur.RecordedAt, &revoke)
+		`SELECT token FROM ingot.revocation_cursor WHERE id`).Scan(&cur.Token)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("registry: get revocation cursor: %w", err)
 	}
-	if cur.Revoke, err = cid.Cast(revoke); err != nil {
-		return nil, fmt.Errorf("registry: get revocation cursor: decode revoke cid: %w", err)
-	}
 	return &cur, nil
 }
 
 func (r *Postgres) PutRevocationCursor(ctx context.Context, cur RevocationCursor) error {
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.revocation_cursor (id, recorded_at, revoke)
-		 VALUES (true, $1, $2)
+		`INSERT INTO ingot.revocation_cursor (id, token)
+		 VALUES (true, $1)
 		 ON CONFLICT (id) DO UPDATE
-		   SET recorded_at = EXCLUDED.recorded_at,
-		       revoke      = EXCLUDED.revoke,
-		       updated_at  = now()`,
-		cur.RecordedAt, cur.Revoke.Bytes())
+		   SET token      = EXCLUDED.token,
+		       updated_at = now()`,
+		cur.Token)
 	if err != nil {
 		return fmt.Errorf("registry: put revocation cursor: %w", err)
 	}

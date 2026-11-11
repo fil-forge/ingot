@@ -12,6 +12,7 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 
 	"github.com/fil-forge/ingot/internal/testfakes"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -172,8 +173,8 @@ func TestCompleteRefusedWhenTheKeyIsWrittenDuringIt(t *testing.T) {
 	mp.hook = func() { put = putObjV(t, b, key, []byte("written during the completion")) }
 
 	announced, _, err := completeAnnounced(t, b, key, uploadID, parts)
-	if !errors.Is(err, errReservationSuperseded) {
-		t.Fatalf("Complete: err = %v, want errReservationSuperseded", err)
+	if !errors.Is(err, bucketqueue.ErrReservationSuperseded) {
+		t.Fatalf("Complete: err = %v, want bucketqueue.ErrReservationSuperseded", err)
 	}
 	if got := currentVersionID(t, b, key); got != put.VersionID {
 		t.Fatalf("current version %q, want the PUT's %q", got, put.VersionID)
@@ -203,8 +204,8 @@ func TestCompleteRefusedWhenVersioningIsSuspendedDuringIt(t *testing.T) {
 	uploadID, parts := completeTwoParts(t, b, key)
 	mp.hook = func() { setVersioning(t, b, types.BucketVersioningStatusSuspended) }
 
-	if _, _, err := completeAnnounced(t, b, key, uploadID, parts); !errors.Is(err, errReservationSuperseded) {
-		t.Fatalf("Complete: err = %v, want errReservationSuperseded", err)
+	if _, _, err := completeAnnounced(t, b, key, uploadID, parts); !errors.Is(err, bucketqueue.ErrReservationSuperseded) {
+		t.Fatalf("Complete: err = %v, want bucketqueue.ErrReservationSuperseded", err)
 	}
 	if st := sessionState(t, mp.multipart, uploadID); st != registry.SessionOpen {
 		t.Fatalf("session state %q after the refusal, want open", st)
@@ -269,8 +270,8 @@ func TestCompleteRefusedWhenVersioningIsEnabledDuringIt(t *testing.T) {
 	reported, _, err := completeReporting(t, b, key, uploadID, parts, func(string) {
 		setVersioning(t, b, types.BucketVersioningStatusEnabled)
 	})
-	if !errors.Is(err, errReservationSuperseded) {
-		t.Fatalf("Complete: err = %v, want errReservationSuperseded", err)
+	if !errors.Is(err, bucketqueue.ErrReservationSuperseded) {
+		t.Fatalf("Complete: err = %v, want bucketqueue.ErrReservationSuperseded", err)
 	}
 	if !slices.Equal(reported, []string{""}) {
 		t.Fatalf("reported %q, want one empty report", reported)

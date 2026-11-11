@@ -1,7 +1,6 @@
 package s3frontend
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -20,6 +19,11 @@ import (
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/internal/testfakes"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
+	"github.com/fil-forge/ingot/queue/multipartqueue"
+	"github.com/fil-forge/ingot/queue/shardqueue"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
+	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
@@ -33,11 +37,12 @@ import (
 type testStore struct {
 	*registry.Postgres
 	testfakes.Authority
-	pool  *pgxpool.Pool
+	pool *pgxpool.Pool
+	// tasks runs one backend's tasks (newBackend).
 	tasks *taskrunner.Runner
-	// started is set once a backend's handlers are registered and the queues
-	// run; a store serves one backend's tasks.
-	started bool
+	// limits are the backend's multipart limits, which a test may change
+	// while it runs.
+	limits *multipartqueue.Limits
 }
 
 // stores maps each test backend to the store it runs on, for helpers that
@@ -55,6 +60,16 @@ const testNode = "did:web:ingot.test"
 
 func newTestStore(t testing.TB) *testStore {
 	t.Helper()
+	return newTestStoreWithLease(t, time.Second)
+}
+
+// newTestStoreWithLease is newTestStore with the task runner's leases lasting
+// ttl. Renewal runs every third of the TTL, and a lease it finds expired is
+// lost, so a test that holds one through minutes of work under the race
+// detector needs longer than the default to survive a late renewal. Tests
+// that wait out a lease left to expire need it short.
+func newTestStoreWithLease(t testing.TB, ttl time.Duration) *testStore {
+	t.Helper()
 	pool := pgtest.New(t)
 	r, err := taskrunner.New(pool, taskrunner.Options{
 		Schema: "ingot",
@@ -63,17 +78,17 @@ func newTestStore(t testing.TB) *testStore {
 		Queues: []taskrunner.QueueOptions{
 			// Uploads' changes run sync, in their requests; the workers run
 			// the auto-aborts and reaps, and the accepts UploadPart queues,
-			// which tests delay (Backend.acceptDelay) so that only they run
+			// which tests delay (Limits.AcceptDelay) so that only they run
 			// one (runAccepts) or Complete does. The blobs' accepts an
 			// upload's accept queues run on queue-space-shard's workers.
-			{Name: registry.MultipartQueue, Workers: 2},
+			{Name: multipartqueue.Name, Workers: 2},
 			// Commits run sync, in the request; the workers run ships.
-			{Name: registry.BucketQueue, Workers: 2},
-			{Name: registry.UploadQueue, Workers: 2},
-			{Name: registry.ReleaseQueue, Workers: 2},
-			{Name: ShardQueue, Workers: 2},
+			{Name: bucketqueue.Name, Workers: 2},
+			{Name: spaceuploadqueue.Name, Workers: 2},
+			{Name: spaceshardqueue.Name, Workers: 2},
+			{Name: shardqueue.Name, Workers: 2},
 		},
-		LeaseTTL:     time.Second,
+		LeaseTTL:     ttl,
 		PollInterval: 10 * time.Millisecond,
 		Node:         testNode,
 		Logger:       zaptest.NewLogger(t),
@@ -84,51 +99,47 @@ func newTestStore(t testing.TB) *testStore {
 	if err := r.Migrate(context.Background()); err != nil {
 		t.Fatalf("migrate task queues: %v", err)
 	}
-	return &testStore{Postgres: registry.NewPostgres(pool, registry.WithTasks(r)), pool: pool, tasks: r}
+	return &testStore{Postgres: registry.NewPostgres(pool), pool: pool, tasks: r}
 }
 
-// start registers b's task handlers and runs the queues until t ends. The
-// first backend built over the store runs its tasks; a later one shares them.
-func (s *testStore) start(t testing.TB, b *Backend) {
+// newBackend builds a backend over deps that runs its tasks on the store's
+// runner, and runs the queues until t ends.
+func (s *testStore) newBackend(t testing.TB, deps Deps) *Backend {
 	t.Helper()
-	b.acceptDelay = time.Hour
-	if s.started {
-		b.tasks, b.shards, b.releases, b.buckets, b.uploads = s.tasks, s.tasks, s.tasks, s.tasks, s.tasks
-		b.cache.OnRead(b.renewCached)
-		return
+	deps.Tasks = s.tasks
+	// A failed release waits for the next sweep (SweepPendingReleases), not
+	// a delay, and holds its subject meanwhile, as in production.
+	tune := deps.tuneBlobs
+	deps.tuneBlobs = func(d *spaceshardqueue.Deps) {
+		d.ReleaseRetry = taskrunner.RetryPolicy{First: time.Hour, Max: time.Hour, HoldsSubject: true}
+		if tune != nil {
+			tune(d)
+		}
 	}
-	if err := b.RegisterUploadTasks(s.tasks); err != nil {
-		t.Fatalf("register upload tasks: %v", err)
+	s.limits = &multipartqueue.Limits{AcceptDelay: time.Hour}
+	tuneUploads := deps.tuneUploads
+	deps.tuneUploads = func(d *multipartqueue.Deps) {
+		s.limits.RehashBudget = d.Limits.RehashBudget
+		d.Limits = s.limits
+		if tuneUploads != nil {
+			tuneUploads(d)
+		}
 	}
-	if err := b.RegisterShardTasks(s.tasks); err != nil {
-		t.Fatalf("register shard tasks: %v", err)
+	b, err := New(deps)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
 	}
-	if err := s.tasks.Handle(ShardQueue, shardFlush, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+	if err := s.tasks.Handle(shardqueue.Name, shardFlush, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
 		return nil, nil
 	}); err != nil {
 		t.Fatalf("register shard flush: %v", err)
 	}
-	// A failed release waits for the next sweep (SweepPendingReleases), not
-	// a delay, and holds its subject meanwhile, as in production.
-	b.releaseRetry = taskrunner.RetryPolicy{First: time.Hour, Max: time.Hour, HoldsSubject: true}
-	if err := b.RegisterReleaseTasks(s.tasks); err != nil {
-		t.Fatalf("register release tasks: %v", err)
-	}
-	if err := b.RegisterAcceptTasks(s.tasks); err != nil {
-		t.Fatalf("register accept tasks: %v", err)
-	}
-	if err := b.RegisterBucketTasks(s.tasks); err != nil {
-		t.Fatalf("register bucket tasks: %v", err)
-	}
-	if err := b.RegisterMultipartTasks(s.tasks); err != nil {
-		t.Fatalf("register multipart tasks: %v", err)
-	}
 	if err := s.tasks.Start(context.Background()); err != nil {
 		t.Fatalf("start task queues: %v", err)
 	}
-	s.started = true
 	stores.Store(b, s)
 	t.Cleanup(func() { _ = s.tasks.Stop(context.Background()) })
+	return b
 }
 
 // shardFlush is a queue-shard action that does nothing, which settleCache
@@ -142,7 +153,7 @@ const shardFlush = "flush"
 func settleCache(t testing.TB, b *Backend, digests ...multihash.Multihash) {
 	t.Helper()
 	for _, d := range digests {
-		if _, err := b.shards.Run(t.Context(), taskrunner.Spec{Queue: ShardQueue, Subject: hex.EncodeToString(d), Action: shardFlush}); err != nil {
+		if _, err := storeFor(b).tasks.Run(t.Context(), taskrunner.Spec{Queue: shardqueue.Name, Subject: hex.EncodeToString(d), Action: shardFlush}); err != nil {
 			t.Fatalf("settle the cache tasks of %x: %v", d, err)
 		}
 	}
@@ -184,7 +195,7 @@ func (s *testStore) drainUploads(t testing.TB) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		tasks, err := s.queued(context.Background(), registry.UploadQueue)
+		tasks, err := s.queued(context.Background(), spaceuploadqueue.Name)
 		if err != nil {
 			t.Fatalf("list queued uploads: %v", err)
 		}
@@ -325,16 +336,16 @@ func (s *testStore) queued(ctx context.Context, queue string) ([]taskrunnertest.
 // ListReleasesBySpace returns the space's pending releases, due or not,
 // oldest first.
 func (s *testStore) ListReleasesBySpace(ctx context.Context, space did.DID) ([]pendingRelease, error) {
-	tasks, err := s.queued(ctx, registry.ReleaseQueue)
+	tasks, err := s.queued(ctx, spaceshardqueue.Name)
 	if err != nil {
 		return nil, err
 	}
 	var out []pendingRelease
 	for _, t := range tasks {
-		if t.Action != registry.ReleaseAction || t.State != "pending" {
+		if t.Action != spaceshardqueue.ReleaseAction || t.State != "pending" {
 			continue
 		}
-		sp, d, err := registry.ParseReleaseSubject(t.Subject)
+		sp, d, err := spaceshardqueue.ParseSubject(t.Subject)
 		if err != nil {
 			return nil, err
 		}
@@ -353,7 +364,12 @@ func (s *testStore) ListReleasesBySpace(ctx context.Context, space did.DID) ([]p
 // EnqueueRelease queues the release of digest in space at notBefore, as a
 // commit dropping its last claim would, with no authority of its own.
 func (s *testStore) EnqueueRelease(ctx context.Context, space did.DID, digest multihash.Multihash, notBefore time.Time) error {
-	return s.QueueReleases(ctx, space, []multihash.Multihash{digest}, notBefore, registry.ReleaseTask{})
+	spec, err := (spaceshardqueue.ReleaseTask{}).Spec(space, digest, notBefore)
+	if err != nil {
+		return err
+	}
+	_, err = s.tasks.Submit(ctx, spec)
+	return err
 }
 
 // ReleasingDigests reports which of digests have a release pending or running
@@ -361,9 +377,9 @@ func (s *testStore) EnqueueRelease(ctx context.Context, space did.DID, digest mu
 func (s *testStore) ReleasingDigests(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error) {
 	subjects := make([]string, len(digests))
 	for i, d := range digests {
-		subjects[i] = registry.ReleaseSubject(space, d)
+		subjects[i] = spaceshardqueue.Subject(space, d)
 	}
-	pending, err := s.tasks.Pending(ctx, registry.ReleaseQueue, subjects, registry.ReleaseAction)
+	pending, err := s.tasks.Pending(ctx, spaceshardqueue.Name, subjects, spaceshardqueue.ReleaseAction)
 	if err != nil {
 		return nil, err
 	}
@@ -385,7 +401,7 @@ func (s *testStore) ReleasingDigests(ctx context.Context, space did.DID, digests
 // is left waiting to retry.
 func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 	s := storeFor(b)
-	tasks, err := s.queued(ctx, registry.ReleaseQueue)
+	tasks, err := s.queued(ctx, spaceshardqueue.Name)
 	if err != nil {
 		return 0, err
 	}
@@ -393,7 +409,7 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 	before := map[taskrunner.TaskID]bool{}
 	seen := map[string]bool{}
 	for _, t := range tasks {
-		if t.Action != registry.ReleaseAction || t.State != "pending" {
+		if t.Action != spaceshardqueue.ReleaseAction || t.State != "pending" {
 			continue
 		}
 		before[t.ID] = true
@@ -402,7 +418,7 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 			subjects = append(subjects, t.Subject)
 		}
 		if t.Attempts > 0 {
-			if _, err := b.releases.Expedite(ctx, registry.ReleaseQueue, t.Subject, registry.ReleaseAction); err != nil {
+			if _, err := storeFor(b).tasks.Expedite(ctx, spaceshardqueue.Name, t.Subject, spaceshardqueue.ReleaseAction); err != nil {
 				return 0, err
 			}
 		}
@@ -411,17 +427,17 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 	// no-op behind it cannot start: its flush expires, which is not the
 	// sweep's failure.
 	for _, subject := range subjects {
-		err := b.flushRelease(ctx, subject, time.Now().Add(2*time.Second))
+		err := b.blobs.Flush(ctx, subject, time.Now().Add(2*time.Second))
 		if err != nil && !errors.Is(err, taskrunner.ErrExpired) && !errors.Is(err, context.DeadlineExceeded) {
 			return 0, err
 		}
 	}
-	if tasks, err = s.queued(ctx, registry.ReleaseQueue); err != nil {
+	if tasks, err = s.queued(ctx, spaceshardqueue.Name); err != nil {
 		return 0, err
 	}
 	n := 0
 	for _, t := range tasks {
-		if before[t.ID] && t.State == "succeeded" && string(t.Result) == string(releasedResult) {
+		if before[t.ID] && t.State == "succeeded" && string(t.Result) == "released" {
 			n++
 		}
 	}
@@ -432,14 +448,18 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 // refs, as a put through the bucket queue: for tests that write a manifest
 // no S3 verb would.
 func commitPut(ctx context.Context, b *Backend, st *registry.State, key string, mf *msbucket.ObjectManifest, blobs msbucket.BlobRefs, refs map[string]taskrunner.TaskID) error {
-	_, _, err := b.commitOne(ctx, st, KeyChange{Key: key, Put: &PutChange{Manifest: mf, HasBlobs: blobs != nil, Blobs: blobs, Refs: blobRefTasks(refs)}}, "commit version")
+	_, _, err := b.commitOne(ctx, st, bucketqueue.KeyChange{Key: key, Put: &bucketqueue.PutChange{Manifest: mf, HasBlobs: blobs != nil, Blobs: blobs, Refs: blobRefTasks(refs)}}, "commit version")
 	return err
 }
 
 // PutPart records p as an add-part's commit does, outside any task, for
 // tests that set up a part directly.
-func (s *testStore) PutPart(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree, release registry.ReleaseTask) ([]multihash.Multihash, error) {
-	w, released, err := s.PartWrites(ctx, p, tree, release)
+func (s *testStore) PutPart(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree) ([]multihash.Multihash, error) {
+	w, err := s.PartWrites(ctx, p, tree)
+	if err != nil {
+		return nil, err
+	}
+	specs, err := spaceshardqueue.OwedSpecs(w, spaceshardqueue.ReleaseTask{})
 	if err != nil {
 		return nil, err
 	}
@@ -453,13 +473,15 @@ func (s *testStore) PutPart(ctx context.Context, p registry.MultipartPart, tree 
 			return nil, err
 		}
 	}
-	for _, spec := range w.Spawns {
-		if _, err := s.tasks.SubmitTx(ctx, tx, spec); err != nil {
-			return nil, err
-		}
-	}
-	if err := s.tasks.CancelTx(ctx, tx, registry.ReleaseQueue, w.Expiries...); err != nil {
+	if _, err := s.tasks.SubmitAllTx(ctx, tx, specs); err != nil {
 		return nil, err
+	}
+	if err := s.tasks.CancelTx(ctx, tx, spaceshardqueue.Name, w.Expiries...); err != nil {
+		return nil, err
+	}
+	var released []multihash.Multihash
+	for _, r := range w.Releases {
+		released = append(released, r.Digest)
 	}
 	return released, tx.Commit(ctx)
 }
@@ -496,21 +518,22 @@ func sweepUploads(ctx context.Context, b *Backend) (int, error) {
 	rows.Close()
 	n := 0
 	for _, u := range uploads {
-		action, args := registry.MultipartReapAction, []byte(nil)
-		if u.state == registry.SessionOpen {
-			var buf bytes.Buffer
-			if err := (&MultipartAbortTask{Auto: true}).MarshalCBOR(&buf); err != nil {
+		if u.state != registry.SessionOpen {
+			if err := b.uploads.Reap(ctx, u.id); err != nil {
 				return n, err
 			}
-			action, args = registry.MultipartAbortAction, buf.Bytes()
+			n++
+			continue
 		}
-		call := &abortCall{}
-		if _, err := b.uploads.Run(context.WithValue(ctx, abortKey{}, call), uploadSpec(u.id, action, args)); err != nil {
+		space, err := did.Parse(u.space)
+		if err != nil {
 			return n, err
 		}
-		if space, err := did.Parse(u.space); err == nil {
-			b.releaseNow(ctx, space, call.released)
+		released, err := b.uploads.Abort(ctx, registry.MultipartSession{UploadID: u.id, Space: space})
+		if err != nil {
+			return n, err
 		}
+		b.blobs.ReleaseNow(ctx, space, released)
 		n++
 	}
 	return n, nil
@@ -520,18 +543,18 @@ func sweepUploads(ctx context.Context, b *Backend) (int, error) {
 // not, each once.
 func releaseSpaces(t *testing.T, mem *testStore) []did.DID {
 	t.Helper()
-	tasks, err := mem.queued(context.Background(), registry.ReleaseQueue)
+	tasks, err := mem.queued(context.Background(), spaceshardqueue.Name)
 	if err != nil {
 		t.Fatalf("queued releases: %v", err)
 	}
 	var out []did.DID
 	for _, task := range tasks {
-		if task.Action != registry.ReleaseAction {
+		if task.Action != spaceshardqueue.ReleaseAction {
 			continue
 		}
-		space, _, err := registry.ParseReleaseSubject(task.Subject)
+		space, _, err := spaceshardqueue.ParseSubject(task.Subject)
 		if err != nil {
-			t.Fatalf("release subject: %v", err)
+			t.Fatalf("space-shard subject: %v", err)
 		}
 		if !slices.Contains(out, space) {
 			out = append(out, space)

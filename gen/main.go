@@ -8,8 +8,11 @@ package main
 
 import (
 	"github.com/fil-forge/ingot/bucket"
-	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/s3frontend"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
+	"github.com/fil-forge/ingot/queue/multipartqueue"
+	"github.com/fil-forge/ingot/queue/shardqueue"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
+	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	cbg "github.com/whyrusleeping/cbor-gen"
 )
 
@@ -31,33 +34,45 @@ func main() {
 	); err != nil {
 		panic(err)
 	}
-	if err := cfg.WriteMapEncodersToFile("../registry/cbor_gen.go", "registry",
-		registry.UploadTask{},
-		registry.ReleaseTask{},
+	if err := cfg.WriteMapEncodersToFile("../queue/shardqueue/cbor_gen.go", "shardqueue",
+		shardqueue.CacheTask{},
+		shardqueue.EvictTask{},
 	); err != nil {
 		panic(err)
 	}
-	if err := cfg.WriteMapEncodersToFile("../s3frontend/cbor_gen.go", "s3frontend",
-		s3frontend.ShardCacheTask{},
-		s3frontend.ShardEvictTask{},
-		s3frontend.ShardAddTask{},
-		s3frontend.BucketCommitTask{},
-		s3frontend.KeyChange{},
-		s3frontend.PutChange{},
-		s3frontend.BlobRefTask{},
-		s3frontend.ReservedVersion{},
-		s3frontend.DeleteChange{},
-		s3frontend.DeletePreconditions{},
-		s3frontend.SetAttributesChange{},
-		s3frontend.BucketCommitResult{},
-		s3frontend.ChangeResult{},
-		s3frontend.ChangeError{},
-		s3frontend.BucketTask{},
-		s3frontend.BucketCreateTask{},
-		s3frontend.BucketSetVersioningTask{},
-		s3frontend.BucketSetLockConfigTask{},
-		s3frontend.BucketSetConfigTask{},
-		s3frontend.MultipartAbortTask{},
+	if err := cfg.WriteMapEncodersToFile("../queue/spaceuploadqueue/cbor_gen.go", "spaceuploadqueue",
+		spaceuploadqueue.Task{},
+	); err != nil {
+		panic(err)
+	}
+	if err := cfg.WriteMapEncodersToFile("../queue/spaceshardqueue/cbor_gen.go", "spaceshardqueue",
+		spaceshardqueue.AddTask{},
+		spaceshardqueue.ReleaseTask{},
+	); err != nil {
+		panic(err)
+	}
+	if err := cfg.WriteMapEncodersToFile("../queue/bucketqueue/cbor_gen.go", "bucketqueue",
+		bucketqueue.BucketCommitTask{},
+		bucketqueue.KeyChange{},
+		bucketqueue.PutChange{},
+		bucketqueue.BlobRefTask{},
+		bucketqueue.ReservedVersion{},
+		bucketqueue.DeleteChange{},
+		bucketqueue.DeletePreconditions{},
+		bucketqueue.SetAttributesChange{},
+		bucketqueue.BucketCommitResult{},
+		bucketqueue.ChangeResult{},
+		bucketqueue.ChangeError{},
+		bucketqueue.BucketTask{},
+		bucketqueue.BucketCreateTask{},
+		bucketqueue.BucketSetVersioningTask{},
+		bucketqueue.BucketSetLockConfigTask{},
+		bucketqueue.BucketSetConfigTask{},
+	); err != nil {
+		panic(err)
+	}
+	if err := cfg.WriteMapEncodersToFile("../queue/multipartqueue/cbor_gen.go", "multipartqueue",
+		multipartqueue.AbortTask{},
 	); err != nil {
 		panic(err)
 	}

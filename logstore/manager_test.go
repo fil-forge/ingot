@@ -53,7 +53,6 @@ func openTestManager(t *testing.T, dir string, meta Meta, flush *recordingFlush)
 		// Tiny SealAge so appends seal + flush quickly.
 		Catalog:  PlaneConfig{SealBytes: 1 << 20, SealAge: 50 * time.Millisecond, Ship: true, Retain: 2},
 		FlushFor: flush.forBucket,
-		OnSealed: sh.sealed,
 		Logger:   zaptest.NewLogger(t),
 	})
 	if err != nil {
@@ -64,23 +63,14 @@ func openTestManager(t *testing.T, dir string, meta Meta, flush *recordingFlush)
 }
 
 // managerShipper stands in for the ship queue: each seal starts a
-// ShipBucket, retried until it succeeds or the test ends. Seals reported
-// while the manager opens wait for start.
+// ShipBucket, retried until it succeeds or the test ends.
 type managerShipper struct {
-	mu    sync.Mutex
-	m     *Manager
-	ctx   context.Context
-	wg    sync.WaitGroup
-	early []string
+	m   *Manager
+	ctx context.Context
+	wg  sync.WaitGroup
 }
 
 func (sh *managerShipper) sealed(bucket string) {
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	if sh.m == nil {
-		sh.early = append(sh.early, bucket)
-		return
-	}
 	m, ctx := sh.m, sh.ctx
 	sh.wg.Add(1)
 	go func() {
@@ -93,19 +83,13 @@ func (sh *managerShipper) sealed(bucket string) {
 
 func (sh *managerShipper) start(t *testing.T, m *Manager) {
 	ctx, cancel := context.WithCancel(context.Background())
-	sh.mu.Lock()
 	sh.m, sh.ctx = m, ctx
-	early := sh.early
-	sh.early = nil
-	sh.mu.Unlock()
 	t.Cleanup(func() {
 		cancel()
 		sh.wg.Wait()
 		_ = m.Close(context.Background())
 	})
-	for _, b := range early {
-		sh.sealed(b)
-	}
+	m.OnSealed(sh.sealed)
 }
 
 func appendFor(t *testing.T, m *Manager, bucket, payload string) block.Block {

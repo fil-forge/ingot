@@ -417,7 +417,7 @@ own row, in its own space, and succeeds.
 2. UPLOAD  (request, per blob, as the body arrives)
      blob/add(size) → PUT the bytes as they arrive, sha256 on the way (a local copy
        teed into the cache) → PARKED; a failed PUT aborts the allocation and fails the request
-     queue-space-shard.add on the blob's release subject (waits up to 30 s behind a release):
+     queue-space-shard.add on the blob's subject (waits up to 30 s behind a release):
        conclude the PUT receipt → Sprue issues blob/accept
        → Piri publishes the location commitment; the blob enters aggregation
        (a blob the space holds already is reused and the new allocation aborted)
@@ -1037,11 +1037,10 @@ CREATE TABLE ingot.gc_candidates (
 );
 
 -- The revocation-firehose cursor: one row holding the resume point in the
--- revocation service's stream. No row means "connect from now".
+-- revocation service's stream. No row means "start at the stream's head".
 CREATE TABLE ingot.revocation_cursor (
     id          boolean PRIMARY KEY DEFAULT true CHECK (id), -- single-row latch
-    recorded_at timestamptz NOT NULL,                    -- the {since} of the next reconnect
-    revoke      bytea NOT NULL,                          -- revoked delegation CID, for observability
+    token       text NOT NULL,                           -- the service's cursor the next reconnect resumes after
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 ```
@@ -1203,7 +1202,7 @@ harness (`make itest`); unit tests cover libraries and pure logic only:
   race on a digest not yet published would return.
 - **Multipart parts park at UploadPart and are accepted during the upload.** (Built: `parkBlobs`
   over the `blob_parks` table, and the `queue-multipart-upload.accept` and
-  `queue-space-shard.accept` tasks in `s3frontend/acceptor.go` and `registry/accept.go`.) A part
+  `queue-space-shard.accept` tasks in `queue/multipartqueue/accept.go` and `registry/accept.go`.) A part
   holds no local bytes: its blobs stream to their providers, and each blob's accept concludes it
   from its park row. Complete runs the upload's accept for the parts it names and waits for their
   blobs' accepts, and answers accepts that do not finish within 30 s with a 409 that the AWS CLI

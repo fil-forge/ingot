@@ -19,7 +19,6 @@ import (
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/uploader"
-	"github.com/fil-forge/ucantone/did"
 )
 
 // This file is the streaming body write path (the trailer-hash RFC). A
@@ -214,14 +213,3 @@ func (w *bodyWriter) abandonStreamed(ctx context.Context) {
 
 // errPutFinished closes the PUT's end of the pipe once the PUT has returned.
 var errPutFinished = errors.New("s3frontend: put finished")
-
-// abandonStream gives up a streamed upload whose blob the space holds
-// already (see addBlob): the allocation is aborted on its provider,
-// best effort, as bodyWriter.abandon does.
-func (b *Backend) abandonStream(ctx context.Context, space did.DID, sb uploader.StreamedBlob) {
-	ctx, cancel := context.WithTimeout(ctx, abandonTimeLimit)
-	defer cancel()
-	if err := b.streaming.AbortBlob(ctx, space, sb.AddTask); err != nil {
-		b.logger.Warn("abandoning streamed upload failed; the provider expires it", zap.Stringer("add", sb.AddTask), zap.Error(err))
-	}
-}

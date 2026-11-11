@@ -2,9 +2,11 @@ package taskrunner
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +23,25 @@ type hold struct {
 	// lost is set when renewal finds the lease taken over. Nothing more may
 	// run under it.
 	lost atomic.Bool
+	// turn is the place in the subject's line of the Run caller holding the
+	// lease, or nil for a worker or a tree's child. Releasing the lease does
+	// not wake it: it released the lease itself, and backs off.
+	turn *runTurn
+	// claimed is set when the statement that took the lease also claimed
+	// the task to run first under it and recorded that task's tree age, so
+	// the task need not record its age, nor check the lease, again if it
+	// starts soon after (see runRoot). It holds for that one task.
+	claimed bool
+	// taken is when the statement that took the lease was sent: the lease
+	// runs for a TTL from no earlier than this.
+	taken time.Time
+	// releaseOnCommit is set for a Run caller's hold: its task's commit
+	// deletes the lease row in the same transaction, rather than extending
+	// it, since the caller releases the lease once its task has run.
+	releaseOnCommit bool
+	// released is set once a commit has deleted the lease row, so ending the
+	// hold has nothing left to delete.
+	released bool
 }
 
 func (h *hold) key() subjectKey { return subjectKey{h.q.name, h.subject} }
@@ -71,24 +92,11 @@ type freeSub struct {
 // the age of the tree holding it. Both results are nil when the holder's age
 // could not be read.
 func (r *Runner) tryLease(ctx context.Context, q *queue, subject string, age treeAge) (*hold, *treeAge, error) {
-	// A caller that has already gone needs no lease.
-	if err := ctx.Err(); err != nil {
-		return nil, nil, err
-	}
 	token := uuid.New()
 	var taken, tookOver bool
 	var holderCreated *time.Time
 	var holderID *uuid.UUID
-	// The take runs past ctx's end, so that its caller learns whether it took
-	// the lease: cut off by ctx, it can take the lease on the server and
-	// still fail here, leaving a lease no hold records, which nothing would
-	// renew or release. The lease's own TTL bounds it instead, together with
-	// any drop that follows it. A lease left by that bound expires a TTL after
-	// its statement started, which is soon after the take gives up unless the
-	// take waited long for a connection.
-	takeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.opts.LeaseTTL)
-	defer cancel()
-	err := r.db.QueryRow(takeCtx, `
+	err := r.db.QueryRow(ctx, `
 WITH taken AS (
 	INSERT INTO `+q.leases+` AS l (subject, owner, expires, tree_created, tree_id)
 	VALUES ($1, $2, now() + $3 * interval '1 millisecond', $4, $5)
@@ -109,14 +117,6 @@ SELECT false, false, tree_created, tree_id FROM `+q.leases+`
 		// The holder committed after this statement's snapshot was taken.
 		return nil, nil, nil
 	case err != nil:
-		// The take may have written the lease anyway: drop it. One that
-		// failed with its connection may still be running on the server and
-		// land after the drop; that lease expires on its own.
-		r.dropUntracked(takeCtx, q, subject, token)
-		if cerr := ctx.Err(); cerr != nil {
-			// The caller's own end, rather than the take's bound.
-			err = cerr
-		}
 		return nil, nil, fmt.Errorf("take lease %s/%s: %w", q.name, subject, err)
 	}
 	if !taken {
@@ -133,13 +133,121 @@ SELECT false, false, tree_created, tree_id FROM `+q.leases+`
 	return h, nil, nil
 }
 
+// takeTurn is tryLease and claim in one statement, for a Run caller whose
+// task, target with sequence number upTo, is to run first under the lease.
+// It takes the lease only when that task is the subject's oldest due task.
+// When another task is, it takes nothing, and returns an *aheadError for a
+// task the workers are to run, so the caller can wake them. For one whose own
+// caller is waiting for it, here or on another instance, one that waits to
+// retry, or one placed on another instance, it returns nothing: the caller
+// backs off until that task has gone. When the caller's task is next, it returns a
+// nil hold if the lease is held, and otherwise the hold and the task, or the
+// hold alone for the caller to claim under afresh, as claim does: the
+// statement's view of the tasks is as old as the statement, and taking the
+// lease may have waited for a commit that changed them.
+func (r *Runner) takeTurn(ctx context.Context, q *queue, subject string, age treeAge, upTo int64, target TaskID) (_ *hold, _ *Task, ahead, err error) {
+	token := uuid.New()
+	var taken, tookOver bool
+	var next *uuid.UUID
+	var waited, backingOff *bool
+	var node *string
+	var c struct {
+		seq                *int64
+		id                 *uuid.UUID
+		action             *string
+		created            *time.Time
+		notBefore, expires *time.Time
+		args               []byte
+		sync               *bool
+		attempts           *int
+		node               *string
+	}
+	sent := time.Now()
+	// Every part reads the snapshot the statement started with. A write in
+	// a WITH runs whether or not anything reads it, so the lease is taken
+	// from mine, which is empty unless the caller's task is next, and the
+	// claim joins taken. Taking the lease can wait for a holder's commit
+	// that deletes its row, and the snapshot is then older than that
+	// commit, so the claim stands only when the snapshot had no live lease
+	// to wait for: no row, or one this statement took over once it expired.
+	// The claim runs whether or not the lease was taken, and names its task
+	// by subject and sequence number as well as ID, so whichever index the
+	// planner picks finds the one row rather than scanning pending tasks.
+	err = r.db.QueryRow(ctx, `
+WITH prior AS (
+	SELECT 1 FROM `+q.leases+` WHERE subject = $1
+), next AS (
+	SELECT id, coalesce(waiting_until > now(), false) AS waited,
+		coalesce(retry_at > now(), false) AS backing_off, node FROM `+q.tasks+`
+	WHERE subject = $1 AND state = 'pending' AND seq <= $6
+	AND (not_before IS NULL OR not_before <= now())
+	ORDER BY seq LIMIT 1
+), mine AS (
+	SELECT 1 FROM next WHERE id = $7 AND NOT backing_off AND (node IS NULL OR node = $8)
+), taken AS (
+	INSERT INTO `+q.leases+` AS l (subject, owner, expires, tree_created, tree_id)
+	SELECT $1, $2, now() + $3 * interval '1 millisecond', $4, $5 FROM mine
+	ON CONFLICT (subject) DO UPDATE
+		SET owner = EXCLUDED.owner, expires = EXCLUDED.expires,
+		    tree_created = EXCLUDED.tree_created, tree_id = EXCLUDED.tree_id
+		WHERE l.expires < now()
+	RETURNING xmax <> 0 AS took_over
+), claimed AS (
+	UPDATE `+q.tasks+` t SET started = coalesce(t.started, now())
+	FROM taken
+	WHERE t.subject = $1 AND t.seq = $6 AND t.id = $7 AND t.state = 'pending'
+	AND (taken.took_over OR NOT EXISTS (SELECT 1 FROM prior))
+	RETURNING t.seq, t.id, t.action, t.created, t.not_before, t.expires, t.args, t.sync, t.attempts, t.node
+)
+SELECT EXISTS (SELECT 1 FROM taken), coalesce((SELECT took_over FROM taken), false),
+	next.id, next.waited, next.backing_off, next.node,
+	claimed.seq, claimed.id, claimed.action, claimed.created, claimed.not_before,
+	claimed.expires, claimed.args, claimed.sync, claimed.attempts, claimed.node
+FROM (SELECT 1) one LEFT JOIN next ON true LEFT JOIN claimed ON true`,
+		subject, token, r.opts.LeaseTTL.Milliseconds(), age.created, age.id, upTo, target, r.opts.Node,
+	).Scan(&taken, &tookOver, &next, &waited, &backingOff, &node,
+		&c.seq, &c.id, &c.action, &c.created, &c.notBefore, &c.expires, &c.args, &c.sync, &c.attempts, &c.node)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("take lease %s/%s: %w", q.name, subject, err)
+	}
+	if !taken {
+		switch {
+		case next == nil, *next == target, *waited, *backingOff, !r.mayRun(node):
+			// Nothing is due, the caller's task is next and the lease is
+			// held, or the oldest due task is its own caller's to run, or
+			// holds the subject.
+			return nil, nil, nil, nil
+		default:
+			return nil, nil, &aheadError{*next}, nil
+		}
+	}
+	if tookOver {
+		r.metrics.observeTakeover(ctx, q)
+	}
+	h := &hold{q: q, subject: subject, token: token, age: age, releaseOnCommit: true}
+	r.mu.Lock()
+	r.holds[token] = h
+	r.mu.Unlock()
+	if c.id == nil {
+		return h, nil, nil, nil
+	}
+	h.claimed, h.taken = true, sent
+	return h, &Task{
+		Queue: q.name, Subject: subject, ID: *c.id, Action: *c.action, Created: *c.created,
+		NotBefore: c.notBefore, Expires: c.expires, Args: c.args, sync: *c.sync,
+		Attempt: *c.attempts, Node: c.node, seq: *c.seq,
+	}, nil, nil
+}
+
 // setAge records the tree about to run under h, for other trees' wait-or-die
 // decisions. It is also the check, before each task's handler starts, that h
-// still owns the lease: it returns errLeaseLost when another consumer has
-// taken it over.
+// still owns the lease, which it extends by a TTL from now, so the handler
+// starts with the whole of it: it returns errLeaseLost when another consumer
+// has taken the lease over or it has expired.
 func (r *Runner) setAge(ctx context.Context, h *hold, age treeAge) error {
-	tag, err := r.db.Exec(ctx, `UPDATE `+h.q.leases+` SET tree_created = $3, tree_id = $4
-		WHERE subject = $1 AND owner = $2 AND expires >= now()`, h.subject, h.token, age.created, age.id)
+	tag, err := r.db.Exec(ctx, `UPDATE `+h.q.leases+` SET tree_created = $3, tree_id = $4,
+		expires = now() + $5 * interval '1 millisecond'
+		WHERE subject = $1 AND owner = $2 AND expires >= now()`, h.subject, h.token, age.created, age.id, r.opts.LeaseTTL.Milliseconds())
 	if err != nil {
 		return fmt.Errorf("record tree on lease %s/%s: %w", h.q.name, h.subject, err)
 	}
@@ -151,24 +259,6 @@ func (r *Runner) setAge(ctx context.Context, h *hold, age treeAge) error {
 	return nil
 }
 
-// dropUntracked deletes the lease a failed take may have written under token,
-// which only that take knows, and wakes this process's waiters on the subject
-// if there was one. It runs on the take's own context, so the take and the
-// drop together last at most the lease TTL, past which any lease the take
-// wrote has expired anyway; if it fails, the lease expires on its own.
-func (r *Runner) dropUntracked(takeCtx context.Context, q *queue, subject string, token uuid.UUID) {
-	tag, err := r.db.Exec(takeCtx, `DELETE FROM `+q.leases+` WHERE subject = $1 AND owner = $2`,
-		subject, token)
-	if err != nil {
-		r.log.Warn("drop a lease a failed take may have written; it expires on its own",
-			zapSubject(q.name, subject), zapErr(err))
-		return
-	}
-	if tag.RowsAffected() > 0 {
-		r.wakeFreed(subjectKey{q.name, subject})
-	}
-}
-
 // release deletes the lease and wakes this process's waiters on the subject.
 func (r *Runner) release(ctx context.Context, h *hold) {
 	r.forget(h)
@@ -178,17 +268,166 @@ func (r *Runner) release(ctx context.Context, h *hold) {
 		r.log.Warn("release lease; it expires on its own",
 			zapSubject(h.q.name, h.subject), zapErr(err))
 	}
-	r.wakeFreed(h.key())
+	r.wakeReleased(h)
 }
 
-// wakeFreed wakes this process's waiters on key's lease being released.
-func (r *Runner) wakeFreed(key subjectKey) {
+// releasedInCommit ends h once a commit has deleted its lease row.
+func (r *Runner) releasedInCommit(h *hold) {
+	h.released = true
+	r.forget(h)
+	r.wakeReleased(h)
+}
+
+// wakeReleased wakes this process's waiters on h's subject once its lease
+// row is gone.
+func (r *Runner) wakeReleased(h *hold) {
+	r.mu.Lock()
+	if sub, ok := r.freed[h.key()]; ok {
+		close(sub.ch)
+		delete(r.freed, h.key())
+	}
+	if line := r.lines[h.key()]; len(line) > 0 && line[0] != h.turn {
+		r.wakeFront(h.key())
+	}
+	r.mu.Unlock()
+}
+
+// runTurn is one Run caller's place in its subject's line.
+type runTurn struct {
+	seq int64
+	// wake is signalled when the caller should look at the subject again:
+	// the lease was released in this process, or the caller came to the
+	// front. It holds one signal, so none is lost while the caller is busy.
+	wake chan struct{}
+}
+
+// A subject's line holds this process's Run callers in their tasks' order.
+// Their tasks run in that order, so only the caller at the front can make
+// progress: the others wait without querying, and a release wakes the front
+// caller alone rather than every caller on the subject, each of which would
+// try the lease for one of them to win it. Callers in other processes, and
+// tasks the workers run, are not in the line; the front caller's backoff
+// covers them.
+
+// joinLine puts a Run caller of the task with the given seq in key's line.
+func (r *Runner) joinLine(key subjectKey, seq int64) *runTurn {
+	t := &runTurn{seq: seq, wake: make(chan struct{}, 1)}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if sub, ok := r.freed[key]; ok {
-		close(sub.ch)
-		delete(r.freed, key)
+	line := r.lines[key]
+	i, _ := slices.BinarySearchFunc(line, seq, func(t *runTurn, seq int64) int { return cmp.Compare(t.seq, seq) })
+	r.lines[key] = slices.Insert(line, i, t)
+	return t
+}
+
+// leaveLine takes t out of key's line, waking the caller that comes to the
+// front in its place.
+func (r *Runner) leaveLine(key subjectKey, t *runTurn) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	line := r.lines[key]
+	i := slices.Index(line, t)
+	if i < 0 {
+		return
 	}
+	line = slices.Delete(line, i, i+1)
+	if len(line) == 0 {
+		delete(r.lines, key)
+		return
+	}
+	r.lines[key] = line
+	if i == 0 {
+		r.wakeFront(key)
+	}
+}
+
+// frontOfLine reports whether t is at the front of key's line.
+func (r *Runner) frontOfLine(key subjectKey, t *runTurn) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	line := r.lines[key]
+	return len(line) > 0 && line[0] == t
+}
+
+// wakeFront wakes the caller at the front of key's line. r.mu must be held.
+func (r *Runner) wakeFront(key subjectKey) {
+	if line := r.lines[key]; len(line) > 0 {
+		select {
+		case line[0].wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// turnWait is how a Run caller's wait for its turn ended.
+type turnWait struct {
+	// done is set when the task has an outcome, or the caller must stop:
+	// res and err are what Run returns.
+	done bool
+	res  []byte
+	err  error
+	// woken is set when t was woken.
+	woken bool
+	// finished is set when done came from the task's recorded outcome, or
+	// from the task being gone: it no longer needs its caller's claim.
+	finished bool
+}
+
+// hasOutcome reports whether err, from outcome, says the task has an outcome
+// recorded or is gone, rather than that reading it failed.
+func hasOutcome(err error) bool {
+	var herr *HandlerError
+	return err == nil || errors.As(err, &herr) || errors.Is(err, ErrExpired) ||
+		errors.Is(err, ErrCancelled) || errors.Is(err, ErrNotFound)
+}
+
+// awaitTurn reads the task's outcome and, while it is still pending and
+// before expires, waits until the task finishes in this process, t is woken,
+// d passes, or ctx ends. It listens for the finish before it reads, as Wait
+// does, so a finish committed in between still wakes it.
+//
+// ahead, when set, is a task the caller found due before its own. The wait
+// ends as well once that task is over in this process, as when it is
+// cancelled and no subject is released to wake t. It is read after the
+// listening starts, so one over since the caller saw it ends the wait at
+// once.
+func (r *Runner) awaitTurn(ctx context.Context, q *queue, id TaskID, t *runTurn, d time.Duration, expires *time.Time, ahead TaskID) turnWait {
+	ch := r.addWaiter(id)
+	defer r.removeWaiter(id, ch)
+	var gone chan struct{}
+	if ahead != (TaskID{}) {
+		gone = r.addWaiter(ahead)
+		defer r.removeWaiter(ahead, gone)
+	}
+	if res, err, done := r.outcome(ctx, q, id); done {
+		return turnWait{done: true, res: res, err: err, finished: hasOutcome(err)}
+	}
+	if gone != nil {
+		if _, _, over := r.outcome(ctx, q, ahead); over {
+			return turnWait{}
+		}
+	}
+	// Past its Expires the task can no longer start: whoever takes the
+	// subject next records it as expired, so the caller can stop waiting.
+	if expires != nil {
+		left := time.Until(*expires)
+		if left <= 0 {
+			return turnWait{done: true, err: ErrExpired}
+		}
+		d = min(d, left)
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ch:
+	case <-gone:
+	case <-t.wake:
+		return turnWait{woken: true}
+	case <-timer.C:
+	case <-ctx.Done():
+		return turnWait{done: true, err: ctx.Err()}
+	}
+	return turnWait{}
 }
 
 // forget stops renewing h, leaving its row to expire.
@@ -201,6 +440,9 @@ func (r *Runner) forget(h *hold) {
 // endHold releases a root hold after a drain, or leaves it to expire when the
 // drain stopped on a tree that could not commit or lost the lease.
 func (r *Runner) endHold(ctx context.Context, h *hold, stop error) {
+	if h.released {
+		return
+	}
 	if errors.Is(stop, errNotCommitted) || errors.Is(stop, errLeaseLost) {
 		r.forget(h)
 		return

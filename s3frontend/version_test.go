@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"slices"
-	"sort"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -107,43 +106,6 @@ func apiErrCode(t *testing.T, err error) string {
 		t.Fatalf("not an API error: %v", err)
 	}
 	return apiErr.Code
-}
-
-func TestVersionID_Classify(t *testing.T) {
-	if kind, _ := classifyVersionID(""); kind != versionKindCurrent {
-		t.Fatalf("empty → %v, want current", kind)
-	}
-	if kind, _ := classifyVersionID("null"); kind != versionKindNull {
-		t.Fatalf("null → %v, want null", kind)
-	}
-	// A minted token round-trips to its seq.
-	tok := mintVersionID(42)
-	kind, seq := classifyVersionID(tok)
-	if kind != versionKindToken || seq != 42 {
-		t.Fatalf("minted token → (%v, %d), want (token, 42)", kind, seq)
-	}
-	// A foreign-but-well-formed ULID is a token (resolution rejects it later).
-	if kind, _ := classifyVersionID("01G65Z755AFWAKHE12NY0CQ9FH"); kind != versionKindToken {
-		t.Fatalf("foreign ULID → %v, want token", kind)
-	}
-	// Malformed ids are invalid.
-	for _, bad := range []string{"invalid_version_id", "../../secret.txt", "abc", "NULL "} {
-		if kind, _ := classifyVersionID(bad); kind != versionKindInvalid {
-			t.Fatalf("%q → %v, want invalid", bad, kind)
-		}
-	}
-}
-
-func TestRevSeqKey_NewestFirst(t *testing.T) {
-	// Larger seq must sort lexicographically smaller (newest-first walk).
-	keys := []string{revSeqKey(1), revSeqKey(2), revSeqKey(10), revSeqKey(1 << 40)}
-	sorted := append([]string(nil), keys...)
-	sort.Strings(sorted)
-	for i := range keys {
-		if keys[len(keys)-1-i] != sorted[i] {
-			t.Fatalf("revSeqKey ordering broken: %v (sorted %v)", keys, sorted)
-		}
-	}
 }
 
 func TestVersioning_EnabledPutRetainsVersions(t *testing.T) {
