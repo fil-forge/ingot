@@ -2,9 +2,11 @@ package taskrunner
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -144,7 +146,92 @@ func (r *Runner) release(ctx context.Context, h *hold) {
 		close(sub.ch)
 		delete(r.freed, h.key())
 	}
+	r.wakeFront(h.key())
 	r.mu.Unlock()
+}
+
+// runTurn is one Run caller's place in its subject's line.
+type runTurn struct {
+	seq int64
+	// wake is signalled when the caller should look at the subject again:
+	// the lease was released in this process, or the caller came to the
+	// front. It holds one signal, so none is lost while the caller is busy.
+	wake chan struct{}
+}
+
+// A subject's line holds this process's Run callers in their tasks' order.
+// Their tasks run in that order, so only the caller at the front can make
+// progress: the others wait without querying, and a release wakes the front
+// caller alone rather than every caller on the subject, each of which would
+// try the lease for one of them to win it. Callers in other processes, and
+// tasks the workers run, are not in the line; the front caller's backoff
+// covers them.
+
+// joinLine puts a Run caller of the task with the given seq in key's line.
+func (r *Runner) joinLine(key subjectKey, seq int64) *runTurn {
+	t := &runTurn{seq: seq, wake: make(chan struct{}, 1)}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	line := r.lines[key]
+	i, _ := slices.BinarySearchFunc(line, seq, func(t *runTurn, seq int64) int { return cmp.Compare(t.seq, seq) })
+	r.lines[key] = slices.Insert(line, i, t)
+	return t
+}
+
+// leaveLine takes t out of key's line, waking the caller that comes to the
+// front in its place.
+func (r *Runner) leaveLine(key subjectKey, t *runTurn) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	line := r.lines[key]
+	i := slices.Index(line, t)
+	if i < 0 {
+		return
+	}
+	line = slices.Delete(line, i, i+1)
+	if len(line) == 0 {
+		delete(r.lines, key)
+		return
+	}
+	r.lines[key] = line
+	if i == 0 {
+		r.wakeFront(key)
+	}
+}
+
+// frontOfLine reports whether t is at the front of key's line.
+func (r *Runner) frontOfLine(key subjectKey, t *runTurn) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	line := r.lines[key]
+	return len(line) > 0 && line[0] == t
+}
+
+// wakeFront wakes the caller at the front of key's line. r.mu must be held.
+func (r *Runner) wakeFront(key subjectKey) {
+	if line := r.lines[key]; len(line) > 0 {
+		select {
+		case line[0].wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// awaitTurn waits until the task finishes in this process, t is woken, d
+// passes, or ctx ends.
+func (r *Runner) awaitTurn(ctx context.Context, id TaskID, t *runTurn, d time.Duration) error {
+	ch := r.addWaiter(id)
+	defer r.removeWaiter(id, ch)
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ch:
+	case <-t.wake:
+	case <-timer.C:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
 }
 
 // forget stops renewing h, leaving its row to expire.

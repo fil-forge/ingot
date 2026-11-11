@@ -228,6 +228,9 @@ type Runner struct {
 	waiting map[TaskID]*queue
 	waiters map[TaskID]map[chan struct{}]struct{}
 	freed   map[subjectKey]*freeSub
+	// lines holds each subject's Run callers in this process in their tasks'
+	// order (see runLine).
+	lines map[subjectKey][]*runTurn
 
 	// wg counts pollers and workers, inline the Run calls in progress.
 	wg     sync.WaitGroup
@@ -304,6 +307,7 @@ func New(db DB, opts Options) (*Runner, error) {
 		waiters:  map[TaskID]map[chan struct{}]struct{}{},
 		waiting:  map[TaskID]*queue{},
 		freed:    map[subjectKey]*freeSub{},
+		lines:    map[subjectKey][]*runTurn{},
 	}
 	// Metrics never stop the runner: instruments the provider refuses leave
 	// it reporting nothing.
@@ -803,10 +807,29 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 	}
 	age := treeAge{created, id}
 	key := subjectKey{q.name, s.Subject}
+	turn := r.joinLine(key, seq)
+	defer r.leaveLine(key, turn)
 
 	wait := newBackoff(r.opts.PollInterval)
 	start := time.Now()
 	for {
+		if !r.frontOfLine(key, turn) {
+			// An older Run in this process goes first, and this task cannot
+			// start before it: wait for the turn without asking the database.
+			d := r.opts.PollInterval
+			if s.Expires != nil {
+				left := time.Until(*s.Expires)
+				if left <= 0 {
+					return nil, ErrExpired
+				}
+				d = min(d, left)
+			}
+			if err := r.awaitTurn(ctx, id, turn, d); err != nil {
+				return nil, err
+			}
+			wait = newBackoff(r.opts.PollInterval)
+			continue
+		}
 		h, _, err := r.tryLease(ctx, q, s.Subject, age)
 		if err != nil {
 			return nil, err
@@ -855,7 +878,7 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 			}
 			d = min(d, left)
 		}
-		if err := r.waitTask(ctx, id, key, d); err != nil {
+		if err := r.awaitTurn(ctx, id, turn, d); err != nil {
 			return nil, err
 		}
 	}
