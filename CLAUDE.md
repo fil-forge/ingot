@@ -107,10 +107,9 @@ Internal:
   with an access key from the environment, as JSON, for benchmark runs);
   `deps.go` (agent identity from the PEM key + optional did:web, pgx pool).
 - **`s3frontend/`** — versitygw `backend.Backend`: `object.go`
-  (Put/Get/Head/Delete/List), `version.go` (resolveVersion / applyPut,
-  the per-key version tree), `bucketqueue.go` (`queue-bucket.commit`: one
-  task per bucket change, sync for the request, on the bucket's subject;
-  applies an ordered list of key changes, `bucketchanges.go`, to one Tx),
+  (Put/Get/Head/Delete/List), `version.go` (resolveVersion, reading the
+  per-key version tree), `bucketqueue.go` (the requests' commits through
+  `queue/bucketqueue`), `conditions.go` (its errors' S3 answers),
   `bucketadmin.go` (`queue-bucket.create`, `.set-versioning`,
   `.set-object-lock-config`, `.set-tagging`, `.set-cors`, `.set-encryption`,
   `.close`, `.admit-upload`), `bucketship.go`
@@ -154,9 +153,12 @@ Internal:
   calls for its sync tasks and specs for the async ones other queues spawn:
   `shardqueue` (`queue-shard`, the cache's copies), `spaceuploadqueue`
   (`queue-space-upload`, the object-count changes), `spaceshardqueue`
-  (`queue-space-shard`, the tasks on one blob in one space). Its name,
+  (`queue-space-shard`, the tasks on one blob in one space; its name,
   subjects and release arguments are in `registry`, which queues releases
-  with bucket commits and part writes. The other queues'
+  with bucket commits and part writes), `bucketqueue`
+  (`queue-bucket.commit`, every change to a bucket's objects: an ordered
+  list of key changes applied to one Tx, the version tree's write rule,
+  and the errors a change fails with on its own terms). The other
   handlers are in `s3frontend`.
 - **`taskrunner/`** — durable task queues in Postgres (one tasks table and
   one leases table per queue), serialized per (queue, subject) by a lease
@@ -184,7 +186,8 @@ Internal:
   upload ID: an upload's create, add-part, accept, complete, abort and reap,
   one at a time, the accept (`s3frontend/acceptor.go`) queuing a
   `queue-space-shard.accept` for each blob of the upload's parked parts;
-  `queue-bucket` (`s3frontend/bucketqueue.go`), subject the bucket's space
+  `queue-bucket` (`queue/bucketqueue` for commits, `s3frontend` for the
+  rest), subject the bucket's space
   DID: every change to a bucket, placed on the instance holding its catalog
   log; `queue-space-upload` (`queue/spaceuploadqueue`), the
   object-count changes a `queue-bucket.commit` spawns with its own

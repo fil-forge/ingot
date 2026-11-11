@@ -4,6 +4,7 @@ import (
 	"context"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 )
 
 // This file implements S3 object tagging (docs/s3-object-tagging.md): the
@@ -24,7 +25,7 @@ func (b *Backend) resolveTagTarget(ctx context.Context, bucketName, key, version
 // mutateVersionTags runs a per-version state write for the tagging methods:
 // mutateVersionState with no bucket gate.
 func (b *Backend) mutateVersionTags(ctx context.Context, bucketName, key, versionID string, tags map[string]string) error {
-	return b.mutateVersionState(ctx, bucketName, key, &SetAttributesChange{VersionID: versionID, SetTags: true, Tags: tags})
+	return b.mutateVersionState(ctx, bucketName, key, &bucketqueue.SetAttributesChange{VersionID: versionID, SetTags: true, Tags: tags})
 }
 
 // applyTagsIfPresent merges a creation-time tag set into a version's initial

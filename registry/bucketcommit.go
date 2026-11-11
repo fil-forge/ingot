@@ -57,6 +57,26 @@ type CommitWrites struct {
 	Expiries []taskrunner.TaskID
 }
 
+// Apply adds w to the commit of the task ex runs: its guards, then its
+// statements (a part's tree row follows the part row its guard writes), its
+// spawns and the expiries it cancels.
+func (w CommitWrites) Apply(ctx context.Context, ex *taskrunner.Exec) error {
+	for _, st := range w.Guards {
+		if err := ex.WriteConditional(ctx, st.SQL, st.Args...); err != nil {
+			return err
+		}
+	}
+	for _, st := range w.Statements {
+		if err := ex.Write(ctx, st.SQL, st.Args...); err != nil {
+			return err
+		}
+	}
+	if _, err := ex.SubmitAll(ctx, w.Spawns); err != nil {
+		return err
+	}
+	return ex.Cancel(ctx, ReleaseQueue, w.Expiries...)
+}
+
 // RootCommitWrites returns the writes that advance bucket name's root from
 // expect to next and record c with it: c's catalog blocks journaled under
 // their segment while it is unshipped, its upload registrations, its claims

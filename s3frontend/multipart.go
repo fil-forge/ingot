@@ -29,6 +29,7 @@ import (
 
 	"github.com/fil-forge/ingot/blake3tree"
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
@@ -533,7 +534,7 @@ type completeCall struct {
 	reported bool
 	// reserved is the version the Complete reserved and reported, kept for
 	// the same reason: a run again installs the id the client already has.
-	reserved *versionReservation
+	reserved *bucketqueue.ReservedVersion
 }
 
 // runComplete is queue-multipart-upload.complete (completeUpload).
@@ -832,13 +833,13 @@ func (b *Backend) completeUpload(ctx context.Context, ex *taskrunner.Exec, call 
 	// commits its early 200 with x-amz-version-id, and an error after it can
 	// only go in the 200's body. The re-hash refusal above comes first so
 	// that it keeps its 400. The commit then installs exactly this id, or
-	// fails (errReservationSuperseded). Every other Complete reports no id,
-	// and the commit then refuses to create a numbered version, which the
-	// client could never learn.
+	// fails (bucketqueue.ErrReservationSuperseded). Every other Complete
+	// reports no id, and the commit then refuses to create a numbered
+	// version, which the client could never learn.
 	if call.reserved == nil {
-		call.reserved = &versionReservation{}
+		call.reserved = &bucketqueue.ReservedVersion{}
 		if bucketState.Versioning == registry.VersioningEnabled && !call.reported {
-			r, err := b.reserveVersion(ctx, bucket)
+			r, err := b.commits.Reserve(ctx, bucket)
 			if err != nil {
 				call.reserved = nil
 				return s3response.CompleteMultipartUploadResult{}, "", err
@@ -933,15 +934,15 @@ func (b *Backend) completeUpload(ctx context.Context, ex *taskrunner.Exec, call 
 	// the reference-index claims and drops with the root's advance, all
 	// committed with this task. The commit re-checks the conditional-write
 	// preconditions against the version it supersedes.
-	put := &PutChange{Manifest: mf, HasBlobs: true, Blobs: blobs, InitState: initState, Reserved: &ReservedVersion{Seq: reserved.Seq, VersionID: reserved.VersionID}, Completes: true}
+	put := &bucketqueue.PutChange{Manifest: mf, HasBlobs: true, Blobs: blobs, InitState: initState, Reserved: reserved, Completes: true}
 	if ifMatch != nil {
 		put.HasIfMatch, put.IfMatch = true, *ifMatch
 	}
 	if ifNoneMatch != nil {
 		put.HasIfNoneMatch, put.IfNoneMatch = true, *ifNoneMatch
 	}
-	node, effState, err := b.commitOneWith(ctx, ex, bucketState, KeyChange{Key: key, Put: put}, "commit version")
-	if errors.Is(err, errReservationSuperseded) {
+	node, effState, err := b.commitOneChild(ctx, ex, bucketState, bucketqueue.KeyChange{Key: key, Put: put}, "commit version")
+	if errors.Is(err, bucketqueue.ErrReservationSuperseded) {
 		b.logger.Info("multipart completion refused: the key or the bucket's versioning changed since it reported its version",
 			zap.String("key", key), zap.String("uploadID", uploadID), zap.String("versionID", reserved.VersionID))
 	}

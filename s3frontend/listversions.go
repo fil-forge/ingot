@@ -19,6 +19,7 @@ import (
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -49,7 +50,7 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 
 	// A version-id marker must accompany a key marker and be well-formed.
 	if versionIDMarker != "" {
-		if kind, _ := classifyVersionID(versionIDMarker); keyMarker == "" || kind == versionKindInvalid {
+		if kind, _ := bucketqueue.ClassifyVersionID(versionIDMarker); keyMarker == "" || kind == bucketqueue.VersionKindInvalid {
 			return s3response.ListVersionsResult{}, errInvalidVersionID(versionIDMarker)
 		}
 	}
@@ -157,7 +158,7 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 		} else {
 			// Manifest-valued key (§2.1): its single version is the current one, and the
 			// value block is already the manifest.
-			current = msbucket.VersionNode{Seq: val.Manifest.Seq, VersionID: manifestVersionID(val.Manifest), Manifest: valCid}
+			current = msbucket.VersionNode{Seq: val.Manifest.Seq, VersionID: bucketqueue.ManifestVersionID(val.Manifest), Manifest: valCid}
 		}
 
 		// Versions of the marker key resume strictly after the marker version:
@@ -172,14 +173,14 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 		// loss is not, and pagination still advances.
 		seqBelow := uint64(math.MaxUint64)
 		if k == keyMarker && versionIDMarker != "" {
-			switch kind, seq := classifyVersionID(versionIDMarker); kind {
-			case versionKindNull:
+			switch kind, seq := bucketqueue.ClassifyVersionID(versionIDMarker); kind {
+			case bucketqueue.VersionKindNull:
 				if current.VersionID == registry.NullVersionID {
 					seqBelow = current.Seq
 				} else if leaf != nil && leaf.NullSeq != 0 {
 					seqBelow = leaf.NullSeq
 				}
-			case versionKindToken:
+			case bucketqueue.VersionKindToken:
 				seqBelow = seq
 			}
 		}
@@ -206,7 +207,7 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 					LastModified: &lm,
 				})
 			} else {
-				etag := etagOf(mf)
+				etag := mf.QuotedETag()
 				size := mf.Body.Size
 				ov := s3response.ObjectVersion{
 					Key:          &key,
@@ -250,12 +251,12 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 		}
 		pt := mst.LoadMST(b.read, st.Space, *leaf.Prev)
 		// The prev walk is newest-first (inverted-seq keys); resume strictly
-		// after the marker version by starting just past its key. revSeqKey is
-		// fixed-width, so appending "\x01" forms a bound that sorts after the
-		// marker's key and before every other key.
+		// after the marker version by starting just past its key. RevSeqKey
+		// is fixed-width, so appending "\x01" forms a bound that sorts after
+		// the marker's key and before every other key.
 		prevFrom := ""
 		if seqBelow != math.MaxUint64 {
-			prevFrom = revSeqKey(seqBelow) + "\x01"
+			prevFrom = bucketqueue.RevSeqKey(seqBelow) + "\x01"
 		}
 		stopped := false
 		perr := pt.WalkLeavesFrom(ctx, prevFrom, func(_ string, mfCid cid.Cid) error {

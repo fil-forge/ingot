@@ -17,6 +17,7 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
@@ -127,7 +128,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	if srcBucket == dstBucket && srcKey == dstKey && !replace && srcVersionID != "" && srcRv.isLatest {
 		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidCopyDest)
 	}
-	if err := evaluateCopySourcePreconditions(etagOf(srcMf), time.Unix(srcMf.Created, 0), backend.PreConditions{
+	if err := evaluateCopySourcePreconditions(srcMf.QuotedETag(), time.Unix(srcMf.Created, 0), backend.PreConditions{
 		IfMatch:       input.CopySourceIfMatch,
 		IfNoneMatch:   input.CopySourceIfNoneMatch,
 		IfModSince:    input.CopySourceIfModifiedSince,
@@ -292,14 +293,14 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 			return s3response.CopyObjectOutput{}, err
 		}
 	}
-	put := &PutChange{Manifest: dstMf, HasBlobs: blobs != nil, Blobs: blobs, Refs: blobRefTasks(refs), InitState: applyTagsIfPresent(initState, dstTags)}
-	node, effState, err := b.commitOne(ctx, bucketState, KeyChange{Key: dstKey, Put: put}, "commit version")
+	put := &bucketqueue.PutChange{Manifest: dstMf, HasBlobs: blobs != nil, Blobs: blobs, Refs: blobRefTasks(refs), InitState: applyTagsIfPresent(initState, dstTags)}
+	node, effState, err := b.commitOne(ctx, bucketState, bucketqueue.KeyChange{Key: dstKey, Put: put}, "commit version")
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
 
 	lastMod := time.Unix(dstMf.Created, 0)
-	quotedETag := etagOf(dstMf)
+	quotedETag := dstMf.QuotedETag()
 	result := &s3response.CopyObjectResult{
 		ETag:         &quotedETag,
 		LastModified: &lastMod,

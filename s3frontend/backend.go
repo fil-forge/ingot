@@ -46,6 +46,7 @@ import (
 	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/authority"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
@@ -95,8 +96,10 @@ type Backend struct {
 	// blobs runs the tasks on one blob in one space: a write's references,
 	// its accept, its release.
 	blobs *spaceshardqueue.Queue
-	// buckets runs the queue-bucket tasks.
+	// buckets runs the queue-bucket tasks besides commit.
 	buckets *taskrunner.Runner
+	// commits runs queue-bucket.commit, every change to a bucket's objects.
+	commits *bucketqueue.Queue
 	// uploads runs the queue-multipart-upload tasks.
 	uploads *taskrunner.Runner
 	// acceptDelay is how long after a part lands its upload's accept is due:
@@ -403,6 +406,15 @@ func New(d Deps) (*Backend, error) {
 		b.blobs, err = spaceshardqueue.New(d.Tasks, bd)
 	}
 	if err == nil {
+		b.commits, err = bucketqueue.New(d.Tasks, bucketqueue.Deps{
+			Registry:     d.Registry,
+			Txns:         b.txns,
+			ReleaseGrace: d.ReleaseGrace,
+			Appended:     b.queueAwaitedShip,
+			Logger:       logger,
+		})
+	}
+	if err == nil {
 		err = b.registerTasks(d.Tasks)
 	}
 	if err != nil {
@@ -416,7 +428,7 @@ func New(d Deps) (*Backend, error) {
 func (b *Backend) registerTasks(r *taskrunner.Runner) error {
 	for _, register := range []func(*taskrunner.Runner) error{
 		b.registerMultipartTasks,
-		b.registerBucketTasks,
+		b.registerBucketAdmin,
 		b.registerAcceptTasks,
 	} {
 		if err := register(r); err != nil {

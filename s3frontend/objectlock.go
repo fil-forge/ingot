@@ -8,12 +8,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3err"
-	"github.com/ipfs/go-cid"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/mst"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -24,22 +23,6 @@ import (
 // itself lives in versitygw's controller (auth.CheckObjectAccess), which
 // consumes these methods; the backend only stores state and returns the §2
 // sentinels. Bucket-level configuration is in bucket.go.
-
-// bucketLockEnabled reports whether the bucket carries an Enabled object-lock
-// configuration. The stored document is the controller's own
-// auth.BucketLockConfig JSON; a document that does not parse reports disabled,
-// which fails toward refusing lock operations, never toward ignoring locks
-// (CheckObjectAccess parses the same bytes itself and errors loudly).
-func bucketLockEnabled(st *registry.State) bool {
-	if len(st.ObjectLockConfig) == 0 {
-		return false
-	}
-	var cfg auth.BucketLockConfig
-	if err := json.Unmarshal(st.ObjectLockConfig, &cfg); err != nil {
-		return false
-	}
-	return cfg.Enabled
-}
 
 // lockStateFromHeaders builds the VersionState a version-creating write
 // stamps from its x-amz-object-lock-* headers (§7), already validated by the
@@ -61,7 +44,7 @@ func lockStateFromHeaders(st *registry.State, mode types.ObjectLockMode, retainU
 	if mode == "" && retainUntil == nil && hold == "" {
 		return nil, nil
 	}
-	if !bucketLockEnabled(st) {
+	if !bucketqueue.LockEnabled(st) {
 		return nil, s3err.GetAPIError(s3err.ErrMissingObjectLockConfigurationNoSpaces)
 	}
 	vs := &msbucket.VersionState{}
@@ -114,7 +97,7 @@ func (b *Backend) resolveStateTarget(ctx context.Context, bucketName, key, versi
 		}
 		return nil, fmt.Errorf("s3frontend: mst get: %w", err)
 	}
-	if requireLock && !bucketLockEnabled(st) {
+	if requireLock && !bucketqueue.LockEnabled(st) {
 		return nil, s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)
 	}
 	rv, err := b.resolveVersion(ctx, bucketName, key, versionID)
@@ -142,7 +125,7 @@ func (b *Backend) versionStateOf(ctx context.Context, rv *resolvedVersion) (*msb
 		return nil, nil
 	}
 	t := mst.LoadMST(b.read, rv.st.Space, *rv.leaf.State)
-	scid, err := t.Get(ctx, revSeqKey(rv.node.Seq))
+	scid, err := t.Get(ctx, bucketqueue.RevSeqKey(rv.node.Seq))
 	if errors.Is(err, mst.ErrNotFound) {
 		return nil, nil
 	}
@@ -196,7 +179,7 @@ func (b *Backend) GetObjectLegalHold(ctx context.Context, bucket, object, versio
 // mutateVersionLock runs a per-version state write for the lock methods:
 // mutateVersionState with the lock-enabled gate required. The tagging twin
 // is mutateVersionTags (objecttag.go).
-func (b *Backend) mutateVersionLock(ctx context.Context, bucketName, key string, set *SetAttributesChange) error {
+func (b *Backend) mutateVersionLock(ctx context.Context, bucketName, key string, set *bucketqueue.SetAttributesChange) error {
 	set.RequireLock = true
 	return b.mutateVersionState(ctx, bucketName, key, set)
 }
@@ -206,7 +189,7 @@ func (b *Backend) mutateVersionLock(ctx context.Context, bucketName, key string,
 // COMPLIANCE never weakened, governance bypass) ran in the controller before
 // this is called.
 func (b *Backend) PutObjectRetention(ctx context.Context, bucket, object, versionId string, retention []byte) error {
-	return b.mutateVersionLock(ctx, bucket, object, &SetAttributesChange{VersionID: versionId, SetRetention: true, Retention: retention})
+	return b.mutateVersionLock(ctx, bucket, object, &bucketqueue.SetAttributesChange{VersionID: versionId, SetRetention: true, Retention: retention})
 }
 
 // PutObjectLegalHold stores the version's legal-hold status.
@@ -215,7 +198,7 @@ func (b *Backend) PutObjectLegalHold(ctx context.Context, bucket, object, versio
 	if status {
 		hold = msbucket.LegalHoldOn
 	}
-	return b.mutateVersionLock(ctx, bucket, object, &SetAttributesChange{VersionID: versionId, SetLegalHold: true, LegalHold: hold})
+	return b.mutateVersionLock(ctx, bucket, object, &bucketqueue.SetAttributesChange{VersionID: versionId, SetLegalHold: true, LegalHold: hold})
 }
 
 // mutateVersionState runs one per-version state write (§6): the check order
@@ -229,7 +212,7 @@ func (b *Backend) PutObjectLegalHold(ctx context.Context, bucket, object, versio
 // entirely inside the commit (a missing bucket surfaces through
 // mapCommitError); key existence outranks lock-enabled, which outranks the
 // versionId grammar, matching posix and the pinning conformance cases.
-func (b *Backend) mutateVersionState(ctx context.Context, bucketName, key string, set *SetAttributesChange) error {
+func (b *Backend) mutateVersionState(ctx context.Context, bucketName, key string, set *bucketqueue.SetAttributesChange) error {
 	st, err := b.reg.Get(ctx, bucketName)
 	if errors.Is(err, registry.ErrNotFound) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
@@ -237,214 +220,8 @@ func (b *Backend) mutateVersionState(ctx context.Context, bucketName, key string
 	if err != nil {
 		return fmt.Errorf("s3frontend: put object state: %w", err)
 	}
-	_, _, err = b.commitOne(ctx, st, KeyChange{Key: key, SetAttributes: set}, "put object lock state")
+	_, _, err = b.commitOne(ctx, st, bucketqueue.KeyChange{Key: key, SetAttributes: set}, "put object lock state")
 	return err
-}
-
-// applySetAttributes is the state write mutateVersionState commits: it sets
-// the fields set names on the version's state block, carrying the rest.
-func (b *Backend) applySetAttributes(ctx context.Context, sc *commitScope, key string, set *SetAttributesChange) (cid.Cid, error) {
-	tx := sc.tx
-	versionID, requireLock := set.VersionID, set.RequireLock
-	mutate := func(vs *msbucket.VersionState) {
-		if set.SetRetention {
-			vs.Retention = set.Retention
-		}
-		if set.SetLegalHold {
-			vs.LegalHold = set.LegalHold
-		}
-		if set.SetTags {
-			vs.Tags = set.Tags
-			if len(vs.Tags) == 0 {
-				vs.Tags = nil
-			}
-		}
-	}
-	return func() (cid.Cid, error) {
-		st := tx.State()
-		if !st.Root.Defined() {
-			return cid.Undef, s3err.GetAPIError(s3err.ErrNoSuchKey)
-		}
-		t := tx.LoadTree()
-		valCid, gerr := t.Get(ctx, key)
-		if errors.Is(gerr, mst.ErrNotFound) {
-			return cid.Undef, s3err.GetAPIError(s3err.ErrNoSuchKey)
-		}
-		if gerr != nil {
-			return cid.Undef, fmt.Errorf("mst get: %w", gerr)
-		}
-		if requireLock && !bucketLockEnabled(st) {
-			return cid.Undef, s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)
-		}
-		kind, seq := classifyVersionID(versionID)
-		if kind == versionKindInvalid {
-			return cid.Undef, errInvalidVersionID(versionID)
-		}
-		var val msbucket.ObjectValue
-		if err := tx.Get(ctx, st.Space, valCid, &val); err != nil {
-			return cid.Undef, fmt.Errorf("load value: %w", err)
-		}
-
-		// Locate the target version and its seq; reject markers (§6 step 5).
-		var leaf msbucket.ObjectLeaf
-		var targetSeq uint64
-		if val.Manifest != nil {
-			// Manifest-arm key: the single version either matches or the
-			// named version is absent; a match upgrades the key to a leaf
-			// built from the manifest's own identity fields (§4.1 rule 1).
-			mf := val.Manifest
-			node := msbucket.VersionNode{Seq: mf.Seq, VersionID: manifestVersionID(mf), Manifest: valCid}
-			switch kind {
-			case versionKindNull:
-				if node.VersionID != registry.NullVersionID {
-					return cid.Undef, s3err.GetNoSuchVersionErr(key, versionID)
-				}
-			case versionKindToken:
-				if mf.VersionID != versionID {
-					return cid.Undef, s3err.GetNoSuchVersionErr(key, versionID)
-				}
-			}
-			if mf.DeleteMarker {
-				return cid.Undef, s3err.GetAPIError(s3err.ErrMethodNotAllowed)
-			}
-			leaf = msbucket.ObjectLeaf{Current: node}
-			targetSeq = mf.Seq
-		} else {
-			leaf = *val.Leaf
-			targetSeq = seq
-			isCurrent := false
-			switch kind {
-			case versionKindCurrent:
-				isCurrent = true
-			case versionKindNull:
-				if leaf.Current.VersionID == registry.NullVersionID {
-					isCurrent = true
-				} else if leaf.NullSeq != 0 {
-					targetSeq = leaf.NullSeq
-				} else {
-					return cid.Undef, s3err.GetNoSuchVersionErr(key, versionID)
-				}
-			case versionKindToken:
-				isCurrent = leaf.Current.Seq == seq && leaf.Current.VersionID == versionID
-			}
-			var targetEm msbucket.EnvelopedManifest
-			if isCurrent {
-				targetSeq = leaf.Current.Seq
-				if err := tx.Get(ctx, st.Space, leaf.Current.Manifest, &targetEm); err != nil {
-					return cid.Undef, fmt.Errorf("load manifest: %w", err)
-				}
-			} else {
-				if leaf.Prev == nil {
-					return cid.Undef, s3err.GetNoSuchVersionErr(key, versionID)
-				}
-				pt := mst.LoadMST(tx, st.Space, *leaf.Prev)
-				mfCid, err := pt.Get(ctx, revSeqKey(targetSeq))
-				if errors.Is(err, mst.ErrNotFound) {
-					return cid.Undef, s3err.GetNoSuchVersionErr(key, versionID)
-				}
-				if err != nil {
-					return cid.Undef, fmt.Errorf("prev get: %w", err)
-				}
-				if err := tx.Get(ctx, st.Space, mfCid, &targetEm); err != nil {
-					return cid.Undef, fmt.Errorf("load manifest: %w", err)
-				}
-				// A token names a version only when the stored id matches (§3).
-				if kind == versionKindToken && targetEm.Manifest.VersionID != versionID {
-					return cid.Undef, s3err.GetNoSuchVersionErr(key, versionID)
-				}
-			}
-			if targetEm.Manifest.DeleteMarker {
-				return cid.Undef, s3err.GetAPIError(s3err.ErrMethodNotAllowed)
-			}
-		}
-
-		// Read-modify-write the target's state block.
-		var stateTree *mst.MerkleSearchTree
-		if leaf.State != nil {
-			stateTree = mst.LoadMST(tx, st.Space, *leaf.State)
-		}
-		var vs msbucket.VersionState
-		var oldStateCid cid.Cid
-		if stateTree != nil {
-			scid, err := stateTree.Get(ctx, revSeqKey(targetSeq))
-			switch {
-			case err == nil:
-				var env msbucket.EnvelopedVersionState
-				if err := tx.Get(ctx, st.Space, scid, &env); err != nil {
-					return cid.Undef, fmt.Errorf("load version state: %w", err)
-				}
-				vs = *env.State
-				oldStateCid = scid
-			case errors.Is(err, mst.ErrNotFound):
-			default:
-				return cid.Undef, fmt.Errorf("state get: %w", err)
-			}
-		}
-		mutate(&vs)
-
-		if vs.Empty() {
-			// Elision (§4.1 rule 3): an empty block is removed, never stored.
-			// Lock mutations never produce one; the branch serves operations
-			// that unset (tagging's delete).
-			if !oldStateCid.Defined() {
-				return cid.Undef, nil // nothing stored, nothing to store
-			}
-			tx.AddGCCandidate(oldStateCid)
-			var err error
-			if stateTree, err = stateTree.Delete(ctx, revSeqKey(targetSeq)); err != nil {
-				return cid.Undef, fmt.Errorf("state delete: %w", err)
-			}
-			empty, err := mstEmpty(ctx, stateTree)
-			if err != nil {
-				return cid.Undef, fmt.Errorf("state empty check: %w", err)
-			}
-			if empty {
-				leaf.State = nil
-			} else {
-				root, perr := stateTree.GetPointer(ctx, tx)
-				if perr != nil {
-					return cid.Undef, fmt.Errorf("state pointer: %w", perr)
-				}
-				leaf.State = &root
-			}
-		} else {
-			newStateCid, err := tx.Put(ctx, &msbucket.EnvelopedVersionState{State: &vs})
-			if err != nil {
-				return cid.Undef, fmt.Errorf("state put: %w", err)
-			}
-			if stateTree == nil {
-				stateTree = mst.NewEmptyMST(tx, st.Space)
-			}
-			if oldStateCid.Defined() {
-				tx.AddGCCandidate(oldStateCid)
-				stateTree, err = stateTree.Update(ctx, revSeqKey(targetSeq), newStateCid)
-			} else {
-				stateTree, err = stateTree.Add(ctx, revSeqKey(targetSeq), newStateCid, -1)
-			}
-			if err != nil {
-				return cid.Undef, fmt.Errorf("state write: %w", err)
-			}
-			root, perr := stateTree.GetPointer(ctx, tx)
-			if perr != nil {
-				return cid.Undef, fmt.Errorf("state pointer: %w", perr)
-			}
-			leaf.State = &root
-		}
-
-		// Rewrite the leaf (the replaced value block is superseded) and
-		// splice the top MST. Invariant 5 is untouched: no manifest and no
-		// prev entry was rewritten.
-		tx.AddGCCandidate(valCid)
-		newValCid, err := tx.Put(ctx, &msbucket.EnvelopedLeaf{Leaf: &leaf})
-		if err != nil {
-			return cid.Undef, fmt.Errorf("leaf put: %w", err)
-		}
-		t2, err := t.Update(ctx, key, newValCid)
-		if err != nil {
-			return cid.Undef, fmt.Errorf("mst update: %w", err)
-		}
-		return t2.GetPointer(ctx, tx)
-	}()
 }
 
 // stateHeaderFields returns the state-derived response fields for a resolved
@@ -470,7 +247,7 @@ func (b *Backend) stateHeaderFields(ctx context.Context, rv *resolvedVersion) (t
 		c := int32(n)
 		tagCount = &c
 	}
-	if !bucketLockEnabled(rv.st) {
+	if !bucketqueue.LockEnabled(rv.st) {
 		return "", nil, "", tagCount, nil
 	}
 	var mode types.ObjectLockMode

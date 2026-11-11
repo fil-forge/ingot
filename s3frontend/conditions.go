@@ -13,6 +13,8 @@ import (
 	"github.com/fil-forge/ingot/registry"
 
 	"github.com/fil-forge/ingot/bucketop"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // copySourceConditionPrefix is what S3 prepends to the failed header's name
@@ -74,7 +76,7 @@ func (b *Backend) currentObjectETag(ctx context.Context, bucket, key string) (et
 	if rv.mf.DeleteMarker {
 		return "", false, nil
 	}
-	return etagOf(rv.mf), true, nil
+	return rv.mf.QuotedETag(), true, nil
 }
 
 // isNoSuchKey reports whether err is the NoSuchKey API error resolution
@@ -84,42 +86,68 @@ func isNoSuchKey(err error) bool {
 }
 
 // mapCommitError maps an error from a bucket commit, or from one of its
-// changes, to the S3-facing error: a missing bucket becomes NoSuchBucket, a
-// versitygw API error (e.g. a precondition failure raised by a change) is
-// surfaced verbatim
-// so its HTTP status is preserved, and anything else is wrapped with op for the
-// server log.
+// changes, to the S3 error that answers it. Anything else is wrapped with op
+// for the server log, and answers InternalError: a superseded reservation
+// is among them, since the client retries it.
 func mapCommitError(err error, op string) error {
-	if errors.Is(err, bucketop.ErrBucketNotFound) {
-		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+	var ce *bucketqueue.ChangeError
+	if errors.As(err, &ce) {
+		switch ce.Kind {
+		case bucketqueue.KindPreconditionFailed:
+			if ce.Condition == "" {
+				return s3err.GetAPIError(s3err.ErrPreconditionFailed)
+			}
+			return s3err.GetPreconditionFailedErr(s3err.Condition(ce.Condition))
+		case bucketqueue.KindNoSuchKey:
+			return s3err.GetAPIError(s3err.ErrNoSuchKey)
+		case bucketqueue.KindNoSuchVersion:
+			return s3err.GetNoSuchVersionErr(ce.Key, ce.VersionID)
+		case bucketqueue.KindInvalidVersionID:
+			return errInvalidVersionID(ce.VersionID)
+		case bucketqueue.KindDeleteMarker:
+			return s3err.GetAPIError(s3err.ErrMethodNotAllowed)
+		case bucketqueue.KindNoObjectLock:
+			return s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)
+		}
 	}
-	if errors.Is(err, registry.ErrReferenceExpired) {
+	switch {
+	case errors.Is(err, bucketop.ErrBucketNotFound):
+		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+	case errors.Is(err, bucketqueue.ErrBucketClosing):
+		return errBucketClosing
+	case errors.Is(err, registry.ErrReferenceExpired):
 		// The write's reference to one of the body's blobs expired before
 		// the commit, and the blob may be released: the swap wrote nothing,
 		// and the client sends the write again.
 		return s3err.GetAPIError(s3err.ErrSlowDown)
 	}
-	// PreconditionFailedError, NoSuchVersionError, and InvalidArgumentError
-	// embed APIError but are distinct concrete types, so errors.As against
-	// APIError below won't match them. Surface each verbatim so its status
-	// and XML body reach the versitygw error renderer (which type-asserts
-	// s3err.S3Error without unwrapping — a generic %w wrap would degrade it
-	// to InternalError).
-	var pf s3err.PreconditionFailedError
-	if errors.As(err, &pf) {
-		return pf
-	}
-	var nsv s3err.NoSuchVersionError
-	if errors.As(err, &nsv) {
-		return nsv
-	}
-	var inv s3err.InvalidArgumentError
-	if errors.As(err, &inv) {
-		return inv
-	}
-	var apiErr s3err.APIError
-	if errors.As(err, &apiErr) {
-		return apiErr
-	}
 	return fmt.Errorf("s3frontend: %s: %w", op, err)
+}
+
+// deletePreconditions converts S3's delete preconditions for a change;
+// nil for none.
+func deletePreconditions(p *backend.ObjectDeletePreconditions) *bucketqueue.DeletePreconditions {
+	if p == nil || (p.IfMatch == nil && p.IfMatchSize == nil && p.IfMatchLastModTime == nil) {
+		return nil
+	}
+	var out bucketqueue.DeletePreconditions
+	if p.IfMatch != nil {
+		out.HasIfMatch, out.IfMatch = true, *p.IfMatch
+	}
+	if p.IfMatchSize != nil {
+		out.HasSize, out.Size = true, *p.IfMatchSize
+	}
+	if p.IfMatchLastModTime != nil {
+		out.HasModTime, out.ModTime = true, p.IfMatchLastModTime.UnixNano()
+	}
+	return &out
+}
+
+// blobRefTasks converts a write's pending references for a change.
+func blobRefTasks(refs map[string]taskrunner.TaskID) []bucketqueue.BlobRefTask {
+	out := make([]bucketqueue.BlobRefTask, 0, len(refs))
+	for d, id := range refs {
+		out = append(out, bucketqueue.BlobRefTask{Digest: []byte(d), Ref: append([]byte(nil), id[:]...)})
+	}
+	return out
 }

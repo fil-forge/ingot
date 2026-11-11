@@ -187,7 +187,7 @@ func (b *Backend) runAddPart(ctx context.Context, ex *taskrunner.Exec, _ taskrun
 		return nil, err
 	}
 	w.Spawns = append(w.Spawns, registry.AcceptSpec(call.part.UploadID, time.Now().Add(b.acceptDelay)))
-	if err := applyCommitWrites(ctx, ex, w); err != nil {
+	if err := w.Apply(ctx, ex); err != nil {
 		return nil, err
 	}
 	call.released = released
@@ -282,24 +282,4 @@ func spawnReleases(ctx context.Context, ex *taskrunner.Exec, space did.DID, dige
 	}
 	_, err := ex.SubmitAll(ctx, specs)
 	return err
-}
-
-// applyCommitWrites adds w to the task's commit: its guards, then its
-// statements (a part's tree row follows the part row its guard writes), its
-// spawns and the expiries it cancels.
-func applyCommitWrites(ctx context.Context, ex *taskrunner.Exec, w registry.CommitWrites) error {
-	for _, st := range w.Guards {
-		if err := ex.WriteConditional(ctx, st.SQL, st.Args...); err != nil {
-			return err
-		}
-	}
-	for _, st := range w.Statements {
-		if err := ex.Write(ctx, st.SQL, st.Args...); err != nil {
-			return err
-		}
-	}
-	if _, err := ex.SubmitAll(ctx, w.Spawns); err != nil {
-		return err
-	}
-	return ex.Cancel(ctx, registry.ReleaseQueue, w.Expiries...)
 }

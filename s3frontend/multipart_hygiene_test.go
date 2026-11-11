@@ -278,15 +278,15 @@ func TestCompleteFailsClosedOnMissingParamsRow(t *testing.T) {
 // otherwise stay registered behind the reader grace and hilt would refuse
 // the space deletion.
 func TestDrainSpaceReleasesIgnoresGrace(t *testing.T) {
-	b, mem, rm := newRefTestBackend(t)
+	// A live grace: the delete queues the blob's release an hour out, so
+	// neither a worker nor the ordinary sweep touches it.
+	mem := newTestStore(t)
+	b, _, rm := newRefTestBackendOver(t, mem, newRetainedLog(t, mem), 0, func(d *Deps) { d.ReleaseGrace = time.Hour })
 	ctx := context.Background()
 	data := testBody(1 << 10)
 
 	putObj(t, b, "k1", data)
 	d := blobDigestOf(t, b, "k1", "")
-	// A live grace: the delete queues the blob's release an hour out, so
-	// neither a worker nor the ordinary sweep touches it.
-	b.releaseGrace = time.Hour
 	deleteObj(t, b, "k1")
 
 	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 0 {
