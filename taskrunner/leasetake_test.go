@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap/zaptest"
@@ -35,6 +34,8 @@ type leaseTakeDB struct {
 	once     sync.Once
 }
 
+// isLeaseTake reports whether sql is one of the runner's lease takes, each of
+// which inserts into a queue's leases table.
 func isLeaseTake(sql string) bool { return strings.Contains(sql, `_leases" AS l (subject, owner`) }
 
 func (d *leaseTakeDB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
@@ -45,37 +46,37 @@ func (d *leaseTakeDB) QueryRow(ctx context.Context, sql string, args ...any) pgx
 	if d.lose {
 		return lostAnswer{d.Pool.QueryRow(ctx, sql, args...)}
 	}
-	done := make(chan takeAnswer, 1)
+	sent := make(chan pgx.Row, 1)
 	go func() {
-		defer d.once.Do(func() { close(d.landed) })
 		time.Sleep(d.inFlight)
-		var a takeAnswer
-		a.err = d.Pool.QueryRow(context.WithoutCancel(ctx), sql, args...).Scan(&a.taken, &a.tookOver, &a.created, &a.id)
-		done <- a
+		sent <- d.Pool.QueryRow(context.WithoutCancel(ctx), sql, args...)
 	}()
 	select {
 	case <-ctx.Done():
+		// The caller has its error; the take still runs, and nobody reads
+		// its answer.
+		go func() {
+			_ = (<-sent).Scan()
+			d.landedNow()
+		}()
 		return errRow{ctx.Err()}
-	case a := <-done:
-		return a
+	case row := <-sent:
+		return landedRow{row, d}
 	}
 }
 
-// takeAnswer is a lease take's answer, which it hands on as a pgx.Row.
-type takeAnswer struct {
-	taken, tookOver bool
-	created         *time.Time
-	id              *uuid.UUID
-	err             error
+func (d *leaseTakeDB) landedNow() { d.once.Do(func() { close(d.landed) }) }
+
+// landedRow hands a delayed take's answer to its caller, and reports the take
+// landed once the caller has read it.
+type landedRow struct {
+	pgx.Row
+	d *leaseTakeDB
 }
 
-func (a takeAnswer) Scan(dest ...any) error {
-	if a.err != nil {
-		return a.err
-	}
-	*dest[0].(*bool), *dest[1].(*bool) = a.taken, a.tookOver
-	*dest[2].(**time.Time), *dest[3].(**uuid.UUID) = a.created, a.id
-	return nil
+func (r landedRow) Scan(dest ...any) error {
+	defer r.d.landedNow()
+	return r.Row.Scan(dest...)
 }
 
 type lostAnswer struct{ pgx.Row }
@@ -92,13 +93,13 @@ type errRow struct{ err error }
 func (r errRow) Scan(...any) error { return r.err }
 
 // newLeaseTakeRunner starts a runner over db with a no-op action on qTop and
-// a lease far longer than the test, so that only a release clears one. It
-// runs no workers, so the test's own Run makes every take.
-func newLeaseTakeRunner(t *testing.T, env taskrunnertest.Env, db taskrunner.DB) *taskrunner.Runner {
+// a lease far longer than the test, so that only a release clears one. With
+// no workers, the test's own Run makes every take.
+func newLeaseTakeRunner(t *testing.T, env taskrunnertest.Env, db taskrunner.DB, workers int) *taskrunner.Runner {
 	t.Helper()
 	r, err := taskrunner.New(db, taskrunner.Options{
 		Schema:       env.Schema,
-		Queues:       []taskrunner.QueueOptions{{Name: qTop}},
+		Queues:       []taskrunner.QueueOptions{{Name: qTop, Workers: workers}},
 		LeaseTTL:     time.Minute,
 		PollInterval: 20 * time.Millisecond,
 		Logger:       zaptest.NewLogger(t),
@@ -139,7 +140,7 @@ func leaseRows(t *testing.T, env taskrunnertest.Env) int {
 func TestALeaseTakeWhoseAnswerIsLostLeavesNoLease(t *testing.T) {
 	env := taskrunnertest.NewEnv(t)
 	db := &leaseTakeDB{Pool: env.DB, lose: true}
-	r := newLeaseTakeRunner(t, env, db)
+	r := newLeaseTakeRunner(t, env, db, 0)
 
 	_, err := r.Run(context.Background(), taskrunner.Spec{Queue: qTop, Subject: "s", Action: "noop"})
 	if !errors.Is(err, context.DeadlineExceeded) {
@@ -153,6 +154,32 @@ func TestALeaseTakeWhoseAnswerIsLostLeavesNoLease(t *testing.T) {
 	}
 }
 
+// TestAWorkersLeaseTakeWhoseAnswerIsLostLeavesNoLease is the same for a
+// worker, which takes its lease by another path than Run.
+func TestAWorkersLeaseTakeWhoseAnswerIsLostLeavesNoLease(t *testing.T) {
+	env := taskrunnertest.NewEnv(t)
+	db := &leaseTakeDB{Pool: env.DB, lose: true}
+	r := newLeaseTakeRunner(t, env, db, 1)
+
+	if _, err := r.Submit(context.Background(), taskrunner.Spec{Queue: qTop, Subject: "s", Action: "noop"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for db.takes.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no worker took the subject's lease")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Once the workers have stopped, a lease row left is one no take tracks.
+	if err := r.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := leaseRows(t, env); n != 0 {
+		t.Fatalf("%d lease rows left on the subject, want none", n)
+	}
+}
+
 // TestALeaseTakeOutlivesItsCallersDeadline: a take whose caller's deadline
 // passes while it is on its way to the database still lands there. It must
 // finish, so that the runner learns it took the lease and releases it; cut
@@ -160,7 +187,7 @@ func TestALeaseTakeWhoseAnswerIsLostLeavesNoLease(t *testing.T) {
 func TestALeaseTakeOutlivesItsCallersDeadline(t *testing.T) {
 	env := taskrunnertest.NewEnv(t)
 	db := &leaseTakeDB{Pool: env.DB, inFlight: 300 * time.Millisecond, landed: make(chan struct{})}
-	r := newLeaseTakeRunner(t, env, db)
+	r := newLeaseTakeRunner(t, env, db, 0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
