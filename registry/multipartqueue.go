@@ -13,24 +13,6 @@ import (
 	"github.com/fil-forge/ingot/taskrunner"
 )
 
-// MultipartQueue is the task queue a multipart upload's changes run on: its
-// creation, its parts, the scheduling of their accepts, its Complete and its
-// Abort. Its subject is the upload
-// ID, so one change to an upload runs at a time. It is first in the queue
-// order: a create runs queue-bucket.admit-upload as a child, and a Complete
-// runs queue-bucket.commit as one.
-const MultipartQueue = "queue-multipart-upload"
-
-// The queue-multipart-upload actions.
-const (
-	MultipartCreateAction   = "create"
-	MultipartAddPartAction  = "add-part"
-	MultipartAcceptAction   = "accept"
-	MultipartCompleteAction = "complete"
-	MultipartAbortAction    = "abort"
-	MultipartReapAction     = "reap"
-)
-
 // CreatedSession is the write that records a new upload, open.
 func CreatedSession(s MultipartSession) (Statement, error) {
 	if !s.Space.Defined() {
@@ -96,25 +78,25 @@ func DeletedPartTrees(uploadID string) Statement {
 // are returned for the caller to run. An upload missing or no longer open is
 // ErrNotFound, and a reference already gone ErrReferenceExpired. The writes
 // run on the upload's subject, so the row read here is the one they replace.
-func (r *Postgres) PartWrites(ctx context.Context, p MultipartPart, tree *PartTree, release ReleaseTask) (CommitWrites, []multihash.Multihash, error) {
+func (r *Postgres) PartWrites(ctx context.Context, p MultipartPart, tree *PartTree) (CommitWrites, error) {
 	var w CommitWrites
 	var spaceStr, state string
 	err := r.pool.QueryRow(ctx, `SELECT space, state FROM ingot.multipart_sessions WHERE upload_id = $1`, p.UploadID).Scan(&spaceStr, &state)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && state != SessionOpen) {
-		return w, nil, ErrNotFound
+		return w, ErrNotFound
 	}
 	if err != nil {
-		return w, nil, fmt.Errorf("registry: put part: read session: %w", err)
+		return w, fmt.Errorf("registry: put part: read session: %w", err)
 	}
 	space, err := did.Parse(spaceStr)
 	if err != nil {
-		return w, nil, fmt.Errorf("registry: put part: session space: %w", err)
+		return w, fmt.Errorf("registry: put part: session space: %w", err)
 	}
 	var replaced []multihash.Multihash
 	if err := r.pool.QueryRow(ctx,
 		`SELECT blob_digests FROM ingot.multipart_parts WHERE upload_id = $1 AND part_number = $2`,
 		p.UploadID, p.PartNumber).Scan(&replaced); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return w, nil, fmt.Errorf("registry: put part: read replaced: %w", err)
+		return w, fmt.Errorf("registry: put part: read replaced: %w", err)
 	}
 
 	pstate := p.State
@@ -141,7 +123,7 @@ func (r *Postgres) PartWrites(ctx context.Context, p MultipartPart, tree *PartTr
 		[]any{p.UploadID, p.PartNumber, p.ETagMD5, p.Size, p.Checksum, p.BlobDigests, p.SpanLengths, pstate, SessionOpen},
 	})
 	if err := r.refWrites(ctx, &w, p.Refs); err != nil {
-		return CommitWrites{}, nil, err
+		return CommitWrites{}, err
 	}
 	// The tree row follows the part row: a superseding part without a tree
 	// must not keep its predecessor's.
@@ -161,19 +143,13 @@ func (r *Postgres) PartWrites(ctx context.Context, p MultipartPart, tree *PartTr
 		})
 	}
 	// The replaced row's blobs this part does not name lose their last part
-	// reference with this write; their releases are queued with it, due now
+	// reference with this write; their releases are owed with it, due now
 	// (a part blob was never readable through the catalog, so no reader
 	// grace is owed).
-	var released []multihash.Multihash
 	for _, d := range digestsDropped(replaced, p.BlobDigests) {
-		spec, err := release.Spec(space, d, DueNow())
-		if err != nil {
-			return CommitWrites{}, nil, err
-		}
-		w.Spawns = append(w.Spawns, spec)
-		released = append(released, d)
+		w.Releases = append(w.Releases, BlobRelease{Space: space, Digest: d, At: DueNow()})
 	}
-	return w, released, nil
+	return w, nil
 }
 
 // refWrites adds the writes that take refs, pending references, over for

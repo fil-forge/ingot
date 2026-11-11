@@ -1,4 +1,4 @@
-package s3frontend
+package shardqueue
 
 import (
 	"testing"

@@ -345,7 +345,13 @@ func (tr *tree) commit(ctx context.Context, a *action, outcomes []Outcome) (*fai
 	if tr.deferred != nil {
 		return nil, tr.deferred
 	}
-	if err := lockLease(ctx, tx, tr.rootHold, tr.r.opts.LeaseTTL); err != nil {
+	var err error
+	if tr.rootHold.releaseOnCommit {
+		err = deleteLease(ctx, tx, tr.rootHold)
+	} else {
+		err = lockLease(ctx, tx, tr.rootHold, tr.r.opts.LeaseTTL)
+	}
+	if err != nil {
 		return nil, err
 	}
 	for _, h := range tr.holds {
@@ -390,7 +396,21 @@ func (tr *tree) commit(ctx context.Context, a *action, outcomes []Outcome) (*fai
 			return nil, err
 		}
 	}
-	return rec, tx.Commit(ctx)
+	root := tr.rootHold
+	if !root.releaseOnCommit {
+		return rec, tx.Commit(ctx)
+	}
+	// The commit deletes the lease row: stop renewing the hold first, as
+	// release does, so the renewer never finds the row gone and takes the
+	// lease for lost. A failed commit leaves the row, and the hold renewed.
+	tr.r.forget(root)
+	if err := tx.Commit(ctx); err != nil {
+		tr.r.mu.Lock()
+		tr.r.holds[root.token] = root
+		tr.r.mu.Unlock()
+		return nil, err
+	}
+	return rec, nil
 }
 
 // lockLease locks h's lease row for the rest of tx, and extends it by a
@@ -410,6 +430,21 @@ func lockLease(ctx context.Context, tx pgx.Tx, h *hold, ttl time.Duration) error
 	return err
 }
 
+// deleteLease is lockLease for a hold that ends with tx: it deletes h's
+// lease row, which stays locked until tx ends, so the release commits with
+// the task. It returns errLeaseLost as lockLease does.
+func deleteLease(ctx context.Context, tx pgx.Tx, h *hold) error {
+	var one int
+	err := tx.QueryRow(ctx, `DELETE FROM `+h.q.leases+`
+		WHERE subject = $1 AND owner = $2 AND expires >= now() RETURNING 1`,
+		h.subject, h.token).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		h.lost.Store(true)
+		return errLeaseLost
+	}
+	return err
+}
+
 // runRoot runs due tasks under h, their subject's lease: one task, or a batch
 // of one action's tasks. It returns the result and error of the first task
 // once it has an outcome; stop is set instead when it has none yet: the tree
@@ -418,8 +453,19 @@ func lockLease(ctx context.Context, tx pgx.Tx, h *hold, ttl time.Duration) error
 func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte, err error, stop error) {
 	first := tasks[0]
 	age := treeAge{first.Created, first.ID}
-	if err := r.setAge(ctx, h, age); err != nil {
-		return nil, nil, err
+	// A task the statement that took the lease claimed has its age recorded
+	// and its lease confirmed already. The lease runs a TTL from when that
+	// statement was sent, and the claim can have waited on a lock for much
+	// of it, so the task skips its own check only while the lease is
+	// certainly young, as renewal keeps it; otherwise the check confirms the
+	// lease and extends it.
+	recorded := h.claimed && time.Since(h.taken) < r.opts.LeaseTTL/3 &&
+		h.age.id == age.id && h.age.created.Equal(age.created)
+	h.claimed = false
+	if !recorded {
+		if err := r.setAge(ctx, h, age); err != nil {
+			return nil, nil, err
+		}
 	}
 	live := tasks
 	start := time.Now()
@@ -513,6 +559,9 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 		rec, cerr := tr.commit(ctx, a, outcomes)
 		tr.releaseChildren(ctx)
 		if cerr == nil {
+			if h.releaseOnCommit {
+				r.releasedInCommit(h)
+			}
 			woken := tr.woken
 			var succeeded []Task
 			for i, t := range live {

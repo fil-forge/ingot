@@ -27,7 +27,7 @@ modules in; ingot is a standalone module and must build on its own `go.mod`:
 make build      # the daemon binary, ./ingot (GOWORK=off go build -o ingot ./cmd/ingot)
 make test       # every package's tests, with Postgres and OpenBao in Docker
 make itest      # integration tests: boots the Forge stack in Docker (~20 min)
-make itest-group GROUP=auth   # one CI group: encryption|conformance|uploads|releases|auth|rest
+make itest-group GROUP=auth   # one CI group: encryption|conformance|uploads|releases|auth|localdisk|rest
 make s3compat   # the S3 compatibility corpus, written as an HTML report
 make gen        # regenerate the cbor-gen marshalers (go generate ./... runs gen/)
 make gen-check  # make gen, then fail if bucket/cbor_gen*.go changed
@@ -107,18 +107,14 @@ Internal:
   with an access key from the environment, as JSON, for benchmark runs);
   `deps.go` (agent identity from the PEM key + optional did:web, pgx pool).
 - **`s3frontend/`** — versitygw `backend.Backend`: `object.go`
-  (Put/Get/Head/Delete/List), `version.go` (resolveVersion / applyPut,
-  the per-key version tree), `bucketqueue.go` (`queue-bucket.commit`: one
-  task per bucket change, sync for the request, on the bucket's subject;
-  applies an ordered list of key changes, `bucketchanges.go`, to one Tx),
-  `bucketadmin.go` (`queue-bucket.create`, `.set-versioning`,
-  `.set-object-lock-config`, `.set-tagging`, `.set-cors`, `.set-encryption`,
-  `.close`, `.admit-upload`), `bucketship.go`
-  (`queue-bucket.ship`, queued on each seal), `multipart.go`,
-  `multipartqueue.go` (`queue-multipart-upload`: every change to an upload,
-  on the upload ID's subject), `acceptor.go`
-  (`queue-multipart-upload.accept`, queueing a `queue-space-shard.accept` per
-  parked blob, which concludes it while the client uploads), `bucket.go` (`queue-bucket.delete`), `listversions.go`,
+  (Put/Get/Head/Delete/List), `version.go` (resolveVersion, reading the
+  per-key version tree), `bucketqueue.go` (the requests' commits through
+  `queue/bucketqueue`), `conditions.go` (its errors' S3 answers),
+  `bucketadmin.go` (bucket settings through `queue/bucketqueue`),
+  `multipart.go` (the multipart verbs through `queue/multipartqueue`),
+  `multipartqueue.go` (its errors' S3 answers), `bucket.go`
+  (DeleteBucket: the close, the uploads' aborts, then
+  `queue-bucket.delete`), `listversions.go`,
   `backend.go`, `stream.go` (each body blob streams to its
   provider as the body arrives, teeing an object's bytes into the cache; a
   failed stream fails the request and aborts its allocation, and an
@@ -138,17 +134,40 @@ Internal:
   production `blockstore.Log`), `store.go`, `planelog.go`, `segment.go`,
   `recovery.go`. See `logstore/README.md`.
 - **`registry/`** — Postgres metadata: `postgres.go` (`Registry` + `State`;
-  `EmptyRoot`, DeleteBucket's first write), `bucketcommit.go` (`queue-bucket`
-  names, `RootCommitWrites`: the guarded root advance, claims, drops, GC
+  `EmptyRoot`, DeleteBucket's first write), `bucketcommit.go` (`RootCommitWrites`: the guarded root advance, claims, drops, GC
   candidates and the journal rows of each commit's catalog blocks in
   `ingot.catalog_journal` until their segment ships, written with the commit
   task), `segments.go` (`logstore.Meta`, and `CatalogUsage`, the per-bucket
   sums the catalog usage gauges report), `stores*.go` (intents, locations,
-  inclusions, blob_refs and pending refs (`CountReferences`), GC,
+  inclusions, blob_refs and pending refs (`CountReferences`),
   multipart sessions/parts, parks, encryption params, the revocation
   cursor),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
   all of them.
+- **`queue/`** — one package per task queue, each built over the runner
+  with what its handlers need, registering them in its `New`, with typed
+  calls for its sync tasks and specs for the async ones other queues spawn.
+  `s3frontend.New` builds them from the end of the queue order back, each
+  over the ones after it, which are the only queues a package imports; the
+  bucket queue hands the catalog log its ship callback.
+  The packages:
+  `shardqueue` (`queue-shard`, the cache's copies), `spaceuploadqueue`
+  (`queue-space-upload`, the object-count changes), `spaceshardqueue`
+  (`queue-space-shard`, the tasks on one blob in one space; the releases
+  bucket commits and part writes owe come back from `registry` as data,
+  and the queue that applies those writes queues them through it),
+  `bucketqueue` (`queue-bucket`,
+  every change to a bucket: `.commit` applies an ordered list of key
+  changes to one Tx under the version tree's write rule, failing a change
+  on its own terms with one of a fixed set of errors; `.create`,
+  `.set-versioning`, `.set-object-lock-config`, `.set-tagging`,
+  `.set-cors`, `.set-encryption`, `.close`, `.admit-upload` and `.delete`;
+  `.ship`, queued on each seal), `multipartqueue`
+  (`queue-multipart-upload`, every change to a multipart upload: its create,
+  parts, accept, Complete, abort and reap; the accept queues a
+  `queue-space-shard.accept` per parked blob, which concludes it while the
+  client uploads, and Complete validates the part list, assembles the
+  object and commits it as a `queue-bucket.commit` child).
 - **`taskrunner/`** — durable task queues in Postgres (one tasks table and
   one leases table per queue), serialized per (queue, subject) by a lease
   row. A task's tree (its handler plus sync children in later queues) adds
@@ -171,20 +190,19 @@ Internal:
   tables are migrated in the migration hook, and `Server` starts and stops
   it. Queues in order: `queue-multipart-upload`, `queue-bucket`,
   `queue-space-upload`, `queue-space-shard`, `queue-shard`.
-  `queue-multipart-upload` (`s3frontend/multipartqueue.go`), subject the
+  `queue-multipart-upload` (`queue/multipartqueue`), subject the
   upload ID: an upload's create, add-part, accept, complete, abort and reap,
-  one at a time, the accept (`s3frontend/acceptor.go`) queuing a
+  one at a time, the accept queuing a
   `queue-space-shard.accept` for each blob of the upload's parked parts;
-  `queue-bucket` (`s3frontend/bucketqueue.go`), subject the bucket's space
+  `queue-bucket` (`queue/bucketqueue`), subject the bucket's space
   DID: every change to a bucket, placed on the instance holding its catalog
-  log; `queue-space-upload` (`s3frontend/uploadqueue.go`), the
+  log; `queue-space-upload` (`queue/spaceuploadqueue`), the
   object-count changes a `queue-bucket.commit` spawns with its own
-  commit; `queue-shard` (`s3frontend/shardqueue.go`), subject the hex
+  commit; `queue-shard` (`queue/shardqueue`), subject the hex
   digest: a cached blob's time to live, `queue-shard.cache` scheduling its
   `queue-shard.evict` at `CacheTTL`, run again by reads with under half
   left, and the budget pass's evictions as sync `queue-shard.evict`s;
-  `queue-space-shard` (`s3frontend/releasequeue.go`,
-  `shardref.go`, `acceptor.go`), subject space/hex digest: a blob's release,
+  `queue-space-shard` (`queue/spaceshardqueue`), subject space/hex digest: a blob's release,
   a parked blob's `queue-space-shard.accept` (its conclude), a write's sync
   `queue-space-shard.add` (its pending reference, in `blob_pending_refs`)
   and the reference's `queue-space-shard.expire` at 24 h. Its own tests each use a schema of their own
@@ -250,6 +268,10 @@ Internal:
 - **`internal/pgtest`** — a fresh, migrated Postgres database per test;
   **`internal/testfakes`** — the network's stand-ins (`NopBaseReader`,
   `NopUploader`, a bucket `Authority` in place of hilt). Both test-only.
+- **`internal/authority`** — the authority queued tasks make their network
+  calls with (`Resolver`): a store a request lends for the space while it
+  waits on them, then the chain the task carries, then the space's captured
+  ship authority.
 - **`cars/`**, **`migrations/`**,
   **`internal/{reqscope,ucanexec,fasthttputil,cors,build}`**, **`gen/`**,
   **`testing/`** — CAR codec, goose SQL (`ingot` schema), request-scoped ctx

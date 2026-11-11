@@ -88,7 +88,7 @@ func (b *Backend) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyIn
 	if end-start+1 > maxCopySize {
 		return s3response.CopyPartResult{}, s3err.GetCopySourceObjectTooLargeErr(maxCopySize)
 	}
-	if err := evaluateCopySourcePreconditions(etagOf(srcMf), time.Unix(srcMf.Created, 0), backend.PreConditions{
+	if err := evaluateCopySourcePreconditions(srcMf.QuotedETag(), time.Unix(srcMf.Created, 0), backend.PreConditions{
 		IfMatch:       input.CopySourceIfMatch,
 		IfNoneMatch:   input.CopySourceIfNoneMatch,
 		IfModSince:    input.CopySourceIfModifiedSince,

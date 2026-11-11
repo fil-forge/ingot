@@ -17,6 +17,7 @@ import (
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/internal/testfakes"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
@@ -239,7 +240,7 @@ func TestPlaintextSpaces_SameSpaceRewriteMakesTheReleaseStale(t *testing.T) {
 	d := blobDigestOf(t, b, "old", "")
 	deleteFrom(t, b, "bk", "old")
 	putIn(t, b, "bk", "new", data)
-	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
+	if err := b.blobs.DrainSpace(ctx, mem.bk()); err != nil {
 		t.Fatalf("run the space's releases: %v", err)
 	}
 
@@ -351,16 +352,14 @@ func TestPlaintextRelease_WriteWaitsOutAStartedRelease(t *testing.T) {
 // to retry.
 func TestPlaintextRelease_WaitIsBounded(t *testing.T) {
 	gate := newGatedRemover()
-	b, _ := newDeferredBackend(t, testfakes.NopUploader{}, withGate(gate))
+	b, _ := newDeferredBackend(t, testfakes.NopUploader{}, withGate(gate),
+		withBlobs(func(d *spaceshardqueue.Deps) { d.AddWait = 50 * time.Millisecond }))
 	ctx := context.Background()
 	setNone(t, b)
 	data := testBody(8 << 10)
 	putIn(t, b, "bk", "old", data)
 	deleteFrom(t, b, "bk", "old")
 	holdRelease(t, b, gate)
-	limit := addWaitLimit
-	addWaitLimit = 50 * time.Millisecond
-	t.Cleanup(func() { addWaitLimit = limit })
 
 	bucket, key := "bk", "new"
 	_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
@@ -805,6 +804,19 @@ func withGate(gate *gatedRemover) func(*Deps) {
 	return func(d *Deps) { d.Remover = gate }
 }
 
+// withBlobs adjusts the backend's queue-space-shard dependencies.
+func withBlobs(tune func(*spaceshardqueue.Deps)) func(*Deps) {
+	return func(d *Deps) {
+		prev := d.tuneBlobs
+		d.tuneBlobs = func(bd *spaceshardqueue.Deps) {
+			if prev != nil {
+				prev(bd)
+			}
+			tune(bd)
+		}
+	}
+}
+
 // holdRelease runs b's due releases in the background and returns once one
 // is held in its network remove: a release under way. The returned func lets
 // it finish and waits for it; it is also run when the test ends.
@@ -836,13 +848,12 @@ func holdRelease(t *testing.T, b *Backend, gate *gatedRemover) (finish func()) {
 }
 
 // TestPlaintextRelease_StalledRemoveTimesOut: a release whose network remove
-// never answers gives up the attempt at releaseAttemptTimeLimit and stays
+// never answers gives up the attempt at its time limit and stays
 // queued to retry, rather than holding its worker for good.
 func TestPlaintextRelease_StalledRemoveTimesOut(t *testing.T) {
-	defer func(d time.Duration) { releaseAttemptTimeLimit = d }(releaseAttemptTimeLimit)
-	releaseAttemptTimeLimit = 50 * time.Millisecond
 	gate := newGatedRemover() // never opened
-	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, withGate(gate))
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, withGate(gate),
+		withBlobs(func(d *spaceshardqueue.Deps) { d.AttemptLimit = 50 * time.Millisecond }))
 	ctx := context.Background()
 	setNone(t, b)
 
@@ -889,7 +900,7 @@ func TestAbortReleasesAPublishedPartBlobItsObjectLeft(t *testing.T) {
 	completeIn(t, b, "bk", "done", doneID, parts)
 	d := blobDigestOf(t, b, "done", "")
 	deleteFrom(t, b, "bk", "done")
-	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
+	if err := b.blobs.DrainSpace(ctx, mem.bk()); err != nil {
 		t.Fatalf("run the deleted object's release: %v", err)
 	}
 	if n := rm.removedDigests()[string(d)]; n != 0 {
@@ -900,7 +911,7 @@ func TestAbortReleasesAPublishedPartBlobItsObjectLeft(t *testing.T) {
 	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &openID}); err != nil {
 		t.Fatalf("AbortMultipartUpload: %v", err)
 	}
-	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
+	if err := b.blobs.DrainSpace(ctx, mem.bk()); err != nil {
 		t.Fatalf("run the abort's releases: %v", err)
 	}
 	if n := rm.removedDigests()[string(d)]; n != 1 {

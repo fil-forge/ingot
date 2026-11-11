@@ -10,37 +10,15 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
+	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/taskrunner"
 )
 
-// BucketQueue is the task queue a bucket's changes run on: its object
-// commits, the shipping of its catalog, its settings and its lifecycle. Its
-// subject is the bucket's space (BucketSubject), so one change to a bucket
-// runs at a time.
-const BucketQueue = "queue-bucket"
-
-// The queue-bucket actions.
-const (
-	BucketCreateAction        = "create"
-	BucketCommitAction        = "commit"
-	BucketShipAction          = "ship"
-	BucketSetVersioningAction = "set-versioning"
-	BucketSetLockConfigAction = "set-object-lock-config"
-	BucketSetTaggingAction    = "set-tagging"
-	BucketSetCORSAction       = "set-cors"
-	BucketSetEncryptionAction = "set-encryption"
-	BucketCloseAction         = "close"
-	BucketAdmitUploadAction   = "admit-upload"
-	BucketDeleteAction        = "delete"
-)
-
-// BucketSubject is the subject of space's bucket on BucketQueue.
-func BucketSubject(space did.DID) string { return space.String() }
-
-// CommitWrites is what a root commit writes, for a queue-bucket.commit to
-// commit with its outcome: its statements, the tasks it queues and the
-// queue-space-shard.expire tasks it cancels.
+// CommitWrites is what a root commit or a part's record writes, for the task
+// that runs it to commit with its outcome: its statements, the tasks it
+// queues, the blob releases it owes and the expiries of the pending
+// references it takes over.
 type CommitWrites struct {
 	// Guards are writes that must each affect a row, or the commit fails and
 	// runs again (taskrunner.Exec.WriteConditional): the root's advance from
@@ -49,12 +27,43 @@ type CommitWrites struct {
 	Guards []Statement
 	// Statements are the other writes, in order, after the guards.
 	Statements []Statement
-	// Spawns are the tasks the commit queues: upload registrations and
-	// releases.
+	// Spawns are the upload registrations the commit queues.
 	Spawns []taskrunner.Spec
+	// Releases are the blobs the commit leaves unreferenced, whose releases
+	// it owes.
+	Releases []BlobRelease
 	// Expiries are the queue-space-shard.expire tasks of the pending
-	// references the commit's claims take over.
+	// references the commit's claims take over, for it to cancel.
 	Expiries []taskrunner.TaskID
+}
+
+// BlobRelease is a release a commit owes: of Digest in Space, due At.
+type BlobRelease struct {
+	// Space is the space the blob is released from.
+	Space did.DID
+	// Digest is the blob's digest.
+	Digest multihash.Multihash
+	// At is when the release is due.
+	At time.Time
+}
+
+// Apply adds w's writes to the commit of the task ex runs: its guards, then
+// its statements (a part's tree row follows the part row its guard writes),
+// and its spawns. Its releases and expiries are queue-space-shard tasks, for
+// the caller to queue and cancel.
+func (w CommitWrites) Apply(ctx context.Context, ex *taskrunner.Exec) error {
+	for _, st := range w.Guards {
+		if err := ex.WriteConditional(ctx, st.SQL, st.Args...); err != nil {
+			return err
+		}
+	}
+	for _, st := range w.Statements {
+		if err := ex.Write(ctx, st.SQL, st.Args...); err != nil {
+			return err
+		}
+	}
+	_, err := ex.SubmitAll(ctx, w.Spawns)
+	return err
 }
 
 // RootCommitWrites returns the writes that advance bucket name's root from
@@ -96,13 +105,7 @@ func (r *Postgres) RootCommitWrites(ctx context.Context, name string, expect, ne
 		SQL:  `UPDATE ingot.buckets SET root_cid = $1 WHERE name = $2 AND root_cid IS NOT DISTINCT FROM $3`,
 		Args: []any{next.Bytes(), name, expectBytes},
 	})
-	for _, reg := range c.Registrations {
-		spec, err := reg.Spec()
-		if err != nil {
-			return CommitWrites{}, err
-		}
-		w.Spawns = append(w.Spawns, spec)
-	}
+	w.Spawns = append(w.Spawns, c.Registrations...)
 	if err := r.claimWrites(ctx, &w, c.Claims); err != nil {
 		return CommitWrites{}, err
 	}
@@ -226,11 +229,7 @@ func (r *Postgres) dropWrites(ctx context.Context, w *CommitWrites, c RootCommit
 			continue
 		}
 		seen[k] = true
-		spec, err := c.Release.Spec(d.Space, d.Digest, due)
-		if err != nil {
-			return err
-		}
-		w.Spawns = append(w.Spawns, spec)
+		w.Releases = append(w.Releases, BlobRelease{Space: d.Space, Digest: d.Digest, At: due})
 	}
 	return nil
 }

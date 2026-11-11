@@ -69,7 +69,6 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 		Registry:   mem,
 		Intents:    mem,
 		Locations:  mem,
-		GC:         mem,
 		Reads:      blockstore.NewLayered(cache, log, testfakes.NopBaseReader{}),
 		Log:        log,
 		Cache:      cache,
@@ -82,8 +81,7 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 		TenantKeys: testTenantKeys(),
 	}
 	withStreaming(t, &deps, dir)
-	b := New(deps)
-	mem.start(t, b)
+	b := mem.newBackend(t, deps)
 	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}

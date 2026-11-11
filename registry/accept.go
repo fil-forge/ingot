@@ -1,45 +1,9 @@
 package registry
 
 import (
-	"time"
-
 	"github.com/fil-forge/ucantone/did"
 	"github.com/multiformats/go-multihash"
-
-	"github.com/fil-forge/ingot/taskrunner"
 )
-
-// BlobAcceptAction concludes a parked blob on the upload service and marks
-// accepted the parts it completes. It runs on queue-space-shard, under the
-// blob's subject (ReleaseSubject), so it never overlaps the blob's release
-// or a write's add of it.
-const BlobAcceptAction = "accept"
-
-// AcceptSpec returns the queue-multipart-upload.accept an UploadPart queues
-// for uploadID, due at: a replacement, so an upload has at most one pending.
-func AcceptSpec(uploadID string, at time.Time) taskrunner.Spec {
-	return taskrunner.Spec{
-		Queue:     MultipartQueue,
-		Subject:   uploadID,
-		Action:    MultipartAcceptAction,
-		NotBefore: &at,
-		Replace:   true,
-	}
-}
-
-// BlobAcceptSpec returns the accept of digest in space an upload's accept
-// queues: a replacement due now, so a blob has at most one pending, however
-// many parts or uploads name it.
-func BlobAcceptSpec(space did.DID, digest multihash.Multihash) taskrunner.Spec {
-	now := DueNow()
-	return taskrunner.Spec{
-		Queue:     ReleaseQueue,
-		Subject:   ReleaseSubject(space, digest),
-		Action:    BlobAcceptAction,
-		NotBefore: &now,
-		Replace:   true,
-	}
-}
 
 // acceptedIntent marks the space's intent for a located blob accepted. A
 // published intent stays published.

@@ -18,7 +18,7 @@ import (
 // partQueueStore is what the multipart acceptance queue needs of a store.
 type partQueueStore interface {
 	registry.MultipartStore
-	PutPart(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree, release registry.ReleaseTask) ([]multihash.Multihash, error)
+	PutPart(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree) ([]multihash.Multihash, error)
 	registry.ParkStore
 	registry.LocationStore
 	registry.IntentStore
@@ -27,7 +27,7 @@ type partQueueStore interface {
 // TestPartQueue runs the acceptance-queue operations against Postgres.
 func TestPartQueue(t *testing.T) {
 	pool := pgtest.New(t)
-	runPartQueueSuite(t, pool, registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool))))
+	runPartQueueSuite(t, pool, liveRegistry(pool, liveUploadTasks(t, pool)))
 }
 
 func runPartQueueSuite(t *testing.T, pool *pgxpool.Pool, st partQueueStore) {
@@ -68,7 +68,7 @@ func runPartQueueSuite(t *testing.T, pool *pgxpool.Pool, st partQueueStore) {
 			sizes[i] = int64(i + 1)
 		}
 		p := registry.MultipartPart{UploadID: uploadID, PartNumber: n, ETagMD5: []byte{byte(n)}, Size: 1, BlobDigests: digests, SpanLengths: sizes}
-		if _, err := st.PutPart(ctx, p, nil, registry.ReleaseTask{}); err != nil {
+		if _, err := st.PutPart(ctx, p, nil); err != nil {
 			t.Fatalf("PutPart %d: %v", n, err)
 		}
 		return p
@@ -95,7 +95,7 @@ func runPartQueueSuite(t *testing.T, pool *pgxpool.Pool, st partQueueStore) {
 		// Sizes must match the digests one for one, which a constraint
 		// enforces.
 		bad := registry.MultipartPart{UploadID: id, PartNumber: 9, ETagMD5: []byte{9}, Size: 1, BlobDigests: []multihash.Multihash{{0xd9}}, SpanLengths: []int64{1, 2}}
-		if _, err := st.PutPart(ctx, bad, nil, registry.ReleaseTask{}); err == nil {
+		if _, err := st.PutPart(ctx, bad, nil); err == nil {
 			t.Fatal("PutPart with mismatched sizes was accepted")
 		}
 	})
@@ -109,7 +109,7 @@ func runPartQueueSuite(t *testing.T, pool *pgxpool.Pool, st partQueueStore) {
 		}
 		t.Cleanup(func() { _ = st.DeleteSession(ctx, legacy) })
 		p := registry.MultipartPart{UploadID: legacy, PartNumber: 7, ETagMD5: []byte{7}, Size: 1, BlobDigests: []multihash.Multihash{{0xd7}}}
-		if _, err := st.PutPart(ctx, p, nil, registry.ReleaseTask{}); err != nil {
+		if _, err := st.PutPart(ctx, p, nil); err != nil {
 			t.Fatalf("PutPart without span lengths: %v", err)
 		}
 		parts, err := st.ListParts(ctx, legacy)

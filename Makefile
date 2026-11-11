@@ -36,31 +36,34 @@ itest:
 # are the time each test takes with its stack boot included; rebalance here
 # when `go test -tags itest -v` shows one has moved. The first test to run in
 # a group also absorbs the runner's image pulls, about a minute.
-GROUP_encryption  := TestForgeEncryption                  # 6m50
-GROUP_conformance := TestForgeVersity                     # 3m45
-GROUP_conformance += TestForgeAWSCLI                      # 2m36
-GROUP_uploads     := TestForgeMaxSizePart                 # 3m02, needs INGOT_ITEST_BIG
-GROUP_uploads     += TestForgeScenarios                   # 2m16
-GROUP_uploads     += TestForgeMultipartExpiryShred        # 1m33
-GROUP_releases    := TestForgeDeleteReleasesNetworkBlob   # 2m48, waits on piri's removal sweep
-GROUP_releases    += TestForgeObjectCount                 # 2m19
-GROUP_releases    += TestForgeDeleteBucketReleases        # 1m52
-GROUP_auth        := TestForgeAccessKeyExpiry             # 2m29, waits for the key to lapse
-GROUP_auth        += TestForgeCopyAuthorization           # 0m51
-GROUP_auth        += TestForgeRoutePermissions            # 0m50
-GROUP_auth        += TestForgeBucketEncryptionPermissions # 0m49
+GROUP_encryption  := TestForgeEncryption                  # 5m26
+GROUP_conformance := TestForgeVersity                     # 4m08
+GROUP_conformance += TestForgeAWSCLI                      # 2m05
+GROUP_uploads     := TestForgeMaxSizePart                 # 2m45, needs INGOT_ITEST_BIG
+GROUP_uploads     += TestForgeScenarios                   # 1m56
+GROUP_uploads     += TestForgeMultipartExpiryShred        # 1m17
+GROUP_releases    := TestForgeDeleteReleasesNetworkBlob   # 2m14, waits on piri's removal sweep
+GROUP_releases    += TestForgeDeleteBucketReleases        # 1m59
+GROUP_releases    += TestForgeObjectCount                 # 0m47
+GROUP_auth        := TestForgeAccessKeyExpiry             # 2m24, waits for the key to lapse
+GROUP_auth        += TestForgeCopyAuthorization           # 0m46
+GROUP_auth        += TestForgeRoutePermissions            # 0m46
+GROUP_auth        += TestForgeBucketEncryptionPermissions # 0m46
 GROUP_auth        += TestForgeBucketPolicy                # skips unless INGOT_ITEST_IAM=1 or a hilt override
+GROUP_localdisk   := TestForgeCatalogUsage                # 1m23
+GROUP_localdisk   += TestForgeLocalBlobBudget             # 1m16
+GROUP_localdisk   += TestForgeRebuildAfterLostVolume      # 0m52
+GROUP_localdisk   += TestForgeReadAfterCatalogRetention   # 0m51
+GROUP_localdisk   += TestForgeReadAfterEviction           # 0m45
 
 # TestForgeS3Compat runs in its own CI job and belongs to no group.
-GROUP_CLAIMED := $(GROUP_encryption) $(GROUP_conformance) $(GROUP_uploads) $(GROUP_releases) $(GROUP_auth) TestForgeS3Compat
+GROUP_CLAIMED := $(GROUP_encryption) $(GROUP_conformance) $(GROUP_uploads) $(GROUP_releases) $(GROUP_auth) $(GROUP_localdisk) TestForgeS3Compat
 
 # `rest` is the complement, so a test added to itest/ runs there rather than
-# matching no group and silently never running: CatalogUsage (1m27),
-# LocalBlobBudget (1m21), BucketEncryption (1m16), RebuildAfterLostVolume
-# (0m57), ReadAfterCatalogRetention (0m56), and ReadAfterEviction,
-# UncachedWrites, NativeProvision and DeferredMultipart at ~0m50 each (~9m20 in
-# total);
-# MultipartManyParts skips unless INGOT_ITEST_MP_BENCH=1.
+# matching no group and silently never running: BucketEncryption (2m01), and
+# CompleteKeepalive, UncachedWrites, DeferredMultipart and NativeProvision at
+# ~0m45 each (~5m00 in total); MultipartManyParts skips unless
+# INGOT_ITEST_MP_BENCH=1.
 GROUP_ALL  = $(filter Test%,$(shell GOWORK=off $(GO) test -tags itest -list '.*' ./itest))
 GROUP_rest = $(filter-out $(GROUP_CLAIMED),$(GROUP_ALL))
 
@@ -71,9 +74,9 @@ empty :=
 space := $(empty) $(empty)
 group-regex = ^($(subst $(space),|,$(strip $(GROUP_$(1)))))$$
 
-## itest-group: run one group of the integration suite (GROUP=encryption|conformance|uploads|releases|auth|rest)
+## itest-group: run one group of the integration suite (GROUP=encryption|conformance|uploads|releases|auth|localdisk|rest)
 itest-group:
-	@test -n "$(strip $(GROUP))" || { echo "itest-group: set GROUP=encryption|conformance|uploads|releases|auth|rest"; exit 2; }
+	@test -n "$(strip $(GROUP))" || { echo "itest-group: set GROUP=encryption|conformance|uploads|releases|auth|localdisk|rest"; exit 2; }
 	@test -n "$(strip $(GROUP_$(GROUP)))" || { echo "itest-group: GROUP=$(GROUP) selects no tests (unknown group, or 'go test -list' failed above)"; exit 2; }
 	$(GO) test -tags itest -v -timeout 20m -run '$(call group-regex,$(GROUP))' ./itest
 

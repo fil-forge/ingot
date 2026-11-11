@@ -1,4 +1,4 @@
-package s3frontend
+package bucketqueue
 
 import (
 	"bytes"
@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/multiformats/go-multihash"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 )
@@ -16,7 +18,10 @@ func TestPutChangeCarriesALargeBody(t *testing.T) {
 	const n = 10240
 	in := PutChange{HasBlobs: true, Blobs: make([]msbucket.BlobRef, n), Refs: make([]BlobRefTask, n)}
 	for i := range n {
-		d := mustSum([]byte(strconv.Itoa(i)))
+		d, err := multihash.Sum([]byte(strconv.Itoa(i)), multihash.SHA2_256, -1)
+		if err != nil {
+			t.Fatal(err)
+		}
 		in.Blobs[i] = msbucket.BlobRef{Digest: d, Start: int64(i) << 19, End: int64(i+1) << 19}
 		in.Refs[i] = BlobRefTask{Digest: d, Ref: d[:16]}
 	}

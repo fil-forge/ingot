@@ -33,6 +33,7 @@ import (
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/logstore"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
@@ -73,9 +74,7 @@ type ServerDeps struct {
 	// service counts to report the space's object count.
 	Registrar uploader.UploadRegistrar
 	// Tasks runs ingot's durable task queues: New registers the handlers,
-	// Start starts it and Stop stops it. It must be migrated, and be the
-	// runner the Postgres registry queues through (registry.WithTasks).
-	// Required.
+	// Start starts it and Stop stops it. It must be migrated. Required.
 	Tasks *taskrunner.Runner
 
 	// Authority is the service that authorizes bucket creation and deletion.
@@ -89,13 +88,11 @@ type ServerDeps struct {
 	// Intents tracks each local blob's upload_intents lifecycle; Locations
 	// records where each accepted body blob (and shipped catalog shard) can be
 	// retrieved from; Inclusions records each shipped shard's inner-block byte
-	// ranges so retired catalog blocks stay resolvable; GC records superseded
-	// MST/manifest CIDs. Typically all
-	// the same instance as Registry (*registry.Postgres).
+	// ranges so retired catalog blocks stay resolvable. Typically all the
+	// same instance as Registry (*registry.Postgres).
 	Intents    registry.IntentStore
 	Locations  registry.LocationStore
 	Inclusions registry.InclusionStore
-	GC         registry.GCStore
 	Multipart  registry.MultipartStore
 	// Parks persists deferred-accept park state between UploadPart and
 	// Complete/Abort.
@@ -141,7 +138,11 @@ type ServerDeps struct {
 // runtime type assertion on this shape; pin *logstore.Manager to it at compile
 // time so a signature drift is a build error rather than a silently skipped
 // release.
-var _ s3frontend.SegmentDigestLister = (*logstore.Manager)(nil)
+var _ bucketqueue.SegmentDigestLister = (*logstore.Manager)(nil)
+
+// The bucket queue takes the log's seal callback through the same kind of
+// assertion.
+var _ bucketqueue.SealReporter = (*logstore.Manager)(nil)
 
 // Server is a fully-wired ingot S3 listener. Use Start/Stop for
 // lifecycle. fx callers wrap these in OnStart/OnStop hooks; tests
@@ -181,9 +182,8 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	// The log is segregated per bucket (each bucket's segments live under
 	// segments/<bucket>/ and ship to that bucket's Forge space); the manager
 	// stands in wherever the single global log stood. Its seals queue ships
-	// on the backend, which is built after the log: seals reported before
-	// then wait in ships.
-	ships := &shipRelay{}
+	// on the bucket queue, which takes the log's callback when the backend
+	// builds it: the log holds the seals reported before then.
 	log, err := logstore.OpenManager(ctx, logstore.ManagerConfig{
 		Dir:  SegmentsDir(cfg.DataDir),
 		Meta: deps.Meta,
@@ -196,8 +196,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		FlushFor: func(bucket string) logstore.FlushFunc {
 			return newBucketFlushFunc(deps.Uploader, deps.Registry, deps.Locations, deps.Inclusions, bucket, logger)
 		},
-		OnSealed: ships.queue,
-		Logger:   logger,
+		Logger: logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("ingot: logstore: %w", err)
@@ -215,12 +214,12 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	if err := bs.CountBlobReads(otel.Meter("github.com/fil-forge/ingot/blockstore")); err != nil {
 		logger.Warn("local blob read metric not created", zap.Error(err))
 	}
-	backend := s3frontend.New(s3frontend.Deps{
+	backend, err := s3frontend.New(s3frontend.Deps{
+		Tasks:        deps.Tasks,
 		Authority:    deps.Authority,
 		Registry:     deps.Registry,
 		Intents:      deps.Intents,
 		Locations:    deps.Locations,
-		GC:           deps.GC,
 		Multipart:    deps.Multipart,
 		Parks:        deps.Parks,
 		Reads:        bs,
@@ -252,36 +251,9 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Logger:              logger,
 	})
 
-	if err := backend.RegisterUploadTasks(deps.Tasks); err != nil {
-		_ = backend.CloseMetrics()
+	if err != nil {
 		_ = log.Close(ctx)
-		return nil, fmt.Errorf("ingot: register upload tasks: %w", err)
-	}
-	if err := backend.RegisterShardTasks(deps.Tasks); err != nil {
-		_ = backend.CloseMetrics()
-		_ = log.Close(ctx)
-		return nil, fmt.Errorf("ingot: register shard tasks: %w", err)
-	}
-	if err := backend.RegisterMultipartTasks(deps.Tasks); err != nil {
-		_ = backend.CloseMetrics()
-		_ = log.Close(ctx)
-		return nil, fmt.Errorf("ingot: register multipart tasks: %w", err)
-	}
-	if err := backend.RegisterBucketTasks(deps.Tasks); err != nil {
-		_ = backend.CloseMetrics()
-		_ = log.Close(ctx)
-		return nil, fmt.Errorf("ingot: register bucket tasks: %w", err)
-	}
-	ships.attach(backend)
-	if err := backend.RegisterReleaseTasks(deps.Tasks); err != nil {
-		_ = backend.CloseMetrics()
-		_ = log.Close(ctx)
-		return nil, fmt.Errorf("ingot: register release tasks: %w", err)
-	}
-	if err := backend.RegisterAcceptTasks(deps.Tasks); err != nil {
-		_ = backend.CloseMetrics()
-		_ = log.Close(ctx)
-		return nil, fmt.Errorf("ingot: register accept tasks: %w", err)
+		return nil, fmt.Errorf("ingot: %w", err)
 	}
 
 	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, logger)
@@ -603,37 +575,6 @@ func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations r
 	}
 }
 
-// shipRelay hands the catalog log's seals to the backend's QueueShip, and
-// holds the buckets reported before the backend exists.
-type shipRelay struct {
-	mu      sync.Mutex
-	backend *s3frontend.Backend
-	early   []string
-}
-
-func (r *shipRelay) queue(bucket string) {
-	r.mu.Lock()
-	b := r.backend
-	if b == nil {
-		r.early = append(r.early, bucket)
-	}
-	r.mu.Unlock()
-	if b != nil {
-		b.QueueShip(bucket)
-	}
-}
-
-// attach forwards seals to b from now on, and the ones held so far.
-func (r *shipRelay) attach(b *s3frontend.Backend) {
-	r.mu.Lock()
-	early := r.early
-	r.backend, r.early = b, nil
-	r.mu.Unlock()
-	for _, bucket := range early {
-		b.QueueShip(bucket)
-	}
-}
-
 // buildS3API constructs the versitygw S3ApiServer with the wiring ingot
 // needs: no event sink, generous concurrency limits, and an audit-log sink
 // that reports unexpected request failures through zap. Every access key
@@ -783,9 +724,6 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.Locations == nil {
 		return errors.New("ingot: ServerDeps.Locations is required")
-	}
-	if deps.GC == nil {
-		return errors.New("ingot: ServerDeps.GC is required")
 	}
 	if deps.Multipart == nil {
 		return errors.New("ingot: ServerDeps.Multipart is required")
