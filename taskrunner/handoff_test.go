@@ -25,6 +25,9 @@ type countingDB struct {
 	*pgxpool.Pool
 	statements atomic.Int64
 	leaseTries atomic.Int64
+	// stopWaitingDelay holds back the statement that clears a sync task's
+	// waiting caller, widening the window in which others can see it.
+	stopWaitingDelay atomic.Int64
 }
 
 func (c *countingDB) count(sql string) {
@@ -46,6 +49,9 @@ func (c *countingDB) QueryRow(ctx context.Context, sql string, args ...any) pgx.
 
 func (c *countingDB) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	c.count(sql)
+	if strings.Contains(sql, "SET waiting_until = NULL") {
+		time.Sleep(time.Duration(c.stopWaitingDelay.Load()))
+	}
 	return c.Pool.Exec(ctx, sql, args...)
 }
 
@@ -231,5 +237,51 @@ func TestCancelledRunReturnsWhileOthersHoldTheSubject(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("cancelled Run still waiting behind the caller holding the subject")
+	}
+}
+
+// A caller that gives up while its task is still pending clears its claim on
+// the task before it wakes the caller behind it. Woken first, that caller
+// would find the older task still claimed, leave it to its absent caller, and
+// wait out its poll interval.
+func TestRunCallerGivingUpClearsItsClaimBeforeWakingTheNext(t *testing.T) {
+	hold := make(chan struct{})
+	started := make(chan struct{}, 1)
+	r, db := newCountingRunner(t, time.Minute, func(_ context.Context, _ *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if string(task.Args) == "worker" {
+			started <- struct{}{}
+			<-hold
+		}
+		return nil, nil
+	})
+	db.stopWaitingDelay.Store(int64(300 * time.Millisecond))
+	ctx := waitCtx(t)
+	if _, err := r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte("worker")}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+
+	quitCtx, quit := context.WithCancel(ctx)
+	go func() {
+		_, _ = r.Run(quitCtx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte("quitter")})
+	}()
+	time.Sleep(50 * time.Millisecond) // queued behind the worker's task
+	last := make(chan error, 1)
+	go func() {
+		_, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte("last")})
+		last <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // queued behind quitter
+
+	quit()
+	time.Sleep(20 * time.Millisecond)
+	close(hold) // the worker releases the subject while quitter's claim stands
+	select {
+	case err := <-last:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the caller behind one that gave up stalled behind its abandoned claim")
 	}
 }

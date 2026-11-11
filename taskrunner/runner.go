@@ -799,16 +799,19 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 	r.mu.Lock()
 	r.waiting[id] = q
 	r.mu.Unlock()
-	defer r.stopWaiting(q, id)
 	if err := r.db.QueryRow(ctx, `INSERT INTO `+q.tasks+` (id, subject, action, expires, args, sync, node, waiting_until)
 		VALUES ($1, $2, $3, $4, $5, true, $6, now() + $7 * interval '1 millisecond') RETURNING seq, created`,
 		id, s.Subject, s.Action, s.Expires, s.Args, s.Node, r.opts.LeaseTTL.Milliseconds()).Scan(&seq, &created); err != nil {
+		r.stopWaiting(q, id)
 		return nil, fmt.Errorf("submit %s.%s: %w", s.Queue, s.Action, err)
 	}
 	age := treeAge{created, id}
 	key := subjectKey{q.name, s.Subject}
 	turn := r.joinLine(key, seq)
 	defer r.leaveLine(key, turn)
+	// Deferred after leaveLine so it runs first: the caller woken next must
+	// not find this task still claimed by a caller that has gone.
+	defer r.stopWaiting(q, id)
 
 	wait := newBackoff(r.opts.PollInterval)
 	start := time.Now()
