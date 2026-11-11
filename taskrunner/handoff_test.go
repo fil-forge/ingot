@@ -33,6 +33,9 @@ type countingDB struct {
 	// leaseReleases counts the lease releases sent on their own, outside a
 	// task's commit.
 	leaseReleases atomic.Int64
+	// claimRenewals counts the renewer's statements that keep waiting
+	// callers' claims live.
+	claimRenewals atomic.Int64
 	// stopWaitingDelay holds back the statement that clears a sync task's
 	// waiting caller, widening the window in which others can see it.
 	stopWaitingDelay atomic.Int64
@@ -69,6 +72,9 @@ func (c *countingDB) count(sql string) {
 	}
 	if strings.HasPrefix(sql, "DELETE FROM") && strings.Contains(sql, "WHERE subject = $1 AND owner = $2") {
 		c.leaseReleases.Add(1)
+	}
+	if strings.Contains(sql, "SET waiting_until = now() +") {
+		c.claimRenewals.Add(1)
 	}
 }
 
@@ -692,5 +698,65 @@ func TestRunCallerStartsItsHandlerWithAFullLeaseAfterASlowClaim(t *testing.T) {
 	t.Logf("the handler started with %dms of its %v lease left", left.Load(), ttl)
 	if got := time.Duration(left.Load()) * time.Millisecond; got < ttl/2 {
 		t.Errorf("the handler started with %v of its %v lease left; want at least %v", got, ttl, ttl/2)
+	}
+}
+
+// A finished Run leaves nothing for the renewer: once every caller has its
+// outcome, the renewer has no waiting claim to keep live.
+func TestFinishedRunsLeaveNoClaimsToRenew(t *testing.T) {
+	const ttl = 300 * time.Millisecond
+	env := taskrunnertest.NewEnv(t)
+	db := &countingDB{Pool: env.DB}
+	r := startCountingRunner(t, env, db, ttl, time.Minute, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	for i := range 5 {
+		if _, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte(strconv.Itoa(i))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := db.claimRenewals.Load()
+	time.Sleep(ttl) // three renewals' worth
+	if n := db.claimRenewals.Load() - before; n > 0 {
+		t.Errorf("the renewer renewed waiting claims %d time(s) after every Run had finished; want none", n)
+	}
+}
+
+// A Run caller whose own deadline passes while its task is still pending
+// clears its claim on the task as it returns, so the workers can take the task
+// and record it as expired rather than leave it, and the callers behind it,
+// until the claim lapses.
+func TestRunPastItsDeadlineClearsItsClaim(t *testing.T) {
+	hold := make(chan struct{})
+	started := make(chan struct{}, 1)
+	env := taskrunnertest.NewEnv(t)
+	r := startCountingRunner(t, env, &countingDB{Pool: env.DB}, 5*time.Second, time.Minute, func(_ context.Context, _ *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if string(task.Args) == "first" {
+			started <- struct{}{}
+			<-hold
+		}
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	defer close(hold)
+	go func() {
+		_, _ = r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte("first")})
+	}()
+	<-started
+	expires := time.Now().Add(200 * time.Millisecond)
+	if _, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte("late"), Expires: &expires}); !errors.Is(err, taskrunner.ErrExpired) {
+		t.Fatalf("Run past its deadline: %v, want ErrExpired", err)
+	}
+	var state string
+	var claimed bool
+	if err := env.DB.QueryRow(ctx, `SELECT state, waiting_until IS NOT NULL FROM `+env.Table(queueTable(qTop)+"_tasks")+` WHERE args = $1`, []byte("late")).Scan(&state, &claimed); err != nil {
+		t.Fatal(err)
+	}
+	if state != "pending" {
+		t.Fatalf("task is %s; this test wants it still pending", state)
+	}
+	if claimed {
+		t.Error("the caller left its claim on a pending task it gave up on")
 	}
 }

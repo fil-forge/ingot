@@ -814,7 +814,9 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 	// with an outcome has no claim left to clear, so that costs nothing.
 	finished := false
 	defer func() {
-		if !finished {
+		if finished {
+			r.forgetWaiting(id)
+		} else {
 			r.stopWaiting(q, id)
 		}
 	}()
@@ -1037,11 +1039,19 @@ func (r *Runner) finished(ids ...TaskID) {
 	}
 }
 
+// forgetWaiting stops the renewer keeping the task's claim live, for a
+// caller that has stopped waiting.
+func (r *Runner) forgetWaiting(id TaskID) {
+	r.mu.Lock()
+	delete(r.waiting, id)
+	r.mu.Unlock()
+}
+
 // stopWaiting ends a Run caller's claim on its task, so that if the task is
 // still pending, workers may take it at once.
 func (r *Runner) stopWaiting(q *queue, id TaskID) {
+	r.forgetWaiting(id)
 	r.mu.Lock()
-	delete(r.waiting, id)
 	ctx := context.WithoutCancel(r.ctx)
 	r.mu.Unlock()
 	if _, err := r.db.Exec(ctx, `UPDATE `+q.tasks+` SET waiting_until = NULL
