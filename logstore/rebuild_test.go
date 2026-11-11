@@ -708,10 +708,20 @@ func TestRecover_UnshippedRetiredCARWithoutIdx(t *testing.T) {
 		t.Fatalf("OpenManager: %v", err)
 	}
 	requireReadable(t, m, written)
+	// Wait for the retired row to record the ship, not for the flush: the
+	// ship writes the row after the flush returns, on a goroutine Close
+	// doesn't wait for, and the reopen below decides from the row.
 	deadline := time.Now().Add(5 * time.Second)
-	for !ship.shipped()[seq] {
+	for {
+		retired, err := mem.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk")
+		if err != nil {
+			t.Fatalf("ListRetiredSegments: %v", err)
+		}
+		if len(retired) == 1 && retired[0].Seq == seq && retired[0].ShippedAt != 0 {
+			break
+		}
 		if time.Now().After(deadline) {
-			t.Fatalf("segment %d never shipped", seq)
+			t.Fatalf("segment %d never shipped (flushed: %v, retired rows: %+v)", seq, ship.shipped()[seq], retired)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
