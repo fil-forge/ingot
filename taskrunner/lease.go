@@ -2,9 +2,11 @@ package taskrunner
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +23,10 @@ type hold struct {
 	// lost is set when renewal finds the lease taken over. Nothing more may
 	// run under it.
 	lost atomic.Bool
+	// turn is the place in the subject's line of the Run caller holding the
+	// lease, or nil for a worker or a tree's child. Releasing the lease does
+	// not wake it: it released the lease itself, and backs off.
+	turn *runTurn
 }
 
 func (h *hold) key() subjectKey { return subjectKey{h.q.name, h.subject} }
@@ -144,7 +150,120 @@ func (r *Runner) release(ctx context.Context, h *hold) {
 		close(sub.ch)
 		delete(r.freed, h.key())
 	}
+	if line := r.lines[h.key()]; len(line) > 0 && line[0] != h.turn {
+		r.wakeFront(h.key())
+	}
 	r.mu.Unlock()
+}
+
+// runTurn is one Run caller's place in its subject's line.
+type runTurn struct {
+	seq int64
+	// wake is signalled when the caller should look at the subject again:
+	// the lease was released in this process, or the caller came to the
+	// front. It holds one signal, so none is lost while the caller is busy.
+	wake chan struct{}
+}
+
+// A subject's line holds this process's Run callers in their tasks' order.
+// Their tasks run in that order, so only the caller at the front can make
+// progress: the others wait without querying, and a release wakes the front
+// caller alone rather than every caller on the subject, each of which would
+// try the lease for one of them to win it. Callers in other processes, and
+// tasks the workers run, are not in the line; the front caller's backoff
+// covers them.
+
+// joinLine puts a Run caller of the task with the given seq in key's line.
+func (r *Runner) joinLine(key subjectKey, seq int64) *runTurn {
+	t := &runTurn{seq: seq, wake: make(chan struct{}, 1)}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	line := r.lines[key]
+	i, _ := slices.BinarySearchFunc(line, seq, func(t *runTurn, seq int64) int { return cmp.Compare(t.seq, seq) })
+	r.lines[key] = slices.Insert(line, i, t)
+	return t
+}
+
+// leaveLine takes t out of key's line, waking the caller that comes to the
+// front in its place.
+func (r *Runner) leaveLine(key subjectKey, t *runTurn) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	line := r.lines[key]
+	i := slices.Index(line, t)
+	if i < 0 {
+		return
+	}
+	line = slices.Delete(line, i, i+1)
+	if len(line) == 0 {
+		delete(r.lines, key)
+		return
+	}
+	r.lines[key] = line
+	if i == 0 {
+		r.wakeFront(key)
+	}
+}
+
+// frontOfLine reports whether t is at the front of key's line.
+func (r *Runner) frontOfLine(key subjectKey, t *runTurn) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	line := r.lines[key]
+	return len(line) > 0 && line[0] == t
+}
+
+// wakeFront wakes the caller at the front of key's line. r.mu must be held.
+func (r *Runner) wakeFront(key subjectKey) {
+	if line := r.lines[key]; len(line) > 0 {
+		select {
+		case line[0].wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// turnWait is how a Run caller's wait for its turn ended.
+type turnWait struct {
+	// done is set when the task has an outcome, or the caller must stop:
+	// res and err are what Run returns.
+	done bool
+	res  []byte
+	err  error
+	// woken is set when t was woken.
+	woken bool
+}
+
+// awaitTurn reads the task's outcome and, while it is still pending and
+// before expires, waits until the task finishes in this process, t is woken,
+// d passes, or ctx ends. It listens for the finish before it reads, as Wait
+// does, so a finish committed in between still wakes it.
+func (r *Runner) awaitTurn(ctx context.Context, q *queue, id TaskID, t *runTurn, d time.Duration, expires *time.Time) turnWait {
+	ch := r.addWaiter(id)
+	defer r.removeWaiter(id, ch)
+	if res, err, done := r.outcome(ctx, q, id); done {
+		return turnWait{done: true, res: res, err: err}
+	}
+	// Past its Expires the task can no longer start: whoever takes the
+	// subject next records it as expired, so the caller can stop waiting.
+	if expires != nil {
+		left := time.Until(*expires)
+		if left <= 0 {
+			return turnWait{done: true, err: ErrExpired}
+		}
+		d = min(d, left)
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ch:
+	case <-t.wake:
+		return turnWait{woken: true}
+	case <-timer.C:
+	case <-ctx.Done():
+		return turnWait{done: true, err: ctx.Err()}
+	}
+	return turnWait{}
 }
 
 // forget stops renewing h, leaving its row to expire.

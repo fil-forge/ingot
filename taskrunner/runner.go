@@ -228,6 +228,9 @@ type Runner struct {
 	waiting map[TaskID]*queue
 	waiters map[TaskID]map[chan struct{}]struct{}
 	freed   map[subjectKey]*freeSub
+	// lines holds each subject's Run callers in this process in their tasks'
+	// order (see runLine).
+	lines map[subjectKey][]*runTurn
 
 	// wg counts pollers and workers, inline the Run calls in progress.
 	wg     sync.WaitGroup
@@ -304,6 +307,7 @@ func New(db DB, opts Options) (*Runner, error) {
 		waiters:  map[TaskID]map[chan struct{}]struct{}{},
 		waiting:  map[TaskID]*queue{},
 		freed:    map[subjectKey]*freeSub{},
+		lines:    map[subjectKey][]*runTurn{},
 	}
 	// Metrics never stop the runner: instruments the provider refuses leave
 	// it reporting nothing.
@@ -795,23 +799,43 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 	r.mu.Lock()
 	r.waiting[id] = q
 	r.mu.Unlock()
-	defer r.stopWaiting(q, id)
 	if err := r.db.QueryRow(ctx, `INSERT INTO `+q.tasks+` (id, subject, action, expires, args, sync, node, waiting_until)
 		VALUES ($1, $2, $3, $4, $5, true, $6, now() + $7 * interval '1 millisecond') RETURNING seq, created`,
 		id, s.Subject, s.Action, s.Expires, s.Args, s.Node, r.opts.LeaseTTL.Milliseconds()).Scan(&seq, &created); err != nil {
+		r.stopWaiting(q, id)
 		return nil, fmt.Errorf("submit %s.%s: %w", s.Queue, s.Action, err)
 	}
 	age := treeAge{created, id}
 	key := subjectKey{q.name, s.Subject}
+	turn := r.joinLine(key, seq)
+	defer r.leaveLine(key, turn)
+	// Deferred after leaveLine so it runs first: the caller woken next must
+	// not find this task still claimed by a caller that has gone.
+	defer r.stopWaiting(q, id)
 
 	wait := newBackoff(r.opts.PollInterval)
 	start := time.Now()
 	for {
+		if !r.frontOfLine(key, turn) {
+			// An older Run in this process goes first, and this task cannot
+			// start before it: wait for the turn without taking the lease. Each
+			// wait reads the task's outcome first, which finds a cancel here or
+			// on another instance.
+			w := r.awaitTurn(ctx, q, id, turn, r.opts.PollInterval, s.Expires)
+			if w.done {
+				return w.res, w.err
+			}
+			if w.woken {
+				wait = newBackoff(r.opts.PollInterval)
+			}
+			continue
+		}
 		h, _, err := r.tryLease(ctx, q, s.Subject, age)
 		if err != nil {
 			return nil, err
 		}
 		if h != nil {
+			h.turn = turn
 			r.metrics.observeLeaseWait(ctx, q, start)
 			d := r.drainSync(ctx, q, h, seq, id)
 			r.endHold(ctx, h, d.stop)
@@ -842,21 +866,8 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 				return nil, d.stop
 			}
 		}
-		if res, err, done := r.outcome(ctx, q, id); done {
-			return res, err
-		}
-		// Past its Expires the task can no longer start: whoever takes the
-		// subject next records it as expired, so the caller can stop waiting.
-		d := wait.next()
-		if s.Expires != nil {
-			left := time.Until(*s.Expires)
-			if left <= 0 {
-				return nil, ErrExpired
-			}
-			d = min(d, left)
-		}
-		if err := r.waitTask(ctx, id, key, d); err != nil {
-			return nil, err
+		if w := r.awaitTurn(ctx, q, id, turn, wait.next(), s.Expires); w.done {
+			return w.res, w.err
 		}
 	}
 }
