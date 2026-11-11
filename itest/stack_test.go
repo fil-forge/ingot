@@ -103,6 +103,11 @@ func localIngotBinary(t *testing.T) string {
 	return builtBinary
 }
 
+// pinnedBlockchainImage is the filecoin-localdev image (its multi-arch index,
+// tagged 96e9d9e) that was :main before 2026-11-11; forgeStack explains why
+// it is pinned.
+const pinnedBlockchainImage = "ghcr.io/fil-forge/filecoin-localdev@sha256:96e72624eb71efb1c15de1d0729b780955e5ece700e840dd56291f5c522b4bee"
+
 // forgeStack boots the smelt stack with the working tree's ingot injected
 // (plus any extra stack options), waits for ingot's S3 listener, and returns
 // the stack and ingot's host endpoint. Callers must provision a hilt tenant
@@ -125,6 +130,18 @@ func forgeStack(t *testing.T, extra ...stack.Option) (*stack.Stack, string) {
 	// tenant spaces, so both sprue (bucket create / catalog ship) and piri
 	// (the /content/retrieve read tier) must be able to resolve did:plc — a
 	// capability that lands in those services branch-by-branch.
+	// The blockchain image is pinned, not smelt's default moving :main tag:
+	// Anvil loads the chain state smelt commits beside its compose file only
+	// in the localdev image that wrote it, and the :main republished on
+	// 2026-11-11 can't parse the state of the smelt version pinned in go.mod.
+	// Drop the pin (and this override with it) once ingot bumps smelt to a
+	// version whose committed state matches the published image.
+	blockchainImage := pinnedBlockchainImage
+	if img := os.Getenv("INGOT_ITEST_BLOCKCHAIN_IMAGE"); img != "" {
+		t.Logf("using blockchain image override: %s", img)
+		blockchainImage = img
+	}
+	opts = append(opts, stack.WithBlockchainImage(blockchainImage))
 	if img := os.Getenv("INGOT_ITEST_UPLOAD_IMAGE"); img != "" {
 		t.Logf("using upload-service image override: %s", img)
 		opts = append(opts, stack.WithUploadImage(img))

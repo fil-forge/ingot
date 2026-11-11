@@ -54,6 +54,11 @@ yet — e.g. one built from an unmerged branch — point the stack at it:
 INGOT_ITEST_UPLOAD_IMAGE=<image> make itest
 ```
 
+The blockchain (Anvil) image is the exception: `forgeStack` pins
+`filecoin-localdev` by digest, because Anvil loads smelt's committed chain
+state only in the image that wrote it. `INGOT_ITEST_BLOCKCHAIN_IMAGE=<image>`
+overrides the pin.
+
 **Teardown-blocked XFail rows (historical):** before `DeleteObject` released
 network blobs (FIL-588), a bucket that ever held a non-empty object body
 could not be deleted — hilt's `/s3/bucket/delete` refuses non-empty spaces —
