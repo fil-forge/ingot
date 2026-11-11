@@ -68,15 +68,15 @@ func main() {
 		bucketqueue.BucketCommitResult{},
 		bucketqueue.ChangeResult{},
 		bucketqueue.ChangeError{},
+		bucketqueue.BucketTask{},
+		bucketqueue.BucketCreateTask{},
+		bucketqueue.BucketSetVersioningTask{},
+		bucketqueue.BucketSetLockConfigTask{},
+		bucketqueue.BucketSetConfigTask{},
 	); err != nil {
 		panic(err)
 	}
 	if err := cfg.WriteMapEncodersToFile("../s3frontend/cbor_gen.go", "s3frontend",
-		s3frontend.BucketTask{},
-		s3frontend.BucketCreateTask{},
-		s3frontend.BucketSetVersioningTask{},
-		s3frontend.BucketSetLockConfigTask{},
-		s3frontend.BucketSetConfigTask{},
 		s3frontend.MultipartAbortTask{},
 	); err != nil {
 		panic(err)

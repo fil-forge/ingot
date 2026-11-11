@@ -1,10 +1,11 @@
-package s3frontend
+package bucketqueue
 
 import (
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -34,8 +35,8 @@ type BucketShipper interface {
 }
 
 // registerShip registers queue-bucket.ship.
-func (b *Backend) registerShip(r *taskrunner.Runner) error {
-	return r.Handle(registry.BucketQueue, registry.BucketShipAction, b.runShip, taskrunner.WithRetry(shipRetry))
+func (q *Queue) registerShip(r *taskrunner.Runner) error {
+	return r.Handle(registry.BucketQueue, registry.BucketShipAction, q.runShip, taskrunner.WithRetry(shipRetry))
 }
 
 // QueueShip queues a ship of bucket's sealed catalog segments, due now, as
@@ -43,13 +44,13 @@ func (b *Backend) registerShip(r *taskrunner.Runner) error {
 // a segment seals. A ship that cannot be queued is owed, and queued again
 // with backoff until it is (retryOwedShips): an idle bucket has no next seal
 // to queue one.
-func (b *Backend) QueueShip(bucket string) {
+func (q *Queue) QueueShip(bucket string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := b.queueShip(ctx, bucket); err != nil {
-		b.logger.Warn("could not queue a catalog ship; it is retried",
+	if err := q.queueShip(ctx, bucket); err != nil {
+		q.logger.Warn("could not queue a catalog ship; it is retried",
 			zap.String("bucket", bucket), zap.Error(err))
-		b.oweShip(bucket)
+		q.oweShip(bucket)
 	}
 }
 
@@ -58,124 +59,143 @@ func (b *Backend) QueueShip(bucket string) {
 // log captures fresh authority and queues the ship again with its own writes
 // (awaitingShip), until a ship succeeds. A seal can be a long way off, so the
 // ship does not wait for one.
-func (b *Backend) awaitShipAuthority(bucket string) {
-	b.shipMu.Lock()
-	defer b.shipMu.Unlock()
-	if b.shipAwaiting == nil {
-		b.shipAwaiting = map[string]bool{}
+func (q *Queue) awaitShipAuthority(bucket string) {
+	q.ships.mu.Lock()
+	defer q.ships.mu.Unlock()
+	if q.ships.awaiting == nil {
+		q.ships.awaiting = map[string]bool{}
 	}
-	b.shipAwaiting[bucket] = true
+	q.ships.awaiting[bucket] = true
 }
 
 // awaitingShip reports whether bucket's ship awaits authority.
-func (b *Backend) awaitingShip(bucket string) bool {
-	b.shipMu.Lock()
-	defer b.shipMu.Unlock()
-	return b.shipAwaiting[bucket]
+func (q *Queue) awaitingShip(bucket string) bool {
+	q.ships.mu.Lock()
+	defer q.ships.mu.Unlock()
+	return q.ships.awaiting[bucket]
 }
 
 // queueAwaitedShip queues st's bucket's ship with a commit that appended to
 // its log, when the ship awaits authority: the append captured fresh ship
 // authority.
-func (b *Backend) queueAwaitedShip(ctx context.Context, ex *taskrunner.Exec, st *registry.State) error {
-	if !b.awaitingShip(st.Name) {
+func (q *Queue) queueAwaitedShip(ctx context.Context, ex *taskrunner.Exec, st *registry.State) error {
+	if !q.awaitingShip(st.Name) {
 		return nil
 	}
 	raw, err := encodeBucketTask(&BucketTask{Name: st.Name})
 	if err != nil {
 		return err
 	}
-	spec := b.bucketSpec(st.Space, registry.BucketShipAction, raw)
+	spec := q.bucketSpec(st.Space, registry.BucketShipAction, raw)
 	now := registry.DueNow()
 	spec.NotBefore, spec.Replace = &now, true
 	_, err = ex.Submit(ctx, spec)
 	return err
 }
 
-// shipNoticeFirst and shipNoticeMax bound the backoff between attempts to
-// queue an owed ship. Package-level so tests can shrink them.
-var (
-	shipNoticeFirst = time.Second
-	shipNoticeMax   = time.Minute
+// The default backoff between attempts to queue an owed ship.
+const (
+	defaultShipRetryFirst = time.Second
+	defaultShipRetryMax   = time.Minute
 )
+
+// ships is the state of the buckets' ships that the queue keeps itself.
+type ships struct {
+	// mu guards the fields below.
+	mu sync.Mutex
+	// owed are the buckets whose ship could not be queued, which
+	// retryOwedShips queues once it can.
+	owed map[string]bool
+	// awaiting are the buckets whose ship found no authority to send with,
+	// which the bucket's next commit queues again (awaitShipAuthority).
+	awaiting map[string]bool
+	// retrying is set while retryOwedShips runs.
+	retrying bool
+	// stop, closed by StopShips, ends retryOwedShips.
+	stop chan struct{}
+	// stopped is set once StopShips has run.
+	stopped bool
+	// retryFirst and retryMax bound the backoff between its attempts.
+	retryFirst, retryMax time.Duration
+}
 
 // oweShip records that bucket's ship could not be queued, and starts the
 // retries unless they run already or the backend is draining.
-func (b *Backend) oweShip(bucket string) {
-	b.shipMu.Lock()
-	defer b.shipMu.Unlock()
-	if b.shipOwed == nil {
-		b.shipOwed = map[string]bool{}
+func (q *Queue) oweShip(bucket string) {
+	q.ships.mu.Lock()
+	defer q.ships.mu.Unlock()
+	if q.ships.owed == nil {
+		q.ships.owed = map[string]bool{}
 	}
-	b.shipOwed[bucket] = true
-	if b.shipRetrying || b.shipStopped {
+	q.ships.owed[bucket] = true
+	if q.ships.retrying || q.ships.stopped {
 		return
 	}
-	if b.shipStop == nil {
-		b.shipStop = make(chan struct{})
+	if q.ships.stop == nil {
+		q.ships.stop = make(chan struct{})
 	}
-	b.shipRetrying = true
-	go b.retryOwedShips(b.shipStop)
+	q.ships.retrying = true
+	go q.retryOwedShips(q.ships.stop)
 }
 
 // retryOwedShips queues the owed ships, with backoff while any fails, until
 // none is owed or stop closes. A bucket deleted meanwhile is owed nothing
 // (queueShip). After a restart, the log reports its unshipped segments again.
-func (b *Backend) retryOwedShips(stop <-chan struct{}) {
-	delay := shipNoticeFirst
+func (q *Queue) retryOwedShips(stop <-chan struct{}) {
+	delay := q.ships.retryFirst
 	for {
 		select {
 		case <-stop:
 			return
 		case <-time.After(delay):
 		}
-		b.shipMu.Lock()
-		owed := make([]string, 0, len(b.shipOwed))
-		for bucket := range b.shipOwed {
+		q.ships.mu.Lock()
+		owed := make([]string, 0, len(q.ships.owed))
+		for bucket := range q.ships.owed {
 			owed = append(owed, bucket)
 		}
-		b.shipMu.Unlock()
+		q.ships.mu.Unlock()
 		failed := false
 		for _, bucket := range owed {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			err := b.queueShip(ctx, bucket)
+			err := q.queueShip(ctx, bucket)
 			cancel()
 			if err != nil {
 				failed = true
 				continue
 			}
-			b.shipMu.Lock()
-			delete(b.shipOwed, bucket)
-			b.shipMu.Unlock()
+			q.ships.mu.Lock()
+			delete(q.ships.owed, bucket)
+			q.ships.mu.Unlock()
 		}
-		b.shipMu.Lock()
-		if len(b.shipOwed) == 0 {
-			b.shipRetrying = false
-			b.shipMu.Unlock()
+		q.ships.mu.Lock()
+		if len(q.ships.owed) == 0 {
+			q.ships.retrying = false
+			q.ships.mu.Unlock()
 			return
 		}
-		b.shipMu.Unlock()
+		q.ships.mu.Unlock()
 		if failed {
-			delay = min(2*delay, shipNoticeMax)
+			delay = min(2*delay, q.ships.retryMax)
 		}
 	}
 }
 
-// stopShipRetries ends the retries of owed ships.
-func (b *Backend) stopShipRetries() {
-	b.shipMu.Lock()
-	defer b.shipMu.Unlock()
-	if b.shipStopped {
+// StopShips ends the retries of owed ships, for a drain.
+func (q *Queue) StopShips() {
+	q.ships.mu.Lock()
+	defer q.ships.mu.Unlock()
+	if q.ships.stopped {
 		return
 	}
-	b.shipStopped = true
-	if b.shipStop != nil {
-		close(b.shipStop)
+	q.ships.stopped = true
+	if q.ships.stop != nil {
+		close(q.ships.stop)
 	}
 }
 
-func (b *Backend) queueShip(ctx context.Context, bucket string) error {
-	st, err := b.reg.Get(ctx, bucket)
+func (q *Queue) queueShip(ctx context.Context, bucket string) error {
+	st, err := q.reg.Get(ctx, bucket)
 	if errors.Is(err, registry.ErrNotFound) {
 		// Deleted: its log goes with it.
 		return nil
@@ -187,10 +207,10 @@ func (b *Backend) queueShip(ctx context.Context, bucket string) error {
 	if err != nil {
 		return err
 	}
-	spec := b.bucketSpec(st.Space, registry.BucketShipAction, args)
+	spec := q.bucketSpec(st.Space, registry.BucketShipAction, args)
 	now := registry.DueNow()
 	spec.NotBefore, spec.Replace = &now, true
-	_, err = b.buckets.Submit(ctx, spec)
+	_, err = q.runner.Submit(ctx, spec)
 	return err
 }
 
@@ -199,23 +219,23 @@ func (b *Backend) queueShip(ctx context.Context, bucket string) error {
 // until the bucket's next write captures fresh authority, and that write's
 // commit queues the ship again (awaitShipAuthority). Any other failure is
 // retried.
-func (b *Backend) runShip(ctx context.Context, _ *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
+func (q *Queue) runShip(ctx context.Context, _ *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
 	var args BucketTask
 	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
 		return nil, taskrunner.Permanent(fmt.Errorf("decode ship: %w", err))
 	}
-	shipper, ok := b.log.(BucketShipper)
+	shipper, ok := q.log.(BucketShipper)
 	if !ok {
 		return nil, nil
 	}
 	// A ship queued for a bucket since deleted, or for an earlier bucket of
 	// the name, has nothing to ship: opening the log would recreate a store
 	// for the name, or ship another space's catalog.
-	st, err := b.reg.Get(ctx, args.Name)
+	st, err := q.reg.Get(ctx, args.Name)
 	if errors.Is(err, registry.ErrNotFound) {
-		b.shipMu.Lock()
-		delete(b.shipAwaiting, args.Name)
-		b.shipMu.Unlock()
+		q.ships.mu.Lock()
+		delete(q.ships.awaiting, args.Name)
+		q.ships.mu.Unlock()
 		return nil, nil
 	}
 	if err != nil {
@@ -227,13 +247,13 @@ func (b *Backend) runShip(ctx context.Context, _ *taskrunner.Exec, t taskrunner.
 	if err := shipper.ShipBucket(ctx, args.Name); err != nil {
 		err = fmt.Errorf("ship catalog of %q: %w", args.Name, err)
 		if errors.Is(err, uploader.ErrNoShipAuthority) {
-			b.awaitShipAuthority(args.Name)
+			q.awaitShipAuthority(args.Name)
 			return nil, taskrunner.Permanent(err)
 		}
 		return nil, err
 	}
-	b.shipMu.Lock()
-	delete(b.shipAwaiting, args.Name)
-	b.shipMu.Unlock()
+	q.ships.mu.Lock()
+	delete(q.ships.awaiting, args.Name)
+	q.ships.mu.Unlock()
 	return nil, nil
 }

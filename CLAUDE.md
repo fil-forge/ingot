@@ -110,14 +110,14 @@ Internal:
   (Put/Get/Head/Delete/List), `version.go` (resolveVersion, reading the
   per-key version tree), `bucketqueue.go` (the requests' commits through
   `queue/bucketqueue`), `conditions.go` (its errors' S3 answers),
-  `bucketadmin.go` (`queue-bucket.create`, `.set-versioning`,
-  `.set-object-lock-config`, `.set-tagging`, `.set-cors`, `.set-encryption`,
-  `.close`, `.admit-upload`), `bucketship.go`
-  (`queue-bucket.ship`, queued on each seal), `multipart.go`,
+  `bucketadmin.go` (bucket settings through `queue/bucketqueue`),
+  `multipart.go`,
   `multipartqueue.go` (`queue-multipart-upload`: every change to an upload,
   on the upload ID's subject), `acceptor.go`
   (`queue-multipart-upload.accept`, queueing a `queue-space-shard.accept` per
-  parked blob, which concludes it while the client uploads), `bucket.go` (`queue-bucket.delete`), `listversions.go`,
+  parked blob, which concludes it while the client uploads), `bucket.go`
+  (DeleteBucket: the close, the uploads' aborts, then
+  `queue-bucket.delete`), `listversions.go`,
   `backend.go`, `stream.go` (each body blob streams to its
   provider as the body arrives, teeing an object's bytes into the cache; a
   failed stream fails the request and aborts its allocation, and an
@@ -155,11 +155,13 @@ Internal:
   (`queue-space-upload`, the object-count changes), `spaceshardqueue`
   (`queue-space-shard`, the tasks on one blob in one space; its name,
   subjects and release arguments are in `registry`, which queues releases
-  with bucket commits and part writes), `bucketqueue`
-  (`queue-bucket.commit`, every change to a bucket's objects: an ordered
-  list of key changes applied to one Tx, the version tree's write rule,
-  and the errors a change fails with on its own terms). The other
-  handlers are in `s3frontend`.
+  with bucket commits and part writes), `bucketqueue` (`queue-bucket`,
+  every change to a bucket: `.commit` applies an ordered list of key
+  changes to one Tx under the version tree's write rule, failing a change
+  on its own terms with one of a fixed set of errors; `.create`,
+  `.set-versioning`, `.set-object-lock-config`, `.set-tagging`,
+  `.set-cors`, `.set-encryption`, `.close`, `.admit-upload` and `.delete`;
+  `.ship`, queued on each seal). The other handlers are in `s3frontend`.
 - **`taskrunner/`** — durable task queues in Postgres (one tasks table and
   one leases table per queue), serialized per (queue, subject) by a lease
   row. A task's tree (its handler plus sync children in later queues) adds
@@ -186,8 +188,7 @@ Internal:
   upload ID: an upload's create, add-part, accept, complete, abort and reap,
   one at a time, the accept (`s3frontend/acceptor.go`) queuing a
   `queue-space-shard.accept` for each blob of the upload's parked parts;
-  `queue-bucket` (`queue/bucketqueue` for commits, `s3frontend` for the
-  rest), subject the bucket's space
+  `queue-bucket` (`queue/bucketqueue`), subject the bucket's space
   DID: every change to a bucket, placed on the instance holding its catalog
   log; `queue-space-upload` (`queue/spaceuploadqueue`), the
   object-count changes a `queue-bucket.commit` spawns with its own

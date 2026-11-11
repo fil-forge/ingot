@@ -116,12 +116,8 @@ func (b *Backend) runCreateUpload(ctx context.Context, ex *taskrunner.Exec, t ta
 	if sess == nil {
 		return nil, taskrunner.Permanent(errors.New("create: its request has gone"))
 	}
-	admit, err := encodeBucketTask(&BucketTask{Name: sess.Bucket})
-	if err != nil {
-		return nil, err
-	}
-	if _, err := ex.Run(ctx, b.bucketSpec(sess.Space, registry.BucketAdmitUploadAction, admit)); err != nil {
-		return nil, err
+	if err := b.buckets.AdmitUpload(ctx, ex, sess.Space, sess.Bucket); err != nil {
+		return nil, mapBucketError(err, "create multipart upload")
 	}
 	st, err := registry.CreatedSession(*sess)
 	if err != nil {

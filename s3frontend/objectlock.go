@@ -210,7 +210,7 @@ func (b *Backend) PutObjectLegalHold(ctx context.Context, bucket, object, versio
 // mutateVersionLock / mutateVersionTags, which set the gate for their
 // operation family. The check order runs
 // entirely inside the commit (a missing bucket surfaces through
-// mapCommitError); key existence outranks lock-enabled, which outranks the
+// mapBucketError); key existence outranks lock-enabled, which outranks the
 // versionId grammar, matching posix and the pinning conformance cases.
 func (b *Backend) mutateVersionState(ctx context.Context, bucketName, key string, set *bucketqueue.SetAttributesChange) error {
 	st, err := b.reg.Get(ctx, bucketName)

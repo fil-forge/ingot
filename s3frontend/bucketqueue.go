@@ -16,9 +16,9 @@ import (
 // it, with the request's authority for the tasks the commit spawns: the
 // releases of the claims it drops and the upload registrations it queues.
 func (b *Backend) commit(ctx context.Context, st *registry.State, changes ...bucketqueue.KeyChange) (bucketqueue.Outcome, error) {
-	out, err := b.commits.Commit(ctx, st, b.commitAuthority(ctx, st.Space), changes...)
+	out, err := b.buckets.Commit(ctx, st, b.commitAuthority(ctx, st.Space), changes...)
 	if err != nil {
-		return bucketqueue.Outcome{}, mapCommitError(err, "commit")
+		return bucketqueue.Outcome{}, mapBucketError(err, "commit")
 	}
 	return out, nil
 }
@@ -36,9 +36,9 @@ func (b *Backend) commitOne(ctx context.Context, st *registry.State, change buck
 // commitOneChild is commitOne run as a child of the task ex runs: a
 // Complete commits its object with its own writes.
 func (b *Backend) commitOneChild(ctx context.Context, ex *taskrunner.Exec, st *registry.State, change bucketqueue.KeyChange, op string) (bucketqueue.ChangeResult, registry.VersioningState, error) {
-	out, err := b.commits.CommitChild(ctx, ex, st, b.commitAuthority(ctx, st.Space), change)
+	out, err := b.buckets.CommitChild(ctx, ex, st, b.commitAuthority(ctx, st.Space), change)
 	if err != nil {
-		return bucketqueue.ChangeResult{}, "", mapCommitError(err, "commit")
+		return bucketqueue.ChangeResult{}, "", mapBucketError(err, "commit")
 	}
 	return oneResult(out, op)
 }
@@ -48,7 +48,7 @@ func (b *Backend) commitOneChild(ctx context.Context, ex *taskrunner.Exec, st *r
 func oneResult(out bucketqueue.Outcome, op string) (bucketqueue.ChangeResult, registry.VersioningState, error) {
 	res := out.Results[0]
 	if res.Err != nil {
-		return res, out.Versioning, mapCommitError(res.Err, op)
+		return res, out.Versioning, mapBucketError(res.Err, op)
 	}
 	return res, out.Versioning, nil
 }

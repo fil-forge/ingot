@@ -1109,7 +1109,7 @@ func (b *Backend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInpu
 		if e.change >= 0 {
 			cr = outcome.Results[e.change]
 			if cr.Err != nil {
-				e.err = mapCommitError(cr.Err, "delete")
+				e.err = mapBucketError(cr.Err, "delete")
 			}
 		}
 		if e.err != nil {

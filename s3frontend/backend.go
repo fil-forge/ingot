@@ -96,10 +96,8 @@ type Backend struct {
 	// blobs runs the tasks on one blob in one space: a write's references,
 	// its accept, its release.
 	blobs *spaceshardqueue.Queue
-	// buckets runs the queue-bucket tasks besides commit.
-	buckets *taskrunner.Runner
-	// commits runs queue-bucket.commit, every change to a bucket's objects.
-	commits *bucketqueue.Queue
+	// buckets runs the queue-bucket tasks: every change to a bucket.
+	buckets *bucketqueue.Queue
 	// uploads runs the queue-multipart-upload tasks.
 	uploads *taskrunner.Runner
 	// acceptDelay is how long after a part lands its upload's accept is due:
@@ -108,18 +106,6 @@ type Backend struct {
 	// multipartTTL is how long an upload stays open before its auto-abort,
 	// and a completed one is kept (Deps.MultipartSessionTTL).
 	multipartTTL time.Duration
-	// shipMu guards the ship fields below. shipOwed are the buckets whose
-	// ship could not be queued, which retryOwedShips queues once it can;
-	// shipRetrying is set while it runs, and shipStop, closed by Drain, ends
-	// it.
-	shipMu   sync.Mutex
-	shipOwed map[string]bool
-	// shipAwaiting are the buckets whose ship found no authority to send
-	// with, which the bucket's next commit queues again (awaitShipAuthority).
-	shipAwaiting map[string]bool
-	shipRetrying bool
-	shipStop     chan struct{}
-	shipStopped  bool
 	releaseGrace time.Duration
 	// Local blob sweeper knobs (see Deps). localBlobSweepMu serialises
 	// SweepLocalBlobs; lastOrphanPass is when its orphan pass last ran.
@@ -307,6 +293,8 @@ type Deps struct {
 
 	// tuneBlobs adjusts the queue-space-shard dependencies, for tests.
 	tuneBlobs func(*spaceshardqueue.Deps)
+	// tuneBuckets adjusts the queue-bucket dependencies, for tests.
+	tuneBuckets func(*bucketqueue.Deps)
 }
 
 // Compile-time assertion that Backend satisfies versitygw's interface.
@@ -406,13 +394,24 @@ func New(d Deps) (*Backend, error) {
 		b.blobs, err = spaceshardqueue.New(d.Tasks, bd)
 	}
 	if err == nil {
-		b.commits, err = bucketqueue.New(d.Tasks, bucketqueue.Deps{
+		bd := bucketqueue.Deps{
 			Registry:     d.Registry,
 			Txns:         b.txns,
+			Read:         b.read,
+			Log:          d.Log,
+			Sessions:     d.Multipart,
+			Remover:      d.Remover,
+			Buckets:      d.Authority,
+			Authority:    b.proofs,
+			Blobs:        b.blobs,
+			Counts:       b.counts,
 			ReleaseGrace: d.ReleaseGrace,
-			Appended:     b.queueAwaitedShip,
 			Logger:       logger,
-		})
+		}
+		if d.tuneBuckets != nil {
+			d.tuneBuckets(&bd)
+		}
+		b.buckets, err = bucketqueue.New(d.Tasks, bd)
 	}
 	if err == nil {
 		err = b.registerTasks(d.Tasks)
@@ -428,7 +427,6 @@ func New(d Deps) (*Backend, error) {
 func (b *Backend) registerTasks(r *taskrunner.Runner) error {
 	for _, register := range []func(*taskrunner.Runner) error{
 		b.registerMultipartTasks,
-		b.registerBucketAdmin,
 		b.registerAcceptTasks,
 	} {
 		if err := register(r); err != nil {
@@ -457,7 +455,7 @@ func (b *Backend) Recover(_ context.Context) error { return nil }
 // again. After Drain returns cleanly, no acked write is unrepresented in
 // Postgres.
 func (b *Backend) Drain(ctx context.Context) error {
-	b.stopShipRetries()
+	b.buckets.StopShips()
 	if b.txns == nil {
 		return nil
 	}

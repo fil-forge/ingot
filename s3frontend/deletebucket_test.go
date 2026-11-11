@@ -15,12 +15,12 @@ import (
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
-	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/internal/testfakes"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 )
@@ -173,10 +173,12 @@ func TestDeleteBucket_RefusalLeavesBucketReadable(t *testing.T) {
 // the bucket's last segment unshipped until its next write, and the journal
 // must not wait with it: nothing the emptied bucket reads needs those blocks.
 func TestDeleteBucket_RefusalDropsTheJournal(t *testing.T) {
-	b, mem, _, _ := newJournalingBackend(t)
-	auth := &refusingAuthority{BucketAuthority: mem}
+	var auth *refusingAuthority
+	b, mem, _, _ := newJournalingBackend(t, func(d *Deps) {
+		auth = &refusingAuthority{BucketAuthority: d.Authority}
+		d.Authority = auth
+	})
 	auth.refuse.Store(true)
-	b.authority = auth
 	ctx := context.WithValue(context.Background(), reqscope.RequestKey(), cmds3.Request{})
 
 	// The ship waits on the test, so the PUT's and DELETE's blocks stay
@@ -199,13 +201,11 @@ func TestDeleteBucket_RefusalDropsTheJournal(t *testing.T) {
 // would, it finds no mark of its own DeleteBucket and fails without touching
 // the bucket.
 func TestAnAbandonedDeleteNeverActs(t *testing.T) {
-	b, mem := newDeferredBackend(t, &parkingUploader{})
+	_, mem := newDeferredBackend(t, &parkingUploader{})
 	ctx := context.Background()
-	args, err := encodeBucketTask(&BucketTask{Name: "bk"})
-	require.NoError(t, err)
 
 	put := context.WithValue(ctx, reqscope.RequestKey(), cmds3.Request{})
-	_, err = b.runDeleteBucket(put, nil, taskrunner.Task{Queue: registry.BucketQueue, Action: registry.BucketDeleteAction, Args: args})
+	err := runBucketTaskRaw(put, mem, mem.bk(), registry.BucketDeleteAction, &bucketqueue.BucketTask{Name: "bk"})
 	if err == nil || !taskrunner.IsPermanent(err) {
 		t.Fatalf("delete run with another request's context: %v, want a permanent refusal", err)
 	}

@@ -32,6 +32,7 @@ import (
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/logstore"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
@@ -140,7 +141,7 @@ type ServerDeps struct {
 // runtime type assertion on this shape; pin *logstore.Manager to it at compile
 // time so a signature drift is a build error rather than a silently skipped
 // release.
-var _ s3frontend.SegmentDigestLister = (*logstore.Manager)(nil)
+var _ bucketqueue.SegmentDigestLister = (*logstore.Manager)(nil)
 
 // Server is a fully-wired ingot S3 listener. Use Start/Stop for
 // lifecycle. fx callers wrap these in OnStart/OnStop hooks; tests

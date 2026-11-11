@@ -13,9 +13,9 @@ import (
 	"github.com/fil-forge/ingot/registry"
 )
 
-// Each way a commit or one of its changes fails answers its S3 error, of the
+// Each way a bucket task or one of a commit's changes fails answers its S3 error, of the
 // concrete type versitygw renders without unwrapping.
-func TestMapCommitError(t *testing.T) {
+func TestMapBucketError(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		err  error
@@ -42,8 +42,13 @@ func TestMapCommitError(t *testing.T) {
 		{"bucket gone", fmt.Errorf("begin: %w", bucketop.ErrBucketNotFound),
 			s3err.GetAPIError(s3err.ErrNoSuchBucket)},
 		{"bucket closing", bucketqueue.ErrBucketClosing, errBucketClosing},
+		{"bucket exists", bucketqueue.ErrBucketExists, s3err.GetAPIError(s3err.ErrBucketAlreadyExists)},
+		{"bucket not empty", bucketqueue.ErrBucketNotEmpty, s3err.GetAPIError(s3err.ErrBucketNotEmpty)},
+		{"versioned bucket not empty", bucketqueue.ErrVersionedBucketNotEmpty, s3err.GetAPIError(s3err.ErrVersionedBucketNotEmpty)},
+		{"suspending a locked bucket", bucketqueue.ErrLockedVersioning, s3err.GetAPIError(s3err.ErrSuspendedVersioningNotAllowed)},
+		{"lock without versioning", bucketqueue.ErrLockNeedsVersioning, s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotAllowed)},
 	} {
-		if got := mapCommitError(tc.err, "commit"); !reflect.DeepEqual(got, tc.want) {
+		if got := mapBucketError(tc.err, "commit"); !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("%s: %#v, want %#v", tc.name, got, tc.want)
 		}
 	}
@@ -51,12 +56,15 @@ func TestMapCommitError(t *testing.T) {
 
 // A superseded reservation and a storage error answer InternalError, and
 // keep their cause for the log and the Complete that checks for it.
-func TestMapCommitErrorWrapsTheRest(t *testing.T) {
+func TestMapBucketErrorWrapsTheRest(t *testing.T) {
+	if err := mapBucketError(nil, "commit"); err != nil {
+		t.Fatalf("no error answered %v", err)
+	}
 	for _, err := range []error{
 		&bucketqueue.ChangeError{Kind: bucketqueue.KindReservationSuperseded},
 		errors.New("disk full"),
 	} {
-		got := mapCommitError(err, "commit")
+		got := mapBucketError(err, "commit")
 		var api s3err.APIError
 		if errors.As(got, &api) {
 			t.Fatalf("%v answered %s, want an internal error", err, api.Code)
@@ -65,7 +73,7 @@ func TestMapCommitErrorWrapsTheRest(t *testing.T) {
 			t.Fatalf("%v lost its cause: %v", err, got)
 		}
 	}
-	if got := mapCommitError(&bucketqueue.ChangeError{Kind: bucketqueue.KindReservationSuperseded}, "commit"); !errors.Is(got, bucketqueue.ErrReservationSuperseded) {
+	if got := mapBucketError(&bucketqueue.ChangeError{Kind: bucketqueue.KindReservationSuperseded}, "commit"); !errors.Is(got, bucketqueue.ErrReservationSuperseded) {
 		t.Fatalf("a superseded reservation is not ErrReservationSuperseded: %v", got)
 	}
 }
