@@ -183,7 +183,7 @@ func (q *Queue) awaitBlobAccepts(ctx context.Context, space did.DID, parts []reg
 	var subjects []string
 	for _, p := range parts {
 		for _, d := range p.BlobDigests {
-			subject := registry.ReleaseSubject(space, d)
+			subject := registry.SpaceShardSubject(space, d)
 			if !seen[subject] {
 				seen[subject] = true
 				subjects = append(subjects, subject)

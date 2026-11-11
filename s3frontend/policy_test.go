@@ -65,7 +65,7 @@ func policyBackend(t *testing.T, authority bucketauthority.BucketAuthority) *s3f
 			{Name: registry.MultipartQueue},
 			{Name: registry.BucketQueue},
 			{Name: spaceuploadqueue.Name},
-			{Name: registry.ReleaseQueue},
+			{Name: registry.SpaceShardQueue},
 			{Name: shardqueue.Name},
 		},
 	})

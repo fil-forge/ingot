@@ -556,7 +556,7 @@ func provideTaskRunner(pool *pgxpool.Pool, id identity.Identity, logger *zap.Log
 			{Name: registry.MultipartQueue, Workers: multipartWorkers},
 			{Name: registry.BucketQueue, Workers: bucketWorkers},
 			{Name: spaceuploadqueue.Name, Workers: uploadRegistrationWorkers},
-			{Name: registry.ReleaseQueue, Workers: releaseWorkers},
+			{Name: registry.SpaceShardQueue, Workers: releaseWorkers},
 			{Name: shardqueue.Name, Workers: shardWorkers},
 		},
 		Logger: logger.Named("tasks"),

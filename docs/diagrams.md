@@ -303,7 +303,7 @@ sequenceDiagram
     end
     B->>R: PutEncryptionParams(region-wrapped CEK, FEE geometry) per blob
     loop each blob (concludeBody → addBlob)
-        Note over B,R: a sync queue-space-shard.add on the blob's release subject (space/hex digest),<br/>after any release ahead of it, within 30 s (else SlowDown)
+        Note over B,R: a sync queue-space-shard.add on the blob's subject (space/hex digest),<br/>after any release ahead of it, within 30 s (else SlowDown)
         alt blob_locations already has (space, digest)
             B->>R: PutIntent(accepted)<br/>(only a plaintext bucket's repeated bytes hit: every envelope digest is new)
         else conclude
@@ -531,7 +531,7 @@ sequenceDiagram
         B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412)#59;<br/>the body is the source's plaintext range through the decrypting reader
     end
     B->>B: ingestPart: splitBody<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope streamed to piri under its ciphertext<br/>digest + params row, as in the PutObject diagram#59; no local copy)
-    loop each part blob (parkBlobs → addBlob: a sync queue-space-shard.add on the blob's release subject)
+    loop each part blob (parkBlobs → addBlob: a sync queue-space-shard.add on the blob's subject)
         alt blob_locations already has the digest
             B->>R: intent accepted (dedup, no park)
         else already parked (GetPark hit)

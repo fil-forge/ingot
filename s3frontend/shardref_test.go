@@ -165,7 +165,7 @@ func TestCommitCancelsItsReferencesExpiries(t *testing.T) {
 	b, mem := newDeferredBackend(t, testfakes.NopUploader{})
 	ctx := context.Background()
 	putIn(t, b, "bk", "k", testBody(4<<10))
-	tasks, err := taskrunnertest.Tasks(ctx, mem.pool, "ingot", registry.ReleaseQueue)
+	tasks, err := taskrunnertest.Tasks(ctx, mem.pool, "ingot", registry.SpaceShardQueue)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +189,7 @@ func TestCommitCancelsItsReferencesExpiries(t *testing.T) {
 func expireRefsTo(t *testing.T, b *Backend, space did.DID, digest multihash.Multihash) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := storeFor(b).tasks.Expedite(ctx, registry.ReleaseQueue, registry.ReleaseSubject(space, digest), registry.ExpireAction); err != nil {
+	if _, err := storeFor(b).tasks.Expedite(ctx, registry.SpaceShardQueue, registry.SpaceShardSubject(space, digest), registry.ExpireAction); err != nil {
 		t.Fatalf("expedite the expiries: %v", err)
 	}
 	b.blobs.ReleaseNow(ctx, space, []multihash.Multihash{digest})

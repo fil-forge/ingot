@@ -417,7 +417,7 @@ own row, in its own space, and succeeds.
 2. UPLOAD  (request, per blob, as the body arrives)
      blob/add(size) → PUT the bytes as they arrive, sha256 on the way (a local copy
        teed into the cache) → PARKED; a failed PUT aborts the allocation and fails the request
-     queue-space-shard.add on the blob's release subject (waits up to 30 s behind a release):
+     queue-space-shard.add on the blob's subject (waits up to 30 s behind a release):
        conclude the PUT receipt → Sprue issues blob/accept
        → Piri publishes the location commitment; the blob enters aggregation
        (a blob the space holds already is reused and the new allocation aborted)

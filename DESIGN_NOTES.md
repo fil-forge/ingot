@@ -209,7 +209,7 @@ its other changes, and does nothing unless the session is `open`. It makes no ne
 queues, with its commit, a `queue-space-shard.accept` for each of their
 blobs (`registry.BlobAcceptSpec`), and marks a part with no blobs accepted.
 
-A blob's accept runs under the blob's own subject (`registry.ReleaseSubject`:
+A blob's accept runs under the blob's own subject (`registry.SpaceShardSubject`:
 the space and the digest), the one the blob's releases and a write's adds
 run under, so a blob's conclude never overlaps its release or a reference
 being taken. It is a replacement due now, so a blob has at most one accept
@@ -505,7 +505,7 @@ the last intent for it.
 
 **References.** Within a space, a write's use of a blob is a pending
 reference (`queue/spaceshardqueue`), taken by a sync
-`queue-space-shard.add` task on the blob's release subject, the space and
+`queue-space-shard.add` task on the blob's subject, the space and
 the digest. The subject's lease serializes the add with the blob's
 `queue-space-shard.release`, so the two never overlap. It runs in one of
 three modes. For an object blob (`streamed`) it concludes the stream's
@@ -565,7 +565,7 @@ release is already due when the write arrives, the write's add runs it
 first and then concludes its own stream. A same-space copy whose source is
 deleted and released between its adds and its commit still commits, since
 its references keep the blobs. Writes of one digest to one space take turns,
-since each runs its add on the blob's release subject, so the second finds
+since each runs its add on the blob's subject, so the second finds
 the first's location or park; a park already recorded wins, and the loser
 gives up its allocation. A release leaves the cached file while
 another space still holds an intent for the digest; a file that two spaces'

@@ -59,7 +59,7 @@ func (r *Postgres) CommitRoot(ctx context.Context, name string, expect, next cid
 		}
 	}
 	if len(w.Expiries) > 0 {
-		if err := r.tasks.CancelTx(ctx, tx, ReleaseQueue, w.Expiries...); err != nil {
+		if err := r.tasks.CancelTx(ctx, tx, SpaceShardQueue, w.Expiries...); err != nil {
 			return err
 		}
 	}
@@ -111,7 +111,7 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree,
 		}
 	}
 	if len(w.Expiries) > 0 {
-		if err := r.tasks.CancelTx(ctx, tx, ReleaseQueue, w.Expiries...); err != nil {
+		if err := r.tasks.CancelTx(ctx, tx, SpaceShardQueue, w.Expiries...); err != nil {
 			return nil, err
 		}
 	}
