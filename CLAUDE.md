@@ -27,7 +27,7 @@ modules in; ingot is a standalone module and must build on its own `go.mod`:
 make build      # the daemon binary, ./ingot (GOWORK=off go build -o ingot ./cmd/ingot)
 make test       # every package's tests, with Postgres and OpenBao in Docker
 make itest      # integration tests: boots the Forge stack in Docker (~20 min)
-make itest-group GROUP=auth   # one CI group: encryption|conformance|uploads|releases|auth|rest
+make itest-group GROUP=auth   # one CI group: encryption|conformance|uploads|releases|auth|localdisk|rest
 make s3compat   # the S3 compatibility corpus, written as an HTML report
 make gen        # regenerate the cbor-gen marshalers (go generate ./... runs gen/)
 make gen-check  # make gen, then fail if bucket/cbor_gen*.go changed
