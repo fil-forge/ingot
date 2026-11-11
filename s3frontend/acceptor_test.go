@@ -23,6 +23,7 @@ import (
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 	"github.com/fil-forge/ingot/uploader"
 )
 
@@ -1122,5 +1123,159 @@ func TestAcceptKeepsAParkThatReplacesALocation(t *testing.T) {
 	}
 	if states := partStates(t, mem, uploadID); states[1] != registry.PartParked {
 		t.Fatalf("part state = %q, want parked", states[1])
+	}
+}
+
+// blobAccept returns the one queue-space-shard.accept queued for d in the
+// test bucket's space.
+func blobAccept(t *testing.T, mem *testStore, d multihash.Multihash) taskrunnertest.QueuedTask {
+	t.Helper()
+	tasks, err := mem.queued(context.Background(), spaceshardqueue.Name)
+	if err != nil {
+		t.Fatalf("queued blob accepts: %v", err)
+	}
+	subject := spaceshardqueue.Subject(mem.bk(), d)
+	var found []taskrunnertest.QueuedTask
+	for _, task := range tasks {
+		if task.Subject == subject && task.Action == spaceshardqueue.AcceptAction {
+			found = append(found, task)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("accepts queued for the blob = %d, want 1", len(found))
+	}
+	return found[0]
+}
+
+// TestAcceptRetriesUntilTheConcludeSucceeds: a blob's accept whose conclude
+// keeps failing stays queued to retry however often it has failed, with no
+// later part or Complete to queue it again, and accepts the part once the
+// upload service answers.
+func TestAcceptRetriesUntilTheConcludeSucceeds(t *testing.T) {
+	const failures = 8
+	cc := &countingConcluder{fails: failures}
+	b, mem := newDeferredBackend(t, cc)
+	ctx := context.Background()
+	key := "accept-keeps-retrying"
+	uploadID := mpCreate(t, b, key, "", "")
+	uploadDistinctParts(t, b, key, uploadID, 1)
+	d := hygienePartDigests(t, mem, uploadID, 1)[0]
+	// The blob's accept fails once and waits to retry.
+	if err := runAccepts(t, b, uploadID); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+
+	// Each retry is brought forward in place of waiting out its backoff. A
+	// task's attempts count its failures.
+	bringForward := func() {
+		t.Helper()
+		if _, err := b.blobs.ExpediteAccepts(ctx, mem.bk()); err != nil {
+			t.Fatalf("bring the accept forward: %v", err)
+		}
+	}
+	for failed := 2; failed <= failures; failed++ {
+		bringForward()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			task := blobAccept(t, mem, d)
+			if task.State != "pending" {
+				t.Fatalf("the accept is %s after %d failures, want it waiting to retry", task.State, task.Attempts)
+			}
+			if task.Attempts >= failed {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("failure %d did not happen: %+v", failed, task)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	bringForward()
+	deadline := time.Now().Add(10 * time.Second)
+	for !allIn(partStates(t, mem, uploadID), registry.PartAccepted) {
+		if time.Now().After(deadline) {
+			t.Fatalf("part states = %v after the conclude succeeded, want accepted; accept = %+v",
+				partStates(t, mem, uploadID), blobAccept(t, mem, d))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// goneConcluder concludes like the parking uploader, except that the
+// provider no longer holds the allocation of a digest marked gone.
+type goneConcluder struct {
+	parkingUploader
+	gmu  sync.Mutex
+	gone map[string]bool
+}
+
+func (g *goneConcluder) setGone(digests ...multihash.Multihash) {
+	g.gmu.Lock()
+	defer g.gmu.Unlock()
+	g.gone = map[string]bool{}
+	for _, d := range digests {
+		g.gone[string(d)] = true
+	}
+}
+
+func (g *goneConcluder) ConcludeBlobs(ctx context.Context, space did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
+	g.gmu.Lock()
+	for _, p := range parked {
+		if g.gone[string(p.Digest)] {
+			g.gmu.Unlock()
+			return make([]*uploader.BlobLocation, len(parked)), fmt.Errorf("conclude: %w", uploader.ErrAllocationGone)
+		}
+	}
+	g.gmu.Unlock()
+	return g.parkingUploader.ConcludeBlobs(ctx, space, parked)
+}
+
+// TestAcceptFailsForGoodWhenTheAllocationIsGone: the provider no longer holds
+// a parked part's allocation, so its blob's accept fails without a retry and
+// drops the park. Complete refuses the part with InvalidPart, and the same
+// bytes uploaded again park a new allocation, which Complete accepts.
+func TestAcceptFailsForGoodWhenTheAllocationIsGone(t *testing.T) {
+	gc := &goneConcluder{}
+	b, mem := newDeferredBackend(t, gc)
+	setNone(t, b)
+	ctx := context.Background()
+	key := "accept-allocation-gone"
+	part := testBody(int(backend.MinPartSize))
+	d := digestOf(t, part)
+	uploadID, parts := uploadOnePart(t, b, "bk", key, part)
+	gc.setGone(d)
+
+	if err := runAccepts(t, b, uploadID); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if task := blobAccept(t, mem, d); task.State != "failed" {
+		t.Fatalf("the blob's accept is %s, want failed with no retry", task.State)
+	}
+	if _, err := mem.GetPark(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("park of the lost blob: err = %v, want it gone", err)
+	}
+	if states := partStates(t, mem, uploadID); states[1] != registry.PartParked {
+		t.Fatalf("part state = %q, want parked", states[1])
+	}
+	_, err := mpComplete(t, b, key, uploadID, parts, nil)
+	var apiErr s3err.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "InvalidPart" {
+		t.Fatalf("Complete of the lost part: err = %v, want InvalidPart", err)
+	}
+
+	gc.setGone()
+	out, err := mpUploadPart(t, b, key, uploadID, 1, part, nil)
+	if err != nil {
+		t.Fatalf("UploadPart again: %v", err)
+	}
+	if got := hygienePartDigests(t, mem, uploadID, 1)[0]; !bytes.Equal(got, d) {
+		t.Fatalf("the part uploaded again is stored under %x, want %x", got, d)
+	}
+	if _, err := mem.GetPark(ctx, mem.bk(), d); err != nil {
+		t.Fatalf("park of the part uploaded again: %v", err)
+	}
+	n := int32(1)
+	if _, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{ETag: out.ETag, PartNumber: &n}}, nil); err != nil {
+		t.Fatalf("Complete after the part was uploaded again: %v", err)
 	}
 }

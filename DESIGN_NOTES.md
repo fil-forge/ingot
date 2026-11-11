@@ -243,9 +243,18 @@ and a part replaced or dropped meanwhile is not there to mark. A park of
 the same bytes recorded since by another write names another allocation,
 and stays for its own conclude. A failed conclude fails the blob's accept,
 and nothing it wrote is recorded; the retry concludes again, which the
-upload service treats as a repeat. A blob's accept retries 5 times, from
-5 s, doubling, up to 1 minute (`acceptRetry`); a later part's accept, or
-Complete's, queues whatever is left. `ingot.multipart.parked_age` (read from
+upload service treats as a repeat. A blob's accept retries with no attempt
+limit, from 5 s, doubling, up to 5 minutes (`acceptRetry`), as does the
+upload's accept that queues it: once the client has sent its last part
+nothing else queues an accept again, and a provider expires an allocation
+that is not accepted within a day. The retries end when the conclude
+succeeds, or when the blob's park or its references go, as an abort takes
+them. They also end when the provider answers that it no longer holds the
+allocation (`AllocationExpired` or `AllocationNotFound` on the
+`/blob/accept` receipt, `uploader.ErrAllocationGone`): the accept drops the
+park and fails for good, leaving its parts parked with no park behind them.
+Complete answers InvalidPart for such a part, and the part uploaded again
+parks a new allocation. `ingot.multipart.parked_age` (read from
 the part rows when it is collected), `ingot.multipart.accept_passes` (blob
 concludes, by outcome) and `ingot.multipart.complete_deferred` report the
 queue's health; the README lists them.

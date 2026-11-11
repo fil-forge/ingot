@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	assertcmds "github.com/fil-forge/libforge/commands/assert"
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
@@ -77,7 +78,9 @@ type DeferredBodyUploader interface {
 	// On error the slice still has one entry per blob. A non-nil entry is a
 	// blob the upload service accepted before the failure, which the caller
 	// must record so it is neither concluded again nor aborted as parked; a
-	// nil entry is a blob still parked.
+	// nil entry is a blob still parked. The error wraps [ErrAllocationGone]
+	// when the provider refused a blob because it no longer holds the blob's
+	// allocation: that blob can never be concluded.
 	ConcludeBlobs(ctx context.Context, space did.DID, parked []UploadedBlob) ([]*BlobLocation, error)
 	// AbortBlob releases a parked blob on its provider. A blob the space has
 	// already accepted cannot be aborted: the error wraps [ErrBlobAccepted]
@@ -120,9 +123,39 @@ func (u *Forge) ConcludeBlobs(ctx context.Context, space did.DID, parked []Uploa
 		locations[i] = &loc
 	}
 	if err != nil {
+		if allocationGone(err) {
+			return locations, fmt.Errorf("uploader: conclude blobs: %w: %w", ErrAllocationGone, err)
+		}
 		return locations, fmt.Errorf("uploader: conclude blobs: %w", err)
 	}
 	return locations, nil
+}
+
+// ErrAllocationGone reports a conclude the provider refused because it no
+// longer holds the blob's allocation: it expired before the bytes arrived, or
+// the provider removed it after it expired. Concluding the blob again gets
+// the same answer; its bytes are uploaded again under a new allocation.
+var ErrAllocationGone = errors.New("uploader: the provider no longer holds the blob's allocation")
+
+// allocationGone reports whether err, or any error it wraps or joins, is a
+// /blob/accept failure saying the provider no longer holds the allocation.
+func allocationGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	if named, ok := err.(ucanerrors.Named); ok {
+		switch named.Name() {
+		case blobcmds.AllocationExpiredErrorName, blobcmds.AllocationNotFoundErrorName:
+			return true
+		}
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		return allocationGone(u.Unwrap())
+	case interface{ Unwrap() []error }:
+		return slices.ContainsFunc(u.Unwrap(), allocationGone)
+	}
+	return false
 }
 
 // ErrBlobAccepted reports an abort the provider refused because the space

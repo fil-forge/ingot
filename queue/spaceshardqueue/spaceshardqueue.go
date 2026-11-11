@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -758,9 +759,13 @@ func (q *Queue) DropRefsNow(ctx context.Context, space did.DID, refs []taskrunne
 // repeat.
 const defaultConcludeTimeout = 2 * time.Minute
 
-// acceptRetry retries a failed accept a few times. A later part's accept, or
-// Complete, queues whatever is left again.
-var acceptRetry = taskrunner.RetryPolicy{First: 5 * time.Second, Max: time.Minute, Multiplier: 2, Attempts: 5}
+// acceptRetry retries a failed accept with no attempt limit: nothing else
+// queues the accept again once the client has sent its last part, and a part
+// left parked is lost when the provider expires its allocation. The retries
+// end when the conclude succeeds, when the provider says the allocation is
+// gone, or when the blob's park or references go, as an abort's release
+// takes them.
+var acceptRetry = taskrunner.RetryPolicy{First: 5 * time.Second, Max: 5 * time.Minute, Multiplier: 2}
 
 // runAccept is queue-space-shard.accept: it concludes the blob its
 // subject names, if it is still parked, and marks accepted, with its commit,
@@ -770,6 +775,13 @@ var acceptRetry = taskrunner.RetryPolicy{First: 5 * time.Second, Max: time.Minut
 // released, and its parts are left parked. So is a parked blob nothing in the
 // space references any more, as a dropped part's is: its release aborts the
 // allocation instead.
+//
+// A conclude the provider refuses because it no longer holds the allocation
+// (uploader.ErrAllocationGone) can never succeed. The accept drops the park,
+// outside its commit, and fails for good. Its parts stay parked with no park
+// behind them: Complete refuses them with ErrInvalidPart, and the part
+// uploaded again parks its own allocation. The blob's intent stays for the
+// release that follows.
 func (q *Queue) runAccept(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) (_ []byte, err error) {
 	space, digest, err := ParseSubject(t.Subject)
 	if err != nil {
@@ -804,6 +816,16 @@ func (q *Queue) runAccept(ctx context.Context, ex *taskrunner.Exec, t taskrunner
 		locations, err := q.deferred.ConcludeBlobs(cctx, space, []uploader.UploadedBlob{blob})
 		cancel()
 		q.concluded(ctx, err)
+		if errors.Is(err, uploader.ErrAllocationGone) {
+			if derr := q.parks.DeletePark(ctx, space, digest); derr != nil {
+				// The park still stands, so the retry gets the same answer
+				// and drops it then.
+				return nil, fmt.Errorf("conclude blob: %w; drop its park: %w", err, derr)
+			}
+			q.logger.Warn("parked blob lost: its provider no longer holds the allocation; its parts must be uploaded again",
+				zap.Stringer("space", space), zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
+			return nil, taskrunner.Permanent(fmt.Errorf("conclude blob: %w", err))
+		}
 		if err != nil {
 			return nil, fmt.Errorf("conclude blob: %w", err)
 		}
