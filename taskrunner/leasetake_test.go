@@ -29,9 +29,15 @@ type leaseTakeDB struct {
 	// while its caller returns as soon as its ctx ends, as pgx does: the
 	// take lands after the caller has given up.
 	inFlight time.Duration
-	takes    atomic.Int32
-	landed   chan struct{} // closed once a delayed take has run
-	once     sync.Once
+	// onTake, if set, runs as each take arrives, before the take goes on.
+	onTake func()
+	takes  atomic.Int32
+	// took counts the takes whose answer said they took the lease.
+	took atomic.Int32
+	// ran counts the handler's runs.
+	ran    atomic.Int32
+	landed chan struct{} // closed once a delayed take has run
+	once   sync.Once
 }
 
 // isLeaseTake reports whether sql is one of the runner's lease takes, each of
@@ -43,8 +49,11 @@ func (d *leaseTakeDB) QueryRow(ctx context.Context, sql string, args ...any) pgx
 		return d.Pool.QueryRow(ctx, sql, args...)
 	}
 	d.takes.Add(1)
+	if d.onTake != nil {
+		d.onTake()
+	}
 	if d.lose {
-		return lostAnswer{d.Pool.QueryRow(ctx, sql, args...)}
+		return lostAnswer{d.Pool.QueryRow(ctx, sql, args...), d}
 	}
 	sent := make(chan pgx.Row, 1)
 	go func() {
@@ -79,11 +88,19 @@ func (r landedRow) Scan(dest ...any) error {
 	return r.Row.Scan(dest...)
 }
 
-type lostAnswer struct{ pgx.Row }
+// lostAnswer runs a take, then fails its answer. Each take's first column
+// says whether it took the lease.
+type lostAnswer struct {
+	pgx.Row
+	d *leaseTakeDB
+}
 
 func (r lostAnswer) Scan(dest ...any) error {
 	if err := r.Row.Scan(dest...); err != nil {
 		return err
+	}
+	if took, ok := dest[0].(*bool); ok && *took {
+		r.d.took.Add(1)
 	}
 	return context.DeadlineExceeded
 }
@@ -95,7 +112,7 @@ func (r errRow) Scan(...any) error { return r.err }
 // newLeaseTakeRunner starts a runner over db with a no-op action on qTop and
 // a lease far longer than the test, so that only a release clears one. With
 // no workers, the test's own Run makes every take.
-func newLeaseTakeRunner(t *testing.T, env taskrunnertest.Env, db taskrunner.DB, workers int) *taskrunner.Runner {
+func newLeaseTakeRunner(t *testing.T, env taskrunnertest.Env, db *leaseTakeDB, workers int) *taskrunner.Runner {
 	t.Helper()
 	r, err := taskrunner.New(db, taskrunner.Options{
 		Schema:       env.Schema,
@@ -108,6 +125,7 @@ func newLeaseTakeRunner(t *testing.T, env taskrunnertest.Env, db taskrunner.DB, 
 		t.Fatal(err)
 	}
 	if err := r.Handle(qTop, "noop", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		db.ran.Add(1)
 		return nil, nil
 	}); err != nil {
 		t.Fatal(err)
@@ -146,8 +164,8 @@ func TestALeaseTakeWhoseAnswerIsLostLeavesNoLease(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Run = %v, want the lost answer's context.DeadlineExceeded", err)
 	}
-	if db.takes.Load() == 0 {
-		t.Fatal("Run took no lease; the test lost no answer")
+	if db.took.Load() == 0 {
+		t.Fatal("no take took the lease; the test lost no lease's answer")
 	}
 	if n := leaseRows(t, env); n != 0 {
 		t.Fatalf("%d lease rows left on the subject, want none", n)
@@ -165,7 +183,7 @@ func TestAWorkersLeaseTakeWhoseAnswerIsLostLeavesNoLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for db.takes.Load() == 0 {
+	for db.took.Load() == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("no worker took the subject's lease")
 		}
@@ -180,23 +198,27 @@ func TestAWorkersLeaseTakeWhoseAnswerIsLostLeavesNoLease(t *testing.T) {
 	}
 }
 
-// TestALeaseTakeOutlivesItsCallersDeadline: a take whose caller's deadline
-// passes while it is on its way to the database still lands there. It must
-// finish, so that the runner learns it took the lease and releases it; cut
-// off when the deadline passed, it would leave a lease no hold records.
-func TestALeaseTakeOutlivesItsCallersDeadline(t *testing.T) {
+// TestALeaseTakeOutlivesItsCaller: a take whose caller gives up while it is
+// on its way to the database still lands there. It must finish, so that the
+// runner learns it took the lease and releases it; cut off when the caller
+// gave up, it would leave a lease no hold records.
+func TestALeaseTakeOutlivesItsCaller(t *testing.T) {
 	env := taskrunnertest.NewEnv(t)
-	db := &leaseTakeDB{Pool: env.DB, inFlight: 300 * time.Millisecond, landed: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The caller gives up as soon as its take is on its way.
+	db := &leaseTakeDB{Pool: env.DB, inFlight: 300 * time.Millisecond, onTake: cancel, landed: make(chan struct{})}
 	r := newLeaseTakeRunner(t, env, db, 0)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
 	_, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "noop"})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Run = %v, want its ctx's context.DeadlineExceeded", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want its ctx's context.Canceled", err)
 	}
 	if db.takes.Load() == 0 {
-		t.Fatal("Run's deadline passed before it tried to take the lease; the test needs a longer deadline")
+		t.Fatal("Run made no take")
+	}
+	if n := db.ran.Load(); n != 0 {
+		t.Errorf("the handler ran %d time(s) for a caller that had given up", n)
 	}
 	select {
 	case <-db.landed:

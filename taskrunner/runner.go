@@ -435,8 +435,8 @@ func (r *Runner) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop cancels the workers and the Run calls in progress, and waits for them,
-// including any lease take they have in flight, for up to the lease TTL.
+// Stop cancels the workers and the Run calls in progress, and waits for them.
+// A lease take one has in flight runs on for up to the lease TTL first.
 // A Stop that returns early because ctx ended leaves the shutdown running: a
 // later Stop waits for it, and Start fails until it has finished.
 // A task interrupted by Stop stays pending and is resumed by the next process
@@ -850,6 +850,13 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 		h, task, stop, err := r.takeTurn(ctx, q, s.Subject, age, seq, id)
 		if err != nil {
 			return nil, err
+		}
+		if h != nil && ctx.Err() != nil {
+			// The take landed after the caller gave up: hand the lease back
+			// rather than start the task for no one.
+			h.turn = turn
+			r.endHold(ctx, h, nil)
+			return nil, ctx.Err()
 		}
 		if h != nil || stop != nil {
 			d := drained{stop: stop}
