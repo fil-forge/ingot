@@ -257,7 +257,9 @@ func (tr *tree) lease(ctx context.Context, q *queue, subject string) error {
 		if h != nil {
 			tr.holds[key] = h
 			tr.r.metrics.observeLeaseWait(ctx, q, start)
-			return nil
+			// A take that landed after the tree's ctx ended runs nothing:
+			// the tree fails, and releases the lease with its children.
+			return ctx.Err()
 		}
 		if holder != nil && holder.olderThan(tr.age) {
 			return &dieError{key}

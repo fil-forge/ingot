@@ -772,10 +772,11 @@ func (r *Runner) submit(ctx context.Context, db execer, s Spec) (TaskID, error) 
 //
 // If ctx ends first, Run returns ctx's error and the task stays submitted,
 // for a worker to run later unless its Expires passes first. A lease take in
-// flight when ctx ends finishes first, for up to the lease TTL, so that it
-// leaves no lease behind. Give a sync task
-// an Expires, or a ctx with a deadline, whenever a caller that has given up
-// must not see the task take effect later.
+// flight when ctx ends runs on for up to the lease TTL first, so that a
+// lease it took is handed back rather than left to block the subject until
+// it expires; a take not finished by then can still leave one to expire.
+// Give a sync task an Expires, or a ctx with a deadline, whenever a caller
+// that has given up must not see the task take effect later.
 func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 	ctx, leave, err := r.enterInline(ctx)
 	if err != nil {

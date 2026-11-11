@@ -85,7 +85,13 @@ type landedRow struct {
 
 func (r landedRow) Scan(dest ...any) error {
 	defer r.d.landedNow()
-	return r.Row.Scan(dest...)
+	if err := r.Row.Scan(dest...); err != nil {
+		return err
+	}
+	if took, ok := dest[0].(*bool); ok && *took {
+		r.d.took.Add(1)
+	}
+	return nil
 }
 
 // lostAnswer runs a take, then fails its answer. Each take's first column
@@ -214,8 +220,8 @@ func TestALeaseTakeOutlivesItsCaller(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run = %v, want its ctx's context.Canceled", err)
 	}
-	if db.takes.Load() == 0 {
-		t.Fatal("Run made no take")
+	if db.took.Load() == 0 {
+		t.Fatal("no take took the lease; the test delayed no lease's take")
 	}
 	if n := db.ran.Load(); n != 0 {
 		t.Errorf("the handler ran %d time(s) for a caller that had given up", n)
