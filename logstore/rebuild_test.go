@@ -709,8 +709,9 @@ func TestRecover_UnshippedRetiredCARWithoutIdx(t *testing.T) {
 	}
 	requireReadable(t, m, written)
 	// Wait for the retired row to record the ship, not for the flush: the
-	// ship writes the row after the flush returns, on a goroutine Close
-	// doesn't wait for, and the reopen below decides from the row.
+	// ship writes the row after the flush returns, on queueShips's
+	// goroutine, which Close doesn't wait for, and the reopen below decides
+	// from the row.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		retired, err := mem.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk")
