@@ -25,6 +25,8 @@ type countingDB struct {
 	*pgxpool.Pool
 	statements atomic.Int64
 	leaseTries atomic.Int64
+	// callerStatements counts the statements other than background ones.
+	callerStatements atomic.Int64
 	// stopWaitingDelay holds back the statement that clears a sync task's
 	// waiting caller, widening the window in which others can see it.
 	stopWaitingDelay atomic.Int64
@@ -50,6 +52,21 @@ func (c *countingDB) count(sql string) {
 	if strings.Contains(sql, "ON CONFLICT (subject) DO UPDATE") {
 		c.leaseTries.Add(1)
 	}
+	if !background(sql) {
+		c.callerStatements.Add(1)
+	}
+}
+
+// background reports whether sql is one of the runner's own periodic
+// statements, which run whatever its callers do: the workers' poll, lease
+// and claim renewal, and retention.
+func background(sql string) bool {
+	for _, s := range []string{"SELECT d.subject", "FOR UPDATE SKIP LOCKED", "SET waiting_until = now() +", "WHERE id IN ("} {
+		if strings.Contains(sql, s) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *countingDB) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -461,5 +478,29 @@ func TestCancelBetweenAnOutcomeReadAndTheWaitWakesTheCaller(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("a cancel between the outcome read and the wait went unheard until the poll interval")
+	}
+}
+
+// A Run caller on a free subject sends three statements outside its task's
+// own transaction: the task's insert, one that takes the lease and claims the
+// task, and the clearing of its waiting claim. The task's transaction records
+// the outcome and releases the lease. Every statement that runs on its own is
+// a commit, so each one adds to the time the subject is held.
+func TestRunOnAFreeSubjectSendsThreeStatements(t *testing.T) {
+	r, db := newCountingRunner(t, time.Minute, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	const runs = 10
+	before := db.callerStatements.Load()
+	for i := range runs {
+		if _, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte(strconv.Itoa(i))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	per := float64(db.callerStatements.Load()-before) / runs
+	t.Logf("%.1f statements per Run on a free subject", per)
+	if per > 3 {
+		t.Errorf("%.1f statements per Run on a free subject; want at most 3", per)
 	}
 }

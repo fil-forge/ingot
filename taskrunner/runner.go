@@ -835,14 +835,17 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 		// task due ahead of this one that the wait also ends with.
 		var pause time.Duration
 		var behind TaskID
-		h, _, err := r.tryLease(ctx, q, s.Subject, age)
+		h, task, stop, err := r.takeTurn(ctx, q, s.Subject, age, seq, id)
 		if err != nil {
 			return nil, err
 		}
 		if h != nil {
 			h.turn = turn
 			r.metrics.observeLeaseWait(ctx, q, start)
-			d := r.drainSync(ctx, q, h, seq, id)
+			d := drained{stop: stop}
+			if task != nil {
+				d = r.runClaimed(ctx, q, h, *task, seq)
+			}
 			r.endHold(ctx, h, d.stop)
 			start = time.Now()
 			if d.ran {
@@ -884,6 +887,20 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 			return w.res, w.err
 		}
 	}
+}
+
+// runClaimed runs a Run caller's task, claimed as its lease was taken. A
+// commit that keeps failing is tried again as drainSync does, still holding
+// the lease.
+func (r *Runner) runClaimed(ctx context.Context, q *queue, h *hold, t Task, upTo int64) drained {
+	res, terr, stop := r.runRoot(ctx, h, []Task{t})
+	if errors.Is(stop, errNotCommitted) {
+		return r.drainSync(ctx, q, h, upTo, t.ID)
+	}
+	if stop != nil {
+		return drained{stop: stop}
+	}
+	return drained{ran: true, res: res, err: terr}
 }
 
 // drainSync is drain for a sync caller: when a commit keeps failing, it keeps

@@ -27,6 +27,18 @@ type hold struct {
 	// lease, or nil for a worker or a tree's child. Releasing the lease does
 	// not wake it: it released the lease itself, and backs off.
 	turn *runTurn
+	// claimed is set when the statement that took the lease also claimed
+	// the task to run first under it and recorded that task's tree age, so
+	// the task need not record its age, nor check the lease, again before it
+	// starts. It holds for that one task.
+	claimed bool
+	// releaseOnCommit is set for a Run caller's hold: its task's commit
+	// deletes the lease row in the same transaction, rather than extending
+	// it, since the caller releases the lease once its task has run.
+	releaseOnCommit bool
+	// released is set once a commit has deleted the lease row, so ending the
+	// hold has nothing left to delete.
+	released bool
 }
 
 func (h *hold) key() subjectKey { return subjectKey{h.q.name, h.subject} }
@@ -118,6 +130,96 @@ SELECT false, false, tree_created, tree_id FROM `+q.leases+`
 	return h, nil, nil
 }
 
+// takeTurn is tryLease and claim in one statement, for a Run caller whose
+// task, target with sequence number upTo, is to run first under the lease.
+// It returns a nil hold when the lease is held. Otherwise it returns the hold
+// and either the task, claimed, or why it was not: stop is nil when nothing
+// is due or the oldest due task waits to retry or belongs to another
+// instance, a *yieldError when that task's own caller is waiting for it, and
+// an *aheadError when it is another task for the workers. The lease row
+// records the caller's tree age as it is taken, and the claim lands with it,
+// so the task starts without recording its age again.
+func (r *Runner) takeTurn(ctx context.Context, q *queue, subject string, age treeAge, upTo int64, target TaskID) (h *hold, task *Task, stop error, err error) {
+	token := uuid.New()
+	var taken, tookOver bool
+	var next *uuid.UUID
+	var waited, backingOff *bool
+	var node *string
+	var c struct {
+		seq                *int64
+		id                 *uuid.UUID
+		action             *string
+		created            *time.Time
+		notBefore, expires *time.Time
+		args               []byte
+		sync               *bool
+		attempts           *int
+		node               *string
+	}
+	// Every part reads the snapshot the statement started with: claimed
+	// joins taken, so it marks the task started only when this statement
+	// took the lease.
+	err = r.db.QueryRow(ctx, `
+WITH taken AS (
+	INSERT INTO `+q.leases+` AS l (subject, owner, expires, tree_created, tree_id)
+	VALUES ($1, $2, now() + $3 * interval '1 millisecond', $4, $5)
+	ON CONFLICT (subject) DO UPDATE
+		SET owner = EXCLUDED.owner, expires = EXCLUDED.expires,
+		    tree_created = EXCLUDED.tree_created, tree_id = EXCLUDED.tree_id
+		WHERE l.expires < now()
+	RETURNING xmax <> 0 AS took_over
+), next AS (
+	SELECT id, coalesce(waiting_until > now(), false) AS waited,
+		coalesce(retry_at > now(), false) AS backing_off, node FROM `+q.tasks+`
+	WHERE subject = $1 AND state = 'pending' AND seq <= $6
+	AND (not_before IS NULL OR not_before <= now())
+	ORDER BY seq LIMIT 1
+), claimed AS (
+	UPDATE `+q.tasks+` t SET started = coalesce(t.started, now())
+	FROM taken, next
+	WHERE t.id = next.id AND t.id = $7 AND t.state = 'pending'
+	AND NOT next.backing_off AND (next.node IS NULL OR next.node = $8)
+	RETURNING t.seq, t.id, t.action, t.created, t.not_before, t.expires, t.args, t.sync, t.attempts, t.node
+)
+SELECT EXISTS (SELECT 1 FROM taken), coalesce((SELECT took_over FROM taken), false),
+	next.id, next.waited, next.backing_off, next.node,
+	claimed.seq, claimed.id, claimed.action, claimed.created, claimed.not_before,
+	claimed.expires, claimed.args, claimed.sync, claimed.attempts, claimed.node
+FROM (SELECT 1) one LEFT JOIN next ON true LEFT JOIN claimed ON true`,
+		subject, token, r.opts.LeaseTTL.Milliseconds(), age.created, age.id, upTo, target, r.opts.Node,
+	).Scan(&taken, &tookOver, &next, &waited, &backingOff, &node,
+		&c.seq, &c.id, &c.action, &c.created, &c.notBefore, &c.expires, &c.args, &c.sync, &c.attempts, &c.node)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("take lease %s/%s: %w", q.name, subject, err)
+	}
+	if !taken {
+		return nil, nil, nil, nil
+	}
+	if tookOver {
+		r.metrics.observeTakeover(ctx, q)
+	}
+	h = &hold{q: q, subject: subject, token: token, age: age, releaseOnCommit: true}
+	r.mu.Lock()
+	r.holds[token] = h
+	r.mu.Unlock()
+	switch {
+	case c.id != nil:
+		h.claimed = true
+		return h, &Task{
+			Queue: q.name, Subject: subject, ID: *c.id, Action: *c.action, Created: *c.created,
+			NotBefore: c.notBefore, Expires: c.expires, Args: c.args, sync: *c.sync,
+			Attempt: *c.attempts, Node: c.node, seq: *c.seq,
+		}, nil, nil
+	case next == nil, *backingOff, !r.mayRun(node):
+		// Nothing is due, or the oldest due task holds the subject.
+		return h, nil, nil, nil
+	case *waited && *next != target:
+		return h, nil, &yieldError{*next}, nil
+	default:
+		return h, nil, &aheadError{*next}, nil
+	}
+}
+
 // setAge records the tree about to run under h, for other trees' wait-or-die
 // decisions. It is also the check, before each task's handler starts, that h
 // still owns the lease: it returns errLeaseLost when another consumer has
@@ -145,6 +247,19 @@ func (r *Runner) release(ctx context.Context, h *hold) {
 		r.log.Warn("release lease; it expires on its own",
 			zapSubject(h.q.name, h.subject), zapErr(err))
 	}
+	r.wakeReleased(h)
+}
+
+// releasedInCommit ends h once a commit has deleted its lease row.
+func (r *Runner) releasedInCommit(h *hold) {
+	h.released = true
+	r.forget(h)
+	r.wakeReleased(h)
+}
+
+// wakeReleased wakes this process's waiters on h's subject once its lease
+// row is gone.
+func (r *Runner) wakeReleased(h *hold) {
 	r.mu.Lock()
 	if sub, ok := r.freed[h.key()]; ok {
 		close(sub.ch)
@@ -293,6 +408,9 @@ func (r *Runner) forget(h *hold) {
 // endHold releases a root hold after a drain, or leaves it to expire when the
 // drain stopped on a tree that could not commit or lost the lease.
 func (r *Runner) endHold(ctx context.Context, h *hold, stop error) {
+	if h.released {
+		return
+	}
 	if errors.Is(stop, errNotCommitted) || errors.Is(stop, errLeaseLost) {
 		r.forget(h)
 		return
