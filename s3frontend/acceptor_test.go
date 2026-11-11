@@ -78,7 +78,7 @@ func runAccepts(t *testing.T, b *Backend, uploadID string) error {
 	expires := time.Now().Add(10 * time.Second)
 	for _, p := range parts {
 		for _, d := range p.BlobDigests {
-			subject := registry.ReleaseSubject(sess.Space, d)
+			subject := registry.SpaceShardSubject(sess.Space, d)
 			if len(due[subject]) == 0 {
 				continue
 			}

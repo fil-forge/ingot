@@ -69,17 +69,10 @@ type Backend struct {
 	reg       registry.Registry
 	intents   registry.IntentStore
 	locations registry.LocationStore
-	gc        registry.GCStore
 	multipart registry.MultipartStore
 	txns      *bucketop.Coordinator
-	log       blockstore.Log
 	cache     *blockstore.BlobCache
 	deferred  uploader.DeferredBodyUploader
-	parks     registry.ParkStore
-	remover   uploader.BlobRemover
-	registrar uploader.UploadRegistrar
-	// counts keeps each version's place in its space's object count.
-	counts *spaceuploadqueue.Queue
 	// shards keeps the cache's copies.
 	shards *shardqueue.Queue
 	// proofs finds the authority queued tasks make their network calls
@@ -89,10 +82,6 @@ type Backend struct {
 	encParams registry.EncryptionParamsStore
 	// streaming sends each body blob to its provider as the body arrives.
 	streaming uploader.StreamingBodyUploader
-	// claims counts a blob's claims; releaseGrace is how far past the
-	// last-claim drop each release is due (readers holding the prior catalog
-	// root get at least this long to finish their prefetch).
-	claims registry.BlobRefStore
 	// blobs runs the tasks on one blob in one space: a write's references,
 	// its accept, its release.
 	blobs *spaceshardqueue.Queue
@@ -100,8 +89,7 @@ type Backend struct {
 	buckets *bucketqueue.Queue
 	// uploads runs the queue-multipart-upload tasks: every change to a
 	// multipart upload.
-	uploads      *multipartqueue.Queue
-	releaseGrace time.Duration
+	uploads *multipartqueue.Queue
 	// Local blob sweeper knobs (see Deps). localBlobSweepMu serialises
 	// SweepLocalBlobs; lastOrphanPass is when its orphan pass last ran.
 	localBlobMaxBytes  int64
@@ -324,27 +312,20 @@ func New(d Deps) (*Backend, error) {
 		localBlobOrphanAge = DefaultLocalBlobOrphanAge
 	}
 	b := &Backend{
-		authority:    d.Authority,
-		read:         d.Reads,
-		reg:          d.Registry,
-		intents:      d.Intents,
-		locations:    d.Locations,
-		gc:           d.GC,
-		multipart:    d.Multipart,
-		txns:         bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads, Ships: d.Ships}),
-		log:          d.Log,
-		cache:        d.Cache,
-		deferred:     d.Deferred,
-		parks:        d.Parks,
-		remover:      d.Remover,
-		streaming:    d.Streaming,
-		registrar:    d.Registrar,
-		proofs:       authority.New(d.Registrar),
-		encParams:    d.EncParams,
-		regionKeys:   d.RegionKeys,
-		tenantKeys:   d.TenantKeys,
-		claims:       d.Claims,
-		releaseGrace: d.ReleaseGrace,
+		authority:  d.Authority,
+		read:       d.Reads,
+		reg:        d.Registry,
+		intents:    d.Intents,
+		locations:  d.Locations,
+		multipart:  d.Multipart,
+		txns:       bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads, Ships: d.Ships}),
+		cache:      d.Cache,
+		deferred:   d.Deferred,
+		streaming:  d.Streaming,
+		proofs:     authority.New(d.Registrar),
+		encParams:  d.EncParams,
+		regionKeys: d.RegionKeys,
+		tenantKeys: d.TenantKeys,
 
 		localBlobMaxBytes:  d.LocalBlobMaxBytes,
 		localBlobOrphanAge: localBlobOrphanAge,
@@ -364,9 +345,10 @@ func New(d Deps) (*Backend, error) {
 	b.multipartMetrics, b.multipartGauges = newMultipartMetrics(mp, b, logger)
 	b.journalGauges = newJournalGauges(mp, b, logger)
 	b.catalogGauges = newCatalogUsageGauges(mp, b, logger)
+	var counts *spaceuploadqueue.Queue
 	var err error
 	if b.shards, err = shardqueue.New(d.Tasks, shardqueue.Deps{Cache: d.Cache, TTL: d.CacheTTL, Removed: b.cacheRemoved, Logger: logger}); err == nil {
-		b.counts, err = spaceuploadqueue.New(d.Tasks, spaceuploadqueue.Deps{Registrar: d.Registrar, Authority: b.proofs, Logger: logger})
+		counts, err = spaceuploadqueue.New(d.Tasks, spaceuploadqueue.Deps{Registrar: d.Registrar, Authority: b.proofs, Logger: logger})
 	}
 	if err == nil {
 		bd := spaceshardqueue.Deps{
@@ -399,7 +381,7 @@ func New(d Deps) (*Backend, error) {
 			Buckets:      d.Authority,
 			Authority:    b.proofs,
 			Blobs:        b.blobs,
-			Counts:       b.counts,
+			Counts:       counts,
 			ReleaseGrace: d.ReleaseGrace,
 			Logger:       logger,
 		}

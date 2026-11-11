@@ -40,7 +40,7 @@ func newShardFixture(t *testing.T, ttl time.Duration) *shardFixture {
 			{Name: registry.MultipartQueue},
 			{Name: registry.BucketQueue},
 			{Name: spaceuploadqueue.Name},
-			{Name: registry.ReleaseQueue},
+			{Name: registry.SpaceShardQueue},
 			{Name: shardqueue.Name, Workers: 2},
 		},
 		Node:         "did:web:ingot.test",

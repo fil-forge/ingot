@@ -39,8 +39,15 @@ type Manager struct {
 	meta     Meta
 	catalog  PlaneConfig
 	flushFor func(bucket string) FlushFunc
-	onSealed func(bucket string)
 	logger   *zap.Logger
+
+	// sealMu guards onSealed and held.
+	sealMu sync.Mutex
+	// onSealed is told of each bucket with a sealed segment to ship; nil
+	// until OnSealed sets it.
+	onSealed func(bucket string)
+	// held are the buckets whose seals came before onSealed was set.
+	held []string
 
 	mu     sync.Mutex
 	stores map[string]*Store
@@ -68,11 +75,6 @@ type ManagerConfig struct {
 	// (resolving the bucket's Forge space at ship time). Required when
 	// Catalog.Ship is true; ignored otherwise.
 	FlushFor func(bucket string) FlushFunc
-
-	// OnSealed is told when a bucket's log has a sealed segment to ship
-	// (PlaneConfig.OnSealed); the owner then calls ShipBucket. Ignored when
-	// Catalog.Ship is false.
-	OnSealed func(bucket string)
 
 	// Logger is optional; defaults to zap.NewNop().
 	Logger *zap.Logger
@@ -108,7 +110,6 @@ func OpenManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 		meta:     cfg.Meta,
 		catalog:  cfg.Catalog,
 		flushFor: cfg.FlushFor,
-		onSealed: cfg.OnSealed,
 		logger:   cfg.Logger,
 		stores:   map[string]*Store{},
 	}
@@ -156,6 +157,35 @@ func OpenManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 	return m, nil
 }
 
+// OnSealed sets fn to be told when a bucket's log has a sealed segment to
+// ship (PlaneConfig.OnSealed); the owner then calls ShipBucket. The seals
+// reported before, those of the buckets the open recovered among them, are
+// held and told to fn now. Call it once. Seals are reported only when
+// Catalog.Ship is set.
+func (m *Manager) OnSealed(fn func(bucket string)) {
+	m.sealMu.Lock()
+	held := m.held
+	m.onSealed, m.held = fn, nil
+	m.sealMu.Unlock()
+	for _, bucket := range held {
+		fn(bucket)
+	}
+}
+
+// sealed tells the owner of a seal in bucket's log, or holds it until there
+// is one.
+func (m *Manager) sealed(bucket string) {
+	m.sealMu.Lock()
+	fn := m.onSealed
+	if fn == nil {
+		m.held = append(m.held, bucket)
+	}
+	m.sealMu.Unlock()
+	if fn != nil {
+		fn(bucket)
+	}
+}
+
 // logFor returns bucket's log, opening it (with recovery) on first use.
 func (m *Manager) logFor(ctx context.Context, bucket string) (blockstore.Log, error) {
 	if err := validBucketDir(bucket); err != nil {
@@ -175,9 +205,7 @@ func (m *Manager) logFor(ctx context.Context, bucket string) (blockstore.Log, er
 	pc.Flush, pc.OnSealed = nil, nil
 	if pc.Ship {
 		pc.Flush = m.flushFor(bucket)
-		if m.onSealed != nil {
-			pc.OnSealed = func() { m.onSealed(bucket) }
-		}
+		pc.OnSealed = func() { m.sealed(bucket) }
 	}
 	s, err := Open(ctx, Config{
 		Dir:     filepath.Join(m.dir, bucket),

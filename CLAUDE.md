@@ -147,7 +147,11 @@ Internal:
   all of them.
 - **`queue/`** — one package per task queue, each built over the runner
   with what its handlers need, registering them in its `New`, with typed
-  calls for its sync tasks and specs for the async ones other queues spawn:
+  calls for its sync tasks and specs for the async ones other queues spawn.
+  `s3frontend.New` builds them from the end of the queue order back, each
+  over the ones after it, which are the only queues a package imports; the
+  bucket queue hands the catalog log its ship callback.
+  The packages:
   `shardqueue` (`queue-shard`, the cache's copies), `spaceuploadqueue`
   (`queue-space-upload`, the object-count changes), `spaceshardqueue`
   (`queue-space-shard`, the tasks on one blob in one space; its name,

@@ -74,7 +74,7 @@ func (w CommitWrites) Apply(ctx context.Context, ex *taskrunner.Exec) error {
 	if _, err := ex.SubmitAll(ctx, w.Spawns); err != nil {
 		return err
 	}
-	return ex.Cancel(ctx, ReleaseQueue, w.Expiries...)
+	return ex.Cancel(ctx, SpaceShardQueue, w.Expiries...)
 }
 
 // RootCommitWrites returns the writes that advance bucket name's root from

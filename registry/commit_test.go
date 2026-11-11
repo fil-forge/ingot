@@ -71,7 +71,7 @@ type queuedRelease struct {
 // mustListReleases returns the space's pending releases, oldest first.
 func mustListReleases(t *testing.T, pool *pgxpool.Pool, space did.DID) []queuedRelease {
 	t.Helper()
-	tasks, err := taskrunnertest.Tasks(context.Background(), pool, "ingot", registry.ReleaseQueue)
+	tasks, err := taskrunnertest.Tasks(context.Background(), pool, "ingot", registry.SpaceShardQueue)
 	if err != nil {
 		t.Fatalf("list releases: %v", err)
 	}
@@ -80,7 +80,7 @@ func mustListReleases(t *testing.T, pool *pgxpool.Pool, space did.DID) []queuedR
 		if q.Action != registry.ReleaseAction || q.State != "pending" {
 			continue
 		}
-		sp, d, err := registry.ParseReleaseSubject(q.Subject)
+		sp, d, err := registry.ParseSpaceShardSubject(q.Subject)
 		if err != nil {
 			t.Fatal(err)
 		}

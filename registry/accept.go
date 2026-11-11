@@ -11,7 +11,7 @@ import (
 
 // BlobAcceptAction concludes a parked blob on the upload service and marks
 // accepted the parts it completes. It runs on queue-space-shard, under the
-// blob's subject (ReleaseSubject), so it never overlaps the blob's release
+// blob's subject (SpaceShardSubject), so it never overlaps the blob's release
 // or a write's add of it.
 const BlobAcceptAction = "accept"
 
@@ -33,8 +33,8 @@ func AcceptSpec(uploadID string, at time.Time) taskrunner.Spec {
 func BlobAcceptSpec(space did.DID, digest multihash.Multihash) taskrunner.Spec {
 	now := DueNow()
 	return taskrunner.Spec{
-		Queue:     ReleaseQueue,
-		Subject:   ReleaseSubject(space, digest),
+		Queue:     SpaceShardQueue,
+		Subject:   SpaceShardSubject(space, digest),
 		Action:    BlobAcceptAction,
 		NotBefore: &now,
 		Replace:   true,

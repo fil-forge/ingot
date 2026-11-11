@@ -85,7 +85,7 @@ func newTestStoreWithLease(t testing.TB, ttl time.Duration) *testStore {
 			// Commits run sync, in the request; the workers run ships.
 			{Name: registry.BucketQueue, Workers: 2},
 			{Name: spaceuploadqueue.Name, Workers: 2},
-			{Name: registry.ReleaseQueue, Workers: 2},
+			{Name: registry.SpaceShardQueue, Workers: 2},
 			{Name: shardqueue.Name, Workers: 2},
 		},
 		LeaseTTL:     ttl,
@@ -336,7 +336,7 @@ func (s *testStore) queued(ctx context.Context, queue string) ([]taskrunnertest.
 // ListReleasesBySpace returns the space's pending releases, due or not,
 // oldest first.
 func (s *testStore) ListReleasesBySpace(ctx context.Context, space did.DID) ([]pendingRelease, error) {
-	tasks, err := s.queued(ctx, registry.ReleaseQueue)
+	tasks, err := s.queued(ctx, registry.SpaceShardQueue)
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +345,7 @@ func (s *testStore) ListReleasesBySpace(ctx context.Context, space did.DID) ([]p
 		if t.Action != registry.ReleaseAction || t.State != "pending" {
 			continue
 		}
-		sp, d, err := registry.ParseReleaseSubject(t.Subject)
+		sp, d, err := registry.ParseSpaceShardSubject(t.Subject)
 		if err != nil {
 			return nil, err
 		}
@@ -372,9 +372,9 @@ func (s *testStore) EnqueueRelease(ctx context.Context, space did.DID, digest mu
 func (s *testStore) ReleasingDigests(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error) {
 	subjects := make([]string, len(digests))
 	for i, d := range digests {
-		subjects[i] = registry.ReleaseSubject(space, d)
+		subjects[i] = registry.SpaceShardSubject(space, d)
 	}
-	pending, err := s.tasks.Pending(ctx, registry.ReleaseQueue, subjects, registry.ReleaseAction)
+	pending, err := s.tasks.Pending(ctx, registry.SpaceShardQueue, subjects, registry.ReleaseAction)
 	if err != nil {
 		return nil, err
 	}
@@ -396,7 +396,7 @@ func (s *testStore) ReleasingDigests(ctx context.Context, space did.DID, digests
 // is left waiting to retry.
 func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 	s := storeFor(b)
-	tasks, err := s.queued(ctx, registry.ReleaseQueue)
+	tasks, err := s.queued(ctx, registry.SpaceShardQueue)
 	if err != nil {
 		return 0, err
 	}
@@ -413,7 +413,7 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 			subjects = append(subjects, t.Subject)
 		}
 		if t.Attempts > 0 {
-			if _, err := storeFor(b).tasks.Expedite(ctx, registry.ReleaseQueue, t.Subject, registry.ReleaseAction); err != nil {
+			if _, err := storeFor(b).tasks.Expedite(ctx, registry.SpaceShardQueue, t.Subject, registry.ReleaseAction); err != nil {
 				return 0, err
 			}
 		}
@@ -427,7 +427,7 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 			return 0, err
 		}
 	}
-	if tasks, err = s.queued(ctx, registry.ReleaseQueue); err != nil {
+	if tasks, err = s.queued(ctx, registry.SpaceShardQueue); err != nil {
 		return 0, err
 	}
 	n := 0
@@ -469,7 +469,7 @@ func (s *testStore) PutPart(ctx context.Context, p registry.MultipartPart, tree 
 			return nil, err
 		}
 	}
-	if err := s.tasks.CancelTx(ctx, tx, registry.ReleaseQueue, w.Expiries...); err != nil {
+	if err := s.tasks.CancelTx(ctx, tx, registry.SpaceShardQueue, w.Expiries...); err != nil {
 		return nil, err
 	}
 	return released, tx.Commit(ctx)
@@ -532,7 +532,7 @@ func sweepUploads(ctx context.Context, b *Backend) (int, error) {
 // not, each once.
 func releaseSpaces(t *testing.T, mem *testStore) []did.DID {
 	t.Helper()
-	tasks, err := mem.queued(context.Background(), registry.ReleaseQueue)
+	tasks, err := mem.queued(context.Background(), registry.SpaceShardQueue)
 	if err != nil {
 		t.Fatalf("queued releases: %v", err)
 	}
@@ -541,9 +541,9 @@ func releaseSpaces(t *testing.T, mem *testStore) []did.DID {
 		if task.Action != registry.ReleaseAction {
 			continue
 		}
-		space, _, err := registry.ParseReleaseSubject(task.Subject)
+		space, _, err := registry.ParseSpaceShardSubject(task.Subject)
 		if err != nil {
-			t.Fatalf("release subject: %v", err)
+			t.Fatalf("space-shard subject: %v", err)
 		}
 		if !slices.Contains(out, space) {
 			out = append(out, space)

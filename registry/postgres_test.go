@@ -996,7 +996,7 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
 	t.Helper()
 	r, err := taskrunner.New(pool, taskrunner.Options{Schema: "ingot", Queues: []taskrunner.QueueOptions{
-		{Name: spaceuploadqueue.Name}, {Name: registry.ReleaseQueue},
+		{Name: spaceuploadqueue.Name}, {Name: registry.SpaceShardQueue},
 	}})
 	if err != nil {
 		t.Fatalf("task runner: %v", err)
@@ -1009,7 +1009,7 @@ func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
 			t.Fatalf("register %s: %v", op, err)
 		}
 	}
-	if err := r.Handle(registry.ReleaseQueue, registry.ReleaseAction, noop); err != nil {
+	if err := r.Handle(registry.SpaceShardQueue, registry.ReleaseAction, noop); err != nil {
 		t.Fatalf("register release: %v", err)
 	}
 	if err := r.Migrate(context.Background()); err != nil {

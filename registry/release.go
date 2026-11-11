@@ -13,11 +13,12 @@ import (
 	"github.com/fil-forge/ingot/taskrunner"
 )
 
-// ReleaseQueue is the task queue a space's blobs are released on, and its
-// multipart part blobs accepted on (BlobAcceptAction). Its subject is the
-// space and the digest (ReleaseSubject), so at most one task on a blob in a
-// space runs at a time, and a space's subjects share a prefix.
-const ReleaseQueue = "queue-space-shard"
+// SpaceShardQueue is queue-space-shard, the task queue of the tasks on one
+// blob in one space: a write's add of it and the expiry of the reference
+// the add took, its accept (BlobAcceptAction) and its release. Its subject
+// is the space and the digest (SpaceShardSubject), so at most one task on a
+// blob in a space runs at a time, and a space's subjects share a prefix.
+const SpaceShardQueue = "queue-space-shard"
 
 // ReleaseAction removes a blob nothing in the space claims any more from the
 // space on the network, and its local rows and copy.
@@ -32,31 +33,31 @@ const (
 	ExpireAction = "expire"
 )
 
-// ReleaseSubject is the subject of the release of digest in space.
-func ReleaseSubject(space did.DID, digest multihash.Multihash) string {
+// SpaceShardSubject is the subject of the tasks on digest in space.
+func SpaceShardSubject(space did.DID, digest multihash.Multihash) string {
 	return space.String() + "/" + hex.EncodeToString(digest)
 }
 
-// SpaceReleases is the subject pattern matching every task on the release
-// queue in space, its releases and its blobs' accepts, for
-// taskrunner.Runner.Expedite.
-func SpaceReleases(space did.DID) string {
+// SpaceShardSubjects is the subject pattern matching every queue-space-shard
+// task in space, for taskrunner.Runner.Expedite.
+func SpaceShardSubjects(space did.DID) string {
 	return space.String() + "/*"
 }
 
-// ParseReleaseSubject returns the space and digest a release subject names.
-func ParseReleaseSubject(subject string) (did.DID, multihash.Multihash, error) {
+// ParseSpaceShardSubject returns the space and digest a queue-space-shard
+// subject names.
+func ParseSpaceShardSubject(subject string) (did.DID, multihash.Multihash, error) {
 	i := strings.LastIndexByte(subject, '/')
 	if i < 0 {
-		return did.Undef, nil, fmt.Errorf("registry: release subject %q has no digest", subject)
+		return did.Undef, nil, fmt.Errorf("registry: space-shard subject %q has no digest", subject)
 	}
 	space, err := did.Parse(subject[:i])
 	if err != nil {
-		return did.Undef, nil, fmt.Errorf("registry: release subject space: %w", err)
+		return did.Undef, nil, fmt.Errorf("registry: space-shard subject space: %w", err)
 	}
 	digest, err := hex.DecodeString(subject[i+1:])
 	if err != nil {
-		return did.Undef, nil, fmt.Errorf("registry: release subject digest: %w", err)
+		return did.Undef, nil, fmt.Errorf("registry: space-shard subject digest: %w", err)
 	}
 	return space, digest, nil
 }
@@ -89,8 +90,8 @@ func (args ReleaseTask) Spec(space did.DID, digest multihash.Multihash, notBefor
 		return taskrunner.Spec{}, fmt.Errorf("registry: encode release: %w", err)
 	}
 	return taskrunner.Spec{
-		Queue:     ReleaseQueue,
-		Subject:   ReleaseSubject(space, digest),
+		Queue:     SpaceShardQueue,
+		Subject:   SpaceShardSubject(space, digest),
 		Action:    ReleaseAction,
 		Args:      buf.Bytes(),
 		NotBefore: &notBefore,

@@ -136,6 +136,9 @@ func New(r *taskrunner.Runner, d Deps) (*Queue, error) {
 	if err := q.registerAdmin(r); err != nil {
 		return nil, err
 	}
+	if seals, ok := q.log.(SealReporter); ok {
+		seals.OnSealed(q.QueueShip)
+	}
 	return q, nil
 }
 

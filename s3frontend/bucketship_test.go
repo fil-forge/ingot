@@ -47,7 +47,7 @@ func TestShipWithoutAuthorityFailsForGood(t *testing.T) {
 				log.Log = d.Log
 				d.Log = log
 			})
-			b.QueueShip("bk")
+			b.buckets.QueueShip("bk")
 			deadline := time.Now().Add(10 * time.Second)
 			for log.ships.Load() == 0 || shipState(t, mem) == "pending" && tc.state == "failed" {
 				if time.Now().After(deadline) {
@@ -87,7 +87,7 @@ func TestTheNextWriteQueuesAShipThatFoundNoAuthority(t *testing.T) {
 		d.Log = log
 	})
 	log.b = b
-	b.QueueShip("bk")
+	b.buckets.QueueShip("bk")
 	require.Eventually(t, func() bool { return shipState(t, mem) == "failed" },
 		10*time.Second, 10*time.Millisecond, "the ship without authority never failed")
 
@@ -139,7 +139,7 @@ func TestAShipThatCannotBeQueuedIsRetried(t *testing.T) {
 		d.tuneBuckets = func(d *bucketqueue.Deps) { d.ShipRetryFirst = 20 * time.Millisecond }
 	})
 	reg.fails.Store(2)
-	b.QueueShip("bk")
+	b.buckets.QueueShip("bk")
 
 	require.Eventually(t, func() bool {
 		tasks, err := mem.queued(context.Background(), registry.BucketQueue)
