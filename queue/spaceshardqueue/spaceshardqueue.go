@@ -145,12 +145,41 @@ func (q *Queue) ExpediteAccepts(ctx context.Context, space did.DID) (map[string]
 	return q.tasks.Expedite(ctx, Name, SpaceSubjects(space), AcceptAction)
 }
 
+// AcceptSpecs returns the accept (AcceptSpec) of each of digests in space
+// that has none pending. A pending accept is left to do the work: one that
+// has failed and waits to retry is not replaced by a new submission, so
+// without this every part uploaded and every Complete sent while the upload
+// service is failing would add another accept of each parked blob, each
+// retrying on its own. Complete brings a waiting one forward
+// (ExpediteAccepts). Two submitters that both find none pending queue one
+// each; the second to run finds the blob located.
+func (q *Queue) AcceptSpecs(ctx context.Context, space did.DID, digests []multihash.Multihash) ([]taskrunner.Spec, error) {
+	if len(digests) == 0 {
+		return nil, nil
+	}
+	subjects := make([]string, len(digests))
+	for i, d := range digests {
+		subjects[i] = Subject(space, d)
+	}
+	pending, err := q.tasks.Pending(ctx, Name, subjects, AcceptAction)
+	if err != nil {
+		return nil, err
+	}
+	var specs []taskrunner.Spec
+	for i, d := range digests {
+		if len(pending[subjects[i]]) == 0 {
+			specs = append(specs, AcceptSpec(space, d))
+		}
+	}
+	return specs, nil
+}
+
 // AwaitAccepts waits for the accepts of one blob that ExpediteAccepts
 // returned: until one of them has succeeded, or every one is over, having
 // failed for good, expired, been cancelled or gone. It does not say which,
 // since the blob's park and location do. An accept that failed and waits to
 // retry is not over, but one beside it that succeeds ends the wait: a blob
-// has two when Complete queues one while an earlier one waits to retry. The
+// has two when two submitters each found none pending (AcceptSpecs). The
 // error is ctx's, or that of a failed read of a task.
 func (q *Queue) AwaitAccepts(ctx context.Context, ids []taskrunner.TaskID) error {
 	ctx, cancel := context.WithCancel(ctx)
@@ -817,7 +846,10 @@ func (q *Queue) runAccept(ctx context.Context, ex *taskrunner.Exec, t taskrunner
 		cancel()
 		q.concluded(ctx, err)
 		if errors.Is(err, uploader.ErrAllocationGone) {
-			if derr := q.parks.DeletePark(ctx, space, digest); derr != nil {
+			// Only the park this attempt concluded: were the attempt to
+			// outlive its lease, a part uploaded again meanwhile has parked
+			// another allocation, which stays.
+			if derr := q.parks.DeleteParkOf(ctx, space, digest, park.AddTask); derr != nil {
 				// The park still stands, so the retry gets the same answer
 				// and drops it then.
 				return nil, fmt.Errorf("conclude blob: %w; drop its park: %w", err, derr)

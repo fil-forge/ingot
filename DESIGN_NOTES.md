@@ -207,7 +207,11 @@ upload's `queue-multipart-upload.accept` (`queue/multipartqueue/accept.go`,
 accept pending. That accept runs on the upload's own subject, in turn with
 its other changes, and does nothing unless the session is `open`. It makes no network calls: it lists the upload's parked parts and
 queues, with its commit, a `queue-space-shard.accept` for each of their
-blobs (`spaceshardqueue.AcceptSpec`), and marks a part with no blobs accepted.
+blobs that has none pending (`spaceshardqueue.AcceptSpecs`), and marks a part
+with no blobs accepted. A pending accept is left to do the work: one that has
+failed and waits to retry is not replaced by a new submission, so queueing
+another beside it on every part and every Complete would multiply the
+concludes sent to an upload service that is already failing.
 
 A blob's accept runs under the blob's own subject (`spaceshardqueue.Subject`:
 the space and the digest), the one the blob's releases and a write's adds
@@ -260,7 +264,7 @@ concludes, by outcome) and `ingot.multipart.complete_deferred` report the
 queue's health; the README lists them.
 
 Complete queues the accept of each blob of the parts it names that are still
-parked, then brings those blobs' pending accepts forward from any retry's
+parked and have no accept pending, then brings those blobs' pending accepts forward from any retry's
 backoff and waits for each of those accepts to be over, within the accept
 wait (30 s, `multipartqueue.DefaultAcceptWait`). An accept that fails and
 waits to retry is not over, so Complete waits through its retries, unless a
