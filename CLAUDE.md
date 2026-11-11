@@ -111,11 +111,8 @@ Internal:
   per-key version tree), `bucketqueue.go` (the requests' commits through
   `queue/bucketqueue`), `conditions.go` (its errors' S3 answers),
   `bucketadmin.go` (bucket settings through `queue/bucketqueue`),
-  `multipart.go`,
-  `multipartqueue.go` (`queue-multipart-upload`: every change to an upload,
-  on the upload ID's subject), `acceptor.go`
-  (`queue-multipart-upload.accept`, queueing a `queue-space-shard.accept` per
-  parked blob, which concludes it while the client uploads), `bucket.go`
+  `multipart.go` (the multipart verbs through `queue/multipartqueue`),
+  `multipartqueue.go` (its errors' S3 answers), `bucket.go`
   (DeleteBucket: the close, the uploads' aborts, then
   `queue-bucket.delete`), `listversions.go`,
   `backend.go`, `stream.go` (each body blob streams to its
@@ -161,7 +158,12 @@ Internal:
   on its own terms with one of a fixed set of errors; `.create`,
   `.set-versioning`, `.set-object-lock-config`, `.set-tagging`,
   `.set-cors`, `.set-encryption`, `.close`, `.admit-upload` and `.delete`;
-  `.ship`, queued on each seal). The other handlers are in `s3frontend`.
+  `.ship`, queued on each seal), `multipartqueue`
+  (`queue-multipart-upload`, every change to a multipart upload: its create,
+  parts, accept, Complete, abort and reap; the accept queues a
+  `queue-space-shard.accept` per parked blob, which concludes it while the
+  client uploads, and Complete validates the part list, assembles the
+  object and commits it as a `queue-bucket.commit` child).
 - **`taskrunner/`** — durable task queues in Postgres (one tasks table and
   one leases table per queue), serialized per (queue, subject) by a lease
   row. A task's tree (its handler plus sync children in later queues) adds
@@ -184,9 +186,9 @@ Internal:
   tables are migrated in the migration hook, and `Server` starts and stops
   it. Queues in order: `queue-multipart-upload`, `queue-bucket`,
   `queue-space-upload`, `queue-space-shard`, `queue-shard`.
-  `queue-multipart-upload` (`s3frontend/multipartqueue.go`), subject the
+  `queue-multipart-upload` (`queue/multipartqueue`), subject the
   upload ID: an upload's create, add-part, accept, complete, abort and reap,
-  one at a time, the accept (`s3frontend/acceptor.go`) queuing a
+  one at a time, the accept queuing a
   `queue-space-shard.accept` for each blob of the upload's parked parts;
   `queue-bucket` (`queue/bucketqueue`), subject the bucket's space
   DID: every change to a bucket, placed on the instance holding its catalog

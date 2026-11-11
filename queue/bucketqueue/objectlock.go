@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/ipfs/go-cid"
 
@@ -236,4 +238,45 @@ func LockEnabled(st *registry.State) bool {
 		return false
 	}
 	return cfg.Enabled
+}
+
+// LockState builds the VersionState a version-creating write stamps from its
+// x-amz-object-lock-* headers (docs/s3-object-lock.md §7), already validated
+// by the controller (mode and date arrive together, future-dated, known
+// enums). Nil when no header was supplied. Headers against a bucket without
+// lock enabled are ErrNoObjectLock.
+func LockState(st *registry.State, mode types.ObjectLockMode, retainUntil *time.Time, hold types.ObjectLockLegalHoldStatus) (*msbucket.VersionState, error) {
+	// The controller populates the retain-until pointer unconditionally
+	// (object-put.go: &objLock.RetainUntilDate), so an absent header arrives
+	// as a pointer to the zero time, never as nil.
+	if retainUntil != nil && retainUntil.IsZero() {
+		retainUntil = nil
+	}
+	if mode == "" && retainUntil == nil && hold == "" {
+		return nil, nil
+	}
+	if !LockEnabled(st) {
+		return nil, ErrNoObjectLock
+	}
+	vs := &msbucket.VersionState{}
+	if mode != "" {
+		ret, err := json.Marshal(types.ObjectLockRetention{
+			Mode:            types.ObjectLockRetentionMode(mode),
+			RetainUntilDate: retainUntil,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("bucketqueue: marshal retention: %w", err)
+		}
+		vs.Retention = ret
+	}
+	switch hold {
+	case types.ObjectLockLegalHoldStatusOn:
+		vs.LegalHold = msbucket.LegalHoldOn
+	case types.ObjectLockLegalHoldStatusOff:
+		vs.LegalHold = msbucket.LegalHoldOff
+	}
+	if vs.Empty() {
+		return nil, nil // never stamp an empty state block (§4.1 rule 3)
+	}
+	return vs, nil
 }

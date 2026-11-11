@@ -1202,7 +1202,7 @@ harness (`make itest`); unit tests cover libraries and pure logic only:
   race on a digest not yet published would return.
 - **Multipart parts park at UploadPart and are accepted during the upload.** (Built: `parkBlobs`
   over the `blob_parks` table, and the `queue-multipart-upload.accept` and
-  `queue-space-shard.accept` tasks in `s3frontend/acceptor.go` and `registry/accept.go`.) A part
+  `queue-space-shard.accept` tasks in `queue/multipartqueue/accept.go` and `registry/accept.go`.) A part
   holds no local bytes: its blobs stream to their providers, and each blob's accept concludes it
   from its park row. Complete runs the upload's accept for the parts it names and waits for their
   blobs' accepts, and answers accepts that do not finish within 30 s with a 409 that the AWS CLI

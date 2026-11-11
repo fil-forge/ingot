@@ -289,7 +289,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 				return fmt.Errorf("s3frontend: delete bucket: abort multipart upload %s: %w", s.UploadID, err)
 			}
 		case registry.SessionCompleted:
-			if err := b.reapNow(ctx, s.UploadID); err != nil {
+			if err := b.uploads.Reap(ctx, s.UploadID); err != nil {
 				return fmt.Errorf("s3frontend: delete bucket: reap multipart upload %s: %w", s.UploadID, err)
 			}
 		}

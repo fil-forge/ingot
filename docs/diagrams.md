@@ -562,7 +562,7 @@ sequenceDiagram
     S->>R: with the task's commit: park swapped for the location while the concluded park<br/>(by AddTask) stands#59; intent accepted (published stays)#59; a park beside a standing<br/>location dropped#59; the blob taken off its parts' lists of blobs still to accept, while it is located, and a part left with none accepted
     Note over S,R: a failed conclude fails the task and records nothing#59; the retry concludes again<br/>(a repeat to sprue)#59; 5 attempts from 5 s, doubling, up to 1 min
     C->>B: CompleteMultipartUpload(parts)
-    B->>M: run sync: queue-multipart-upload.complete, to start within replayWaitBudget (10 s)<br/>behind the upload's other changes, another Complete included
+    B->>M: run sync: queue-multipart-upload.complete, to start within the complete wait (10 s)<br/>behind the upload's other changes, another Complete included
     alt it did not start in time
         B-->>C: 409 OperationAborted
     else session already completed
@@ -579,7 +579,7 @@ sequenceDiagram
         end
         Note over B,C: from here the body is padded with a newline every<br/>complete_multipart_keepalive (5 s), and any error goes in the 200's body
         M->>R: manifest spans from each part's span_lengths<br/>(rows without them: intent size + FEE geometry)
-        M->>S: queue the accept of each blob of the named parts still parked, committed at once,<br/>then bring them forward and wait for them, within acceptWaitBudget (30 s) in all#59;<br/>their writes commit before Complete reads the parts and assembles the tree
+        M->>S: queue the accept of each blob of the named parts still parked, committed at once,<br/>then bring them forward and wait for them, within the accept wait (30 s) in all#59;<br/>their writes commit before Complete reads the parts and assembles the tree
         alt the accepts did not finish in time
             B-->>C: OperationAborted in the 200's body#59; the upload stays open
         else a named part still parked (its blob's accept failed)
@@ -640,12 +640,13 @@ sequenceDiagram
 Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 [§7.3](./architecture.md#73-one-change-per-upload-the-abortcomplete-race).
 
-Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
-acceptRequested, sessionReleases), `s3frontend/multipartqueue.go`
-(runCreateUpload, runAddPart, runAbort, runReap), `registry/multipartqueue.go`
-(PartWrites, CompletedSession),
+Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs),
+`queue/multipartqueue/multipartqueue.go` (runCreate, runAddPart, runAbort,
+sessionReleases, runReap), `queue/multipartqueue/complete.go` (complete),
+`queue/multipartqueue/accept.go` (runAccept, acceptRequested),
+`registry/multipartqueue.go` (PartWrites, CompletedSession),
 `queue/bucketqueue/version.go` (Reserve, applyPut), `queue/bucketqueue/bucketqueue.go` (putPreCheck),
-`s3frontend/acceptor.go` (runAccept), `queue/spaceshardqueue/spaceshardqueue.go` (runAccept), `registry/accept.go`,
+`queue/spaceshardqueue/spaceshardqueue.go` (runAccept), `registry/accept.go`,
 `s3frontend/stream.go`,
 `queue/spaceshardqueue/spaceshardqueue.go` (Add, runAdd, DropRefsNow),
 `queue/spaceshardqueue/spaceshardqueue.go` (runRelease, ReleaseNow),
@@ -685,8 +686,8 @@ stateDiagram-v2
 
 Sources: `registry/stores.go` (Part* consts), `registry/stores_postgres.go`
 (ListParkedParts, OldestParkedPart), `registry/multipartqueue.go` (PartWrites),
-`registry/accept.go`, `s3frontend/acceptor.go`, `s3frontend/multipart.go`
-(ingestPart, acceptRequested), `migrations/sql/00030_part_accept_queue.sql`,
+`registry/accept.go`, `queue/multipartqueue/accept.go` (runAccept,
+acceptRequested), `s3frontend/multipart.go` (ingestPart), `migrations/sql/00030_part_accept_queue.sql`,
 `migrations/sql/00033_task_runner.sql`. Review when these change.
 
 ## Session states: open and completed
@@ -703,7 +704,7 @@ stateDiagram-v2
     completed --> [*] : queue-multipart-upload.reap (one session TTL out, or DeleteBucket)#59;<br/>releases nothing
 ```
 
-- A Complete waits up to 10 s (`replayWaitBudget`) for the upload's other
+- A Complete waits up to 10 s (the complete wait) for the upload's other
   changes, another Complete included, before it reports anything; past
   that it answers `OperationAborted`, a 409. A Complete that runs after
   another one committed replays the ETag and version id recorded on the
@@ -719,7 +720,7 @@ stateDiagram-v2
 - DeleteBucket aborts each open upload and reaps each completed one from
   the request, after `queue-bucket.close`.
 
-Sources: `s3frontend/multipart.go`, `s3frontend/multipartqueue.go`,
+Sources: `s3frontend/multipart.go`, `queue/multipartqueue/`,
 `queue/bucketqueue/bucketqueue.go` (putPreCheck), `registry/multipartqueue.go`
 (CompletedSession, DeletedSession, ReapedSession). Review when these change.
 
@@ -812,9 +813,9 @@ Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
 `s3frontend/stream.go` (WriteSizedBlob), `queue/shardqueue/shardqueue.go` (Cache),
 `blockstore/blobcache.go` (CreateTemp, Adopt), `queue/shardqueue/shardqueue.go`
 (queue-shard.cache, queue-shard.evict),
-`s3frontend/multipart.go`
-(parkBlobs, sessionReleases),
-`s3frontend/acceptor.go`, `registry/accept.go`, `queue/spaceshardqueue/spaceshardqueue.go`
+`s3frontend/multipart.go` (parkBlobs),
+`queue/multipartqueue/multipartqueue.go` (sessionReleases),
+`queue/multipartqueue/accept.go`, `registry/accept.go`, `queue/spaceshardqueue/spaceshardqueue.go`
 (runRelease, runAdd, runExpire),
 `registry/stores_postgres.go` (CountReferences, PendingRefByExpiry),
 `registry/bucketcommit.go` (claimWrites, dropWrites), `registry/multipartqueue.go`
@@ -1356,8 +1357,8 @@ sequenceDiagram
 Sources: `s3frontend/bucket.go` (DeleteBucket),
 `queue/bucketqueue/delete.go` (runDeleteBucket),
 `queue/bucketqueue/admin.go` (runCloseBucket, runAdmitUpload, bucketSpec),
-`s3frontend/multipartqueue.go`
-(abortUpload, runAbort, reapNow, runReap),
+`s3frontend/multipartqueue.go` (abortUpload),
+`queue/multipartqueue/multipartqueue.go` (runAbort, Reap, runReap),
 `queue/spaceshardqueue/spaceshardqueue.go` (DrainSpace),
 `queue/spaceuploadqueue/spaceuploadqueue.go` (Drain),
 `logstore/manager.go`. Review when these change.
@@ -1372,8 +1373,8 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `s3frontend/object.go` | put, get, blob-lifecycle, version-tree, gc-candidates, delete-bucket |
 | `s3frontend/version.go` | get |
 | `queue/bucketqueue/` | put, multipart, blob-lifecycle, version-tree, gc-candidates, delete-bucket, logstore-pipeline |
-| `s3frontend/multipart.go`, `multipartqueue.go`, `registry/multipartqueue.go` | multipart, part-states, multipart-states, blob-lifecycle, delete-bucket |
-| `s3frontend/acceptor.go`, `registry/accept.go` | multipart, part-states, blob-lifecycle |
+| `s3frontend/multipart.go`, `queue/multipartqueue/`, `registry/multipartqueue.go` | multipart, part-states, multipart-states, blob-lifecycle, delete-bucket |
+| `registry/accept.go` | multipart, part-states, blob-lifecycle |
 | `queue/spaceshardqueue/spaceshardqueue.go` | put, multipart, part-states, blob-lifecycle, delete-bucket |
 | `queue/spaceuploadqueue/spaceuploadqueue.go` | put, delete-bucket |
 | `queue/shardqueue/shardqueue.go`, `s3frontend/localblob_sweep.go` | put, blob-lifecycle |
