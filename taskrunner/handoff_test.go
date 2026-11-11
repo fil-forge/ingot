@@ -28,6 +28,21 @@ type countingDB struct {
 	// stopWaitingDelay holds back the statement that clears a sync task's
 	// waiting caller, widening the window in which others can see it.
 	stopWaitingDelay atomic.Int64
+	// afterOutcome, when set, is called once, after the next read of a sync
+	// task's outcome and before the runner sees the result.
+	afterOutcome atomic.Pointer[func()]
+}
+
+// pausedRow is a row whose Scan calls a hook once it has read the row.
+type pausedRow struct {
+	pgx.Row
+	after func()
+}
+
+func (p pausedRow) Scan(dest ...any) error {
+	err := p.Row.Scan(dest...)
+	p.after()
+	return err
 }
 
 func (c *countingDB) count(sql string) {
@@ -44,7 +59,13 @@ func (c *countingDB) Query(ctx context.Context, sql string, args ...any) (pgx.Ro
 
 func (c *countingDB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	c.count(sql)
-	return c.Pool.QueryRow(ctx, sql, args...)
+	row := c.Pool.QueryRow(ctx, sql, args...)
+	if strings.Contains(sql, "SELECT state, result, error FROM") {
+		if after := c.afterOutcome.Swap(nil); after != nil {
+			return pausedRow{Row: row, after: *after}
+		}
+	}
+	return row
 }
 
 func (c *countingDB) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -283,5 +304,62 @@ func TestRunCallerGivingUpClearsItsClaimBeforeWakingTheNext(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the caller behind one that gave up stalled behind its abandoned claim")
+	}
+}
+
+// A cancel that commits after a waiting caller has read its task's outcome,
+// and before the caller sleeps, still wakes it: it hears of the finish from
+// before it reads, so none is missed in between.
+func TestCancelBetweenAnOutcomeReadAndTheWaitWakesTheCaller(t *testing.T) {
+	hold := make(chan struct{})
+	started := make(chan struct{}, 1)
+	r, db := newCountingRunner(t, 2*time.Second, func(_ context.Context, _ *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if string(task.Args) == "first" {
+			started <- struct{}{}
+			<-hold
+		}
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	defer close(hold)
+	go func() {
+		_, _ = r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte("first")})
+	}()
+	<-started
+
+	read, proceed := make(chan struct{}), make(chan struct{})
+	after := func() {
+		close(read)
+		<-proceed
+	}
+	db.afterOutcome.Store(&after)
+	second := make(chan error, 1)
+	go func() {
+		_, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte("second")})
+		second <- err
+	}()
+	select {
+	case <-read:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiting caller never read its outcome")
+	}
+	pending, err := r.Pending(ctx, qTop, []string{"s"}, "step")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending["s"]) != 2 {
+		t.Fatalf("pending tasks %v, want first and second", pending["s"])
+	}
+	if err := r.Cancel(ctx, qTop, pending["s"][1]); err != nil {
+		t.Fatal(err)
+	}
+	close(proceed)
+	select {
+	case err := <-second:
+		if !errors.Is(err, taskrunner.ErrCancelled) {
+			t.Fatalf("cancelled Run returned %v, want ErrCancelled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a cancel between the outcome read and the wait went unheard until the poll interval")
 	}
 }

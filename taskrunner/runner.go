@@ -818,31 +818,15 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 	for {
 		if !r.frontOfLine(key, turn) {
 			// An older Run in this process goes first, and this task cannot
-			// start before it: wait for the turn without taking the lease.
-			d := r.opts.PollInterval
-			expired := false
-			if s.Expires != nil {
-				left := time.Until(*s.Expires)
-				expired = left <= 0
-				d = min(d, left)
+			// start before it: wait for the turn without taking the lease. Each
+			// wait reads the task's outcome first, which finds a cancel here or
+			// on another instance.
+			w := r.awaitTurn(ctx, q, id, turn, r.opts.PollInterval, s.Expires)
+			if w.done {
+				return w.res, w.err
 			}
-			if !expired {
-				woken, err := r.awaitTurn(ctx, id, turn, d)
-				if err != nil {
-					return nil, err
-				}
-				if woken {
-					wait = newBackoff(r.opts.PollInterval)
-					continue
-				}
-			}
-			// The task finished in this process, or the wait ran out: it may
-			// have been cancelled, here or on another instance.
-			if res, err, done := r.outcome(ctx, q, id); done {
-				return res, err
-			}
-			if expired {
-				return nil, ErrExpired
+			if w.woken {
+				wait = newBackoff(r.opts.PollInterval)
 			}
 			continue
 		}
@@ -882,21 +866,8 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 				return nil, d.stop
 			}
 		}
-		if res, err, done := r.outcome(ctx, q, id); done {
-			return res, err
-		}
-		// Past its Expires the task can no longer start: whoever takes the
-		// subject next records it as expired, so the caller can stop waiting.
-		d := wait.next()
-		if s.Expires != nil {
-			left := time.Until(*s.Expires)
-			if left <= 0 {
-				return nil, ErrExpired
-			}
-			d = min(d, left)
-		}
-		if _, err := r.awaitTurn(ctx, id, turn, d); err != nil {
-			return nil, err
+		if w := r.awaitTurn(ctx, q, id, turn, wait.next(), s.Expires); w.done {
+			return w.res, w.err
 		}
 	}
 }
