@@ -21,6 +21,7 @@ import (
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/queue/shardqueue"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
@@ -104,7 +105,13 @@ func (s *testStore) newBackend(t testing.TB, deps Deps) *Backend {
 	deps.Tasks = s.tasks
 	// A failed release waits for the next sweep (SweepPendingReleases), not
 	// a delay, and holds its subject meanwhile, as in production.
-	deps.releaseRetry = taskrunner.RetryPolicy{First: time.Hour, Max: time.Hour, HoldsSubject: true}
+	tune := deps.tuneBlobs
+	deps.tuneBlobs = func(d *spaceshardqueue.Deps) {
+		d.ReleaseRetry = taskrunner.RetryPolicy{First: time.Hour, Max: time.Hour, HoldsSubject: true}
+		if tune != nil {
+			tune(d)
+		}
+	}
 	b, err := New(deps)
 	if err != nil {
 		t.Fatalf("backend: %v", err)
@@ -394,7 +401,7 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 			subjects = append(subjects, t.Subject)
 		}
 		if t.Attempts > 0 {
-			if _, err := b.releases.Expedite(ctx, registry.ReleaseQueue, t.Subject, registry.ReleaseAction); err != nil {
+			if _, err := storeFor(b).tasks.Expedite(ctx, registry.ReleaseQueue, t.Subject, registry.ReleaseAction); err != nil {
 				return 0, err
 			}
 		}
@@ -403,7 +410,7 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 	// no-op behind it cannot start: its flush expires, which is not the
 	// sweep's failure.
 	for _, subject := range subjects {
-		err := b.flushRelease(ctx, subject, time.Now().Add(2*time.Second))
+		err := b.blobs.Flush(ctx, subject, time.Now().Add(2*time.Second))
 		if err != nil && !errors.Is(err, taskrunner.ErrExpired) && !errors.Is(err, context.DeadlineExceeded) {
 			return 0, err
 		}
@@ -413,7 +420,7 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 	}
 	n := 0
 	for _, t := range tasks {
-		if before[t.ID] && t.State == "succeeded" && string(t.Result) == string(releasedResult) {
+		if before[t.ID] && t.State == "succeeded" && string(t.Result) == "released" {
 			n++
 		}
 	}
@@ -501,7 +508,7 @@ func sweepUploads(ctx context.Context, b *Backend) (int, error) {
 			return n, err
 		}
 		if space, err := did.Parse(u.space); err == nil {
-			b.releaseNow(ctx, space, call.released)
+			b.blobs.ReleaseNow(ctx, space, call.released)
 		}
 		n++
 	}

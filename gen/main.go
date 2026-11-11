@@ -9,6 +9,7 @@ package main
 import (
 	"github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/queue/shardqueue"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
@@ -49,8 +50,12 @@ func main() {
 	); err != nil {
 		panic(err)
 	}
+	if err := cfg.WriteMapEncodersToFile("../queue/spaceshardqueue/cbor_gen.go", "spaceshardqueue",
+		spaceshardqueue.AddTask{},
+	); err != nil {
+		panic(err)
+	}
 	if err := cfg.WriteMapEncodersToFile("../s3frontend/cbor_gen.go", "s3frontend",
-		s3frontend.ShardAddTask{},
 		s3frontend.BucketCommitTask{},
 		s3frontend.KeyChange{},
 		s3frontend.PutChange{},

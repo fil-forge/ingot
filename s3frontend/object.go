@@ -33,6 +33,7 @@ import (
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
@@ -485,7 +486,7 @@ func (b *Backend) concludeBody(ctx context.Context, bucket string, space did.DID
 			continue
 		}
 		sb := body.streamed[k]
-		ref, err := b.addBlob(ctx, space, bucket, blob.Digest, body.sizes[k], addStreamed, &sb, release)
+		ref, err := b.addBlob(ctx, space, bucket, blob.Digest, body.sizes[k], spaceshardqueue.Streamed, &sb, release)
 		if err != nil {
 			return nil, err
 		}

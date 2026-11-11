@@ -19,6 +19,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/uploader"
@@ -523,16 +524,13 @@ func (s *stallingConcluder) ConcludeBlobs(ctx context.Context, space did.DID, pa
 }
 
 // TestAcceptConcludeTimesOut: a conclude that never answers ends at
-// acceptConcludeTimeout, failing the blob's accept so its retry can run,
+// its time limit, failing the blob's accept so its retry can run,
 // rather than holding the blob's subject for good.
 func TestAcceptConcludeTimesOut(t *testing.T) {
-	saved := acceptConcludeTimeout
-	acceptConcludeTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { acceptConcludeTimeout = saved })
-
 	sc := &stallingConcluder{}
 	sc.stalled.Store(true)
-	b, mem := newDeferredBackend(t, sc)
+	b, mem := newDeferredBackend(t, sc,
+		withBlobs(func(d *spaceshardqueue.Deps) { d.ConcludeTimeout = 50 * time.Millisecond }))
 	key := "accept-conclude-timeout"
 	uploadID := mpCreate(t, b, key, "", "")
 	uploadDistinctParts(t, b, key, uploadID, 1)

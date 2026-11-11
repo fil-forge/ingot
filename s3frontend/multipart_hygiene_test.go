@@ -293,8 +293,8 @@ func TestDrainSpaceReleasesIgnoresGrace(t *testing.T) {
 		t.Fatalf("sweep executed %d releases (err=%v), want 0 — intent should not be due", n, err)
 	}
 
-	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
-		t.Fatalf("drainSpaceReleases: %v", err)
+	if err := b.blobs.DrainSpace(ctx, mem.bk()); err != nil {
+		t.Fatalf("drain the space's releases: %v", err)
 	}
 	if _, err := mem.GetEncryptionParams(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("enc-params row survived the space drain (err=%v)", err)
@@ -1632,8 +1632,8 @@ func TestSupersedeRecordsReleaseOfSharedBlob(t *testing.T) {
 	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
 		t.Fatalf("Abort: %v", err)
 	}
-	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
-		t.Fatalf("drainSpaceReleases: %v", err)
+	if err := b.blobs.DrainSpace(ctx, mem.bk()); err != nil {
+		t.Fatalf("drain the space's releases: %v", err)
 	}
 	if !pu.abortedDigests()[string(shared)] {
 		t.Fatalf("shared blob %x not released once the session ended", shared)
@@ -1774,8 +1774,8 @@ func TestConcurrentUploadsOfOnePartReleaseTheOverwrittenBlobs(t *testing.T) {
 		}
 	}
 
-	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
-		t.Fatalf("drainSpaceReleases: %v", err)
+	if err := b.blobs.DrainSpace(ctx, mem.bk()); err != nil {
+		t.Fatalf("drain the space's releases: %v", err)
 	}
 	for _, d := range orphans {
 		if !pu.abortedDigests()[string(d)] {

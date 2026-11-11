@@ -29,9 +29,9 @@ import (
 
 	"github.com/fil-forge/ingot/blake3tree"
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
-	"github.com/fil-forge/ingot/uploader"
 )
 
 // defaultMaxListing is the S3 default and cap for max-parts / max-uploads.
@@ -416,7 +416,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		// release the blobs nothing else references. Should the row in fact
 		// have landed and only its result been lost, it took the references
 		// over, and the upload's teardown releases its blobs.
-		b.dropRefsNow(ctx, space, refs, written.Blobs.DigestList())
+		b.blobs.DropRefsNow(ctx, space, refs, written.Blobs.DigestList())
 		var apiErr s3err.APIError
 		if errors.As(err, &apiErr) {
 			return nil, apiErr
@@ -429,7 +429,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		}
 		return nil, fmt.Errorf("s3frontend: record part: %w", err)
 	}
-	b.releaseNow(ctx, space, superseding)
+	b.blobs.ReleaseNow(ctx, space, superseding)
 	out := &ingestedPart{etag: `"` + hex.EncodeToString(rec.MD5) + `"`, size: rec.Size}
 	switch {
 	case sessAlgo != "":
@@ -511,7 +511,7 @@ func (b *Backend) CompleteMultipartUploadReportingHeaders(ctx context.Context, i
 	}
 	// The parts the Complete left out are released now rather than when a
 	// worker reaches them.
-	b.releaseNow(ctx, call.space, call.orphans)
+	b.blobs.ReleaseNow(ctx, call.space, call.orphans)
 	return call.res, call.versionID, nil
 }
 
@@ -1099,7 +1099,7 @@ func (b *Backend) parkBlobs(ctx context.Context, bucket string, space did.DID, b
 		if !ok {
 			return nil, fmt.Errorf("part blob %x did not stream to its provider", blob.Digest)
 		}
-		ref, err := b.addBlob(ctx, space, bucket, blob.Digest, body.sizes[k], addPart, &sb, release)
+		ref, err := b.addBlob(ctx, space, bucket, blob.Digest, body.sizes[k], spaceshardqueue.Part, &sb, release)
 		if err != nil {
 			return nil, err
 		}
@@ -1216,7 +1216,7 @@ func (b *Backend) awaitBlobAccepts(ctx context.Context, space did.DID, parts []r
 			}
 		}
 	}
-	due, err := b.releases.Expedite(ctx, registry.ReleaseQueue, registry.SpaceReleases(space), registry.BlobAcceptAction)
+	due, err := b.blobs.ExpediteAccepts(ctx, space)
 	if err != nil {
 		return fmt.Errorf("bring the blobs' accepts forward: %w", err)
 	}
@@ -1238,7 +1238,7 @@ func (b *Backend) awaitBlobAccepts(ctx context.Context, space did.DID, parts []r
 		wg.Add(1)
 		go func() {
 			defer func() { <-slots; wg.Done() }()
-			err := b.flushRelease(ctx, subject, expires)
+			err := b.blobs.Flush(ctx, subject, expires)
 			if errors.Is(err, taskrunner.ErrExpired) || (errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil) {
 				err = errAcceptWaitExpired
 			}
@@ -1298,32 +1298,6 @@ func (b *Backend) partSpanLengths(ctx context.Context, space did.DID, plaintext 
 // sameDigests reports whether a and b list the same digests in order.
 func sameDigests(a, b []mh.Multihash) bool {
 	return slices.EqualFunc(a, b, func(x, y mh.Multihash) bool { return bytes.Equal(x, y) })
-}
-
-// recordAccepted persists an accepted blob's location and marks its intent.
-// The location is the proof eviction requires that the provider holds the
-// blob, and where reads go once the local copy is gone.
-//
-// The location is written first, so a failure between the two writes leaves
-// the intent in its earlier state with a location row, never accepted
-// without one. An intent left uploading counts as a stalled upload, and a
-// release of it, if one runs, finds the location and removes the blob from
-// the provider. An accepted intent with no location is neither evictable nor
-// counted as stalled.
-func (b *Backend) recordAccepted(ctx context.Context, space did.DID, digest mh.Multihash, loc uploader.BlobLocation) error {
-	if err := b.locations.PutLocation(ctx, registry.BlobLocation{
-		Space:    space,
-		Digest:   digest,
-		Provider: loc.Provider,
-		URL:      loc.URL,
-		Size:     loc.Size,
-	}); err != nil {
-		return fmt.Errorf("record location: %w", err)
-	}
-	if err := b.intents.SetIntentState(ctx, space, digest, registry.IntentAccepted); err != nil {
-		return fmt.Errorf("mark accepted: %w", err)
-	}
-	return nil
 }
 
 // ListParts returns the recorded parts of an in-flight upload, paginated by
