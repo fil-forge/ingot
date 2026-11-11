@@ -30,6 +30,9 @@ type countingDB struct {
 	// leaseChecks counts the separate checks of a lease before a task
 	// starts, which a task claimed as its lease was taken goes without.
 	leaseChecks atomic.Int64
+	// leaseReleases counts the lease releases sent on their own, outside a
+	// task's commit.
+	leaseReleases atomic.Int64
 	// stopWaitingDelay holds back the statement that clears a sync task's
 	// waiting caller, widening the window in which others can see it.
 	stopWaitingDelay atomic.Int64
@@ -63,6 +66,9 @@ func (c *countingDB) count(sql string) {
 	}
 	if strings.Contains(sql, "SET tree_created") {
 		c.leaseChecks.Add(1)
+	}
+	if strings.HasPrefix(sql, "DELETE FROM") && strings.Contains(sql, "WHERE subject = $1 AND owner = $2") {
+		c.leaseReleases.Add(1)
 	}
 }
 
@@ -252,8 +258,9 @@ func TestRunCallerLeavingTheLineWakesTheNext(t *testing.T) {
 }
 
 // The caller at the front of the line backs off while a task ahead of its own
-// holds the subject: releasing the lease it took to find that out does not
-// wake it again at once.
+// holds the subject, and each look at the subject is one statement that takes
+// no lease: a caller takes the lease only when its own task is next, so it has
+// nothing to release when it is not.
 func TestRunCallerBacksOffBehindATaskAhead(t *testing.T) {
 	r, db := newCountingRunner(t, time.Second, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
 		return nil, nil
@@ -264,15 +271,26 @@ func TestRunCallerBacksOffBehindATaskAhead(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := db.leaseTries.Load()
+	beforeStatements, beforeReleases := db.callerStatements.Load(), db.leaseReleases.Load()
 	expires := time.Now().Add(500 * time.Millisecond)
 	_, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Expires: &expires})
 	if !errors.Is(err, taskrunner.ErrExpired) {
 		t.Fatalf("Run behind another instance's task: %v, want ErrExpired", err)
 	}
 	tries := db.leaseTries.Load() - before
-	t.Logf("%d lease attempts in 500ms behind a task ahead", tries)
+	// Besides each look: the task's insert, the caller's outcome read before
+	// each wait, and the clearing of its claim at the end.
+	per := float64(db.callerStatements.Load()-beforeStatements-2) / float64(tries)
+	releases := db.leaseReleases.Load() - beforeReleases
+	t.Logf("%d looks in 500ms behind a task ahead, %.1f statements each, %d leases released", tries, per, releases)
 	if tries > 20 {
-		t.Errorf("%d lease attempts in 500ms behind a task ahead; want at most 20", tries)
+		t.Errorf("%d looks in 500ms behind a task ahead; want at most 20", tries)
+	}
+	if per > 2 {
+		t.Errorf("%.1f statements per look behind a task ahead; want at most 2", per)
+	}
+	if releases > 0 {
+		t.Errorf("%d leases released behind a task ahead; want none taken", releases)
 	}
 }
 
@@ -518,12 +536,13 @@ func TestCancelBetweenAnOutcomeReadAndTheWaitWakesTheCaller(t *testing.T) {
 	}
 }
 
-// A Run caller on a free subject sends three statements outside its task's
-// own transaction: the task's insert, one that takes the lease and claims the
-// task, and the clearing of its waiting claim. The task's transaction records
-// the outcome and releases the lease. Every statement that runs on its own is
-// a commit, so each one adds to the time the subject is held.
-func TestRunOnAFreeSubjectSendsThreeStatements(t *testing.T) {
+// A Run caller on a free subject sends two statements outside its task's own
+// transaction: the task's insert, and one that takes the lease and claims the
+// task. The task's transaction records the outcome and releases the lease,
+// and a task with an outcome has no waiting claim left to clear. Every
+// statement that runs on its own is a commit, so each one adds to the time
+// the subject is held.
+func TestRunOnAFreeSubjectSendsTwoStatements(t *testing.T) {
 	r, db := newCountingRunner(t, time.Minute, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
 		return nil, nil
 	})
@@ -537,8 +556,8 @@ func TestRunOnAFreeSubjectSendsThreeStatements(t *testing.T) {
 	}
 	per := float64(db.callerStatements.Load()-before) / runs
 	t.Logf("%.1f statements per Run on a free subject", per)
-	if per > 3 {
-		t.Errorf("%.1f statements per Run on a free subject; want at most 3", per)
+	if per > 2 {
+		t.Errorf("%.1f statements per Run on a free subject; want at most 2", per)
 	}
 }
 

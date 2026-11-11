@@ -329,7 +329,7 @@ A worker or sync caller holds its subject's lease while it runs tasks there. The
 
 A worker makes at most `Options.DrainLimit` handler runs on one subject, 100 by default and a batch counting as one, before it releases the lease. Each queue is checked for due subjects every `Options.PollInterval`, 1 second by default, and at once when this process submits a task to it or a worker frees up with more due.
 
-Sync callers waiting on one subject in this process form a line in their tasks' order. Only the caller at the front asks for the lease, and a release wakes that caller alone, so the database work per task stays flat however many callers wait. The front caller takes the lease and claims its task in one statement, and the task's commit releases the lease, so a turn on a busy subject costs two commits besides the handler's own work.
+Sync callers waiting on one subject in this process form a line in their tasks' order. Only the caller at the front asks for the lease, and a release wakes that caller alone, so the database work per task stays flat however many callers wait. The front caller takes the lease and claims its task in one statement, and the task's commit releases the lease, so a turn on a busy subject costs two commits besides the handler's own work. While another task is due ahead of the caller's, the same statement takes nothing and only reads, and the caller backs off, waking the workers when that task is theirs to run.
 
 ## Retention
 

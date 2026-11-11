@@ -810,8 +810,14 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 	turn := r.joinLine(key, seq)
 	defer r.leaveLine(key, turn)
 	// Deferred after leaveLine so it runs first: the caller woken next must
-	// not find this task still claimed by a caller that has gone.
-	defer r.stopWaiting(q, id)
+	// not find this task still claimed by a caller that has gone. A task
+	// with an outcome has no claim left to clear, so that costs nothing.
+	finished := false
+	defer func() {
+		if !finished {
+			r.stopWaiting(q, id)
+		}
+	}()
 
 	wait := newBackoff(r.opts.PollInterval)
 	start := time.Now()
@@ -823,6 +829,7 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 			// on another instance.
 			w := r.awaitTurn(ctx, q, id, turn, r.opts.PollInterval, s.Expires, TaskID{})
 			if w.done {
+				finished = w.finished
 				return w.res, w.err
 			}
 			if w.woken {
@@ -835,24 +842,27 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 		// task due ahead of this one that the wait also ends with.
 		var pause time.Duration
 		var behind TaskID
-		h, task, err := r.takeTurn(ctx, q, s.Subject, age, seq, id)
+		h, task, stop, err := r.takeTurn(ctx, q, s.Subject, age, seq, id)
 		if err != nil {
 			return nil, err
 		}
-		if h != nil {
-			h.turn = turn
-			r.metrics.observeLeaseWait(ctx, q, start)
-			var d drained
-			if task != nil {
-				d = r.runClaimed(ctx, q, h, *task, seq)
-			} else {
-				// Something else is due first, or the statement's view was
-				// stale: claim under the lease from what is there now.
-				d = r.drainSync(ctx, q, h, seq, id)
+		if h != nil || stop != nil {
+			d := drained{stop: stop}
+			if h != nil {
+				h.turn = turn
+				r.metrics.observeLeaseWait(ctx, q, start)
+				if task != nil {
+					d = r.runClaimed(ctx, q, h, *task, seq)
+				} else {
+					// The statement's view was older than the lease: claim
+					// under it from what is there now.
+					d = r.drainSync(ctx, q, h, seq, id)
+				}
+				r.endHold(ctx, h, d.stop)
+				start = time.Now()
 			}
-			r.endHold(ctx, h, d.stop)
-			start = time.Now()
 			if d.ran {
+				finished = true
 				return d.res, d.err
 			}
 			var die *dieError
@@ -888,6 +898,7 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 			pause = wait.next()
 		}
 		if w := r.awaitTurn(ctx, q, id, turn, pause, s.Expires, behind); w.done {
+			finished = w.finished
 			return w.res, w.err
 		}
 	}
