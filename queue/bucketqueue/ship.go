@@ -46,7 +46,7 @@ type SealReporter interface {
 
 // registerShip registers queue-bucket.ship.
 func (q *Queue) registerShip(r *taskrunner.Runner) error {
-	return r.Handle(registry.BucketQueue, registry.BucketShipAction, q.runShip, taskrunner.WithRetry(shipRetry))
+	return r.Handle(Name, ShipAction, q.runShip, taskrunner.WithRetry(shipRetry))
 }
 
 // QueueShip queues a ship of bucket's sealed catalog segments, due now, as
@@ -96,7 +96,7 @@ func (q *Queue) queueAwaitedShip(ctx context.Context, ex *taskrunner.Exec, st *r
 	if err != nil {
 		return err
 	}
-	spec := q.bucketSpec(st.Space, registry.BucketShipAction, raw)
+	spec := q.bucketSpec(st.Space, ShipAction, raw)
 	now := registry.DueNow()
 	spec.NotBefore, spec.Replace = &now, true
 	_, err = ex.Submit(ctx, spec)
@@ -217,7 +217,7 @@ func (q *Queue) queueShip(ctx context.Context, bucket string) error {
 	if err != nil {
 		return err
 	}
-	spec := q.bucketSpec(st.Space, registry.BucketShipAction, args)
+	spec := q.bucketSpec(st.Space, ShipAction, args)
 	now := registry.DueNow()
 	spec.NotBefore, spec.Replace = &now, true
 	_, err = q.runner.Submit(ctx, spec)

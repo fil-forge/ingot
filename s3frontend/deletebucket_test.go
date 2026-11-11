@@ -205,7 +205,7 @@ func TestAnAbandonedDeleteNeverActs(t *testing.T) {
 	ctx := context.Background()
 
 	put := context.WithValue(ctx, reqscope.RequestKey(), cmds3.Request{})
-	err := runBucketTaskRaw(put, mem, mem.bk(), registry.BucketDeleteAction, &bucketqueue.BucketTask{Name: "bk"})
+	err := runBucketTaskRaw(put, mem, mem.bk(), bucketqueue.DeleteAction, &bucketqueue.BucketTask{Name: "bk"})
 	if err == nil || !taskrunner.IsPermanent(err) {
 		t.Fatalf("delete run with another request's context: %v, want a permanent refusal", err)
 	}

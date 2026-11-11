@@ -81,11 +81,11 @@ func newTestStoreWithLease(t testing.TB, ttl time.Duration) *testStore {
 			// which tests delay (Limits.AcceptDelay) so that only they run
 			// one (runAccepts) or Complete does. The blobs' accepts an
 			// upload's accept queues run on queue-space-shard's workers.
-			{Name: registry.MultipartQueue, Workers: 2},
+			{Name: multipartqueue.Name, Workers: 2},
 			// Commits run sync, in the request; the workers run ships.
-			{Name: registry.BucketQueue, Workers: 2},
+			{Name: bucketqueue.Name, Workers: 2},
 			{Name: spaceuploadqueue.Name, Workers: 2},
-			{Name: registry.SpaceShardQueue, Workers: 2},
+			{Name: spaceshardqueue.Name, Workers: 2},
 			{Name: shardqueue.Name, Workers: 2},
 		},
 		LeaseTTL:     ttl,
@@ -99,7 +99,7 @@ func newTestStoreWithLease(t testing.TB, ttl time.Duration) *testStore {
 	if err := r.Migrate(context.Background()); err != nil {
 		t.Fatalf("migrate task queues: %v", err)
 	}
-	return &testStore{Postgres: registry.NewPostgres(pool, registry.WithTasks(r)), pool: pool, tasks: r}
+	return &testStore{Postgres: registry.NewPostgres(pool), pool: pool, tasks: r}
 }
 
 // newBackend builds a backend over deps that runs its tasks on the store's
@@ -336,16 +336,16 @@ func (s *testStore) queued(ctx context.Context, queue string) ([]taskrunnertest.
 // ListReleasesBySpace returns the space's pending releases, due or not,
 // oldest first.
 func (s *testStore) ListReleasesBySpace(ctx context.Context, space did.DID) ([]pendingRelease, error) {
-	tasks, err := s.queued(ctx, registry.SpaceShardQueue)
+	tasks, err := s.queued(ctx, spaceshardqueue.Name)
 	if err != nil {
 		return nil, err
 	}
 	var out []pendingRelease
 	for _, t := range tasks {
-		if t.Action != registry.ReleaseAction || t.State != "pending" {
+		if t.Action != spaceshardqueue.ReleaseAction || t.State != "pending" {
 			continue
 		}
-		sp, d, err := registry.ParseSpaceShardSubject(t.Subject)
+		sp, d, err := spaceshardqueue.ParseSubject(t.Subject)
 		if err != nil {
 			return nil, err
 		}
@@ -364,7 +364,12 @@ func (s *testStore) ListReleasesBySpace(ctx context.Context, space did.DID) ([]p
 // EnqueueRelease queues the release of digest in space at notBefore, as a
 // commit dropping its last claim would, with no authority of its own.
 func (s *testStore) EnqueueRelease(ctx context.Context, space did.DID, digest multihash.Multihash, notBefore time.Time) error {
-	return s.QueueReleases(ctx, space, []multihash.Multihash{digest}, notBefore, registry.ReleaseTask{})
+	spec, err := (spaceshardqueue.ReleaseTask{}).Spec(space, digest, notBefore)
+	if err != nil {
+		return err
+	}
+	_, err = s.tasks.Submit(ctx, spec)
+	return err
 }
 
 // ReleasingDigests reports which of digests have a release pending or running
@@ -372,9 +377,9 @@ func (s *testStore) EnqueueRelease(ctx context.Context, space did.DID, digest mu
 func (s *testStore) ReleasingDigests(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error) {
 	subjects := make([]string, len(digests))
 	for i, d := range digests {
-		subjects[i] = registry.SpaceShardSubject(space, d)
+		subjects[i] = spaceshardqueue.Subject(space, d)
 	}
-	pending, err := s.tasks.Pending(ctx, registry.SpaceShardQueue, subjects, registry.ReleaseAction)
+	pending, err := s.tasks.Pending(ctx, spaceshardqueue.Name, subjects, spaceshardqueue.ReleaseAction)
 	if err != nil {
 		return nil, err
 	}
@@ -396,7 +401,7 @@ func (s *testStore) ReleasingDigests(ctx context.Context, space did.DID, digests
 // is left waiting to retry.
 func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 	s := storeFor(b)
-	tasks, err := s.queued(ctx, registry.SpaceShardQueue)
+	tasks, err := s.queued(ctx, spaceshardqueue.Name)
 	if err != nil {
 		return 0, err
 	}
@@ -404,7 +409,7 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 	before := map[taskrunner.TaskID]bool{}
 	seen := map[string]bool{}
 	for _, t := range tasks {
-		if t.Action != registry.ReleaseAction || t.State != "pending" {
+		if t.Action != spaceshardqueue.ReleaseAction || t.State != "pending" {
 			continue
 		}
 		before[t.ID] = true
@@ -413,7 +418,7 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 			subjects = append(subjects, t.Subject)
 		}
 		if t.Attempts > 0 {
-			if _, err := storeFor(b).tasks.Expedite(ctx, registry.SpaceShardQueue, t.Subject, registry.ReleaseAction); err != nil {
+			if _, err := storeFor(b).tasks.Expedite(ctx, spaceshardqueue.Name, t.Subject, spaceshardqueue.ReleaseAction); err != nil {
 				return 0, err
 			}
 		}
@@ -427,7 +432,7 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 			return 0, err
 		}
 	}
-	if tasks, err = s.queued(ctx, registry.SpaceShardQueue); err != nil {
+	if tasks, err = s.queued(ctx, spaceshardqueue.Name); err != nil {
 		return 0, err
 	}
 	n := 0
@@ -449,8 +454,12 @@ func commitPut(ctx context.Context, b *Backend, st *registry.State, key string, 
 
 // PutPart records p as an add-part's commit does, outside any task, for
 // tests that set up a part directly.
-func (s *testStore) PutPart(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree, release registry.ReleaseTask) ([]multihash.Multihash, error) {
-	w, released, err := s.PartWrites(ctx, p, tree, release)
+func (s *testStore) PutPart(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree) ([]multihash.Multihash, error) {
+	w, err := s.PartWrites(ctx, p, tree)
+	if err != nil {
+		return nil, err
+	}
+	specs, err := spaceshardqueue.OwedSpecs(w, spaceshardqueue.ReleaseTask{})
 	if err != nil {
 		return nil, err
 	}
@@ -464,13 +473,15 @@ func (s *testStore) PutPart(ctx context.Context, p registry.MultipartPart, tree 
 			return nil, err
 		}
 	}
-	for _, spec := range w.Spawns {
-		if _, err := s.tasks.SubmitTx(ctx, tx, spec); err != nil {
-			return nil, err
-		}
-	}
-	if err := s.tasks.CancelTx(ctx, tx, registry.SpaceShardQueue, w.Expiries...); err != nil {
+	if _, err := s.tasks.SubmitAllTx(ctx, tx, specs); err != nil {
 		return nil, err
+	}
+	if err := s.tasks.CancelTx(ctx, tx, spaceshardqueue.Name, w.Expiries...); err != nil {
+		return nil, err
+	}
+	var released []multihash.Multihash
+	for _, r := range w.Releases {
+		released = append(released, r.Digest)
 	}
 	return released, tx.Commit(ctx)
 }
@@ -532,16 +543,16 @@ func sweepUploads(ctx context.Context, b *Backend) (int, error) {
 // not, each once.
 func releaseSpaces(t *testing.T, mem *testStore) []did.DID {
 	t.Helper()
-	tasks, err := mem.queued(context.Background(), registry.SpaceShardQueue)
+	tasks, err := mem.queued(context.Background(), spaceshardqueue.Name)
 	if err != nil {
 		t.Fatalf("queued releases: %v", err)
 	}
 	var out []did.DID
 	for _, task := range tasks {
-		if task.Action != registry.ReleaseAction {
+		if task.Action != spaceshardqueue.ReleaseAction {
 			continue
 		}
-		space, _, err := registry.ParseSpaceShardSubject(task.Subject)
+		space, _, err := spaceshardqueue.ParseSubject(task.Subject)
 		if err != nil {
 			t.Fatalf("space-shard subject: %v", err)
 		}

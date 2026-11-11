@@ -19,12 +19,14 @@ import (
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/logstore"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/jackc/pgx/v5"
 )
 
 // liveDigest is the sha256 multihash of s: a digest the batch reads decode.
@@ -53,7 +55,8 @@ func TestPostgresStores(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.New(t)
 
-	r := registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool)))
+	tasks := liveUploadTasks(t, pool)
+	r := liveRegistry(pool, tasks)
 	// seedBucket inserts a bucket row directly, bypassing Create, and returns
 	// the space DID it generated. space and tenant have no default — Create
 	// always supplies the DIDs Hilt returns — so the seed supplies them too,
@@ -205,13 +208,13 @@ func TestPostgresStores(t *testing.T) {
 			t.Fatalf("CreateSession: %v", err)
 		}
 		t.Cleanup(func() { _ = r.DeleteSession(context.Background(), "refs-up") })
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "refs-up", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, Refs: []uuid.UUID{second}}, nil, registry.ReleaseTask{}); err != nil {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "refs-up", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, Refs: []uuid.UUID{second}}, nil); err != nil {
 			t.Fatalf("PutPart: %v", err)
 		}
 		if n := count(t, uuid.Nil); n != 2 {
 			t.Fatalf("references after the part = %d, want 2 (the claim and the part)", n)
 		}
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "refs-up", PartNumber: 2, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, Refs: []uuid.UUID{second}}, nil, registry.ReleaseTask{}); !errors.Is(err, registry.ErrReferenceExpired) {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "refs-up", PartNumber: 2, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, Refs: []uuid.UUID{second}}, nil); !errors.Is(err, registry.ErrReferenceExpired) {
 			t.Fatalf("part with a reference taken over: err=%v, want ErrReferenceExpired", err)
 		}
 	})
@@ -239,14 +242,23 @@ func TestPostgresStores(t *testing.T) {
 
 		// A later queueing of the same release keeps the later time, and a
 		// batch of digests queues each once.
+		queue := func(at time.Time, digests ...multihash.Multihash) {
+			t.Helper()
+			specs := make([]taskrunner.Spec, len(digests))
+			for i, d := range digests {
+				var err error
+				if specs[i], err = (spaceshardqueue.ReleaseTask{}).Spec(space, d, at); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := tasks.SubmitAll(ctx, specs); err != nil {
+				t.Fatalf("queue releases: %v", err)
+			}
+		}
 		later := time.Now().Add(time.Hour).Truncate(time.Millisecond)
-		if err := r.QueueReleases(ctx, space, []multihash.Multihash{digest}, later, registry.ReleaseTask{}); err != nil {
-			t.Fatalf("QueueReleases (later): %v", err)
-		}
+		queue(later, digest)
 		d2 := multihash.Multihash([]byte{0xbb, 0x02})
-		if err := r.QueueReleases(ctx, space, []multihash.Multihash{digest, d2, d2}, registry.DueNow(), registry.ReleaseTask{}); err != nil {
-			t.Fatalf("QueueReleases (batch): %v", err)
-		}
+		queue(registry.DueNow(), digest, d2, d2)
 		queued := mustListReleases(t, pool, space)
 		if len(queued) != 2 {
 			t.Fatalf("queued releases = %v, want two", queued)
@@ -563,11 +575,11 @@ func TestPostgresStores(t *testing.T) {
 		_ = r.DeleteSession(ctx, id+"-space")
 
 		// bytea[] round trip + ordering.
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}, nil, registry.ReleaseTask{}); err != nil {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}, nil); err != nil {
 			t.Fatalf("PutPart 2: %v", err)
 		}
 		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1, 0xa}, {0xd1, 0xb}}},
-			&registry.PartTree{Offset: 0, ChunkLog: 4, Nodes: []byte{0x0a}, Blocks: []byte{0x0b, 0x0c}, Head: []byte{0x0d}, Tail: []byte{0x0e}, Root: []byte{0x0f}}, registry.ReleaseTask{}); err != nil {
+			&registry.PartTree{Offset: 0, ChunkLog: 4, Nodes: []byte{0x0a}, Blocks: []byte{0x0b, 0x0c}, Head: []byte{0x0d}, Tail: []byte{0x0e}, Root: []byte{0x0f}}); err != nil {
 			t.Fatalf("PutPart 1: %v", err)
 		}
 		parts, err := r.ListParts(ctx, id)
@@ -585,14 +597,14 @@ func TestPostgresStores(t *testing.T) {
 		}
 		// A superseding part without a tree drops its predecessor's row; one
 		// with a tree replaces it.
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil, registry.ReleaseTask{}); err != nil {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil); err != nil {
 			t.Fatalf("PutPart 1 again: %v", err)
 		}
 		if again, _ := r.ListPartTrees(ctx, id); again[1] != nil {
 			t.Fatalf("superseded part kept its tree: %+v", again[1])
 		}
 		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}},
-			&registry.PartTree{Offset: 1, ChunkLog: 5, Nodes: []byte{0x1a}, Blocks: []byte{0x1b}}, registry.ReleaseTask{}); err != nil {
+			&registry.PartTree{Offset: 1, ChunkLog: 5, Nodes: []byte{0x1a}, Blocks: []byte{0x1b}}); err != nil {
 			t.Fatalf("PutPart 2 with tree: %v", err)
 		}
 		if again, _ := r.ListPartTrees(ctx, id); again[2] == nil || again[2].Offset != 1 || again[2].ChunkLog != 5 || again[2].Head != nil {
@@ -616,10 +628,10 @@ func TestPostgresStores(t *testing.T) {
 		}
 		// A part cannot land once the session has left 'open', nor on a
 		// session that does not exist.
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagMD5: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}, nil, registry.ReleaseTask{}); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagMD5: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}, nil); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("PutPart on a completed session = %v, want ErrNotFound", err)
 		}
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil, registry.ReleaseTask{}); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("PutPart on a missing session = %v, want ErrNotFound", err)
 		}
 		if parts, _ := r.ListParts(ctx, id); len(parts) != 2 {
@@ -677,10 +689,10 @@ func TestPostgresStores(t *testing.T) {
 
 		// CountPartRefs: bytea[] ANY-match across sessions, excluding one.
 		shared := []byte{0xee, 0x01}
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{shared}}, nil, registry.ReleaseTask{}); err != nil {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{shared}}, nil); err != nil {
 			t.Fatalf("PutPart ls-1: %v", err)
 		}
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-2", PartNumber: 1, ETagMD5: []byte{2}, Size: 1, BlobDigests: []multihash.Multihash{shared, {0xee, 0x02}}}, nil, registry.ReleaseTask{}); err != nil {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-2", PartNumber: 1, ETagMD5: []byte{2}, Size: 1, BlobDigests: []multihash.Multihash{shared, {0xee, 0x02}}}, nil); err != nil {
 			t.Fatalf("PutPart ls-2: %v", err)
 		}
 		if n, err := r.CountPartRefs(ctx, shared, "ls-1"); err != nil || n != 1 {
@@ -936,7 +948,7 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 	}
 	defer pool.Close()
 	tasks := liveUploadTasks(t, setupPool)
-	reg := registry.NewPostgres(pool, registry.WithTasks(tasks))
+	reg := liveRegistry(pool, tasks)
 	setup := registry.NewPostgres(setupPool)
 
 	space := testutil.RandomDID(t)
@@ -991,12 +1003,27 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 	}
 }
 
-// liveUploadTasks returns a migrated runner holding the upload queue, for the
-// registry to queue registrations through.
+// liveRegistry is a registry over pool whose CommitRoot and PutPart queue
+// the tasks a commit's writes owe on tasks, carrying no authority.
+func liveRegistry(pool *pgxpool.Pool, tasks *taskrunner.Runner) *registry.Postgres {
+	return registry.WithOwedTasks(registry.NewPostgres(pool), func(ctx context.Context, tx pgx.Tx, w registry.CommitWrites) error {
+		specs, err := spaceshardqueue.OwedSpecs(w, spaceshardqueue.ReleaseTask{})
+		if err != nil {
+			return err
+		}
+		if _, err := tasks.SubmitAllTx(ctx, tx, specs); err != nil {
+			return err
+		}
+		return tasks.CancelTx(ctx, tx, spaceshardqueue.Name, w.Expiries...)
+	})
+}
+
+// liveUploadTasks returns a migrated runner holding the upload and
+// space-shard queues, for a test registry to queue a commit's tasks on.
 func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
 	t.Helper()
 	r, err := taskrunner.New(pool, taskrunner.Options{Schema: "ingot", Queues: []taskrunner.QueueOptions{
-		{Name: spaceuploadqueue.Name}, {Name: registry.SpaceShardQueue},
+		{Name: spaceuploadqueue.Name}, {Name: spaceshardqueue.Name},
 	}})
 	if err != nil {
 		t.Fatalf("task runner: %v", err)
@@ -1009,7 +1036,7 @@ func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
 			t.Fatalf("register %s: %v", op, err)
 		}
 	}
-	if err := r.Handle(registry.SpaceShardQueue, registry.ReleaseAction, noop); err != nil {
+	if err := r.Handle(spaceshardqueue.Name, spaceshardqueue.ReleaseAction, noop); err != nil {
 		t.Fatalf("register release: %v", err)
 	}
 	if err := r.Migrate(context.Background()); err != nil {
@@ -1063,7 +1090,7 @@ func livePool(t *testing.T) *pgxpool.Pool {
 func TestCommitRootQueuesUploadRegistrations(t *testing.T) {
 	pool := livePool(t)
 	ctx := context.Background()
-	r := registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool)))
+	r := liveRegistry(pool, liveUploadTasks(t, pool))
 	space := testutil.RandomDID(t)
 	if err := r.Create(ctx, "queue-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("create bucket: %v", err)
@@ -1136,7 +1163,7 @@ func TestABucketIsItsOwnSpace(t *testing.T) {
 func TestBucketCORSConfig(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.New(t)
-	r := registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool)))
+	r := liveRegistry(pool, liveUploadTasks(t, pool))
 	if err := r.Create(ctx, "b", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}

@@ -216,19 +216,19 @@ func New(r *taskrunner.Runner, d Deps) (*Queue, error) {
 		q.logger = zap.NewNop()
 	}
 	for action, h := range map[string]taskrunner.Handler{
-		registry.MultipartCreateAction:   q.runCreate,
-		registry.MultipartAddPartAction:  q.runAddPart,
-		registry.MultipartCompleteAction: q.runComplete,
-		registry.MultipartReapAction:     q.runReap,
+		CreateAction:   q.runCreate,
+		AddPartAction:  q.runAddPart,
+		CompleteAction: q.runComplete,
+		ReapAction:     q.runReap,
 	} {
-		if err := r.Handle(registry.MultipartQueue, action, h); err != nil {
+		if err := r.Handle(Name, action, h); err != nil {
 			return nil, err
 		}
 	}
-	if err := r.Handle(registry.MultipartQueue, registry.MultipartAbortAction, q.runAbort, taskrunner.WithRetry(abortRetry)); err != nil {
+	if err := r.Handle(Name, AbortAction, q.runAbort, taskrunner.WithRetry(abortRetry)); err != nil {
 		return nil, err
 	}
-	if err := r.Handle(registry.MultipartQueue, registry.MultipartAcceptAction, q.runAccept, taskrunner.WithRetry(acceptRetry)); err != nil {
+	if err := r.Handle(Name, AcceptAction, q.runAccept, taskrunner.WithRetry(acceptRetry)); err != nil {
 		return nil, err
 	}
 	return q, nil
@@ -238,7 +238,7 @@ func New(r *taskrunner.Runner, d Deps) (*Queue, error) {
 type AbortTask struct {
 	// Release is the authority the releases of the parts' blobs remove them
 	// with: the request's, or the create request's for the auto-abort.
-	Release registry.ReleaseTask
+	Release spaceshardqueue.ReleaseTask
 	// Auto marks the auto-abort, which leaves an upload already completed or
 	// gone alone instead of failing with ErrNoSuchUpload.
 	Auto bool
@@ -258,7 +258,7 @@ type (
 type addPartCall struct {
 	part     registry.MultipartPart
 	tree     *registry.PartTree
-	release  registry.ReleaseTask
+	release  spaceshardqueue.ReleaseTask
 	released []mh.Multihash
 }
 
@@ -268,15 +268,27 @@ type abortCall struct {
 	released []mh.Multihash
 }
 
+// acceptSpec returns the queue-multipart-upload.accept an UploadPart queues
+// for uploadID, due at: a replacement, so an upload has at most one pending.
+func acceptSpec(uploadID string, at time.Time) taskrunner.Spec {
+	return taskrunner.Spec{
+		Queue:     Name,
+		Subject:   uploadID,
+		Action:    AcceptAction,
+		NotBefore: &at,
+		Replace:   true,
+	}
+}
+
 // uploadSpec is a queue-multipart-upload task on uploadID.
 func uploadSpec(uploadID, action string, args []byte) taskrunner.Spec {
-	return taskrunner.Spec{Queue: registry.MultipartQueue, Subject: uploadID, Action: action, Args: args}
+	return taskrunner.Spec{Queue: Name, Subject: uploadID, Action: action, Args: args}
 }
 
 // Create runs sess's queue-multipart-upload.create. It fails with the bucket
 // queue's errors when the bucket does not admit the upload.
 func (q *Queue) Create(ctx context.Context, sess *registry.MultipartSession) error {
-	_, err := q.runner.Run(context.WithValue(ctx, createKey{}, sess), uploadSpec(sess.UploadID, registry.MultipartCreateAction, nil))
+	_, err := q.runner.Run(context.WithValue(ctx, createKey{}, sess), uploadSpec(sess.UploadID, CreateAction, nil))
 	return err
 }
 
@@ -305,7 +317,7 @@ func (q *Queue) runCreate(ctx context.Context, ex *taskrunner.Exec, t taskrunner
 		if err := (&AbortTask{Release: q.capture(ctx, sess.Space).Release, Auto: true}).MarshalCBOR(&buf); err != nil {
 			return nil, fmt.Errorf("encode auto-abort: %w", err)
 		}
-		spec := uploadSpec(t.Subject, registry.MultipartAbortAction, buf.Bytes())
+		spec := uploadSpec(t.Subject, AbortAction, buf.Bytes())
 		at := time.Now().Add(q.sessionTTL)
 		spec.NotBefore = &at
 		if _, err := ex.Submit(ctx, spec); err != nil {
@@ -321,9 +333,9 @@ func (q *Queue) runCreate(ctx context.Context, ex *taskrunner.Exec, t taskrunner
 // addPartWaitLimit fails with ErrBusy. An upload no longer open is
 // ErrNoSuchUpload, and a reference to one of the part's blobs already gone
 // registry.ErrReferenceExpired.
-func (q *Queue) AddPart(ctx context.Context, part registry.MultipartPart, tree *registry.PartTree, release registry.ReleaseTask) ([]mh.Multihash, error) {
+func (q *Queue) AddPart(ctx context.Context, part registry.MultipartPart, tree *registry.PartTree, release spaceshardqueue.ReleaseTask) ([]mh.Multihash, error) {
 	call := &addPartCall{part: part, tree: tree, release: release}
-	spec := uploadSpec(part.UploadID, registry.MultipartAddPartAction, nil)
+	spec := uploadSpec(part.UploadID, AddPartAction, nil)
 	expires := time.Now().Add(addPartWaitLimit)
 	spec.Expires = &expires
 	if _, err := q.runner.Run(context.WithValue(ctx, addPartKey{}, call), spec); err != nil {
@@ -345,16 +357,20 @@ func (q *Queue) runAddPart(ctx context.Context, ex *taskrunner.Exec, _ taskrunne
 	if call == nil {
 		return nil, taskrunner.Permanent(errors.New("add-part: its request has gone"))
 	}
-	w, released, err := q.multipart.PartWrites(ctx, call.part, call.tree, call.release)
+	w, err := q.multipart.PartWrites(ctx, call.part, call.tree)
 	switch {
 	case errors.Is(err, registry.ErrNotFound):
 		return nil, ErrNoSuchUpload
 	case err != nil:
 		return nil, err
 	}
-	w.Spawns = append(w.Spawns, registry.AcceptSpec(call.part.UploadID, time.Now().Add(q.limits.AcceptDelay)))
-	if err := w.Apply(ctx, ex); err != nil {
+	w.Spawns = append(w.Spawns, acceptSpec(call.part.UploadID, time.Now().Add(q.limits.AcceptDelay)))
+	if err := spaceshardqueue.ApplyWrites(ctx, ex, w, call.release); err != nil {
 		return nil, err
+	}
+	var released []mh.Multihash
+	for _, r := range w.Releases {
+		released = append(released, r.Digest)
 	}
 	call.released = released
 	return nil, nil
@@ -369,7 +385,7 @@ func (q *Queue) Abort(ctx context.Context, sess registry.MultipartSession) ([]mh
 		return nil, fmt.Errorf("multipartqueue: encode abort: %w", err)
 	}
 	call := &abortCall{}
-	if _, err := q.runner.Run(context.WithValue(ctx, abortKey{}, call), uploadSpec(sess.UploadID, registry.MultipartAbortAction, buf.Bytes())); err != nil {
+	if _, err := q.runner.Run(context.WithValue(ctx, abortKey{}, call), uploadSpec(sess.UploadID, AbortAction, buf.Bytes())); err != nil {
 		return nil, err
 	}
 	return call.released, nil
@@ -467,7 +483,7 @@ func (q *Queue) sessionReleases(ctx context.Context, space did.DID, uploadID str
 // Reap runs uploadID's queue-multipart-upload.reap at once, for a
 // DeleteBucket that clears the bucket's completed uploads.
 func (q *Queue) Reap(ctx context.Context, uploadID string) error {
-	_, err := q.runner.Run(ctx, uploadSpec(uploadID, registry.MultipartReapAction, nil))
+	_, err := q.runner.Run(ctx, uploadSpec(uploadID, ReapAction, nil))
 	return err
 }
 
@@ -482,7 +498,7 @@ func (q *Queue) runReap(ctx context.Context, ex *taskrunner.Exec, t taskrunner.T
 
 // spawnReleases queues, with the task, a release due at of each of digests
 // in space, carrying release's authority.
-func spawnReleases(ctx context.Context, ex *taskrunner.Exec, space did.DID, digests []mh.Multihash, release registry.ReleaseTask, at time.Time) error {
+func spawnReleases(ctx context.Context, ex *taskrunner.Exec, space did.DID, digests []mh.Multihash, release spaceshardqueue.ReleaseTask, at time.Time) error {
 	specs := make([]taskrunner.Spec, len(digests))
 	for i, d := range digests {
 		var err error

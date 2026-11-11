@@ -189,13 +189,12 @@ func (tx *Tx) ClaimBlobs(claims []registry.BlobClaim) {
 }
 
 // DropClaims records the claims of a discarded generation for this commit
-// to remove. A drop of the space's last claim on a digest queues the blob's
-// release with the commit, due grace after it and carrying release's
-// authority: the grace is measured once the catalog is fsynced, not here.
-func (tx *Tx) DropClaims(drops []registry.ClaimDrop, grace time.Duration, release registry.ReleaseTask) {
+// to remove. A drop of the space's last claim on a digest owes the blob's
+// release with the commit, due grace after it: the grace is measured once
+// the catalog is fsynced, not here.
+func (tx *Tx) DropClaims(drops []registry.ClaimDrop, grace time.Duration) {
 	tx.commit.Drops = append(tx.commit.Drops, drops...)
 	tx.commit.ReleaseGrace = grace
-	tx.commit.Release = release
 }
 
 // Compile-time assertions: Tx is the canonical handle through which

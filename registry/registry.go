@@ -214,9 +214,6 @@ type RootCommit struct {
 	// queued in the same transaction, so no crash window separates "last
 	// claim gone" from "release queued".
 	Drops []ClaimDrop
-	// Release is the authority the releases the Drops queue remove their
-	// blobs with, captured from the request.
-	Release ReleaseTask
 	// ReleaseGrace is how long after the commit a release the Drops queue
 	// is due. It is measured when the swap commits, after the catalog fsync
 	// and any lock wait that precede it, so a reader that resolved the

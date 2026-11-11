@@ -134,8 +134,7 @@ Internal:
   production `blockstore.Log`), `store.go`, `planelog.go`, `segment.go`,
   `recovery.go`. See `logstore/README.md`.
 - **`registry/`** — Postgres metadata: `postgres.go` (`Registry` + `State`;
-  `EmptyRoot`, DeleteBucket's first write), `bucketcommit.go` (`queue-bucket`
-  names, `RootCommitWrites`: the guarded root advance, claims, drops, GC
+  `EmptyRoot`, DeleteBucket's first write), `bucketcommit.go` (`RootCommitWrites`: the guarded root advance, claims, drops, GC
   candidates and the journal rows of each commit's catalog blocks in
   `ingot.catalog_journal` until their segment ships, written with the commit
   task), `segments.go` (`logstore.Meta`, and `CatalogUsage`, the per-bucket
@@ -154,9 +153,10 @@ Internal:
   The packages:
   `shardqueue` (`queue-shard`, the cache's copies), `spaceuploadqueue`
   (`queue-space-upload`, the object-count changes), `spaceshardqueue`
-  (`queue-space-shard`, the tasks on one blob in one space; its name,
-  subjects and release arguments are in `registry`, which queues releases
-  with bucket commits and part writes), `bucketqueue` (`queue-bucket`,
+  (`queue-space-shard`, the tasks on one blob in one space; the releases
+  bucket commits and part writes owe come back from `registry` as data,
+  and the queue that applies those writes queues them through it),
+  `bucketqueue` (`queue-bucket`,
   every change to a bucket: `.commit` applies an ordered list of key
   changes to one Tx under the version tree's write rule, failing a change
   on its own terms with one of a fixed set of errors; `.create`,

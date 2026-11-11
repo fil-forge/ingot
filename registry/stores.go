@@ -315,11 +315,6 @@ type BlobRefStore interface {
 	// ExpiriesOf returns the queue-space-shard.expire task of each of refs
 	// that is still a pending reference, in no particular order.
 	ExpiriesOf(ctx context.Context, refs []taskrunner.TaskID) ([]taskrunner.TaskID, error)
-	// QueueReleases queues the release of each of digests in space, due at
-	// notBefore and carrying release's authority, in one transaction. A
-	// digest repeated is released once, and a release already pending keeps
-	// the later time.
-	QueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time, release ReleaseTask) error
 }
 
 // IntentStore is the upload index (§5): the blobs Ingot wrote and their
@@ -442,7 +437,7 @@ type MultipartStore interface {
 	GetSession(ctx context.Context, uploadID string) (*MultipartSession, error)
 	DeleteSession(ctx context.Context, uploadID string) error
 	// PartWrites returns the writes that record a part (Postgres.PartWrites).
-	PartWrites(ctx context.Context, p MultipartPart, tree *PartTree, release ReleaseTask) (CommitWrites, []multihash.Multihash, error)
+	PartWrites(ctx context.Context, p MultipartPart, tree *PartTree) (CommitWrites, error)
 	// ListParkedParts returns up to limit of uploadID's 'parked' parts
 	// numbered above after, in part-number order: the accept's queue.
 	ListParkedParts(ctx context.Context, uploadID string, after, limit int) ([]MultipartPart, error)

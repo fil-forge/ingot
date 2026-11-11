@@ -16,7 +16,7 @@ import (
 // against Postgres.
 func TestPutPartReplaced(t *testing.T) {
 	pool := pgtest.New(t)
-	runPutPartReplacedSuite(t, pool, registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool))))
+	runPutPartReplacedSuite(t, pool, liveRegistry(pool, liveUploadTasks(t, pool)))
 }
 
 func runPutPartReplacedSuite(t *testing.T, pool *pgxpool.Pool, st *registry.Postgres) {
@@ -47,7 +47,7 @@ func runPutPartReplacedSuite(t *testing.T, pool *pgxpool.Pool, st *registry.Post
 
 	t.Run("a new part number releases nothing", func(t *testing.T) {
 		space := open("pp-new")
-		released, err := st.PutPart(ctx, part("pp-new", 1, digest(1)), nil, registry.ReleaseTask{})
+		released, err := st.PutPart(ctx, part("pp-new", 1, digest(1)), nil)
 		if err != nil || released != nil {
 			t.Fatalf("PutPart = %v, %v; want no releases", released, err)
 		}
@@ -58,11 +58,11 @@ func runPutPartReplacedSuite(t *testing.T, pool *pgxpool.Pool, st *registry.Post
 
 	t.Run("a supersede records a release for each blob the part drops, with the write", func(t *testing.T) {
 		space := open("pp-again")
-		if _, err := st.PutPart(ctx, part("pp-again", 1, digest(1), digest(2), digest(2)), nil, registry.ReleaseTask{}); err != nil {
+		if _, err := st.PutPart(ctx, part("pp-again", 1, digest(1), digest(2), digest(2)), nil); err != nil {
 			t.Fatalf("PutPart: %v", err)
 		}
 		// Digest 2 stays named; digest 1 is dropped and released, once.
-		released, err := st.PutPart(ctx, part("pp-again", 1, digest(3), digest(2)), nil, registry.ReleaseTask{})
+		released, err := st.PutPart(ctx, part("pp-again", 1, digest(3), digest(2)), nil)
 		if err != nil || len(released) != 1 || key(released[0]) != key(digest(1)) {
 			t.Fatalf("PutPart = %v, %v; want one release, of the dropped digest", released, err)
 		}
@@ -71,7 +71,7 @@ func runPutPartReplacedSuite(t *testing.T, pool *pgxpool.Pool, st *registry.Post
 			t.Fatalf("releases recorded = %v, want the dropped digest's, due now", rec)
 		}
 		// Another part number of the upload replaces no row.
-		released, err = st.PutPart(ctx, part("pp-again", 2, digest(4)), nil, registry.ReleaseTask{})
+		released, err = st.PutPart(ctx, part("pp-again", 2, digest(4)), nil)
 		if err != nil || released != nil {
 			t.Fatalf("PutPart of part 2 = %v, %v; want no releases", released, err)
 		}

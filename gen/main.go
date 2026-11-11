@@ -13,7 +13,6 @@ import (
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
-	"github.com/fil-forge/ingot/registry"
 	cbg "github.com/whyrusleeping/cbor-gen"
 )
 
@@ -35,11 +34,6 @@ func main() {
 	); err != nil {
 		panic(err)
 	}
-	if err := cfg.WriteMapEncodersToFile("../registry/cbor_gen.go", "registry",
-		registry.ReleaseTask{},
-	); err != nil {
-		panic(err)
-	}
 	if err := cfg.WriteMapEncodersToFile("../queue/shardqueue/cbor_gen.go", "shardqueue",
 		shardqueue.CacheTask{},
 		shardqueue.EvictTask{},
@@ -53,6 +47,7 @@ func main() {
 	}
 	if err := cfg.WriteMapEncodersToFile("../queue/spaceshardqueue/cbor_gen.go", "spaceshardqueue",
 		spaceshardqueue.AddTask{},
+		spaceshardqueue.ReleaseTask{},
 	); err != nil {
 		panic(err)
 	}

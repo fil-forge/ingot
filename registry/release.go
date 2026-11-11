@@ -1,10 +1,6 @@
 package registry
 
 import (
-	"bytes"
-	"encoding/hex"
-	"fmt"
-	"strings"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
@@ -13,102 +9,11 @@ import (
 	"github.com/fil-forge/ingot/taskrunner"
 )
 
-// SpaceShardQueue is queue-space-shard, the task queue of the tasks on one
-// blob in one space: a write's add of it and the expiry of the reference
-// the add took, its accept (BlobAcceptAction) and its release. Its subject
-// is the space and the digest (SpaceShardSubject), so at most one task on a
-// blob in a space runs at a time, and a space's subjects share a prefix.
-const SpaceShardQueue = "queue-space-shard"
-
-// ReleaseAction removes a blob nothing in the space claims any more from the
-// space on the network, and its local rows and copy.
-const ReleaseAction = "release"
-
-// The queue-space-shard actions a write's use of a blob goes through. An add
-// takes the write's pending reference to the blob, under the blob's subject,
-// so it never overlaps a release; an expire drops the reference at its
-// deadline if nothing took it over.
-const (
-	AddAction    = "add"
-	ExpireAction = "expire"
-)
-
-// SpaceShardSubject is the subject of the tasks on digest in space.
-func SpaceShardSubject(space did.DID, digest multihash.Multihash) string {
-	return space.String() + "/" + hex.EncodeToString(digest)
-}
-
-// SpaceShardSubjects is the subject pattern matching every queue-space-shard
-// task in space, for taskrunner.Runner.Expedite.
-func SpaceShardSubjects(space did.DID) string {
-	return space.String() + "/*"
-}
-
-// ParseSpaceShardSubject returns the space and digest a queue-space-shard
-// subject names.
-func ParseSpaceShardSubject(subject string) (did.DID, multihash.Multihash, error) {
-	i := strings.LastIndexByte(subject, '/')
-	if i < 0 {
-		return did.Undef, nil, fmt.Errorf("registry: space-shard subject %q has no digest", subject)
-	}
-	space, err := did.Parse(subject[:i])
-	if err != nil {
-		return did.Undef, nil, fmt.Errorf("registry: space-shard subject space: %w", err)
-	}
-	digest, err := hex.DecodeString(subject[i+1:])
-	if err != nil {
-		return did.Undef, nil, fmt.Errorf("registry: space-shard subject digest: %w", err)
-	}
-	return space, digest, nil
-}
-
 // DueNow is the NotBefore of a release due at once: a second back, so a
 // database clock a little behind this host's still finds it due, and a caller
 // running it inline straight away does not find it not yet due.
 func DueNow() time.Time {
 	return time.Now().Add(-time.Second)
-}
-
-// ReleaseTask is a release's arguments: the authority it removes the blob
-// with, captured from the request that left it unclaimed, since the release
-// runs after that request has gone. Either may be empty, and the release then
-// borrows authority the space captured since.
-type ReleaseTask struct {
-	// RemoveProofs is an encoded UCAN container holding the chain for
-	// /blob/remove on the space.
-	RemoveProofs []byte
-	// AbortProofs is the same for /blob/abort, for a blob still parked.
-	AbortProofs []byte
-}
-
-// Spec returns the task that releases digest in space at notBefore. It is a
-// replacement, so of two releases of one blob pending, the later is kept: a
-// reader of the version that dropped the claim keeps its grace.
-func (args ReleaseTask) Spec(space did.DID, digest multihash.Multihash, notBefore time.Time) (taskrunner.Spec, error) {
-	var buf bytes.Buffer
-	if err := args.MarshalCBOR(&buf); err != nil {
-		return taskrunner.Spec{}, fmt.Errorf("registry: encode release: %w", err)
-	}
-	return taskrunner.Spec{
-		Queue:     SpaceShardQueue,
-		Subject:   SpaceShardSubject(space, digest),
-		Action:    ReleaseAction,
-		Args:      buf.Bytes(),
-		NotBefore: &notBefore,
-		Replace:   true,
-	}, nil
-}
-
-// ReleaseTaskFrom decodes a release task's arguments.
-func ReleaseTaskFrom(t taskrunner.Task) (ReleaseTask, error) {
-	var args ReleaseTask
-	if len(t.Args) == 0 {
-		return args, nil
-	}
-	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
-		return ReleaseTask{}, fmt.Errorf("registry: decode release: %w", err)
-	}
-	return args, nil
 }
 
 // Statement is one write for a task to commit with its outcome

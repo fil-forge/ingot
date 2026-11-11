@@ -73,9 +73,7 @@ type ServerDeps struct {
 	// service counts to report the space's object count.
 	Registrar uploader.UploadRegistrar
 	// Tasks runs ingot's durable task queues: New registers the handlers,
-	// Start starts it and Stop stops it. It must be migrated, and be the
-	// runner the Postgres registry queues through (registry.WithTasks).
-	// Required.
+	// Start starts it and Stop stops it. It must be migrated. Required.
 	Tasks *taskrunner.Runner
 
 	// Authority is the service that authorizes bucket creation and deletion.
