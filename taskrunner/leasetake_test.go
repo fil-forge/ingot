@@ -3,6 +3,7 @@ package taskrunner_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -221,7 +222,7 @@ func TestALeaseTakeOutlivesItsCaller(t *testing.T) {
 		t.Fatalf("Run = %v, want its ctx's context.Canceled", err)
 	}
 	if db.took.Load() == 0 {
-		t.Fatal("no take took the lease; the test delayed no lease's take")
+		t.Fatal("Run never learned that its delayed take took the lease: the take was cut off when ctx ended, or found the lease held")
 	}
 	if n := db.ran.Load(); n != 0 {
 		t.Errorf("the handler ran %d time(s) for a caller that had given up", n)
@@ -238,5 +239,78 @@ func TestALeaseTakeOutlivesItsCaller(t *testing.T) {
 			t.Fatalf("a lease row is left on the subject after the take landed, want none")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestASyncChildsLeaseTakeOutlivesItsCaller: a sync child's take that lands
+// after the tree's caller gave up does not run the child, whether the parent
+// returns the error or calls the child again, and leaves no lease behind.
+func TestASyncChildsLeaseTakeOutlivesItsCaller(t *testing.T) {
+	for _, again := range []bool{false, true} {
+		t.Run(fmt.Sprintf("again=%v", again), func(t *testing.T) {
+			env := taskrunnertest.NewEnv(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			db := &leaseTakeDB{Pool: env.DB, inFlight: 300 * time.Millisecond, landed: make(chan struct{})}
+			// The parent's take is the first; the caller gives up as the
+			// child's, the second, is on its way.
+			var takes atomic.Int32
+			db.onTake = func() {
+				if takes.Add(1) == 2 {
+					cancel()
+				}
+			}
+			r, err := taskrunner.New(db, taskrunner.Options{
+				Schema:       env.Schema,
+				Queues:       []taskrunner.QueueOptions{{Name: qTop}, {Name: qMiddle}},
+				LeaseTTL:     time.Minute,
+				PollInterval: 20 * time.Millisecond,
+				Logger:       zaptest.NewLogger(t),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			child := taskrunner.Spec{Queue: qMiddle, Subject: "c", Action: "child"}
+			if err := r.Handle(qTop, "parent", func(ctx context.Context, ex *taskrunner.Exec, _ taskrunner.Task) ([]byte, error) {
+				_, err := ex.Run(ctx, child)
+				if again {
+					_, err = ex.Run(ctx, child)
+				}
+				return nil, err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Handle(qMiddle, "child", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+				db.ran.Add(1)
+				return nil, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Migrate(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = r.Stop(context.Background()) })
+
+			_, err = r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "parent"})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run = %v, want its ctx's context.Canceled", err)
+			}
+			if takes.Load() < 2 {
+				t.Fatal("the child made no take")
+			}
+			if n := db.ran.Load(); n != 0 {
+				t.Errorf("the child ran %d time(s) for a caller that had given up", n)
+			}
+			var n int
+			if err := env.DB.QueryRow(context.Background(), `SELECT (SELECT count(*) FROM `+env.Table("queue_top_leases")+`) + (SELECT count(*) FROM `+env.Table("queue_middle_leases")+`)`).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			if n != 0 {
+				t.Errorf("%d lease rows left, want none", n)
+			}
+		})
 	}
 }

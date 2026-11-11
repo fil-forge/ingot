@@ -245,7 +245,9 @@ func (tr *tree) lease(ctx context.Context, q *queue, subject string) error {
 		if h.lost.Load() {
 			return &childLostError{key}
 		}
-		return nil
+		// A hold a take stored after the tree's ctx ended runs nothing on
+		// a second call either.
+		return ctx.Err()
 	}
 	start := time.Now()
 	wait := newBackoff(tr.r.opts.PollInterval)
