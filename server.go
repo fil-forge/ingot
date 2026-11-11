@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/fil-forge/libforge/identity"
@@ -161,8 +160,6 @@ type Server struct {
 	sweepCtx    context.Context
 	sweepCancel context.CancelFunc
 	sweeps      sync.WaitGroup
-	// stopping is set just before Stop closes the listener; see serve.
-	stopping atomic.Bool
 }
 
 // New wires a ServerDeps + ServerConfig into a runnable Server. The
@@ -302,12 +299,10 @@ func (s *Server) Start(ctx context.Context) error {
 	return nil
 }
 
-// serve runs the S3 listener until Stop closes it. versitygw reports that
-// close as an error rather than a clean return, so an error once Stop is
-// closing the listener is the shutdown's own, not a listener failure, and
-// goes unlogged.
+// serve runs the S3 listener until Stop closes it. Stop's close returns nil,
+// so any error is a listener failure.
 func (s *Server) serve() {
-	if err := s.api.ServeMultiPort([]string{s.cfg.Addr}); err != nil && !s.stopping.Load() {
+	if err := s.api.ServeMultiPort([]string{s.cfg.Addr}); err != nil {
 		s.logger.Error("ingot listener error", zap.Error(err))
 	}
 }
@@ -430,7 +425,6 @@ func (s *Server) Stop(ctx context.Context) error {
 	if err := s.backend.CloseMetrics(); err != nil {
 		errs = append(errs, fmt.Errorf("unregister gauges: %w", err))
 	}
-	s.stopping.Store(true)
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))
 	}
