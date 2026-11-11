@@ -133,18 +133,13 @@ SELECT false, false, tree_created, tree_id FROM `+q.leases+`
 // takeTurn is tryLease and claim in one statement, for a Run caller whose
 // task, target with sequence number upTo, is to run first under the lease.
 // It returns a nil hold when the lease is held. Otherwise it returns the hold
-// and either the task, claimed, or why it was not: stop is nil when nothing
-// is due or the oldest due task waits to retry or belongs to another
-// instance, a *yieldError when that task's own caller is waiting for it, and
-// an *aheadError when it is another task for the workers. The lease row
-// records the caller's tree age as it is taken, and the claim lands with it,
-// so the task starts without recording its age again.
-func (r *Runner) takeTurn(ctx context.Context, q *queue, subject string, age treeAge, upTo int64, target TaskID) (h *hold, task *Task, stop error, err error) {
+// and the task when the statement claimed it, the subject's oldest due task.
+// A hold without a task is for the caller to claim under afresh, as claim
+// does: the statement's view of the tasks is as old as the statement, and
+// taking the lease may have waited for a commit that changed them.
+func (r *Runner) takeTurn(ctx context.Context, q *queue, subject string, age treeAge, upTo int64, target TaskID) (*hold, *Task, error) {
 	token := uuid.New()
 	var taken, tookOver bool
-	var next *uuid.UUID
-	var waited, backingOff *bool
-	var node *string
 	var c struct {
 		seq                *int64
 		id                 *uuid.UUID
@@ -156,10 +151,11 @@ func (r *Runner) takeTurn(ctx context.Context, q *queue, subject string, age tre
 		attempts           *int
 		node               *string
 	}
+	sent := time.Now()
 	// Every part reads the snapshot the statement started with: claimed
 	// joins taken, so it marks the task started only when this statement
 	// took the lease.
-	err = r.db.QueryRow(ctx, `
+	err := r.db.QueryRow(ctx, `
 WITH taken AS (
 	INSERT INTO `+q.leases+` AS l (subject, owner, expires, tree_created, tree_id)
 	VALUES ($1, $2, now() + $3 * interval '1 millisecond', $4, $5)
@@ -169,8 +165,7 @@ WITH taken AS (
 		WHERE l.expires < now()
 	RETURNING xmax <> 0 AS took_over
 ), next AS (
-	SELECT id, coalesce(waiting_until > now(), false) AS waited,
-		coalesce(retry_at > now(), false) AS backing_off, node FROM `+q.tasks+`
+	SELECT id, coalesce(retry_at > now(), false) AS backing_off, node FROM `+q.tasks+`
 	WHERE subject = $1 AND state = 'pending' AND seq <= $6
 	AND (not_before IS NULL OR not_before <= now())
 	ORDER BY seq LIMIT 1
@@ -182,42 +177,38 @@ WITH taken AS (
 	RETURNING t.seq, t.id, t.action, t.created, t.not_before, t.expires, t.args, t.sync, t.attempts, t.node
 )
 SELECT EXISTS (SELECT 1 FROM taken), coalesce((SELECT took_over FROM taken), false),
-	next.id, next.waited, next.backing_off, next.node,
 	claimed.seq, claimed.id, claimed.action, claimed.created, claimed.not_before,
 	claimed.expires, claimed.args, claimed.sync, claimed.attempts, claimed.node
-FROM (SELECT 1) one LEFT JOIN next ON true LEFT JOIN claimed ON true`,
+FROM (SELECT 1) one LEFT JOIN claimed ON true`,
 		subject, token, r.opts.LeaseTTL.Milliseconds(), age.created, age.id, upTo, target, r.opts.Node,
-	).Scan(&taken, &tookOver, &next, &waited, &backingOff, &node,
+	).Scan(&taken, &tookOver,
 		&c.seq, &c.id, &c.action, &c.created, &c.notBefore, &c.expires, &c.args, &c.sync, &c.attempts, &c.node)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("take lease %s/%s: %w", q.name, subject, err)
+		return nil, nil, fmt.Errorf("take lease %s/%s: %w", q.name, subject, err)
 	}
 	if !taken {
-		return nil, nil, nil, nil
+		return nil, nil, nil
 	}
 	if tookOver {
 		r.metrics.observeTakeover(ctx, q)
 	}
-	h = &hold{q: q, subject: subject, token: token, age: age, releaseOnCommit: true}
+	h := &hold{q: q, subject: subject, token: token, age: age, releaseOnCommit: true}
 	r.mu.Lock()
 	r.holds[token] = h
 	r.mu.Unlock()
-	switch {
-	case c.id != nil:
-		h.claimed = true
-		return h, &Task{
-			Queue: q.name, Subject: subject, ID: *c.id, Action: *c.action, Created: *c.created,
-			NotBefore: c.notBefore, Expires: c.expires, Args: c.args, sync: *c.sync,
-			Attempt: *c.attempts, Node: c.node, seq: *c.seq,
-		}, nil, nil
-	case next == nil, *backingOff, !r.mayRun(node):
-		// Nothing is due, or the oldest due task holds the subject.
-		return h, nil, nil, nil
-	case *waited && *next != target:
-		return h, nil, &yieldError{*next}, nil
-	default:
-		return h, nil, &aheadError{*next}, nil
+	if c.id == nil {
+		return h, nil, nil
 	}
+	// The lease expires a TTL after the statement started, and the claim
+	// can have waited on a lock for most of that. Only a statement that
+	// answered well inside the TTL, as renewal does, leaves the lease
+	// certainly live; otherwise the task checks it before it starts.
+	h.claimed = time.Since(sent) < r.opts.LeaseTTL/3
+	return h, &Task{
+		Queue: q.name, Subject: subject, ID: *c.id, Action: *c.action, Created: *c.created,
+		NotBefore: c.notBefore, Expires: c.expires, Args: c.args, sync: *c.sync,
+		Attempt: *c.attempts, Node: c.node, seq: *c.seq,
+	}, nil
 }
 
 // setAge records the tree about to run under h, for other trees' wait-or-die

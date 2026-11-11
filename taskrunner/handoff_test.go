@@ -33,6 +33,9 @@ type countingDB struct {
 	// afterOutcome, when set, is called once, after the next read of a sync
 	// task's outcome and before the runner sees the result.
 	afterOutcome atomic.Pointer[func()]
+	// beforeTakeTurn, when set, is called once, with its arguments, before
+	// the next statement that takes a lease and claims a Run caller's task.
+	beforeTakeTurn atomic.Pointer[func(args []any)]
 }
 
 // pausedRow is a row whose Scan calls a hook once it has read the row.
@@ -76,6 +79,11 @@ func (c *countingDB) Query(ctx context.Context, sql string, args ...any) (pgx.Ro
 
 func (c *countingDB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	c.count(sql)
+	if strings.Contains(sql, "claimed AS (") {
+		if before := c.beforeTakeTurn.Swap(nil); before != nil {
+			(*before)(args)
+		}
+	}
 	row := c.Pool.QueryRow(ctx, sql, args...)
 	if strings.Contains(sql, "SELECT state, result, error FROM") {
 		if after := c.afterOutcome.Swap(nil); after != nil {
@@ -106,10 +114,25 @@ func newCountingRunnerWithWorkers(t *testing.T, pollInterval time.Duration, work
 	t.Helper()
 	env := taskrunnertest.NewEnv(t)
 	db := &countingDB{Pool: env.DB}
+	return startCountingRunnerWithWorkers(t, env, db, workers, 5*time.Second, pollInterval, h), db
+}
+
+// startCountingRunner starts a runner over db, on env's schema, with one
+// queue of four workers that poll every pollInterval. Several runners on one
+// env stand for instances sharing a database.
+func startCountingRunner(t *testing.T, env taskrunnertest.Env, db *countingDB, leaseTTL, pollInterval time.Duration, h taskrunner.Handler) *taskrunner.Runner {
+	t.Helper()
+	return startCountingRunnerWithWorkers(t, env, db, 4, leaseTTL, pollInterval, h)
+}
+
+// startCountingRunnerWithWorkers is startCountingRunner with the queue's
+// worker count given.
+func startCountingRunnerWithWorkers(t *testing.T, env taskrunnertest.Env, db *countingDB, workers int, leaseTTL, pollInterval time.Duration, h taskrunner.Handler) *taskrunner.Runner {
+	t.Helper()
 	r, err := taskrunner.New(db, taskrunner.Options{
 		Schema:       env.Schema,
 		Queues:       []taskrunner.QueueOptions{{Name: qTop, Workers: workers}},
-		LeaseTTL:     5 * time.Second,
+		LeaseTTL:     leaseTTL,
 		PollInterval: pollInterval,
 		Logger:       zaptest.NewLogger(t),
 	})
@@ -127,7 +150,7 @@ func newCountingRunnerWithWorkers(t *testing.T, pollInterval time.Duration, work
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = r.Stop(context.Background()) })
-	return r, db
+	return r
 }
 
 // Run callers queued on one subject take its lease in turn: each release wakes
@@ -502,5 +525,95 @@ func TestRunOnAFreeSubjectSendsThreeStatements(t *testing.T) {
 	t.Logf("%.1f statements per Run on a free subject", per)
 	if per > 3 {
 		t.Errorf("%.1f statements per Run on a free subject; want at most 3", per)
+	}
+}
+
+// A Run caller whose claim waited out its lease's TTL does not start its
+// handler under the lapsed lease: it checks the lease before starting, and
+// starts only once it holds a live one. The claim waits here behind a lock
+// on its task's row, as it would behind a transaction cancelling the task
+// that then rolls back.
+func TestRunCallerDoesNotStartUnderALeaseItsClaimOutlived(t *testing.T) {
+	const ttl = 300 * time.Millisecond
+	env := taskrunnertest.NewEnv(t)
+	db := &countingDB{Pool: env.DB}
+	leases := env.Table(queueTable(qTop) + "_leases")
+	var lapsed atomic.Int32
+	r := startCountingRunner(t, env, db, ttl, time.Second, func(ctx context.Context, _ *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		var live bool
+		if err := env.DB.QueryRow(ctx, `SELECT expires >= now() FROM `+leases+` WHERE subject = $1`, task.Subject).Scan(&live); err != nil || !live {
+			lapsed.Add(1)
+		}
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	tasks := env.Table(queueTable(qTop) + "_tasks")
+	before := func(args []any) {
+		tx, err := env.DB.Begin(ctx)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM `+tasks+` WHERE id = $1 FOR UPDATE`, args[6]); err != nil {
+			t.Error(err)
+		}
+		go func() {
+			time.Sleep(3 * ttl)
+			_ = tx.Rollback(context.Background())
+		}()
+	}
+	db.beforeTakeTurn.Store(&before)
+	if _, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := lapsed.Load(); n > 0 {
+		t.Errorf("the handler started %d time(s) under a lapsed lease", n)
+	}
+}
+
+// A Run caller that takes the lease from another instance's commit, which
+// releases it, does not wait behind that instance's task, which the commit
+// finished: it claims afresh rather than trusting what it saw before the
+// commit landed.
+func TestRunCallerTakingALeaseFromAnotherInstancesCommitDoesNotWaitForItsTask(t *testing.T) {
+	env := taskrunnertest.NewEnv(t)
+	hold := make(chan struct{})
+	started := make(chan struct{}, 1)
+	h := func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if string(task.Args) == "first" {
+			started <- struct{}{}
+			<-hold
+			// Keep the commit, which holds the lease row, open a while.
+			return nil, ex.Write(ctx, `SELECT pg_sleep(0.5)`)
+		}
+		return nil, nil
+	}
+	a := startCountingRunner(t, env, &countingDB{Pool: env.DB}, 5*time.Second, 2*time.Second, h)
+	b := startCountingRunner(t, env, &countingDB{Pool: env.DB}, 5*time.Second, 2*time.Second, h)
+	ctx := waitCtx(t)
+
+	first := make(chan error, 1)
+	go func() {
+		_, err := a.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte("first")})
+		first <- err
+	}()
+	<-started
+	second := make(chan error, 1)
+	go func() {
+		_, err := b.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte("second")})
+		second <- err
+	}()
+	time.Sleep(100 * time.Millisecond) // second retries the lease meanwhile
+	close(hold)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-second:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the second instance's caller waited behind a task the first instance's commit had finished")
 	}
 }

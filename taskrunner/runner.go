@@ -835,16 +835,20 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 		// task due ahead of this one that the wait also ends with.
 		var pause time.Duration
 		var behind TaskID
-		h, task, stop, err := r.takeTurn(ctx, q, s.Subject, age, seq, id)
+		h, task, err := r.takeTurn(ctx, q, s.Subject, age, seq, id)
 		if err != nil {
 			return nil, err
 		}
 		if h != nil {
 			h.turn = turn
 			r.metrics.observeLeaseWait(ctx, q, start)
-			d := drained{stop: stop}
+			var d drained
 			if task != nil {
 				d = r.runClaimed(ctx, q, h, *task, seq)
+			} else {
+				// Something else is due first, or the statement's view was
+				// stale: claim under the lease from what is there now.
+				d = r.drainSync(ctx, q, h, seq, id)
 			}
 			r.endHold(ctx, h, d.stop)
 			start = time.Now()
