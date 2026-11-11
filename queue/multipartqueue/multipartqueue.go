@@ -75,7 +75,7 @@ const addPartWaitLimit = 30 * time.Second
 // acceptListPage is how many parked parts an upload's accept reads at a time.
 const acceptListPage = 1000
 
-// acceptWaits bounds how many blobs' subjects Complete waits on at once.
+// acceptWaits bounds how many blobs' accepts Complete waits on at once.
 const acceptWaits = 16
 
 // Deps are what a Queue's tasks need.

@@ -504,11 +504,17 @@ func TestCompleteOverTheWaitBudgetLeavesTheUploadOpen(t *testing.T) {
 	}
 }
 
-// TestCompleteFailsWhileTheConcludeFails: a part whose blob's accept fails
-// fails the request, which clients retry, and the retry commits.
-func TestCompleteFailsWhileTheConcludeFails(t *testing.T) {
+// TestCompleteWaitsThroughAFailedConclude: a part whose blob's accept fails
+// and waits to retry holds Complete for the rest of its wait budget, which
+// then answers OperationAborted and leaves the upload open. The client's
+// retry brings the accept's retry forward, and commits.
+func TestCompleteWaitsThroughAFailedConclude(t *testing.T) {
 	cc := &countingConcluder{fails: 1}
-	b, _ := newDeferredBackend(t, cc)
+	b, mem := newDeferredBackend(t, cc)
+	limits := storeFor(b).limits
+	saved := limits.AcceptWait
+	limits.AcceptWait = 500 * time.Millisecond
+	ctx := context.Background()
 	key := "complete-conclude-failing"
 	uploadID := mpCreate(t, b, key, "", "")
 	parts := uploadDistinctParts(t, b, key, uploadID, 1)
@@ -516,9 +522,20 @@ func TestCompleteFailsWhileTheConcludeFails(t *testing.T) {
 
 	_, err := mpComplete(t, b, key, uploadID, parts, nil)
 	var apiErr s3err.APIError
-	if err == nil || (errors.As(err, &apiErr) && apiErr.Code == "OperationAborted") {
-		t.Fatalf("Complete against a failing conclude: err = %v, want the conclude's error", err)
+	if !errors.As(err, &apiErr) || apiErr.Code != "OperationAborted" {
+		t.Fatalf("Complete against a failing conclude: err = %v, want OperationAborted", err)
 	}
+	cc.mu.Lock()
+	concludes := len(cc.calls)
+	cc.mu.Unlock()
+	if concludes != 1 {
+		t.Fatalf("concludes while Complete waited = %d, want the one that failed", concludes)
+	}
+	if sess, err := mem.GetSession(ctx, uploadID); err != nil || sess.State != registry.SessionOpen {
+		t.Fatalf("session after the refused Complete = %+v, %v; want open", sess, err)
+	}
+
+	limits.AcceptWait = saved
 	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
 		t.Fatalf("retry Complete: %v", err)
 	}
