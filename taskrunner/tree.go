@@ -345,11 +345,13 @@ func (tr *tree) commit(ctx context.Context, a *action, outcomes []Outcome) (*fai
 	if tr.deferred != nil {
 		return nil, tr.deferred
 	}
-	lockRoot := lockLease
+	var err error
 	if tr.rootHold.releaseOnCommit {
-		lockRoot = deleteLease
+		err = deleteLease(ctx, tx, tr.rootHold)
+	} else {
+		err = lockLease(ctx, tx, tr.rootHold, tr.r.opts.LeaseTTL)
 	}
-	if err := lockRoot(ctx, tx, tr.rootHold, tr.r.opts.LeaseTTL); err != nil {
+	if err != nil {
 		return nil, err
 	}
 	for _, h := range tr.holds {
@@ -431,7 +433,7 @@ func lockLease(ctx context.Context, tx pgx.Tx, h *hold, ttl time.Duration) error
 // deleteLease is lockLease for a hold that ends with tx: it deletes h's
 // lease row, which stays locked until tx ends, so the release commits with
 // the task. It returns errLeaseLost as lockLease does.
-func deleteLease(ctx context.Context, tx pgx.Tx, h *hold, _ time.Duration) error {
+func deleteLease(ctx context.Context, tx pgx.Tx, h *hold) error {
 	var one int
 	err := tx.QueryRow(ctx, `DELETE FROM `+h.q.leases+`
 		WHERE subject = $1 AND owner = $2 AND expires >= now() RETURNING 1`,
