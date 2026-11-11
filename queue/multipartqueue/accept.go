@@ -179,20 +179,24 @@ func (q *Queue) acceptAndWait(ctx context.Context, space did.DID, requested []re
 // whatever another upload submits meanwhile. Other uploads' accepts in the
 // space are due now already, so bringing them forward too changes nothing
 // for them. An accept that fails and waits to retry is waited for through
-// its retries: Complete succeeds if one of them does within the wait.
+// its retries: Complete succeeds if one of them does within the wait. A blob
+// with two accepts, one queued here beside an earlier one waiting to retry,
+// is waited for until either succeeds.
 func (q *Queue) awaitBlobAccepts(ctx context.Context, space did.DID, parts []registry.MultipartPart, expires time.Time) error {
 	due, err := q.blobs.ExpediteAccepts(ctx, space)
 	if err != nil {
 		return fmt.Errorf("bring the blobs' accepts forward: %w", err)
 	}
 	seen := map[string]bool{}
-	var waiting []taskrunner.TaskID
+	var waiting [][]taskrunner.TaskID
 	for _, p := range parts {
 		for _, d := range p.BlobDigests {
 			subject := spaceshardqueue.Subject(space, d)
 			if !seen[subject] {
 				seen[subject] = true
-				waiting = append(waiting, due[subject]...)
+				if len(due[subject]) > 0 {
+					waiting = append(waiting, due[subject])
+				}
 			}
 		}
 	}
@@ -203,12 +207,12 @@ func (q *Queue) awaitBlobAccepts(ctx context.Context, space did.DID, parts []reg
 		first error
 		slots = make(chan struct{}, acceptWaits)
 	)
-	for _, id := range waiting {
+	for _, ids := range waiting {
 		slots <- struct{}{}
 		wg.Add(1)
 		go func() {
 			defer func() { <-slots; wg.Done() }()
-			err := q.blobs.AwaitAccept(ctx, id)
+			err := q.blobs.AwaitAccepts(ctx, ids)
 			if errors.Is(err, context.DeadlineExceeded) && !time.Now().Before(expires) {
 				err = errAcceptWaitExpired
 			}

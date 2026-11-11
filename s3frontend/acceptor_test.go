@@ -541,6 +541,38 @@ func TestCompleteWaitsThroughAFailedConclude(t *testing.T) {
 	}
 }
 
+// TestCompleteDoesNotWaitOnASupersededAccept: Complete queues an accept beside
+// one that has failed and waits to retry. When the earlier one fails again and
+// the new one succeeds, the blob is accepted and Complete commits, without
+// waiting out the earlier one's backoff.
+func TestCompleteDoesNotWaitOnASupersededAccept(t *testing.T) {
+	cc := &countingConcluder{fails: 2}
+	b, _ := newDeferredBackend(t, cc)
+	key := "complete-superseded-accept"
+	uploadID := mpCreate(t, b, key, "", "")
+	parts := uploadDistinctParts(t, b, key, uploadID, 1)
+	// The blob's accept fails once and waits to retry.
+	if err := runAccepts(t, b, uploadID); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+
+	// Complete queues a second accept and brings both forward: the earlier
+	// one fails again, and backs off for longer than the bound below.
+	start := time.Now()
+	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if took := time.Since(start); took > 4*time.Second {
+		t.Errorf("Complete took %v: it waited for the accept that failed, though the one beside it succeeded", took)
+	}
+	cc.mu.Lock()
+	concludes := len(cc.calls)
+	cc.mu.Unlock()
+	if concludes != 3 {
+		t.Fatalf("concludes = %d, want 3: two that failed and the second accept's", concludes)
+	}
+}
+
 // stallingConcluder never answers a conclude while stalled: it waits for its
 // context, as a conclude whose response never comes does.
 type stallingConcluder struct {

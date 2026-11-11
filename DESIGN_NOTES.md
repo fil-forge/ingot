@@ -254,7 +254,8 @@ Complete queues the accept of each blob of the parts it names that are still
 parked, then brings those blobs' pending accepts forward from any retry's
 backoff and waits for each of those accepts to be over, within the accept
 wait (30 s, `multipartqueue.DefaultAcceptWait`). An accept that fails and
-waits to retry is not over, so Complete waits through its retries. Past the
+waits to retry is not over, so Complete waits through its retries, unless a
+second accept of the same blob, queued beside it, succeeds first. Past the
 budget it answers OperationAborted. A named part still parked after the wait
 has a blob whose accept failed for good, and Complete fails for the client
 to retry; a part whose blob has gone answers InvalidPart.
