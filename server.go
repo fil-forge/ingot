@@ -87,13 +87,11 @@ type ServerDeps struct {
 	// Intents tracks each local blob's upload_intents lifecycle; Locations
 	// records where each accepted body blob (and shipped catalog shard) can be
 	// retrieved from; Inclusions records each shipped shard's inner-block byte
-	// ranges so retired catalog blocks stay resolvable; GC records superseded
-	// MST/manifest CIDs. Typically all
-	// the same instance as Registry (*registry.Postgres).
+	// ranges so retired catalog blocks stay resolvable. Typically all the
+	// same instance as Registry (*registry.Postgres).
 	Intents    registry.IntentStore
 	Locations  registry.LocationStore
 	Inclusions registry.InclusionStore
-	GC         registry.GCStore
 	Multipart  registry.MultipartStore
 	// Parks persists deferred-accept park state between UploadPart and
 	// Complete/Abort.
@@ -219,7 +217,6 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Registry:     deps.Registry,
 		Intents:      deps.Intents,
 		Locations:    deps.Locations,
-		GC:           deps.GC,
 		Multipart:    deps.Multipart,
 		Parks:        deps.Parks,
 		Reads:        bs,
@@ -717,9 +714,6 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.Locations == nil {
 		return errors.New("ingot: ServerDeps.Locations is required")
-	}
-	if deps.GC == nil {
-		return errors.New("ingot: ServerDeps.GC is required")
 	}
 	if deps.Multipart == nil {
 		return errors.New("ingot: ServerDeps.Multipart is required")

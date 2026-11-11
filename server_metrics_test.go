@@ -186,7 +186,6 @@ func newTestServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerDe
 		Intents:         mem,
 		Locations:       mem,
 		Inclusions:      mem,
-		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
 		Claims:          mem,

@@ -168,7 +168,6 @@ type serverParams struct {
 	Intents         registry.IntentStore
 	Locations       registry.LocationStore
 	Inclusions      registry.InclusionStore
-	GC              registry.GCStore
 	Multipart       registry.MultipartStore
 	Parks           registry.ParkStore
 	Claims          registry.BlobRefStore
@@ -230,7 +229,6 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Intents:         p.Intents,
 				Locations:       p.Locations,
 				Inclusions:      p.Inclusions,
-				GC:              p.GC,
 				Multipart:       p.Multipart,
 				Parks:           p.Parks,
 				Claims:          p.Claims,
@@ -492,7 +490,6 @@ type registryResult struct {
 	Intents           registry.IntentStore
 	Locations         registry.LocationStore
 	Inclusions        registry.InclusionStore
-	GC                registry.GCStore
 	Multipart         registry.MultipartStore
 	Parks             registry.ParkStore
 	Claims            registry.BlobRefStore
@@ -505,14 +502,14 @@ type registryResult struct {
 // provideRegistry wraps the host's pool in the postgres-backed registry and
 // exposes it under every interface ServerModule consumes. One *registry.Postgres
 // satisfies bucket state (Registry), the upload intents (IntentStore),
-// blob locations (LocationStore), the reference index (BlobRefStore), the GC
-// candidate log (GCStore), the catalog usage sums (CatalogUsageStore), and
+// blob locations (LocationStore), the reference index (BlobRefStore), the
+// catalog usage sums (CatalogUsageStore), and
 // segment metadata (Meta). The hilt client is required: bucket
 // create/delete/list are forwarded to Hilt, so forge mode needs
 // hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool, tasks *taskrunner.Runner) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, GC: pg, Multipart: pg, Parks: pg, Claims: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, Multipart: pg, Parks: pg, Claims: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Meta: pg}
 }
 
 // taskSchema is the Postgres schema the task queues' tables live in, beside

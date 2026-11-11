@@ -725,15 +725,6 @@ func TestPostgresStores(t *testing.T) {
 		}
 	})
 
-	t.Run("gc candidate idempotent", func(t *testing.T) {
-		if err := r.AddGCCandidate(ctx, digest, "b"); err != nil {
-			t.Fatalf("AddGCCandidate: %v", err)
-		}
-		if err := r.AddGCCandidate(ctx, digest, "b"); err != nil {
-			t.Fatalf("AddGCCandidate (dup): %v", err)
-		}
-	})
-
 	t.Run("revocation cursor upsert round trip", func(t *testing.T) {
 		if _, err := r.GetRevocationCursor(ctx); err != registry.ErrNotFound {
 			t.Fatalf("GetRevocationCursor before put err = %v, want ErrNotFound", err)

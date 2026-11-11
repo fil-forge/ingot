@@ -139,7 +139,7 @@ Internal:
   `ingot.catalog_journal` until their segment ships, written with the commit
   task), `segments.go` (`logstore.Meta`, and `CatalogUsage`, the per-bucket
   sums the catalog usage gauges report), `stores*.go` (intents, locations,
-  inclusions, blob_refs and pending refs (`CountReferences`), GC,
+  inclusions, blob_refs and pending refs (`CountReferences`),
   multipart sessions/parts, parks, encryption params, the revocation
   cursor),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies

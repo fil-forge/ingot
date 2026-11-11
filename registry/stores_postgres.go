@@ -24,7 +24,6 @@ var (
 	_ EncryptionParamsStore = (*Postgres)(nil)
 	_ InclusionStore        = (*Postgres)(nil)
 	_ MultipartStore        = (*Postgres)(nil)
-	_ GCStore               = (*Postgres)(nil)
 	_ CatalogUsageStore     = (*Postgres)(nil)
 	_ RevocationCursorStore = (*Postgres)(nil)
 )
@@ -690,19 +689,6 @@ func (r *Postgres) CountPartRefs(ctx context.Context, digest multihash.Multihash
 		return 0, fmt.Errorf("registry: count part refs: %w", err)
 	}
 	return n, nil
-}
-
-// GCStore ====================================================================
-
-func (r *Postgres) AddGCCandidate(ctx context.Context, cidBytes []byte, bucket string) error {
-	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.gc_candidates (cid, bucket) VALUES ($1, $2)
-		 ON CONFLICT (cid) DO NOTHING`,
-		cidBytes, nullString(bucket))
-	if err != nil {
-		return fmt.Errorf("registry: add gc candidate: %w", err)
-	}
-	return nil
 }
 
 // RevocationCursorStore ======================================================

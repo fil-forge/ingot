@@ -473,11 +473,6 @@ type MultipartStore interface {
 	CountPartRefs(ctx context.Context, digest multihash.Multihash, excludeUploadID string) (int, error)
 }
 
-// GCStore records superseded MST node CIDs (§4). Write-only this iteration.
-type GCStore interface {
-	AddGCCandidate(ctx context.Context, cidBytes []byte, bucket string) error
-}
-
 // CatalogUsage is one bucket's catalog storage on Forge: the CARs of its
 // shipped catalog segments, retired ones included, which stay registered in
 // its space until DeleteBucket releases them. The segments' index blobs are
