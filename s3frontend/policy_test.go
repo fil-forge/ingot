@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"path/filepath"
 	"testing"
 
 	hiltauth "github.com/fil-forge/hilt/pkg/rpc/service/auth"
@@ -14,9 +15,11 @@ import (
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/stretchr/testify/require"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/internal/reqscope"
+	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
 	"github.com/fil-forge/ingot/taskrunner"
@@ -61,11 +64,13 @@ func policyBackend(t *testing.T, authority bucketauthority.BucketAuthority) *s3f
 			{Name: registry.BucketQueue},
 			{Name: registry.UploadQueue},
 			{Name: registry.ReleaseQueue},
-			{Name: s3frontend.ShardQueue},
+			{Name: shardqueue.Name},
 		},
 	})
 	require.NoError(t, err)
-	b, err := s3frontend.New(s3frontend.Deps{Tasks: tasks, Registry: reg, Authority: authority})
+	cache, err := blockstore.NewBlobCache(filepath.Join(t.TempDir(), "cache"))
+	require.NoError(t, err)
+	b, err := s3frontend.New(s3frontend.Deps{Tasks: tasks, Registry: reg, Cache: cache, Authority: authority})
 	require.NoError(t, err)
 	return b
 }

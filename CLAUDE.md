@@ -149,6 +149,11 @@ Internal:
   cursor),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
   all of them.
+- **`queue/`** — one package per task queue, each built over the runner
+  with what its handlers need, registering them in its `New`, with typed
+  calls for its sync tasks and specs for the async ones other queues spawn:
+  `shardqueue` (`queue-shard`, the cache's copies). The other queues'
+  handlers are in `s3frontend`.
 - **`taskrunner/`** — durable task queues in Postgres (one tasks table and
   one leases table per queue), serialized per (queue, subject) by a lease
   row. A task's tree (its handler plus sync children in later queues) adds
@@ -179,7 +184,7 @@ Internal:
   DID: every change to a bucket, placed on the instance holding its catalog
   log; `queue-space-upload` (`s3frontend/uploadqueue.go`), the
   object-count changes a `queue-bucket.commit` spawns with its own
-  commit; `queue-shard` (`s3frontend/shardqueue.go`), subject the hex
+  commit; `queue-shard` (`queue/shardqueue`), subject the hex
   digest: a cached blob's time to live, `queue-shard.cache` scheduling its
   `queue-shard.evict` at `CacheTTL`, run again by reads with under half
   left, and the budget pass's evictions as sync `queue-shard.evict`s;

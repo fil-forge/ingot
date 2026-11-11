@@ -94,7 +94,7 @@ func (s LocalBlobSweepStats) LogFields() []zap.Field {
 // or at the next orphan pass that runs while the directory is quiet.
 //
 // A cached blob's own eviction, when its time in the cache runs out, is a
-// queue-shard.evict task (see shardqueue.go); the budget pass bounds the disk
+// queue-shard.evict task (see queue/shardqueue); the budget pass bounds the disk
 // besides, since a burst of writes can fill it first. It evicts through the
 // same action, run as a sync task, so a removal takes its turn with the
 // digest's other tasks; the eviction due later finds the file gone. Readers
@@ -122,7 +122,7 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 	now := time.Now()
 	var stats LocalBlobSweepStats
 	var errs []error
-	if b.localBlobMaxBytes > 0 && b.localUsage() > b.localBlobMaxBytes {
+	if b.localBlobMaxBytes > 0 && b.cache.Usage() > b.localBlobMaxBytes {
 		budgetCtx, span := tracing.Start(ctx, "local_blobs.budget_pass")
 		pass, err := b.evictToBudget(budgetCtx, budgetPassTimeLimit)
 		stats.BudgetFiles, stats.BudgetBytes = pass.files, pass.bytes
@@ -137,7 +137,7 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 		switch {
 		case err != nil:
 			errs = append(errs, fmt.Errorf("s3frontend: local blob budget pass: %w", err))
-		case b.localUsage() <= b.localBlobMaxBytes:
+		case b.cache.Usage() <= b.localBlobMaxBytes:
 		case pass.stop == stopDeadline:
 			b.logTimeLimit()
 		case pass.stop == stopExhausted:
@@ -146,7 +146,7 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 	}
 	// The latches reset at the low watermark, where the budget pass stops, so
 	// usage hovering at the budget does not reset them every sweep.
-	if b.localUsage() <= b.localBlobMaxBytes*lowWatermarkPercent/100 {
+	if b.cache.Usage() <= b.localBlobMaxBytes*lowWatermarkPercent/100 {
 		b.overBudgetWarned = false
 		b.timeLimitLogged = false
 	}
@@ -190,7 +190,7 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 // LocalBlobUsage returns the bytes the cache holds, writes in progress
 // included.
 func (b *Backend) LocalBlobUsage() int64 {
-	return b.localUsage()
+	return b.cache.Usage()
 }
 
 // budgetPass is what one evictToBudget run did: the files it removed, their
@@ -248,7 +248,7 @@ func (b *Backend) warnNothingLeft() {
 	}
 	b.overBudgetWarned = true
 	b.logger.Warn("local blob storage is over budget with nothing left to evict; this is logged once until usage falls back to the low watermark. The remaining bytes are bodies being written, files that could not be removed, or orphans younger than local_blob_orphan_age",
-		zap.Int64("usage", b.localUsage()),
+		zap.Int64("usage", b.cache.Usage()),
 		zap.Int64("in_flight", b.cache.InFlight()),
 		zap.Int64("budget", b.localBlobMaxBytes))
 }
@@ -261,7 +261,7 @@ func (b *Backend) logTimeLimit() {
 	}
 	b.timeLimitLogged = true
 	b.logger.Info("local blob budget pass reached its time limit while still over budget; the next sweep continues. This is logged once until usage falls back to the low watermark",
-		zap.Int64("usage", b.localUsage()),
+		zap.Int64("usage", b.cache.Usage()),
 		zap.Int64("budget", b.localBlobMaxBytes))
 }
 
@@ -291,7 +291,7 @@ func (f *removeFailures) log(logger *zap.Logger, pass string) {
 		zap.Error(f.err))
 }
 
-// evictToBudget evicts cached blobs (evictCached), oldest modification time
+// evictToBudget evicts cached blobs (shardqueue.Queue.Evict), oldest modification time
 // first, until usage reaches the low watermark, the cache runs out, or limit
 // has passed since it began removing. It reads the whole cache directory
 // first, to order it. A file it cannot remove is skipped, and the pass logs
@@ -314,14 +314,14 @@ func (b *Backend) evictToBudget(ctx context.Context, limit time.Duration) (pass 
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	for _, f := range files {
-		if b.localUsage() <= target {
+		if b.cache.Usage() <= target {
 			return pass, nil
 		}
 		if !time.Now().Before(deadline) {
 			pass.stop = stopDeadline
 			return pass, nil
 		}
-		freed, err := b.evictCached(ctx, f.Digest)
+		freed, err := b.shards.Evict(ctx, f.Digest)
 		if freed > 0 {
 			pass.files++
 			pass.bytes += freed
@@ -333,7 +333,7 @@ func (b *Backend) evictToBudget(ctx context.Context, limit time.Duration) (pass 
 			failed.add(hex.EncodeToString(f.Digest), err)
 		}
 	}
-	if b.localUsage() > target {
+	if b.cache.Usage() > target {
 		pass.stop = stopExhausted
 	}
 	return pass, nil

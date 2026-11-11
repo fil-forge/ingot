@@ -8,6 +8,8 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 	"go.uber.org/zap"
+
+	"github.com/fil-forge/ingot/queue/shardqueue"
 )
 
 // meterName scopes the backend's instruments.
@@ -102,6 +104,15 @@ func (m localBlobMetrics) removed(ctx context.Context, reason string, files, byt
 	attrs := metric.WithAttributes(attribute.String("reason", reason))
 	m.removals.Add(ctx, files, attrs)
 	m.removedBytes.Add(ctx, bytes, attrs)
+}
+
+// cacheRemoved records a copy an eviction removed.
+func (b *Backend) cacheRemoved(ctx context.Context, why shardqueue.Removal, freed int64) {
+	reason := removedExpired
+	if why == shardqueue.Released {
+		reason = removedReleased
+	}
+	b.localBlobMetrics.removedFile(ctx, reason, freed)
 }
 
 // removedFile records one file removed for reason, if the removal freed

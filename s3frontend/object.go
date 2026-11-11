@@ -489,7 +489,7 @@ func (b *Backend) concludeBody(ctx context.Context, bucket string, space did.DID
 			return nil, err
 		}
 		refs[k] = ref
-		b.cacheWritten(ctx, blob.Digest, body.locals[k])
+		b.shards.Cache(ctx, blob.Digest, body.locals[k])
 	}
 	return refs, nil
 }

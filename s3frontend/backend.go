@@ -46,6 +46,7 @@ import (
 	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/authority"
+	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
@@ -76,16 +77,12 @@ type Backend struct {
 	registrar uploader.UploadRegistrar
 	// tasks runs the queue-space-upload tasks.
 	tasks *taskrunner.Runner
-	// shards runs the queue-shard tasks that keep the cache's copies.
-	// renewals is when this process last renewed each cached blob's time in
-	// the cache, and cacheTTL how long a renewal lasts.
-	shards   *taskrunner.Runner
-	renewals *recencyMap
+	// shards keeps the cache's copies.
+	shards *shardqueue.Queue
 	// proofs finds the authority queued tasks make their network calls
 	// with, and holds what requests lend for their spaces while they wait on
 	// them.
-	proofs   *authority.Resolver
-	cacheTTL time.Duration
+	proofs *authority.Resolver
 	// uploadRetry is the queue-space-upload retry policy, and drainTimeout
 	// how long a bucket delete waits for its space's changes; tests shorten
 	// both.
@@ -268,7 +265,7 @@ type Deps struct {
 	LocalBlobMaxBytes int64
 	// CacheTTL is how long a blob stays in the cache after it was cached or
 	// last read, unless the budget pass evicts it first. Zero →
-	// DefaultCacheTTL.
+	// shardqueue.DefaultTTL.
 	CacheTTL time.Duration
 	// LocalBlobOrphanAge is the age at which SweepLocalBlobs deletes a .tmp-*
 	// file in the cache. Zero → DefaultLocalBlobOrphanAge.
@@ -375,8 +372,6 @@ func New(d Deps) (*Backend, error) {
 		multipartTTL: d.MultipartSessionTTL,
 
 		localBlobMaxBytes:  d.LocalBlobMaxBytes,
-		cacheTTL:           cmp.Or(d.CacheTTL, DefaultCacheTTL),
-		renewals:           newRecencyMap(renewalCapacity),
 		localBlobOrphanAge: localBlobOrphanAge,
 		dropAcceptedBodies: d.DropAcceptedBodies,
 
@@ -395,7 +390,11 @@ func New(d Deps) (*Backend, error) {
 	b.multipartMetrics, b.multipartGauges = newMultipartMetrics(mp, b, logger)
 	b.journalGauges = newJournalGauges(mp, b, logger)
 	b.catalogGauges = newCatalogUsageGauges(mp, b, logger)
-	if err := b.registerTasks(d.Tasks); err != nil {
+	var err error
+	if b.shards, err = shardqueue.New(d.Tasks, shardqueue.Deps{Cache: d.Cache, TTL: d.CacheTTL, Removed: b.cacheRemoved, Logger: logger}); err == nil {
+		err = b.registerTasks(d.Tasks)
+	}
+	if err != nil {
 		_ = b.CloseMetrics()
 		return nil, fmt.Errorf("s3frontend: register tasks: %w", err)
 	}
@@ -406,7 +405,6 @@ func New(d Deps) (*Backend, error) {
 func (b *Backend) registerTasks(r *taskrunner.Runner) error {
 	for _, register := range []func(*taskrunner.Runner) error{
 		b.registerUploadTasks,
-		b.registerShardTasks,
 		b.registerMultipartTasks,
 		b.registerBucketTasks,
 		b.registerReleaseTasks,
