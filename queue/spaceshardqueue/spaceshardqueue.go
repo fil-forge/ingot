@@ -144,6 +144,42 @@ func (q *Queue) ExpediteAccepts(ctx context.Context, space did.DID) (map[string]
 	return q.tasks.Expedite(ctx, Name, SpaceSubjects(space), AcceptAction)
 }
 
+// AwaitAccepts waits for the accepts of one blob that ExpediteAccepts
+// returned: until one of them has succeeded, or every one is over, having
+// failed for good, expired, been cancelled or gone. It does not say which,
+// since the blob's park and location do. An accept that failed and waits to
+// retry is not over, but one beside it that succeeds ends the wait: a blob
+// has two when Complete queues one while an earlier one waits to retry. The
+// error is ctx's, or that of a failed read of a task.
+func (q *Queue) AwaitAccepts(ctx context.Context, ids []taskrunner.TaskID) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	outcomes := make(chan error, len(ids))
+	for _, id := range ids {
+		go func() {
+			_, err := q.tasks.Wait(ctx, Name, id)
+			outcomes <- err
+		}()
+	}
+	var failed *taskrunner.HandlerError
+	for range ids {
+		select {
+		case err := <-outcomes:
+			switch {
+			case err == nil:
+				return nil
+			case errors.As(err, &failed), errors.Is(err, taskrunner.ErrExpired),
+				errors.Is(err, taskrunner.ErrCancelled), errors.Is(err, taskrunner.ErrNotFound):
+			default:
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
 // The ways a write uses a blob (AddTask.Mode).
 const (
 	// Streamed is an object blob the write streamed: concluded, unless
