@@ -102,7 +102,7 @@ return tx.Commit(ctx)
 
 ### Sync
 
-`Run` records a task and runs it in the calling goroutine once it is its subject's oldest due task and the subject's lease is free. It runs no other task: those due ahead of it are left to the queue's workers, on this instance or another, so the task's `Expires` bounds the caller's whole wait. It returns once the task has an outcome: its result, the handler's error, or `ErrExpired`. A commit that fails is retried until it lands or the task's `Expires` passes, so `ErrExpired` means nothing was written.
+`Run` records a task and runs it in the calling goroutine once it is its subject's oldest due task and the subject's lease is free. It runs no other task: those due ahead of it are left to the queue's workers, on this instance or another, so the task's `Expires` bounds the caller's whole wait. While a task is due ahead of it the caller waits for a worker in this process to release the subject, and looks again by itself once every `PollInterval`, for a task that another instance runs. It returns once the task has an outcome: its result, the handler's error, or `ErrExpired`. A commit that fails is retried until it lands or the task's `Expires` passes, so `ErrExpired` means nothing was written.
 
 ```go
 expires := time.Now().Add(30 * time.Second)

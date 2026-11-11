@@ -830,6 +830,9 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 			}
 			continue
 		}
+		// pause is how long to wait before looking at the subject again,
+		// when something other than the backoff sets it.
+		var pause time.Duration
 		h, _, err := r.tryLease(ctx, q, s.Subject, age)
 		if err != nil {
 			return nil, err
@@ -858,15 +861,22 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 				}
 			case errors.As(d.stop, new(*aheadError)):
 				// A task due ahead is a worker's to run: wake them, and wait
-				// for this task's turn below.
+				// for this task's turn below. A worker here wakes this
+				// caller when it releases the subject, so the caller looks
+				// again on its own only once a poll interval, for a task
+				// that another instance runs.
 				r.pokeQueue(q)
+				pause = r.opts.PollInterval
 			case ctx.Err() != nil:
 				return nil, ctx.Err()
 			default:
 				return nil, d.stop
 			}
 		}
-		if w := r.awaitTurn(ctx, q, id, turn, wait.next(), s.Expires); w.done {
+		if pause == 0 {
+			pause = wait.next()
+		}
+		if w := r.awaitTurn(ctx, q, id, turn, pause, s.Expires); w.done {
 			return w.res, w.err
 		}
 	}
