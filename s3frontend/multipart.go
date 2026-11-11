@@ -425,7 +425,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		if errors.Is(err, registry.ErrReferenceExpired) {
 			// A reference to one of the part's blobs expired before its row
 			// was recorded, and the blob may be released: the client sends
-			// the part again, as it does an object write's (mapCommitError).
+			// the part again, as it does an object write's (mapBucketError).
 			return nil, s3err.GetAPIError(s3err.ErrSlowDown)
 		}
 		return nil, fmt.Errorf("s3frontend: record part: %w", err)
@@ -839,7 +839,7 @@ func (b *Backend) completeUpload(ctx context.Context, ex *taskrunner.Exec, call 
 	if call.reserved == nil {
 		call.reserved = &bucketqueue.ReservedVersion{}
 		if bucketState.Versioning == registry.VersioningEnabled && !call.reported {
-			r, err := b.commits.Reserve(ctx, bucket)
+			r, err := b.buckets.Reserve(ctx, bucket)
 			if err != nil {
 				call.reserved = nil
 				return s3response.CompleteMultipartUploadResult{}, "", err

@@ -33,9 +33,28 @@ var (
 	ErrReservationSuperseded = errors.New("reserved version superseded")
 )
 
-// ErrBucketClosing fails a whole commit to a bucket a DeleteBucket has
-// closed.
-var ErrBucketClosing = errors.New("bucket is closing")
+// The errors a bucket's tasks fail with as a whole. A task for a bucket
+// that is gone, or that was deleted and recreated under its name since the
+// task was queued, fails with bucketop.ErrBucketNotFound.
+var (
+	// ErrBucketClosing refuses a commit or an upload to a bucket a delete
+	// has closed, and a delete that finds an upload left after the close.
+	ErrBucketClosing = errors.New("bucket is closing")
+	// ErrBucketExists refuses a create of a name another bucket holds.
+	ErrBucketExists = errors.New("bucket already exists")
+	// ErrBucketNotEmpty refuses a close or a delete of a bucket that holds
+	// objects.
+	ErrBucketNotEmpty = errors.New("bucket is not empty")
+	// ErrVersionedBucketNotEmpty is ErrBucketNotEmpty for a bucket with a
+	// versioning configuration, whose versions must all be deleted.
+	ErrVersionedBucketNotEmpty = errors.New("versioned bucket is not empty")
+	// ErrLockedVersioning refuses suspending versioning on a bucket with an
+	// object lock configuration.
+	ErrLockedVersioning = errors.New("a bucket with object lock cannot suspend versioning")
+	// ErrLockNeedsVersioning refuses an object lock configuration on a
+	// bucket whose versioning is not enabled.
+	ErrLockNeedsVersioning = errors.New("object lock needs versioning enabled")
+)
 
 // The kinds of ChangeError, one per error it unwraps to.
 const (

@@ -85,11 +85,15 @@ func isNoSuchKey(err error) bool {
 	return errors.Is(err, s3err.GetAPIError(s3err.ErrNoSuchKey))
 }
 
-// mapCommitError maps an error from a bucket commit, or from one of its
-// changes, to the S3 error that answers it. Anything else is wrapped with op
-// for the server log, and answers InternalError: a superseded reservation
-// is among them, since the client retries it.
-func mapCommitError(err error, op string) error {
+// mapBucketError maps an error from a bucket queue task, or from one of a
+// commit's changes, to the S3 error that answers it; nil stays nil.
+// Anything else is wrapped with op for the server log, and answers
+// InternalError: a superseded reservation is among them, since the client
+// retries it.
+func mapBucketError(err error, op string) error {
+	if err == nil {
+		return nil
+	}
 	var ce *bucketqueue.ChangeError
 	if errors.As(err, &ce) {
 		switch ce.Kind {
@@ -115,6 +119,16 @@ func mapCommitError(err error, op string) error {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	case errors.Is(err, bucketqueue.ErrBucketClosing):
 		return errBucketClosing
+	case errors.Is(err, bucketqueue.ErrBucketExists):
+		return s3err.GetAPIError(s3err.ErrBucketAlreadyExists)
+	case errors.Is(err, bucketqueue.ErrVersionedBucketNotEmpty):
+		return s3err.GetAPIError(s3err.ErrVersionedBucketNotEmpty)
+	case errors.Is(err, bucketqueue.ErrBucketNotEmpty):
+		return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
+	case errors.Is(err, bucketqueue.ErrLockedVersioning):
+		return s3err.GetAPIError(s3err.ErrSuspendedVersioningNotAllowed)
+	case errors.Is(err, bucketqueue.ErrLockNeedsVersioning):
+		return s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotAllowed)
 	case errors.Is(err, registry.ErrReferenceExpired):
 		// The write's reference to one of the body's blobs expired before
 		// the commit, and the blob may be released: the swap wrote nothing,

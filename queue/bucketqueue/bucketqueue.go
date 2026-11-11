@@ -24,44 +24,83 @@ import (
 	"github.com/ipfs/go-cid"
 	"go.uber.org/zap"
 
+	"github.com/fil-forge/ingot/blockstore"
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/bucketop"
+	"github.com/fil-forge/ingot/internal/authority"
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/ingot/uploader"
 )
 
-// Deps are what a Queue's commits need.
+// Deps are what a Queue's tasks need.
 type Deps struct {
 	// Registry holds the buckets' state, their version seqs and the
 	// writes' pending references.
 	Registry registry.Registry
 	// Txns opens a commit's transaction on a bucket's catalog.
 	Txns *bucketop.Coordinator
+	// Read reads the buckets' catalogs, for a close's and a delete's check
+	// that the bucket is empty.
+	Read blockstore.ReadStore
+	// Log is the catalog log, which ships each bucket's sealed segments;
+	// a delete releases them and removes the bucket's log.
+	Log blockstore.Log
+	// Sessions lists a bucket's multipart uploads, which a delete refuses.
+	Sessions SessionLister
+	// Remover releases a deleted bucket's catalog segments from its space.
+	Remover uploader.BlobRemover
+	// Buckets deletes a bucket's space.
+	Buckets bucketauthority.BucketAuthority
+	// Authority lends a delete's request authority to the tasks it drains.
+	Authority *authority.Resolver
+	// Blobs drains a deleted bucket's space of its blobs' releases.
+	Blobs *spaceshardqueue.Queue
+	// Counts drains a deleted bucket's space of its object-count changes.
+	Counts *spaceuploadqueue.Queue
 	// ReleaseGrace is how long after a commit a blob it drops the last
 	// claim on is released.
 	ReleaseGrace time.Duration
-	// Appended is called with each commit that appends to its bucket's log,
-	// to queue what the append owes with the commit's writes; nil for none.
-	Appended func(ctx context.Context, ex *taskrunner.Exec, st *registry.State) error
+	// ShipRetryFirst is the first wait before a ship that could not be
+	// queued is queued again; zero for a second.
+	ShipRetryFirst time.Duration
+	// ShipRetryMax bounds the doubling waits after it; zero for a minute.
+	ShipRetryMax time.Duration
 	// Logger defaults to a no-op logger.
 	Logger *zap.Logger
 }
 
-// Queue is the queue-bucket queue's commits.
+// SessionLister lists a bucket's multipart uploads.
+type SessionLister interface {
+	ListSessions(ctx context.Context, bucket string, space did.DID) ([]registry.MultipartSession, error)
+}
+
+// Queue is the queue-bucket queue: every change to a bucket, its objects,
+// its settings and its life, one at a time on the bucket's subject.
 type Queue struct {
 	runner       *taskrunner.Runner
 	reg          registry.Registry
 	txns         *bucketop.Coordinator
+	read         blockstore.ReadStore
+	log          blockstore.Log
+	sessions     SessionLister
+	remover      uploader.BlobRemover
+	buckets      bucketauthority.BucketAuthority
+	proofs       *authority.Resolver
+	blobs        *spaceshardqueue.Queue
+	counts       *spaceuploadqueue.Queue
 	releaseGrace time.Duration
-	appended     func(ctx context.Context, ex *taskrunner.Exec, st *registry.State) error
 	logger       *zap.Logger
+	ships        ships
 }
 
-// New returns the queue and registers queue-bucket.commit with r. Call it
-// before r starts.
+// New returns the queue and registers the queue-bucket handlers with r.
+// Call it before r starts.
 func New(r *taskrunner.Runner, d Deps) (*Queue, error) {
 	if d.Txns == nil {
 		return nil, errors.New("bucketqueue: no catalog transactions")
@@ -70,14 +109,31 @@ func New(r *taskrunner.Runner, d Deps) (*Queue, error) {
 		runner:       r,
 		reg:          d.Registry,
 		txns:         d.Txns,
+		read:         d.Read,
+		log:          d.Log,
+		sessions:     d.Sessions,
+		remover:      d.Remover,
+		buckets:      d.Buckets,
+		proofs:       d.Authority,
+		blobs:        d.Blobs,
+		counts:       d.Counts,
 		releaseGrace: d.ReleaseGrace,
-		appended:     d.Appended,
 		logger:       d.Logger,
+		ships:        ships{retryFirst: d.ShipRetryFirst, retryMax: d.ShipRetryMax},
 	}
 	if q.logger == nil {
 		q.logger = zap.NewNop()
 	}
+	if q.ships.retryFirst == 0 {
+		q.ships.retryFirst = defaultShipRetryFirst
+	}
+	if q.ships.retryMax == 0 {
+		q.ships.retryMax = defaultShipRetryMax
+	}
 	if err := r.Handle(registry.BucketQueue, registry.BucketCommitAction, q.runCommit); err != nil {
+		return nil, err
+	}
+	if err := q.registerAdmin(r); err != nil {
 		return nil, err
 	}
 	return q, nil
@@ -148,21 +204,6 @@ func (q *Queue) commitWith(ctx context.Context, run syncRunner, st *registry.Sta
 	return Outcome{Versioning: registry.VersioningState(res.Versioning), Results: res.Results}, nil
 }
 
-// bucketSpec is a queue-bucket task on space's bucket, placed on this
-// instance, which holds the bucket's catalog log.
-func (q *Queue) bucketSpec(space did.DID, action string, args []byte) taskrunner.Spec {
-	spec := taskrunner.Spec{
-		Queue:   registry.BucketQueue,
-		Subject: registry.BucketSubject(space),
-		Action:  action,
-		Args:    args,
-	}
-	if node := q.runner.Node(); node != "" {
-		spec.Node = &node
-	}
-	return spec
-}
-
 // commitScope is one commit's state while its changes apply.
 type commitScope struct {
 	tx   *bucketop.Tx
@@ -226,10 +267,8 @@ func (q *Queue) runCommit(ctx context.Context, ex *taskrunner.Exec, t taskrunner
 		if err := w.Apply(ctx, ex); err != nil {
 			return nil, err
 		}
-		if q.appended != nil {
-			if err := q.appended(ctx, ex, tx.State()); err != nil {
-				return nil, err
-			}
+		if err := q.queueAwaitedShip(ctx, ex, tx.State()); err != nil {
+			return nil, err
 		}
 	}
 	var buf bytes.Buffer

@@ -259,7 +259,7 @@ Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer)
 
 Sources: `s3frontend/object.go` (ingestBody), `s3frontend/stream.go`,
 `queue/spaceshardqueue/spaceshardqueue.go` (runAdd), `queue/bucketqueue/bucketqueue.go` (runCommit),
-`s3frontend/bucketship.go` (runShip),
+`queue/bucketqueue/ship.go` (runShip),
 `bucket/sized.go`, `blockstore/blobcache.go`,
 `blockstore/staging.go`, `logstore/`, `uploader/forge.go`, `uploader/blob.go`,
 `server.go` (newBucketFlushFunc). Review when these change.
@@ -880,7 +880,7 @@ manifest figure this complements.
 
 Sources: `bucket/leaf.go`, `bucket/manifest.go`, `queue/bucketqueue/version.go`
 (mintVersionID, RevSeqKey, applyPut, applyDeleteVersion),
-`s3frontend/bucketadmin.go` (runSetVersioning). Review when
+`queue/bucketqueue/admin.go` (runSetVersioning). Review when
 `bucket/` types change (and re-run `make gen`).
 
 ## Catalog GC candidates: what gets remembered for removal
@@ -1353,9 +1353,10 @@ sequenceDiagram
   The quiesce leaves the last segment sealed and unshipped until that next
   write; its journal rows went with the root.
 
-Sources: `s3frontend/bucket.go` (DeleteBucket, runDeleteBucket),
-`s3frontend/bucketadmin.go` (runCloseBucket, runAdmitUpload),
-`s3frontend/bucketadmin.go` (bucketSpec), `s3frontend/multipartqueue.go`
+Sources: `s3frontend/bucket.go` (DeleteBucket),
+`queue/bucketqueue/delete.go` (runDeleteBucket),
+`queue/bucketqueue/admin.go` (runCloseBucket, runAdmitUpload, bucketSpec),
+`s3frontend/multipartqueue.go`
 (abortUpload, runAbort, reapNow, runReap),
 `queue/spaceshardqueue/spaceshardqueue.go` (DrainSpace),
 `queue/spaceuploadqueue/spaceuploadqueue.go` (Drain),
@@ -1370,7 +1371,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 |---|---|
 | `s3frontend/object.go` | put, get, blob-lifecycle, version-tree, gc-candidates, delete-bucket |
 | `s3frontend/version.go` | get |
-| `queue/bucketqueue/` | put, multipart, blob-lifecycle, version-tree, gc-candidates, logstore-pipeline |
+| `queue/bucketqueue/` | put, multipart, blob-lifecycle, version-tree, gc-candidates, delete-bucket, logstore-pipeline |
 | `s3frontend/multipart.go`, `multipartqueue.go`, `registry/multipartqueue.go` | multipart, part-states, multipart-states, blob-lifecycle, delete-bucket |
 | `s3frontend/acceptor.go`, `registry/accept.go` | multipart, part-states, blob-lifecycle |
 | `queue/spaceshardqueue/spaceshardqueue.go` | put, multipart, part-states, blob-lifecycle, delete-bucket |
@@ -1378,7 +1379,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `queue/shardqueue/shardqueue.go`, `s3frontend/localblob_sweep.go` | put, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |
-| `s3frontend/bucketqueue.go`, `bucketadmin.go`, `bucketship.go` | put, multipart, gc-candidates, delete-bucket, logstore-pipeline |
+| `s3frontend/bucketqueue.go`, `bucketadmin.go` | put, multipart, gc-candidates, delete-bucket |
 | `bucketop/` | put, get, delete-bucket, packages, principals |
 | `taskrunner/` | packages, put, multipart, multipart-states, delete-bucket |
 | `blockstore/` | get, packages, block-routes; `forge.go` also context, principals |

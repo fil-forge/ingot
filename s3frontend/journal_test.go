@@ -24,7 +24,8 @@ import (
 // newJournalingBackend is a backend whose log ships: a segment seals once it
 // is 200ms old, and its ship waits until the test calls the returned release
 // func, so the test can read the journal before the ship and after it.
-func newJournalingBackend(t *testing.T) (*Backend, *testStore, *logstore.Store, func()) {
+// Each opt adjusts the Deps before the Backend is built.
+func newJournalingBackend(t *testing.T, opts ...func(*Deps)) (*Backend, *testStore, *logstore.Store, func()) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -84,6 +85,9 @@ func newJournalingBackend(t *testing.T) (*Backend, *testStore, *logstore.Store, 
 		Claims:     mem,
 	}
 	withStreaming(t, &deps, dir)
+	for _, opt := range opts {
+		opt(&deps)
+	}
 	b := mem.newBackend(t, deps)
 	backend.Store(b)
 	require.NoError(t, mem.Create(ctx, "bk", did.Undef, registry.CreateState{}))

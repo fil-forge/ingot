@@ -14,6 +14,7 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 
 	"github.com/fil-forge/ingot/internal/reqscope"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 )
@@ -113,7 +114,7 @@ func TestClosedBucketRefusesWritesAndUploads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b.runBucket(ctx, st.Space, registry.BucketCloseAction, &BucketTask{Name: "bk"}); err != nil {
+	if err := runBucketTask(ctx, mem, st.Space, registry.BucketCloseAction, &bucketqueue.BucketTask{Name: "bk"}); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 	bucket, key := "bk", "late"
@@ -133,7 +134,7 @@ func TestCloseRefusesANonEmptyBucket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantAPIError(t, "close of a non-empty bucket", b.runBucket(ctx, st.Space, registry.BucketCloseAction, &BucketTask{Name: "bk"}), "BucketNotEmpty")
+	wantAPIError(t, "close of a non-empty bucket", runBucketTask(ctx, mem, st.Space, registry.BucketCloseAction, &bucketqueue.BucketTask{Name: "bk"}), "BucketNotEmpty")
 	putObj(t, b, "after", []byte("body"))
 }
 

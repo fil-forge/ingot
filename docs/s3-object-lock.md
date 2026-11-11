@@ -506,7 +506,7 @@ lock.
 | `registry/registry.go`, `postgres.go`, `bucketcommit.go` | `State.ObjectLockConfig`, `LockConfigSet`, `Create` initial state (§4.2) |
 | `s3frontend/objectlock.go` (new) | the four per-version methods: the §6 check order, the state-tree read and commit paths, the Head/Get echo helper (§8) |
 | `queue/bucketqueue/version.go` | `applyPut` in-commit stamping incl. forced leaf (§7); `applyDeleteVersion` + `spliceLeaf` state-tree threading and cleanup (§9) |
-| `s3frontend/bucket.go`, `bucketadmin.go` | `CreateBucket` lock header (§5), `PutObjectLockConfiguration` and its versioning gate (`queue-bucket.set-object-lock-config`), `GetObjectLockConfiguration`, `PutBucketVersioning` suspend guard (`queue-bucket.set-versioning`) |
+| `s3frontend/bucket.go`, `queue/bucketqueue/admin.go` | `CreateBucket` lock header (§5), `PutObjectLockConfiguration` and its versioning gate (`queue-bucket.set-object-lock-config`), `GetObjectLockConfiguration`, `PutBucketVersioning` suspend guard (`queue-bucket.set-versioning`) |
 | `s3frontend/object.go`, `copy.go`, `multipart.go` | lock-header validation + stamping via the Put change (`applyPut`, §7), Head/Get echo (§8), session carry (§7) |
 | `itest/versity_lock_test.go` (new), `versity_{object,bucket,multipart,versioning}_test.go` | new categories, promotions, exclusions (§11) |
 | `docs/s3-versioning.md` | §10 drops lock from out-of-scope, pointing here |
