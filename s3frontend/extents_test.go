@@ -158,13 +158,11 @@ func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 // parts span several extents serves ?partNumber and ranges from them.
 func TestExtents_MultipartPartNumberAcrossExtents(t *testing.T) {
 	// Complete accepts each of the parts' thousands of tiny blobs on its own.
-	saved := acceptWaitBudget
-	acceptWaitBudget = 5 * time.Minute
-	t.Cleanup(func() { acceptWaitBudget = saved })
 	// Complete holds the upload's lease while it waits on those accepts, long
 	// enough under the race detector for a late renewal to lapse a
 	// one-second lease.
 	b, _, _ := newRefTestBackendOn(t, newTestStoreWithLease(t, 10*time.Second), extentBlobSize)
+	storeFor(b).limits.AcceptWait = 5 * time.Minute
 	part1 := testBody(5 << 20) // 5,120 blobs
 	part2 := bytes.Repeat([]byte("second part "), 30000)
 	key := "mp"
@@ -199,11 +197,8 @@ func TestExtents_MultipartPartNumberAcrossExtents(t *testing.T) {
 // blobs than one manifest can list is refused before the session latches,
 // so it stays open and its blobs unaccepted.
 func TestExtents_CompleteRefusesTooManyBlobs(t *testing.T) {
-	old := maxBodyBlobs
-	maxBodyBlobs = 10
-	t.Cleanup(func() { maxBodyBlobs = old })
-
 	b, mem, _ := newRefTestBackend(t, extentBlobSize)
+	storeFor(b).limits.MaxBodyBlobs = 10
 	key := "mp"
 	uploadID, completed, _ := uploadAll(t, b, key, [][]byte{testBody(11 * extentBlobSize)}, []int32{1})
 	_, err := mpComplete(t, b, key, uploadID, completed, nil)

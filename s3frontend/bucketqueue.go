@@ -8,7 +8,6 @@ import (
 
 	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/taskrunner"
 	uploadcmds "github.com/fil-forge/libforge/commands/upload"
 )
 
@@ -29,16 +28,6 @@ func (b *Backend) commitOne(ctx context.Context, st *registry.State, change buck
 	out, err := b.commit(ctx, st, change)
 	if err != nil {
 		return bucketqueue.ChangeResult{}, "", err
-	}
-	return oneResult(out, op)
-}
-
-// commitOneChild is commitOne run as a child of the task ex runs: a
-// Complete commits its object with its own writes.
-func (b *Backend) commitOneChild(ctx context.Context, ex *taskrunner.Exec, st *registry.State, change bucketqueue.KeyChange, op string) (bucketqueue.ChangeResult, registry.VersioningState, error) {
-	out, err := b.buckets.CommitChild(ctx, ex, st, b.commitAuthority(ctx, st.Space), change)
-	if err != nil {
-		return bucketqueue.ChangeResult{}, "", mapBucketError(err, "commit")
 	}
 	return oneResult(out, op)
 }

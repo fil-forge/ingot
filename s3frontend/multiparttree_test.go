@@ -18,6 +18,7 @@ import (
 	"lukechampine.com/blake3"
 
 	"github.com/fil-forge/ingot/blake3tree"
+	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -241,9 +242,10 @@ func TestMultipartTree(t *testing.T) {
 	t.Run("final part is re-hashed regardless of the budget", func(t *testing.T) {
 		// The final part landing first is the straggler the design expects;
 		// it is covered even with no budget at all.
-		saved := b.rehashBudget
-		b.rehashBudget = 0
-		defer func() { b.rehashBudget = saved }()
+		limits := storeFor(b).limits
+		saved := limits.RehashBudget
+		limits.RehashBudget = 0
+		defer func() { limits.RehashBudget = saved }()
 		parts := [][]byte{taggedBody(minPart, 0x91), taggedBody(minPart, 0x92), taggedBody(70<<10, 0x93)}
 		whole := completeAll(t, b, "final-exempt", parts, []int32{3, 1, 2})
 		assertObjectTree(t, b, "final-exempt", whole)
@@ -255,9 +257,10 @@ func TestMultipartTree(t *testing.T) {
 		// InvalidPartLayout before any part is accepted or its version id
 		// reported. The upload stays open, and the same Complete within the
 		// default budget commits the object with its digest.
-		saved := b.rehashBudget
-		b.rehashBudget = 1
-		defer func() { b.rehashBudget = saved }()
+		limits := storeFor(b).limits
+		saved := limits.RehashBudget
+		limits.RehashBudget = 1
+		defer func() { limits.RehashBudget = saved }()
 		parts := [][]byte{taggedBody(minPart+4096, 0x81), taggedBody(minPart, 0x82), taggedBody(70<<10, 0x83)}
 		bucket, key := "bk", "over-budget"
 		uploadID := mpCreate(t, b, key, "", "")
@@ -297,7 +300,7 @@ func TestMultipartTree(t *testing.T) {
 		if trees := recordedParts(t, b, uploadID, 3); len(trees) != 3 {
 			t.Fatalf("%d part trees after a refused Complete, want 3", len(trees))
 		}
-		b.rehashBudget = DefaultRehashBudget
+		limits.RehashBudget = multipartqueue.DefaultRehashBudget
 		if _, err := mpComplete(t, b, key, uploadID, completed, nil); err != nil {
 			t.Fatalf("Complete within budget after the refusal: %v", err)
 		}
@@ -317,9 +320,10 @@ func TestMultipartTree(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Complete: %v", err)
 		}
-		saved := b.rehashBudget
-		b.rehashBudget = 0
-		defer func() { b.rehashBudget = saved }()
+		limits := storeFor(b).limits
+		saved := limits.RehashBudget
+		limits.RehashBudget = 0
+		defer func() { limits.RehashBudget = saved }()
 		again, err := mpComplete(t, b, key, uploadID, completed, nil)
 		if err != nil {
 			t.Fatalf("duplicate Complete: %v", err)

@@ -40,7 +40,7 @@ func cancelQueuedAccepts(t *testing.T, b *Backend, uploadID string) {
 			ids = append(ids, task.ID)
 		}
 	}
-	if err := b.uploads.Cancel(ctx, registry.MultipartQueue, ids...); err != nil {
+	if err := storeFor(b).tasks.Cancel(ctx, registry.MultipartQueue, ids...); err != nil {
 		t.Fatalf("cancel queued accepts: %v", err)
 	}
 }
@@ -53,7 +53,7 @@ func runAccepts(t *testing.T, b *Backend, uploadID string) error {
 	t.Helper()
 	cancelQueuedAccepts(t, b, uploadID)
 	ctx := context.Background()
-	if _, err := b.uploads.Run(ctx, taskrunner.Spec{
+	if _, err := storeFor(b).tasks.Run(ctx, taskrunner.Spec{
 		Queue:   registry.MultipartQueue,
 		Subject: uploadID,
 		Action:  registry.MultipartAcceptAction,
@@ -71,7 +71,23 @@ func runAccepts(t *testing.T, b *Backend, uploadID string) error {
 	if err != nil {
 		return err
 	}
-	return b.awaitBlobAccepts(ctx, sess.Space, parts, time.Now().Add(10*time.Second))
+	due, err := b.blobs.ExpediteAccepts(ctx, sess.Space)
+	if err != nil {
+		return err
+	}
+	expires := time.Now().Add(10 * time.Second)
+	for _, p := range parts {
+		for _, d := range p.BlobDigests {
+			subject := registry.ReleaseSubject(sess.Space, d)
+			if len(due[subject]) == 0 {
+				continue
+			}
+			if err := b.blobs.Flush(ctx, subject, expires); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // countingConcluder is a parking uploader that records what each conclude
@@ -190,7 +206,7 @@ func TestAcceptAcceptsPartsWhileUploading(t *testing.T) {
 // else run.
 func TestUploadedPartsAreAcceptedInTheBackground(t *testing.T) {
 	b, mem := newDeferredBackend(t, &countingConcluder{})
-	b.acceptDelay = 0
+	storeFor(b).limits.AcceptDelay = 0
 	key := "accept-in-background"
 	uploadID := mpCreate(t, b, key, "", "")
 	uploadDistinctParts(t, b, key, uploadID, 2)
@@ -454,12 +470,11 @@ func TestCompleteWaitsForARunningAccept(t *testing.T) {
 // leaves the upload open, so a client that retries on its own commits once
 // the accept is done (botocore clients do not retry it).
 func TestCompleteOverTheWaitBudgetLeavesTheUploadOpen(t *testing.T) {
-	saved := acceptWaitBudget
-	acceptWaitBudget = 20 * time.Millisecond
-	t.Cleanup(func() { acceptWaitBudget = saved })
-
 	g := newGatedConcluder()
 	b, mem := newDeferredBackend(t, g)
+	limits := storeFor(b).limits
+	saved := limits.AcceptWait
+	limits.AcceptWait = 20 * time.Millisecond
 	ctx := context.Background()
 	key := "complete-over-budget"
 	uploadID := mpCreate(t, b, key, "", "")
@@ -482,7 +497,7 @@ func TestCompleteOverTheWaitBudgetLeavesTheUploadOpen(t *testing.T) {
 	}
 	// The retry's accept starts once the background one's lease is free,
 	// which a loaded machine can take longer than the shrunk budget to see.
-	acceptWaitBudget = saved
+	limits.AcceptWait = saved
 	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
 		t.Fatalf("retry Complete: %v", err)
 	}

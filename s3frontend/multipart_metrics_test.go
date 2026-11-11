@@ -68,13 +68,10 @@ func TestMultipartMetrics_AcceptPasses(t *testing.T) {
 // TestMultipartMetrics_CompleteDeferred: a Complete answered OperationAborted
 // because the upload's accept did not start in time is counted.
 func TestMultipartMetrics_CompleteDeferred(t *testing.T) {
-	saved := acceptWaitBudget
-	acceptWaitBudget = 20 * time.Millisecond
-	t.Cleanup(func() { acceptWaitBudget = saved })
-
 	reader := sdkmetric.NewManualReader()
 	g := newGatedConcluder()
 	b, _ := newDeferredBackend(t, g, meteredBackend(reader))
+	storeFor(b).limits.AcceptWait = 20 * time.Millisecond
 	key := "metrics-deferred"
 	uploadID := mpCreate(t, b, key, "", "")
 	parts := uploadDistinctParts(t, b, key, uploadID, 1)

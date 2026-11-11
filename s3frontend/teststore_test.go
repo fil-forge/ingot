@@ -1,7 +1,6 @@
 package s3frontend
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -21,6 +20,7 @@ import (
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/queue/bucketqueue"
+	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
@@ -40,6 +40,9 @@ type testStore struct {
 	pool *pgxpool.Pool
 	// tasks runs one backend's tasks (newBackend).
 	tasks *taskrunner.Runner
+	// limits are the backend's multipart limits, which a test may change
+	// while it runs.
+	limits *multipartqueue.Limits
 }
 
 // stores maps each test backend to the store it runs on, for helpers that
@@ -75,7 +78,7 @@ func newTestStoreWithLease(t testing.TB, ttl time.Duration) *testStore {
 		Queues: []taskrunner.QueueOptions{
 			// Uploads' changes run sync, in their requests; the workers run
 			// the auto-aborts and reaps, and the accepts UploadPart queues,
-			// which tests delay (Backend.acceptDelay) so that only they run
+			// which tests delay (Limits.AcceptDelay) so that only they run
 			// one (runAccepts) or Complete does. The blobs' accepts an
 			// upload's accept queues run on queue-space-shard's workers.
 			{Name: registry.MultipartQueue, Workers: 2},
@@ -113,11 +116,19 @@ func (s *testStore) newBackend(t testing.TB, deps Deps) *Backend {
 			tune(d)
 		}
 	}
+	s.limits = &multipartqueue.Limits{AcceptDelay: time.Hour}
+	tuneUploads := deps.tuneUploads
+	deps.tuneUploads = func(d *multipartqueue.Deps) {
+		s.limits.RehashBudget = d.Limits.RehashBudget
+		d.Limits = s.limits
+		if tuneUploads != nil {
+			tuneUploads(d)
+		}
+	}
 	b, err := New(deps)
 	if err != nil {
 		t.Fatalf("backend: %v", err)
 	}
-	b.acceptDelay = time.Hour
 	if err := s.tasks.Handle(shardqueue.Name, shardFlush, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
 		return nil, nil
 	}); err != nil {
@@ -496,21 +507,22 @@ func sweepUploads(ctx context.Context, b *Backend) (int, error) {
 	rows.Close()
 	n := 0
 	for _, u := range uploads {
-		action, args := registry.MultipartReapAction, []byte(nil)
-		if u.state == registry.SessionOpen {
-			var buf bytes.Buffer
-			if err := (&MultipartAbortTask{Auto: true}).MarshalCBOR(&buf); err != nil {
+		if u.state != registry.SessionOpen {
+			if err := b.uploads.Reap(ctx, u.id); err != nil {
 				return n, err
 			}
-			action, args = registry.MultipartAbortAction, buf.Bytes()
+			n++
+			continue
 		}
-		call := &abortCall{}
-		if _, err := b.uploads.Run(context.WithValue(ctx, abortKey{}, call), uploadSpec(u.id, action, args)); err != nil {
+		space, err := did.Parse(u.space)
+		if err != nil {
 			return n, err
 		}
-		if space, err := did.Parse(u.space); err == nil {
-			b.blobs.ReleaseNow(ctx, space, call.released)
+		released, err := b.uploads.Abort(ctx, registry.MultipartSession{UploadID: u.id, Space: space})
+		if err != nil {
+			return n, err
 		}
+		b.blobs.ReleaseNow(ctx, space, released)
 		n++
 	}
 	return n, nil

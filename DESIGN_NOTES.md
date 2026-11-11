@@ -202,7 +202,7 @@ listing leaves it on disk.
 The part rows are the acceptance queue. `UploadPart` parks every blob of
 the part through its `queue-space-shard.add`, then records the part as
 `parked`, with each blob's plaintext length. The same transaction queues the
-upload's `queue-multipart-upload.accept` (`s3frontend/acceptor.go`,
+upload's `queue-multipart-upload.accept` (`queue/multipartqueue/accept.go`,
 `registry/accept.go`) as a replacement due now, so an upload has at most one
 accept pending. That accept runs on the upload's own subject, in turn with
 its other changes, and does nothing unless the session is `open`. It makes no network calls: it lists the upload's parked parts and
@@ -252,7 +252,7 @@ queue's health; the README lists them.
 
 Complete queues the accept of each blob of the parts it names that are still
 parked, then brings those blobs' pending accepts forward from any retry's
-backoff and waits for them within `acceptWaitBudget` (30 s), a sync no-op on
+backoff and waits for them within the accept wait (30 s, `multipartqueue.DefaultAcceptWait`), a sync no-op on
 each blob's subject running once the tasks due before it there have run.
 Past the budget it answers OperationAborted. A named part still parked after
 the wait has a blob whose accept failed, and Complete fails for the client to
@@ -272,7 +272,7 @@ share a park, and its one accept concludes it once and marks both uploads'
 parts.
 
 Every change to a multipart upload runs as a task on
-`queue-multipart-upload` (`s3frontend/multipartqueue.go`), with the upload
+`queue-multipart-upload` (`queue/multipartqueue`), with the upload
 ID as its subject, so one change to an upload runs at a time: a part never
 lands beside a Complete or an Abort, and a Complete and an Abort never
 overlap. The queue is first in the runner's order. CreateMultipartUpload
@@ -287,7 +287,7 @@ changes answers SlowDown, and one for an upload that is not open answers
 NoSuchUpload.
 
 `CompleteMultipartUpload` runs `queue-multipart-upload.complete`. It waits
-up to 10 s (`replayWaitBudget`) for the upload's other changes, another
+up to 10 s (`multipartqueue.DefaultCompleteWait`) for the upload's other changes, another
 Complete included, and past that answers OperationAborted. An upload
 already completed replays the result recorded on its session, the same
 ETag and version id. Otherwise Complete validates the parts, checks the
@@ -296,7 +296,7 @@ each blob of the parts it lists that are still parked, so a part it drops
 cannot fail it. It queues them outside its own commit, and waits for them, so
 their writes commit before Complete reads the parts again and assembles the
 object's tree, which reads the accepted blobs back through their locations.
-If they do not finish within 30 s (`acceptWaitBudget`), Complete answers
+If they do not finish within 30 s (the accept wait), Complete answers
 OperationAborted, a 409, and the upload stays open. The AWS CLI and other botocore-based
 clients treat that 409 as final and abort the upload, so the 30 s budget is
 the margin before a client sees a failed upload. An accept that fails fails

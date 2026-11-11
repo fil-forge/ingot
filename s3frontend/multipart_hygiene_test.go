@@ -408,9 +408,9 @@ func TestCompleteWaitBudgetIsOperationAborted(t *testing.T) {
 		first <- err
 	}()
 	<-g.entered
-	saveBudget := replayWaitBudget
-	replayWaitBudget = 50 * time.Millisecond
-	t.Cleanup(func() { replayWaitBudget = saveBudget })
+	limits := storeFor(b).limits
+	saveBudget := limits.CompleteWait
+	limits.CompleteWait = 50 * time.Millisecond
 
 	_, err := mpComplete(t, b, key, uploadID, parts, nil)
 	var apiErr s3err.APIError
@@ -421,7 +421,7 @@ func TestCompleteWaitBudgetIsOperationAborted(t *testing.T) {
 	if err := <-first; err != nil {
 		t.Fatalf("first Complete: %v", err)
 	}
-	replayWaitBudget = saveBudget
+	limits.CompleteWait = saveBudget
 	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
 		t.Fatalf("repeated Complete: %v", err)
 	}

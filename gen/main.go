@@ -9,11 +9,11 @@ package main
 import (
 	"github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/queue/bucketqueue"
+	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/s3frontend"
 	cbg "github.com/whyrusleeping/cbor-gen"
 )
 
@@ -76,8 +76,8 @@ func main() {
 	); err != nil {
 		panic(err)
 	}
-	if err := cfg.WriteMapEncodersToFile("../s3frontend/cbor_gen.go", "s3frontend",
-		s3frontend.MultipartAbortTask{},
+	if err := cfg.WriteMapEncodersToFile("../queue/multipartqueue/cbor_gen.go", "multipartqueue",
+		multipartqueue.AbortTask{},
 	); err != nil {
 		panic(err)
 	}

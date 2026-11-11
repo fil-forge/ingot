@@ -27,7 +27,6 @@
 package s3frontend
 
 import (
-	"cmp"
 	"context"
 	"encoding/xml"
 	"errors"
@@ -47,6 +46,7 @@ import (
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/authority"
 	"github.com/fil-forge/ingot/queue/bucketqueue"
+	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
@@ -98,14 +98,9 @@ type Backend struct {
 	blobs *spaceshardqueue.Queue
 	// buckets runs the queue-bucket tasks: every change to a bucket.
 	buckets *bucketqueue.Queue
-	// uploads runs the queue-multipart-upload tasks.
-	uploads *taskrunner.Runner
-	// acceptDelay is how long after a part lands its upload's accept is due:
-	// none, but tests delay it so that only they run it.
-	acceptDelay time.Duration
-	// multipartTTL is how long an upload stays open before its auto-abort,
-	// and a completed one is kept (Deps.MultipartSessionTTL).
-	multipartTTL time.Duration
+	// uploads runs the queue-multipart-upload tasks: every change to a
+	// multipart upload.
+	uploads      *multipartqueue.Queue
 	releaseGrace time.Duration
 	// Local blob sweeper knobs (see Deps). localBlobSweepMu serialises
 	// SweepLocalBlobs; lastOrphanPass is when its orphan pass last ran.
@@ -153,7 +148,6 @@ type Backend struct {
 
 	maxBlobSize         int64
 	allowNoneEncryption bool
-	rehashBudget        int64
 	// cors is Deps.CORS marshalled once at construction — GetBucketCors
 	// is on the per-request path, so the document is built here rather
 	// than per call. It is the default for a bucket without a document of
@@ -278,7 +272,7 @@ type Deps struct {
 
 	// RehashBudget bounds the bytes CompleteMultipartUpload reads back to
 	// hash non-final parts whose assumed object offset was wrong (0 →
-	// DefaultRehashBudget); the final part is always re-hashed. A completion
+	// multipartqueue.DefaultRehashBudget); the final part is always re-hashed. A completion
 	// needing more is refused with InvalidPartLayout.
 	RehashBudget int64
 
@@ -295,6 +289,9 @@ type Deps struct {
 	tuneBlobs func(*spaceshardqueue.Deps)
 	// tuneBuckets adjusts the queue-bucket dependencies, for tests.
 	tuneBuckets func(*bucketqueue.Deps)
+	// tuneUploads adjusts the queue-multipart-upload dependencies, for
+	// tests.
+	tuneUploads func(*multipartqueue.Deps)
 }
 
 // Compile-time assertion that Backend satisfies versitygw's interface.
@@ -348,7 +345,6 @@ func New(d Deps) (*Backend, error) {
 		tenantKeys:   d.TenantKeys,
 		claims:       d.Claims,
 		releaseGrace: d.ReleaseGrace,
-		multipartTTL: d.MultipartSessionTTL,
 
 		localBlobMaxBytes:  d.LocalBlobMaxBytes,
 		localBlobOrphanAge: localBlobOrphanAge,
@@ -357,7 +353,6 @@ func New(d Deps) (*Backend, error) {
 		logger:              logger,
 		maxBlobSize:         d.MaxBlobSize,
 		allowNoneEncryption: d.AllowNoneEncryption,
-		rehashBudget:        cmp.Or(d.RehashBudget, DefaultRehashBudget),
 		cors:                corsDoc,
 		catalogUsage:        d.CatalogUsage,
 	}
@@ -414,26 +409,32 @@ func New(d Deps) (*Backend, error) {
 		b.buckets, err = bucketqueue.New(d.Tasks, bd)
 	}
 	if err == nil {
-		err = b.registerTasks(d.Tasks)
+		ud := multipartqueue.Deps{
+			Registry:         d.Registry,
+			Multipart:        d.Multipart,
+			Intents:          d.Intents,
+			Parks:            d.Parks,
+			Read:             b.read,
+			Bodies:           uploadBodies{b},
+			Buckets:          b.buckets,
+			Blobs:            b.blobs,
+			Capture:          b.commitAuthority,
+			ReleaseGrace:     d.ReleaseGrace,
+			SessionTTL:       d.MultipartSessionTTL,
+			Limits:           &multipartqueue.Limits{RehashBudget: d.RehashBudget},
+			CompleteDeferred: b.multipartMetrics.completeDeferred,
+			Logger:           logger,
+		}
+		if d.tuneUploads != nil {
+			d.tuneUploads(&ud)
+		}
+		b.uploads, err = multipartqueue.New(d.Tasks, ud)
 	}
 	if err != nil {
 		_ = b.CloseMetrics()
 		return nil, fmt.Errorf("s3frontend: register tasks: %w", err)
 	}
 	return b, nil
-}
-
-// registerTasks registers every queue's handlers with r.
-func (b *Backend) registerTasks(r *taskrunner.Runner) error {
-	for _, register := range []func(*taskrunner.Runner) error{
-		b.registerMultipartTasks,
-		b.registerAcceptTasks,
-	} {
-		if err := register(r); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // String identifies this backend in versitygw logs.

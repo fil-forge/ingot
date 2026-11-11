@@ -24,50 +24,19 @@ import (
 // consumes these methods; the backend only stores state and returns the §2
 // sentinels. Bucket-level configuration is in bucket.go.
 
-// lockStateFromHeaders builds the VersionState a version-creating write
-// stamps from its x-amz-object-lock-* headers (§7), already validated by the
-// controller (mode and date arrive together, future-dated, known enums). Nil
-// when no header was supplied. Headers against a bucket without lock enabled
-// are the "NoSpaces" variant of the §2 missing-configuration error: every
-// creation-time path (PutObject, CopyObject, CreateMultipartUpload) reports
-// it, while the four per-version lock methods report the spaced variant —
-// the wire messages differ by one space and the conformance suite
-// distinguishes them (PutObject_missing_bucket_lock vs
-// GetObjectRetention_disabled_lock).
+// lockStateFromHeaders is bucketqueue.LockState answering a bucket without
+// lock enabled with the "NoSpaces" variant of the §2 missing-configuration
+// error: every creation-time path (PutObject, CopyObject,
+// CreateMultipartUpload, CompleteMultipartUpload) reports it, while the four
+// per-version lock methods report the spaced variant — the wire messages
+// differ by one space and the conformance suite distinguishes them
+// (PutObject_missing_bucket_lock vs GetObjectRetention_disabled_lock).
 func lockStateFromHeaders(st *registry.State, mode types.ObjectLockMode, retainUntil *time.Time, hold types.ObjectLockLegalHoldStatus) (*msbucket.VersionState, error) {
-	// The controller populates the retain-until pointer unconditionally
-	// (object-put.go: &objLock.RetainUntilDate), so an absent header arrives
-	// as a pointer to the zero time, never as nil.
-	if retainUntil != nil && retainUntil.IsZero() {
-		retainUntil = nil
-	}
-	if mode == "" && retainUntil == nil && hold == "" {
-		return nil, nil
-	}
-	if !bucketqueue.LockEnabled(st) {
+	vs, err := bucketqueue.LockState(st, mode, retainUntil, hold)
+	if errors.Is(err, bucketqueue.ErrNoObjectLock) {
 		return nil, s3err.GetAPIError(s3err.ErrMissingObjectLockConfigurationNoSpaces)
 	}
-	vs := &msbucket.VersionState{}
-	if mode != "" {
-		ret, err := json.Marshal(types.ObjectLockRetention{
-			Mode:            types.ObjectLockRetentionMode(mode),
-			RetainUntilDate: retainUntil,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("s3frontend: marshal retention: %w", err)
-		}
-		vs.Retention = ret
-	}
-	switch hold {
-	case types.ObjectLockLegalHoldStatusOn:
-		vs.LegalHold = msbucket.LegalHoldOn
-	case types.ObjectLockLegalHoldStatusOff:
-		vs.LegalHold = msbucket.LegalHoldOff
-	}
-	if vs.Empty() {
-		return nil, nil // never stamp an empty state block (§4.1 rule 3)
-	}
-	return vs, nil
+	return vs, err
 }
 
 // resolveStateTarget runs the read-side check order shared by the
