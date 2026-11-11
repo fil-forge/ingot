@@ -2,6 +2,8 @@ package bucket
 
 import (
 	"github.com/ipfs/go-cid"
+
+	"encoding/hex"
 )
 
 // ObjectManifest is the per-object metadata record stored as a CBOR
@@ -140,4 +142,14 @@ type Body struct {
 	// ("credible exit"). It is unused this iteration; Blobs is the working
 	// index. See docs/architecture.md §8.
 	IndexRoot *cid.Cid `cborgen:"ir"`
+}
+
+// QuotedETag is the version's ETag as S3 headers carry it, in double quotes:
+// the stored ETag, or the hex MD5 of the body when none is stored.
+func (m *ObjectManifest) QuotedETag() string {
+	tag := m.ETag
+	if tag == "" {
+		tag = hex.EncodeToString(m.Body.MD5)
+	}
+	return `"` + tag + `"`
 }

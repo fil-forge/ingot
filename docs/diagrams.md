@@ -258,7 +258,7 @@ Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer)
 [`logstore/README.md`](../logstore/README.md).
 
 Sources: `s3frontend/object.go` (ingestBody), `s3frontend/stream.go`,
-`queue/spaceshardqueue/spaceshardqueue.go` (runAdd), `s3frontend/bucketqueue.go` (runCommit),
+`queue/spaceshardqueue/spaceshardqueue.go` (runAdd), `queue/bucketqueue/bucketqueue.go` (runCommit),
 `s3frontend/bucketship.go` (runShip),
 `bucket/sized.go`, `blockstore/blobcache.go`,
 `blockstore/staging.go`, `logstore/`, `uploader/forge.go`, `uploader/blob.go`,
@@ -409,7 +409,8 @@ Sources: `s3frontend/object.go` (PutObject, ingestBody, concludeBody),
 `queue/spaceshardqueue/spaceshardqueue.go` (Add, runAdd, runExpire), `s3frontend/stream.go` (WriteSizedBlob), `queue/shardqueue/shardqueue.go`
 (Cache), `blockstore/blobcache.go`, `bucket/sized.go`, `uploader/stream.go`,
 `s3frontend/copy.go` (CopyObject, copySourceBucket),
-`s3frontend/version.go` (applyPut), `s3frontend/bucketqueue.go` (commit, runCommit, register),
+`queue/bucketqueue/version.go` (applyPut), `queue/bucketqueue/bucketqueue.go` (Commit, runCommit, register),
+`s3frontend/bucketqueue.go` (commit),
 `registry/bucketcommit.go` (RootCommitWrites),
 `queue/spaceuploadqueue/spaceuploadqueue.go` (the queue-space-upload handlers), `bucketop/bucketop.go`,
 `blockstore/staging.go`, `uploader/blob.go`, `uploader/forge.go`,
@@ -440,7 +441,7 @@ sequenceDiagram
     alt manifest-valued key
         Note over B,LY: the value block is the manifest<br/>(answers every versionId class)
     else leaf-valued key
-        Note over B,LY: Current for the head, otherwise seek the prev tree at<br/>revSeqKey(seq) and confirm the stored VersionID (see version-tree)
+        Note over B,LY: Current for the head, otherwise seek the prev tree at<br/>RevSeqKey(seq) and confirm the stored VersionID (see version-tree)
     end
     Note over B: delete marker: 404 NoSuchKey (current) or 405 (versioned),<br/>then preconditions and selectBytes (Range, or partNumber via Body.PartSizes)
     B->>R: bodyOpener: unless the manifest marks the body plaintext,<br/>blob_encryption_params + blob_locations for the blobs the range covers,<br/>one query each (a missing row fails the read)
@@ -643,7 +644,7 @@ Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
 acceptRequested, sessionReleases), `s3frontend/multipartqueue.go`
 (runCreateUpload, runAddPart, runAbort, runReap), `registry/multipartqueue.go`
 (PartWrites, CompletedSession),
-`s3frontend/version.go` (reserveVersion, applyPut), `s3frontend/bucketqueue.go` (putPreCheck),
+`queue/bucketqueue/version.go` (Reserve, applyPut), `queue/bucketqueue/bucketqueue.go` (putPreCheck),
 `s3frontend/acceptor.go` (runAccept), `queue/spaceshardqueue/spaceshardqueue.go` (runAccept), `registry/accept.go`,
 `s3frontend/stream.go`,
 `queue/spaceshardqueue/spaceshardqueue.go` (Add, runAdd, DropRefsNow),
@@ -719,7 +720,7 @@ stateDiagram-v2
   the request, after `queue-bucket.close`.
 
 Sources: `s3frontend/multipart.go`, `s3frontend/multipartqueue.go`,
-`s3frontend/bucketqueue.go` (putPreCheck), `registry/multipartqueue.go`
+`queue/bucketqueue/bucketqueue.go` (putPreCheck), `registry/multipartqueue.go`
 (CompletedSession, DeletedSession, ReapedSession). Review when these change.
 
 ## Blob lifecycle: uploading, parked, accepted, released
@@ -836,7 +837,7 @@ flowchart TB
     mans["arm /objectmanifest/1<br/>single-version key:<br/>the manifest itself, one-block read<br/>(/objectmanifest/0 decodes into it)"]
     leaf["arm /objectleaf/0<br/>ObjectLeaf"]
     cur["Current: VersionNode<br/>(Seq, VersionID, Manifest CID)"]
-    prev["Prev: per-key sub-MST of noncurrent versions<br/>keyed revSeqKey(seq): %016x of bit-inverted seq,<br/>so a forward walk is newest-first"]
+    prev["Prev: per-key sub-MST of noncurrent versions<br/>keyed RevSeqKey(seq): %016x of bit-inverted seq,<br/>so a forward walk is newest-first"]
     nulls["NullSeq: a noncurrent null<br/>version's seq (0 = none)"]
     em["EnvelopedManifest<br/>one per noncurrent version"]
     mf["ObjectManifest<br/>Seq, VersionID, DeleteMarker, ETag, headers,<br/>Body(Size, BLAKE3, TreeChunkLog, TreeBlocks,<br/>MD5, Blobs, PartSizes)"]
@@ -877,8 +878,8 @@ value union §2.1, prev tree §2.2, token §3, write rule §5, deletes §7);
 [`architecture.md` §4](./architecture.md#4-the-catalog-layer) keeps the ASCII
 manifest figure this complements.
 
-Sources: `bucket/leaf.go`, `bucket/manifest.go`, `s3frontend/version.go`
-(mintVersionID, revSeqKey, applyPut, applyDeleteVersion),
+Sources: `bucket/leaf.go`, `bucket/manifest.go`, `queue/bucketqueue/version.go`
+(mintVersionID, RevSeqKey, applyPut, applyDeleteVersion),
 `s3frontend/bucketadmin.go` (runSetVersioning). Review when
 `bucket/` types change (and re-run `make gen`).
 
@@ -933,10 +934,10 @@ flowchart TB
 Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer),
 [`s3-versioning.md`](./s3-versioning.md) §7.
 
-Sources: `s3frontend/version.go` (applyPut supersession,
-applyDeleteVersion), `s3frontend/object.go` (applyDeleteKey),
-`s3frontend/objectlock.go` (applySetAttributes), `bucketop/bucketop.go`
-(AddGCCandidate, Mark, Restore), `s3frontend/version.go` (pruneVersionState),
+Sources: `queue/bucketqueue/version.go` (applyPut supersession,
+applyDeleteVersion, pruneVersionState), `queue/bucketqueue/claims.go`
+(applyDeleteKey), `queue/bucketqueue/objectlock.go` (applySetAttributes),
+`bucketop/bucketop.go` (AddGCCandidate, Mark, Restore),
 `registry/bucketcommit.go`
 (RootCommitWrites). Review when these change.
 
@@ -1354,7 +1355,7 @@ sequenceDiagram
 
 Sources: `s3frontend/bucket.go` (DeleteBucket, runDeleteBucket),
 `s3frontend/bucketadmin.go` (runCloseBucket, runAdmitUpload),
-`s3frontend/bucketqueue.go` (bucketSpec), `s3frontend/multipartqueue.go`
+`s3frontend/bucketadmin.go` (bucketSpec), `s3frontend/multipartqueue.go`
 (abortUpload, runAbort, reapNow, runReap),
 `queue/spaceshardqueue/spaceshardqueue.go` (DrainSpace),
 `queue/spaceuploadqueue/spaceuploadqueue.go` (Drain),
@@ -1368,7 +1369,8 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | Package / file | Diagrams to review |
 |---|---|
 | `s3frontend/object.go` | put, get, blob-lifecycle, version-tree, gc-candidates, delete-bucket |
-| `s3frontend/version.go` | put, get, multipart, blob-lifecycle, version-tree, gc-candidates |
+| `s3frontend/version.go` | get |
+| `queue/bucketqueue/` | put, multipart, blob-lifecycle, version-tree, gc-candidates, logstore-pipeline |
 | `s3frontend/multipart.go`, `multipartqueue.go`, `registry/multipartqueue.go` | multipart, part-states, multipart-states, blob-lifecycle, delete-bucket |
 | `s3frontend/acceptor.go`, `registry/accept.go` | multipart, part-states, blob-lifecycle |
 | `queue/spaceshardqueue/spaceshardqueue.go` | put, multipart, part-states, blob-lifecycle, delete-bucket |
@@ -1376,7 +1378,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `queue/shardqueue/shardqueue.go`, `s3frontend/localblob_sweep.go` | put, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |
-| `s3frontend/bucketqueue.go`, `bucketchanges.go`, `bucketadmin.go`, `bucketship.go` | put, multipart, gc-candidates, delete-bucket, logstore-pipeline |
+| `s3frontend/bucketqueue.go`, `bucketadmin.go`, `bucketship.go` | put, multipart, gc-candidates, delete-bucket, logstore-pipeline |
 | `bucketop/` | put, get, delete-bucket, packages, principals |
 | `taskrunner/` | packages, put, multipart, multipart-states, delete-bucket |
 | `blockstore/` | get, packages, block-routes; `forge.go` also context, principals |

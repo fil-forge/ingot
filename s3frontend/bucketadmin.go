@@ -82,6 +82,7 @@ func encodeBucketTask(args cborArgs) ([]byte, error) {
 
 // registerBucketAdmin registers the queue-bucket actions besides commit.
 func (b *Backend) registerBucketAdmin(r *taskrunner.Runner) error {
+	b.buckets = r
 	for action, h := range map[string]taskrunner.Handler{
 		registry.BucketCreateAction:        b.runCreateBucket,
 		registry.BucketSetVersioningAction: b.runSetVersioning,
@@ -100,6 +101,21 @@ func (b *Backend) registerBucketAdmin(r *taskrunner.Runner) error {
 		}
 	}
 	return b.registerShip(r)
+}
+
+// bucketSpec is a queue-bucket task on space's bucket, placed on this
+// instance, which holds the bucket's catalog log.
+func (b *Backend) bucketSpec(space did.DID, action string, args []byte) taskrunner.Spec {
+	spec := taskrunner.Spec{
+		Queue:   registry.BucketQueue,
+		Subject: registry.BucketSubject(space),
+		Action:  action,
+		Args:    args,
+	}
+	if node := b.buckets.Node(); node != "" {
+		spec.Node = &node
+	}
+	return spec
 }
 
 // runBucket runs a queue-bucket action on space's bucket for the request

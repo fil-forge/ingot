@@ -8,6 +8,7 @@ package main
 
 import (
 	"github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
@@ -55,18 +56,22 @@ func main() {
 	); err != nil {
 		panic(err)
 	}
+	if err := cfg.WriteMapEncodersToFile("../queue/bucketqueue/cbor_gen.go", "bucketqueue",
+		bucketqueue.BucketCommitTask{},
+		bucketqueue.KeyChange{},
+		bucketqueue.PutChange{},
+		bucketqueue.BlobRefTask{},
+		bucketqueue.ReservedVersion{},
+		bucketqueue.DeleteChange{},
+		bucketqueue.DeletePreconditions{},
+		bucketqueue.SetAttributesChange{},
+		bucketqueue.BucketCommitResult{},
+		bucketqueue.ChangeResult{},
+		bucketqueue.ChangeError{},
+	); err != nil {
+		panic(err)
+	}
 	if err := cfg.WriteMapEncodersToFile("../s3frontend/cbor_gen.go", "s3frontend",
-		s3frontend.BucketCommitTask{},
-		s3frontend.KeyChange{},
-		s3frontend.PutChange{},
-		s3frontend.BlobRefTask{},
-		s3frontend.ReservedVersion{},
-		s3frontend.DeleteChange{},
-		s3frontend.DeletePreconditions{},
-		s3frontend.SetAttributesChange{},
-		s3frontend.BucketCommitResult{},
-		s3frontend.ChangeResult{},
-		s3frontend.ChangeError{},
 		s3frontend.BucketTask{},
 		s3frontend.BucketCreateTask{},
 		s3frontend.BucketSetVersioningTask{},

@@ -20,6 +20,7 @@ import (
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/internal/testfakes"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
@@ -431,7 +432,7 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 // refs, as a put through the bucket queue: for tests that write a manifest
 // no S3 verb would.
 func commitPut(ctx context.Context, b *Backend, st *registry.State, key string, mf *msbucket.ObjectManifest, blobs msbucket.BlobRefs, refs map[string]taskrunner.TaskID) error {
-	_, _, err := b.commitOne(ctx, st, KeyChange{Key: key, Put: &PutChange{Manifest: mf, HasBlobs: blobs != nil, Blobs: blobs, Refs: blobRefTasks(refs)}}, "commit version")
+	_, _, err := b.commitOne(ctx, st, bucketqueue.KeyChange{Key: key, Put: &bucketqueue.PutChange{Manifest: mf, HasBlobs: blobs != nil, Blobs: blobs, Refs: blobRefTasks(refs)}}, "commit version")
 	return err
 }
 

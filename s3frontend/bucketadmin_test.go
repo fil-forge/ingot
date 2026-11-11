@@ -13,6 +13,7 @@ import (
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/reqscope"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 )
@@ -49,11 +50,11 @@ func TestABucketTaskForAnotherSpaceIsNoSuchBucket(t *testing.T) {
 		t.Fatalf("the bucket after a delete for another space: %v", err)
 	}
 
-	commit, err := encodeBucketTask(&BucketCommitTask{Bucket: "bk"})
+	commit, err := encodeBucketTask(&bucketqueue.BucketCommitTask{Bucket: "bk"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = b.runCommit(ctx, nil, taskrunner.Task{Subject: old.String(), Args: commit})
+	_, err = b.buckets.Run(ctx, taskrunner.Spec{Queue: registry.BucketQueue, Subject: old.String(), Action: registry.BucketCommitAction, Args: commit})
 	if !errors.Is(err, bucketop.ErrBucketNotFound) {
 		t.Fatalf("commit for another space: %v, want the bucket not found", err)
 	}

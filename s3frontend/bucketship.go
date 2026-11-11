@@ -74,6 +74,24 @@ func (b *Backend) awaitingShip(bucket string) bool {
 	return b.shipAwaiting[bucket]
 }
 
+// queueAwaitedShip queues st's bucket's ship with a commit that appended to
+// its log, when the ship awaits authority: the append captured fresh ship
+// authority.
+func (b *Backend) queueAwaitedShip(ctx context.Context, ex *taskrunner.Exec, st *registry.State) error {
+	if !b.awaitingShip(st.Name) {
+		return nil
+	}
+	raw, err := encodeBucketTask(&BucketTask{Name: st.Name})
+	if err != nil {
+		return err
+	}
+	spec := b.bucketSpec(st.Space, registry.BucketShipAction, raw)
+	now := registry.DueNow()
+	spec.NotBefore, spec.Replace = &now, true
+	_, err = ex.Submit(ctx, spec)
+	return err
+}
+
 // shipNoticeFirst and shipNoticeMax bound the backoff between attempts to
 // queue an owed ship. Package-level so tests can shrink them.
 var (
