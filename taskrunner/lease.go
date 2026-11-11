@@ -29,9 +29,12 @@ type hold struct {
 	turn *runTurn
 	// claimed is set when the statement that took the lease also claimed
 	// the task to run first under it and recorded that task's tree age, so
-	// the task need not record its age, nor check the lease, again before it
-	// starts. It holds for that one task.
+	// the task need not record its age, nor check the lease, again if it
+	// starts soon after (see runRoot). It holds for that one task.
 	claimed bool
+	// taken is when the statement that took the lease was sent: the lease
+	// runs for a TTL from no earlier than this.
+	taken time.Time
 	// releaseOnCommit is set for a Run caller's hold: its task's commit
 	// deletes the lease row in the same transaction, rather than extending
 	// it, since the caller releases the lease once its task has run.
@@ -154,9 +157,14 @@ func (r *Runner) takeTurn(ctx context.Context, q *queue, subject string, age tre
 	sent := time.Now()
 	// Every part reads the snapshot the statement started with: claimed
 	// joins taken, so it marks the task started only when this statement
-	// took the lease.
+	// took the lease. Taking it can wait for a holder's commit that deletes
+	// the lease row, and the snapshot is then older than that commit, so
+	// the claim stands only when the snapshot had no live lease to wait for:
+	// no row, or one this statement took over once it had expired.
 	err := r.db.QueryRow(ctx, `
-WITH taken AS (
+WITH prior AS (
+	SELECT 1 FROM `+q.leases+` WHERE subject = $1
+), taken AS (
 	INSERT INTO `+q.leases+` AS l (subject, owner, expires, tree_created, tree_id)
 	VALUES ($1, $2, now() + $3 * interval '1 millisecond', $4, $5)
 	ON CONFLICT (subject) DO UPDATE
@@ -174,6 +182,7 @@ WITH taken AS (
 	FROM taken, next
 	WHERE t.id = next.id AND t.id = $7 AND t.state = 'pending'
 	AND NOT next.backing_off AND (next.node IS NULL OR next.node = $8)
+	AND (taken.took_over OR NOT EXISTS (SELECT 1 FROM prior))
 	RETURNING t.seq, t.id, t.action, t.created, t.not_before, t.expires, t.args, t.sync, t.attempts, t.node
 )
 SELECT EXISTS (SELECT 1 FROM taken), coalesce((SELECT took_over FROM taken), false),
@@ -199,11 +208,7 @@ FROM (SELECT 1) one LEFT JOIN claimed ON true`,
 	if c.id == nil {
 		return h, nil, nil
 	}
-	// The lease expires a TTL after the statement started, and the claim
-	// can have waited on a lock for most of that. Only a statement that
-	// answered well inside the TTL, as renewal does, leaves the lease
-	// certainly live; otherwise the task checks it before it starts.
-	h.claimed = time.Since(sent) < r.opts.LeaseTTL/3
+	h.claimed, h.taken = true, sent
 	return h, &Task{
 		Queue: q.name, Subject: subject, ID: *c.id, Action: *c.action, Created: *c.created,
 		NotBefore: c.notBefore, Expires: c.expires, Args: c.args, sync: *c.sync,
@@ -213,11 +218,13 @@ FROM (SELECT 1) one LEFT JOIN claimed ON true`,
 
 // setAge records the tree about to run under h, for other trees' wait-or-die
 // decisions. It is also the check, before each task's handler starts, that h
-// still owns the lease: it returns errLeaseLost when another consumer has
-// taken it over.
+// still owns the lease, which it extends by a TTL from now, so the handler
+// starts with the whole of it: it returns errLeaseLost when another consumer
+// has taken the lease over or it has expired.
 func (r *Runner) setAge(ctx context.Context, h *hold, age treeAge) error {
-	tag, err := r.db.Exec(ctx, `UPDATE `+h.q.leases+` SET tree_created = $3, tree_id = $4
-		WHERE subject = $1 AND owner = $2 AND expires >= now()`, h.subject, h.token, age.created, age.id)
+	tag, err := r.db.Exec(ctx, `UPDATE `+h.q.leases+` SET tree_created = $3, tree_id = $4,
+		expires = now() + $5 * interval '1 millisecond'
+		WHERE subject = $1 AND owner = $2 AND expires >= now()`, h.subject, h.token, age.created, age.id, r.opts.LeaseTTL.Milliseconds())
 	if err != nil {
 		return fmt.Errorf("record tree on lease %s/%s: %w", h.q.name, h.subject, err)
 	}

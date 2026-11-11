@@ -27,6 +27,9 @@ type countingDB struct {
 	leaseTries atomic.Int64
 	// callerStatements counts the statements other than background ones.
 	callerStatements atomic.Int64
+	// leaseChecks counts the separate checks of a lease before a task
+	// starts, which a task claimed as its lease was taken goes without.
+	leaseChecks atomic.Int64
 	// stopWaitingDelay holds back the statement that clears a sync task's
 	// waiting caller, widening the window in which others can see it.
 	stopWaitingDelay atomic.Int64
@@ -57,6 +60,9 @@ func (c *countingDB) count(sql string) {
 	}
 	if !background(sql) {
 		c.callerStatements.Add(1)
+	}
+	if strings.Contains(sql, "SET tree_created") {
+		c.leaseChecks.Add(1)
 	}
 }
 
@@ -165,6 +171,8 @@ func TestRunCallersOnOneSubjectTakeTheLeaseInTurn(t *testing.T) {
 	})
 	ctx := waitCtx(t)
 	before := db.leaseTries.Load()
+	beforeStatements := db.callerStatements.Load()
+	beforeChecks := db.leaseChecks.Load()
 
 	var wg sync.WaitGroup
 	errs := make(chan error, callers)
@@ -182,9 +190,15 @@ func TestRunCallersOnOneSubjectTakeTheLeaseInTurn(t *testing.T) {
 	}
 
 	tries := db.leaseTries.Load() - before
-	t.Logf("%d lease attempts for %d sync tasks on one subject", tries, callers)
+	t.Logf("%d lease attempts for %d sync tasks on one subject, %.1f statements each",
+		tries, callers, float64(db.callerStatements.Load()-beforeStatements)/callers)
 	if tries > 3*callers {
 		t.Errorf("%d lease attempts for %d sync tasks; want at most %d", tries, callers, 3*callers)
+	}
+	// Each caller takes the lease as the one before it leaves the subject,
+	// so each claims its task as it takes the lease.
+	if checks := db.leaseChecks.Load() - beforeChecks; checks > 0 {
+		t.Errorf("%d tasks claimed apart from taking their lease; want none", checks)
 	}
 }
 
@@ -615,5 +629,49 @@ func TestRunCallerTakingALeaseFromAnotherInstancesCommitDoesNotWaitForItsTask(t 
 		}
 	case <-time.After(time.Second):
 		t.Fatal("the second instance's caller waited behind a task the first instance's commit had finished")
+	}
+}
+
+// A Run caller whose claim was slow, though not past its lease, starts its
+// handler with a full lease: the check before the handler starts extends the
+// lease as well as confirming it, so the handler does not start with only the
+// little that the claim's wait left.
+func TestRunCallerStartsItsHandlerWithAFullLeaseAfterASlowClaim(t *testing.T) {
+	const ttl = 600 * time.Millisecond
+	env := taskrunnertest.NewEnv(t)
+	db := &countingDB{Pool: env.DB}
+	leases := env.Table(queueTable(qTop) + "_leases")
+	var left atomic.Int64
+	r := startCountingRunner(t, env, db, ttl, time.Second, func(ctx context.Context, _ *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		var ms float64
+		if err := env.DB.QueryRow(ctx, `SELECT extract(epoch FROM expires - now()) * 1000 FROM `+leases+` WHERE subject = $1`, task.Subject).Scan(&ms); err != nil {
+			return nil, err
+		}
+		left.Store(int64(ms))
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	tasks := env.Table(queueTable(qTop) + "_tasks")
+	before := func(args []any) {
+		tx, err := env.DB.Begin(ctx)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM `+tasks+` WHERE id = $1 FOR UPDATE`, args[6]); err != nil {
+			t.Error(err)
+		}
+		go func() {
+			time.Sleep(350 * time.Millisecond) // past a third of the TTL, short of all of it
+			_ = tx.Rollback(context.Background())
+		}()
+	}
+	db.beforeTakeTurn.Store(&before)
+	if _, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("the handler started with %dms of its %v lease left", left.Load(), ttl)
+	if got := time.Duration(left.Load()) * time.Millisecond; got < ttl/2 {
+		t.Errorf("the handler started with %v of its %v lease left; want at least %v", got, ttl, ttl/2)
 	}
 }

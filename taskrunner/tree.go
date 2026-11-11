@@ -453,12 +453,19 @@ func deleteLease(ctx context.Context, tx pgx.Tx, h *hold) error {
 func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte, err error, stop error) {
 	first := tasks[0]
 	age := treeAge{first.Created, first.ID}
-	if h.claimed && h.age.id == age.id && h.age.created.Equal(age.created) {
-		// The statement that took the lease claimed this task and recorded
-		// its age: the lease is this hold's, and says so.
-		h.claimed = false
-	} else if err := r.setAge(ctx, h, age); err != nil {
-		return nil, nil, err
+	// A task the statement that took the lease claimed has its age recorded
+	// and its lease confirmed already. The lease runs a TTL from when that
+	// statement was sent, and the claim can have waited on a lock for much
+	// of it, so the task skips its own check only while the lease is
+	// certainly young, as renewal keeps it; otherwise the check confirms the
+	// lease and extends it.
+	recorded := h.claimed && time.Since(h.taken) < r.opts.LeaseTTL/3 &&
+		h.age.id == age.id && h.age.created.Equal(age.created)
+	h.claimed = false
+	if !recorded {
+		if err := r.setAge(ctx, h, age); err != nil {
+			return nil, nil, err
+		}
 	}
 	live := tasks
 	start := time.Now()
