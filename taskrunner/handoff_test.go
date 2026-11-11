@@ -25,12 +25,26 @@ type countingDB struct {
 	*pgxpool.Pool
 	statements atomic.Int64
 	leaseTries atomic.Int64
+	// callerStatements counts the statements other than background ones.
+	callerStatements atomic.Int64
+	// leaseChecks counts the separate checks of a lease before a task
+	// starts, which a task claimed as its lease was taken goes without.
+	leaseChecks atomic.Int64
+	// leaseReleases counts the lease releases sent on their own, outside a
+	// task's commit.
+	leaseReleases atomic.Int64
+	// claimRenewals counts the renewer's statements that keep waiting
+	// callers' claims live.
+	claimRenewals atomic.Int64
 	// stopWaitingDelay holds back the statement that clears a sync task's
 	// waiting caller, widening the window in which others can see it.
 	stopWaitingDelay atomic.Int64
 	// afterOutcome, when set, is called once, after the next read of a sync
 	// task's outcome and before the runner sees the result.
 	afterOutcome atomic.Pointer[func()]
+	// beforeTakeTurn, when set, is called once, with its arguments, before
+	// the next statement that takes a lease and claims a Run caller's task.
+	beforeTakeTurn atomic.Pointer[func(args []any)]
 }
 
 // pausedRow is a row whose Scan calls a hook once it has read the row.
@@ -50,6 +64,30 @@ func (c *countingDB) count(sql string) {
 	if strings.Contains(sql, "ON CONFLICT (subject) DO UPDATE") {
 		c.leaseTries.Add(1)
 	}
+	if !background(sql) {
+		c.callerStatements.Add(1)
+	}
+	if strings.Contains(sql, "SET tree_created") {
+		c.leaseChecks.Add(1)
+	}
+	if strings.HasPrefix(sql, "DELETE FROM") && strings.Contains(sql, "WHERE subject = $1 AND owner = $2") {
+		c.leaseReleases.Add(1)
+	}
+	if strings.Contains(sql, "SET waiting_until = now() +") {
+		c.claimRenewals.Add(1)
+	}
+}
+
+// background reports whether sql is one of the runner's own periodic
+// statements, which run whatever its callers do: the workers' poll, lease
+// and claim renewal, and retention.
+func background(sql string) bool {
+	for _, s := range []string{"SELECT d.subject", "FOR UPDATE SKIP LOCKED", "SET waiting_until = now() +", "WHERE id IN ("} {
+		if strings.Contains(sql, s) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *countingDB) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -59,6 +97,11 @@ func (c *countingDB) Query(ctx context.Context, sql string, args ...any) (pgx.Ro
 
 func (c *countingDB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	c.count(sql)
+	if strings.Contains(sql, "claimed AS (") {
+		if before := c.beforeTakeTurn.Swap(nil); before != nil {
+			(*before)(args)
+		}
+	}
 	row := c.Pool.QueryRow(ctx, sql, args...)
 	if strings.Contains(sql, "SELECT state, result, error FROM") {
 		if after := c.afterOutcome.Swap(nil); after != nil {
@@ -89,10 +132,25 @@ func newCountingRunnerWithWorkers(t *testing.T, pollInterval time.Duration, work
 	t.Helper()
 	env := taskrunnertest.NewEnv(t)
 	db := &countingDB{Pool: env.DB}
+	return startCountingRunnerWithWorkers(t, env, db, workers, 5*time.Second, pollInterval, h), db
+}
+
+// startCountingRunner starts a runner over db, on env's schema, with one
+// queue of four workers that poll every pollInterval. Several runners on one
+// env stand for instances sharing a database.
+func startCountingRunner(t *testing.T, env taskrunnertest.Env, db *countingDB, leaseTTL, pollInterval time.Duration, h taskrunner.Handler) *taskrunner.Runner {
+	t.Helper()
+	return startCountingRunnerWithWorkers(t, env, db, 4, leaseTTL, pollInterval, h)
+}
+
+// startCountingRunnerWithWorkers is startCountingRunner with the queue's
+// worker count given.
+func startCountingRunnerWithWorkers(t *testing.T, env taskrunnertest.Env, db *countingDB, workers int, leaseTTL, pollInterval time.Duration, h taskrunner.Handler) *taskrunner.Runner {
+	t.Helper()
 	r, err := taskrunner.New(db, taskrunner.Options{
 		Schema:       env.Schema,
 		Queues:       []taskrunner.QueueOptions{{Name: qTop, Workers: workers}},
-		LeaseTTL:     5 * time.Second,
+		LeaseTTL:     leaseTTL,
 		PollInterval: pollInterval,
 		Logger:       zaptest.NewLogger(t),
 	})
@@ -110,7 +168,7 @@ func newCountingRunnerWithWorkers(t *testing.T, pollInterval time.Duration, work
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = r.Stop(context.Background()) })
-	return r, db
+	return r
 }
 
 // Run callers queued on one subject take its lease in turn: each release wakes
@@ -125,6 +183,8 @@ func TestRunCallersOnOneSubjectTakeTheLeaseInTurn(t *testing.T) {
 	})
 	ctx := waitCtx(t)
 	before := db.leaseTries.Load()
+	beforeStatements := db.callerStatements.Load()
+	beforeChecks := db.leaseChecks.Load()
 
 	var wg sync.WaitGroup
 	errs := make(chan error, callers)
@@ -142,9 +202,15 @@ func TestRunCallersOnOneSubjectTakeTheLeaseInTurn(t *testing.T) {
 	}
 
 	tries := db.leaseTries.Load() - before
-	t.Logf("%d lease attempts for %d sync tasks on one subject", tries, callers)
+	t.Logf("%d lease attempts for %d sync tasks on one subject, %.1f statements each",
+		tries, callers, float64(db.callerStatements.Load()-beforeStatements)/callers)
 	if tries > 3*callers {
 		t.Errorf("%d lease attempts for %d sync tasks; want at most %d", tries, callers, 3*callers)
+	}
+	// Each caller takes the lease as the one before it leaves the subject,
+	// so each claims its task as it takes the lease.
+	if checks := db.leaseChecks.Load() - beforeChecks; checks > 0 {
+		t.Errorf("%d tasks claimed apart from taking their lease; want none", checks)
 	}
 }
 
@@ -198,8 +264,9 @@ func TestRunCallerLeavingTheLineWakesTheNext(t *testing.T) {
 }
 
 // The caller at the front of the line backs off while a task ahead of its own
-// holds the subject: releasing the lease it took to find that out does not
-// wake it again at once.
+// holds the subject, and each look at the subject is one statement that takes
+// no lease: a caller takes the lease only when its own task is next, so it has
+// nothing to release when it is not.
 func TestRunCallerBacksOffBehindATaskAhead(t *testing.T) {
 	r, db := newCountingRunner(t, time.Second, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
 		return nil, nil
@@ -210,15 +277,26 @@ func TestRunCallerBacksOffBehindATaskAhead(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := db.leaseTries.Load()
+	beforeStatements, beforeReleases := db.callerStatements.Load(), db.leaseReleases.Load()
 	expires := time.Now().Add(500 * time.Millisecond)
 	_, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Expires: &expires})
 	if !errors.Is(err, taskrunner.ErrExpired) {
 		t.Fatalf("Run behind another instance's task: %v, want ErrExpired", err)
 	}
 	tries := db.leaseTries.Load() - before
-	t.Logf("%d lease attempts in 500ms behind a task ahead", tries)
+	// Besides each look: the task's insert, the caller's outcome read before
+	// each wait, and the clearing of its claim at the end.
+	per := float64(db.callerStatements.Load()-beforeStatements-2) / float64(tries)
+	releases := db.leaseReleases.Load() - beforeReleases
+	t.Logf("%d looks in 500ms behind a task ahead, %.1f statements each, %d leases released", tries, per, releases)
 	if tries > 20 {
-		t.Errorf("%d lease attempts in 500ms behind a task ahead; want at most 20", tries)
+		t.Errorf("%d looks in 500ms behind a task ahead; want at most 20", tries)
+	}
+	if per > 2 {
+		t.Errorf("%.1f statements per look behind a task ahead; want at most 2", per)
+	}
+	if releases > 0 {
+		t.Errorf("%d leases released behind a task ahead; want none taken", releases)
 	}
 }
 
@@ -461,5 +539,224 @@ func TestCancelBetweenAnOutcomeReadAndTheWaitWakesTheCaller(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("a cancel between the outcome read and the wait went unheard until the poll interval")
+	}
+}
+
+// A Run caller on a free subject sends two statements outside its task's own
+// transaction: the task's insert, and one that takes the lease and claims the
+// task. The task's transaction records the outcome and releases the lease,
+// and a task with an outcome has no waiting claim left to clear. Every
+// statement that runs on its own is a commit, so each one adds to the time
+// the subject is held.
+func TestRunOnAFreeSubjectSendsTwoStatements(t *testing.T) {
+	r, db := newCountingRunner(t, time.Minute, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	const runs = 10
+	before := db.callerStatements.Load()
+	for i := range runs {
+		if _, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte(strconv.Itoa(i))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	per := float64(db.callerStatements.Load()-before) / runs
+	t.Logf("%.1f statements per Run on a free subject", per)
+	if per > 2 {
+		t.Errorf("%.1f statements per Run on a free subject; want at most 2", per)
+	}
+}
+
+// A Run caller whose claim waited out its lease's TTL does not start its
+// handler under the lapsed lease: it checks the lease before starting, and
+// starts only once it holds a live one. The claim waits here behind a lock
+// on its task's row, as it would behind a transaction cancelling the task
+// that then rolls back.
+func TestRunCallerDoesNotStartUnderALeaseItsClaimOutlived(t *testing.T) {
+	const ttl = 300 * time.Millisecond
+	env := taskrunnertest.NewEnv(t)
+	db := &countingDB{Pool: env.DB}
+	leases := env.Table(queueTable(qTop) + "_leases")
+	var lapsed atomic.Int32
+	r := startCountingRunner(t, env, db, ttl, time.Second, func(ctx context.Context, _ *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		var live bool
+		if err := env.DB.QueryRow(ctx, `SELECT expires >= now() FROM `+leases+` WHERE subject = $1`, task.Subject).Scan(&live); err != nil || !live {
+			lapsed.Add(1)
+		}
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	tasks := env.Table(queueTable(qTop) + "_tasks")
+	before := func(args []any) {
+		tx, err := env.DB.Begin(ctx)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM `+tasks+` WHERE id = $1 FOR UPDATE`, args[6]); err != nil {
+			t.Error(err)
+		}
+		go func() {
+			time.Sleep(3 * ttl)
+			_ = tx.Rollback(context.Background())
+		}()
+	}
+	db.beforeTakeTurn.Store(&before)
+	if _, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := lapsed.Load(); n > 0 {
+		t.Errorf("the handler started %d time(s) under a lapsed lease", n)
+	}
+}
+
+// A Run caller that takes the lease from another instance's commit, which
+// releases it, does not wait behind that instance's task, which the commit
+// finished: it claims afresh rather than trusting what it saw before the
+// commit landed.
+func TestRunCallerTakingALeaseFromAnotherInstancesCommitDoesNotWaitForItsTask(t *testing.T) {
+	env := taskrunnertest.NewEnv(t)
+	hold := make(chan struct{})
+	started := make(chan struct{}, 1)
+	h := func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if string(task.Args) == "first" {
+			started <- struct{}{}
+			<-hold
+			// Keep the commit, which holds the lease row, open a while.
+			return nil, ex.Write(ctx, `SELECT pg_sleep(0.5)`)
+		}
+		return nil, nil
+	}
+	a := startCountingRunner(t, env, &countingDB{Pool: env.DB}, 5*time.Second, 2*time.Second, h)
+	b := startCountingRunner(t, env, &countingDB{Pool: env.DB}, 5*time.Second, 2*time.Second, h)
+	ctx := waitCtx(t)
+
+	first := make(chan error, 1)
+	go func() {
+		_, err := a.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte("first")})
+		first <- err
+	}()
+	<-started
+	second := make(chan error, 1)
+	go func() {
+		_, err := b.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte("second")})
+		second <- err
+	}()
+	time.Sleep(100 * time.Millisecond) // second retries the lease meanwhile
+	close(hold)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-second:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the second instance's caller waited behind a task the first instance's commit had finished")
+	}
+}
+
+// A Run caller whose claim was slow, though not past its lease, starts its
+// handler with a full lease: the check before the handler starts extends the
+// lease as well as confirming it, so the handler does not start with only the
+// little that the claim's wait left.
+func TestRunCallerStartsItsHandlerWithAFullLeaseAfterASlowClaim(t *testing.T) {
+	const ttl = 600 * time.Millisecond
+	env := taskrunnertest.NewEnv(t)
+	db := &countingDB{Pool: env.DB}
+	leases := env.Table(queueTable(qTop) + "_leases")
+	var left atomic.Int64
+	r := startCountingRunner(t, env, db, ttl, time.Second, func(ctx context.Context, _ *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		var ms float64
+		if err := env.DB.QueryRow(ctx, `SELECT extract(epoch FROM expires - now()) * 1000 FROM `+leases+` WHERE subject = $1`, task.Subject).Scan(&ms); err != nil {
+			return nil, err
+		}
+		left.Store(int64(ms))
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	tasks := env.Table(queueTable(qTop) + "_tasks")
+	before := func(args []any) {
+		tx, err := env.DB.Begin(ctx)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM `+tasks+` WHERE id = $1 FOR UPDATE`, args[6]); err != nil {
+			t.Error(err)
+		}
+		go func() {
+			time.Sleep(350 * time.Millisecond) // past a third of the TTL, short of all of it
+			_ = tx.Rollback(context.Background())
+		}()
+	}
+	db.beforeTakeTurn.Store(&before)
+	if _, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("the handler started with %dms of its %v lease left", left.Load(), ttl)
+	if got := time.Duration(left.Load()) * time.Millisecond; got < ttl/2 {
+		t.Errorf("the handler started with %v of its %v lease left; want at least %v", got, ttl, ttl/2)
+	}
+}
+
+// A finished Run leaves nothing for the renewer: once every caller has its
+// outcome, the renewer has no waiting claim to keep live.
+func TestFinishedRunsLeaveNoClaimsToRenew(t *testing.T) {
+	const ttl = 300 * time.Millisecond
+	env := taskrunnertest.NewEnv(t)
+	db := &countingDB{Pool: env.DB}
+	r := startCountingRunner(t, env, db, ttl, time.Minute, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	for i := range 5 {
+		if _, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte(strconv.Itoa(i))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := db.claimRenewals.Load()
+	time.Sleep(ttl) // three renewals' worth
+	if n := db.claimRenewals.Load() - before; n > 0 {
+		t.Errorf("the renewer renewed waiting claims %d time(s) after every Run had finished; want none", n)
+	}
+}
+
+// A Run caller whose own deadline passes while its task is still pending
+// clears its claim on the task as it returns, so the workers can take the task
+// and record it as expired rather than leave it, and the callers behind it,
+// until the claim lapses.
+func TestRunPastItsDeadlineClearsItsClaim(t *testing.T) {
+	hold := make(chan struct{})
+	started := make(chan struct{}, 1)
+	env := taskrunnertest.NewEnv(t)
+	r := startCountingRunner(t, env, &countingDB{Pool: env.DB}, 5*time.Second, time.Minute, func(_ context.Context, _ *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if string(task.Args) == "first" {
+			started <- struct{}{}
+			<-hold
+		}
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	defer close(hold)
+	go func() {
+		_, _ = r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte("first")})
+	}()
+	<-started
+	expires := time.Now().Add(200 * time.Millisecond)
+	if _, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte("late"), Expires: &expires}); !errors.Is(err, taskrunner.ErrExpired) {
+		t.Fatalf("Run past its deadline: %v, want ErrExpired", err)
+	}
+	var state string
+	var claimed bool
+	if err := env.DB.QueryRow(ctx, `SELECT state, waiting_until IS NOT NULL FROM `+env.Table(queueTable(qTop)+"_tasks")+` WHERE args = $1`, []byte("late")).Scan(&state, &claimed); err != nil {
+		t.Fatal(err)
+	}
+	if state != "pending" {
+		t.Fatalf("task is %s; this test wants it still pending", state)
+	}
+	if claimed {
+		t.Error("the caller left its claim on a pending task it gave up on")
 	}
 }

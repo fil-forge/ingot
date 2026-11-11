@@ -810,8 +810,16 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 	turn := r.joinLine(key, seq)
 	defer r.leaveLine(key, turn)
 	// Deferred after leaveLine so it runs first: the caller woken next must
-	// not find this task still claimed by a caller that has gone.
-	defer r.stopWaiting(q, id)
+	// not find this task still claimed by a caller that has gone. A task
+	// with an outcome has no claim left to clear, so that costs nothing.
+	finished := false
+	defer func() {
+		if finished {
+			r.forgetWaiting(id)
+		} else {
+			r.stopWaiting(q, id)
+		}
+	}()
 
 	wait := newBackoff(r.opts.PollInterval)
 	start := time.Now()
@@ -823,6 +831,7 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 			// on another instance.
 			w := r.awaitTurn(ctx, q, id, turn, r.opts.PollInterval, s.Expires, TaskID{})
 			if w.done {
+				finished = w.finished
 				return w.res, w.err
 			}
 			if w.woken {
@@ -835,17 +844,27 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 		// task due ahead of this one that the wait also ends with.
 		var pause time.Duration
 		var behind TaskID
-		h, _, err := r.tryLease(ctx, q, s.Subject, age)
+		h, task, stop, err := r.takeTurn(ctx, q, s.Subject, age, seq, id)
 		if err != nil {
 			return nil, err
 		}
-		if h != nil {
-			h.turn = turn
-			r.metrics.observeLeaseWait(ctx, q, start)
-			d := r.drainSync(ctx, q, h, seq, id)
-			r.endHold(ctx, h, d.stop)
-			start = time.Now()
+		if h != nil || stop != nil {
+			d := drained{stop: stop}
+			if h != nil {
+				h.turn = turn
+				r.metrics.observeLeaseWait(ctx, q, start)
+				if task != nil {
+					d = r.runClaimed(ctx, q, h, *task, seq)
+				} else {
+					// The statement's view was older than the lease: claim
+					// under it from what is there now.
+					d = r.drainSync(ctx, q, h, seq, id)
+				}
+				r.endHold(ctx, h, d.stop)
+				start = time.Now()
+			}
 			if d.ran {
+				finished = true
 				return d.res, d.err
 			}
 			var die *dieError
@@ -881,9 +900,24 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 			pause = wait.next()
 		}
 		if w := r.awaitTurn(ctx, q, id, turn, pause, s.Expires, behind); w.done {
+			finished = w.finished
 			return w.res, w.err
 		}
 	}
+}
+
+// runClaimed runs a Run caller's task, claimed as its lease was taken. A
+// commit that keeps failing is tried again as drainSync does, still holding
+// the lease.
+func (r *Runner) runClaimed(ctx context.Context, q *queue, h *hold, t Task, upTo int64) drained {
+	res, terr, stop := r.runRoot(ctx, h, []Task{t})
+	if errors.Is(stop, errNotCommitted) {
+		return r.drainSync(ctx, q, h, upTo, t.ID)
+	}
+	if stop != nil {
+		return drained{stop: stop}
+	}
+	return drained{ran: true, res: res, err: terr}
 }
 
 // drainSync is drain for a sync caller: when a commit keeps failing, it keeps
@@ -1005,11 +1039,19 @@ func (r *Runner) finished(ids ...TaskID) {
 	}
 }
 
+// forgetWaiting stops the renewer keeping the task's claim live, for a
+// caller that has stopped waiting.
+func (r *Runner) forgetWaiting(id TaskID) {
+	r.mu.Lock()
+	delete(r.waiting, id)
+	r.mu.Unlock()
+}
+
 // stopWaiting ends a Run caller's claim on its task, so that if the task is
 // still pending, workers may take it at once.
 func (r *Runner) stopWaiting(q *queue, id TaskID) {
+	r.forgetWaiting(id)
 	r.mu.Lock()
-	delete(r.waiting, id)
 	ctx := context.WithoutCancel(r.ctx)
 	r.mu.Unlock()
 	if _, err := r.db.Exec(ctx, `UPDATE `+q.tasks+` SET waiting_until = NULL
