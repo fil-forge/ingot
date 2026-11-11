@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
+	"github.com/fil-forge/ingot/internal/authority"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
@@ -54,6 +55,7 @@ func newStoppedQueueFixture(t *testing.T, registrar uploader.UploadRegistrar, wo
 	require.NoError(t, err)
 	b := &Backend{
 		registrar:    registrar,
+		proofs:       authority.New(registrar),
 		logger:       zaptest.NewLogger(t),
 		uploadRetry:  taskrunner.RetryPolicy{First: 5 * time.Millisecond, Max: 20 * time.Millisecond, Multiplier: 2, HoldsSubject: true},
 		drainTimeout: 500 * time.Millisecond,
@@ -61,7 +63,7 @@ func newStoppedQueueFixture(t *testing.T, registrar uploader.UploadRegistrar, wo
 	for _, f := range tweak {
 		f(b)
 	}
-	require.NoError(t, b.RegisterUploadTasks(r))
+	require.NoError(t, b.registerUploadTasks(r))
 	require.NoError(t, r.Migrate(context.Background()))
 	return &queueFixture{b: b, r: r, space: testutil.RandomDID(t)}
 }

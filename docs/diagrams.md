@@ -1041,7 +1041,7 @@ Sources: `iam/service.go`, `iam/keyproofs.go`, `iam/proofcache.go`,
 `internal/reqscope/reqscope.go`, `cmd/catalog.go` (forgeSegments),
 `uploader/forge.go` (shipProofs, captureShipProofs, CaptureShipAuthority),
 `uploader/stream.go` (StartBlob), `bucketop/bucketop.go` (Tx.Append),
-`s3frontend/releasequeue.go` (releaseAuthority, withReleaseAuthority),
+`s3frontend/releasequeue.go` (releaseAuthority), `internal/authority/authority.go`,
 `module.go`, `config/config.go` (auth_service fields).
 Review when these change.
 

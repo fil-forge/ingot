@@ -27,28 +27,13 @@ func TestTaskRunnerHasTheBackendsQueues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewBlobCache: %v", err)
 	}
-	b := s3frontend.New(s3frontend.Deps{Cache: cache})
+	b, err := s3frontend.New(s3frontend.Deps{Tasks: r, Cache: cache})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 	// Its gauges are on the global meter provider, which a later test may
 	// install a reader behind.
 	t.Cleanup(func() { _ = b.CloseMetrics() })
-	if err := b.RegisterUploadTasks(r); err != nil {
-		t.Fatalf("RegisterUploadTasks: %v", err)
-	}
-	if err := b.RegisterShardTasks(r); err != nil {
-		t.Fatalf("RegisterShardTasks: %v", err)
-	}
-	if err := b.RegisterReleaseTasks(r); err != nil {
-		t.Fatalf("RegisterReleaseTasks: %v", err)
-	}
-	if err := b.RegisterAcceptTasks(r); err != nil {
-		t.Fatalf("RegisterAcceptTasks: %v", err)
-	}
-	if err := b.RegisterMultipartTasks(r); err != nil {
-		t.Fatalf("RegisterMultipartTasks: %v", err)
-	}
-	if err := b.RegisterBucketTasks(r); err != nil {
-		t.Fatalf("RegisterBucketTasks: %v", err)
-	}
 	if got := r.Node(); got != "did:web:ingot.test" {
 		t.Fatalf("runner node = %q, want the agent's DID", got)
 	}

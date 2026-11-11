@@ -33,11 +33,9 @@ import (
 type testStore struct {
 	*registry.Postgres
 	testfakes.Authority
-	pool  *pgxpool.Pool
+	pool *pgxpool.Pool
+	// tasks runs one backend's tasks (newBackend).
 	tasks *taskrunner.Runner
-	// started is set once a backend's handlers are registered and the queues
-	// run; a store serves one backend's tasks.
-	started bool
 }
 
 // stores maps each test backend to the store it runs on, for helpers that
@@ -97,48 +95,30 @@ func newTestStoreWithLease(t testing.TB, ttl time.Duration) *testStore {
 	return &testStore{Postgres: registry.NewPostgres(pool, registry.WithTasks(r)), pool: pool, tasks: r}
 }
 
-// start registers b's task handlers and runs the queues until t ends. The
-// first backend built over the store runs its tasks; a later one shares them.
-func (s *testStore) start(t testing.TB, b *Backend) {
+// newBackend builds a backend over deps that runs its tasks on the store's
+// runner, and runs the queues until t ends.
+func (s *testStore) newBackend(t testing.TB, deps Deps) *Backend {
 	t.Helper()
+	deps.Tasks = s.tasks
+	// A failed release waits for the next sweep (SweepPendingReleases), not
+	// a delay, and holds its subject meanwhile, as in production.
+	deps.releaseRetry = taskrunner.RetryPolicy{First: time.Hour, Max: time.Hour, HoldsSubject: true}
+	b, err := New(deps)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
 	b.acceptDelay = time.Hour
-	if s.started {
-		b.tasks, b.shards, b.releases, b.buckets, b.uploads = s.tasks, s.tasks, s.tasks, s.tasks, s.tasks
-		b.cache.OnRead(b.renewCached)
-		return
-	}
-	if err := b.RegisterUploadTasks(s.tasks); err != nil {
-		t.Fatalf("register upload tasks: %v", err)
-	}
-	if err := b.RegisterShardTasks(s.tasks); err != nil {
-		t.Fatalf("register shard tasks: %v", err)
-	}
 	if err := s.tasks.Handle(ShardQueue, shardFlush, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
 		return nil, nil
 	}); err != nil {
 		t.Fatalf("register shard flush: %v", err)
 	}
-	// A failed release waits for the next sweep (SweepPendingReleases), not
-	// a delay, and holds its subject meanwhile, as in production.
-	b.releaseRetry = taskrunner.RetryPolicy{First: time.Hour, Max: time.Hour, HoldsSubject: true}
-	if err := b.RegisterReleaseTasks(s.tasks); err != nil {
-		t.Fatalf("register release tasks: %v", err)
-	}
-	if err := b.RegisterAcceptTasks(s.tasks); err != nil {
-		t.Fatalf("register accept tasks: %v", err)
-	}
-	if err := b.RegisterBucketTasks(s.tasks); err != nil {
-		t.Fatalf("register bucket tasks: %v", err)
-	}
-	if err := b.RegisterMultipartTasks(s.tasks); err != nil {
-		t.Fatalf("register multipart tasks: %v", err)
-	}
 	if err := s.tasks.Start(context.Background()); err != nil {
 		t.Fatalf("start task queues: %v", err)
 	}
-	s.started = true
 	stores.Store(b, s)
 	t.Cleanup(func() { _ = s.tasks.Stop(context.Background()) })
+	return b
 }
 
 // shardFlush is a queue-shard action that does nothing, which settleCache

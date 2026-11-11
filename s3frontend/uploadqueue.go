@@ -62,10 +62,10 @@ const uploadFlush = "flush"
 // to be sent before it fails, for the client to retry.
 const uploadDrainTimeout = 30 * time.Second
 
-// RegisterUploadTasks registers the queue-space-upload handlers with r, and
+// registerUploadTasks registers the queue-space-upload handlers with r, and
 // keeps r for draining a space's changes when its bucket is deleted. Call it
 // before r starts.
-func (b *Backend) RegisterUploadTasks(r *taskrunner.Runner) error {
+func (b *Backend) registerUploadTasks(r *taskrunner.Runner) error {
 	b.tasks = r
 	for _, op := range []registry.UploadRegistrationOp{registry.UploadRegistrationAdd, registry.UploadRegistrationRemove} {
 		if err := r.HandleBatch(registry.UploadQueue, string(op), uploadRegistrationBatch,
@@ -133,7 +133,7 @@ func (b *Backend) sendRegistrations(ctx context.Context, op registry.UploadRegis
 	batch := make([]uploader.QueuedUpload, 0, len(regs))
 	sent := make([]int, 0, len(regs))
 	for i, reg := range regs {
-		proofs, fresh, err := b.registrar.PrepareAuthority(b.withLentAuthority(ctx, reg.Space), reg.Space, registrationCommand(op), reg.Proofs)
+		proofs, fresh, err := b.proofs.Prepare(ctx, reg.Space, registrationCommand(op), reg.Proofs)
 		if err != nil {
 			errs[i] = b.spentAuthority(reg, op, attempts[i], err)
 			continue
@@ -256,7 +256,7 @@ func (b *Backend) DrainSpaceRegistrations(ctx context.Context, space did.DID) er
 		if err != nil {
 			continue
 		}
-		proofs, err := b.registrar.CaptureAuthority(ctx, space, uploadcmds.Remove.Command)
+		proofs, err := b.proofs.Capture(ctx, space, uploadcmds.Remove.Command)
 		if err != nil {
 			return fmt.Errorf("s3frontend: authority to resend a retraction: %w", err)
 		}

@@ -529,8 +529,7 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 		mod(&deps)
 	}
 	withStreaming(t, &deps, dir)
-	b := New(deps)
-	mem.start(t, b)
+	b := mem.newBackend(t, deps)
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}

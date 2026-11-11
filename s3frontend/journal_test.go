@@ -84,8 +84,7 @@ func newJournalingBackend(t *testing.T) (*Backend, *testStore, *logstore.Store, 
 		Claims:     mem,
 	}
 	withStreaming(t, &deps, dir)
-	b := New(deps)
-	mem.start(t, b)
+	b := mem.newBackend(t, deps)
 	backend.Store(b)
 	require.NoError(t, mem.Create(ctx, "bk", did.Undef, registry.CreateState{}))
 	return b, mem, log, release

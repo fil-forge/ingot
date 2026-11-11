@@ -30,6 +30,8 @@ import (
 	"cmp"
 	"context"
 	"encoding/xml"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,6 +45,7 @@ import (
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/bucketop"
+	"github.com/fil-forge/ingot/internal/authority"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
@@ -71,16 +74,17 @@ type Backend struct {
 	parks     registry.ParkStore
 	remover   uploader.BlobRemover
 	registrar uploader.UploadRegistrar
-	// tasks runs the queue-space-upload tasks (RegisterUploadTasks).
+	// tasks runs the queue-space-upload tasks.
 	tasks *taskrunner.Runner
-	// shards runs the queue-shard tasks that keep the cache's copies
-	// (RegisterShardTasks). renewals is when this process last renewed each cached blob's time in
+	// shards runs the queue-shard tasks that keep the cache's copies.
+	// renewals is when this process last renewed each cached blob's time in
 	// the cache, and cacheTTL how long a renewal lasts.
 	shards   *taskrunner.Runner
 	renewals *recencyMap
-	// lent is the authority requests lend for their spaces while they wait
-	// on queued work (lendAuthority).
-	lent     lends
+	// proofs finds the authority queued tasks make their network calls
+	// with, and holds what requests lend for their spaces while they wait on
+	// them.
+	proofs   *authority.Resolver
 	cacheTTL time.Duration
 	// uploadRetry is the queue-space-upload retry policy, and drainTimeout
 	// how long a bucket delete waits for its space's changes; tests shorten
@@ -94,15 +98,14 @@ type Backend struct {
 	// streaming sends each body blob to its provider as the body arrives.
 	streaming uploader.StreamingBodyUploader
 	// claims counts a blob's claims for a release's recheck; releases runs
-	// the queue-space-shard tasks (RegisterReleaseTasks); releaseGrace is how
+	// the queue-space-shard tasks; releaseGrace is how
 	// far past the last-claim drop each release is due (readers holding the
 	// prior catalog root get at least this long to finish their prefetch).
 	claims   registry.BlobRefStore
 	releases *taskrunner.Runner
-	// buckets runs the queue-bucket tasks (RegisterBucketTasks).
+	// buckets runs the queue-bucket tasks.
 	buckets *taskrunner.Runner
-	// uploads runs the queue-multipart-upload tasks
-	// (RegisterMultipartTasks).
+	// uploads runs the queue-multipart-upload tasks.
 	uploads *taskrunner.Runner
 	// acceptDelay is how long after a part lands its upload's accept is due:
 	// none, but tests delay it so that only they run it.
@@ -110,15 +113,11 @@ type Backend struct {
 	// multipartTTL is how long an upload stays open before its auto-abort,
 	// and a completed one is kept (Deps.MultipartSessionTTL).
 	multipartTTL time.Duration
-	// shipMu guards shipReady and earlyShips: the ships the catalog log
-	// reported before the ship handler was registered, which registering it
-	// queues.
-	shipMu     sync.Mutex
-	shipReady  bool
-	earlyShips []string
-	// shipOwed are the buckets whose ship could not be queued, which
-	// retryOwedShips queues once it can; shipRetrying is set while it runs,
-	// and shipStop, closed by Drain, ends it. shipMu guards them too.
+	// shipMu guards the ship fields below. shipOwed are the buckets whose
+	// ship could not be queued, which retryOwedShips queues once it can;
+	// shipRetrying is set while it runs, and shipStop, closed by Drain, ends
+	// it.
+	shipMu   sync.Mutex
 	shipOwed map[string]bool
 	// shipAwaiting are the buckets whose ship found no authority to send
 	// with, which the bucket's next commit queues again (awaitShipAuthority).
@@ -186,6 +185,10 @@ type Backend struct {
 
 // Deps wires a Backend over ingot's domain primitives.
 type Deps struct {
+	// Tasks runs the backend's task queues; New registers their handlers on
+	// it, and the host starts it. Required.
+	Tasks *taskrunner.Runner
+
 	Authority bucketauthority.BucketAuthority
 	// Registry tracks per-bucket roots; IntentStore tracks each local blob's
 	// upload_intents lifecycle; LocationStore records where each accepted body
@@ -309,13 +312,21 @@ type Deps struct {
 
 	// Logger is optional; defaults to zap.NewNop().
 	Logger *zap.Logger
+
+	// releaseRetry replaces the queue-space-shard.release retry policy, for
+	// tests; zero keeps the default.
+	releaseRetry taskrunner.RetryPolicy
 }
 
 // Compile-time assertion that Backend satisfies versitygw's interface.
 var _ backend.Backend = (*Backend)(nil)
 
-// New constructs a Backend wired over ingot's domain primitives.
-func New(d Deps) *Backend {
+// New constructs a Backend wired over ingot's domain primitives, and
+// registers its task handlers on d.Tasks.
+func New(d Deps) (*Backend, error) {
+	if d.Tasks == nil {
+		return nil, errors.New("s3frontend: no task runner")
+	}
 	logger := d.Logger
 	if logger == nil {
 		logger = zap.NewNop()
@@ -352,13 +363,14 @@ func New(d Deps) *Backend {
 		remover:      d.Remover,
 		streaming:    d.Streaming,
 		registrar:    d.Registrar,
+		proofs:       authority.New(d.Registrar),
 		uploadRetry:  uploadRegistrationRetry,
 		drainTimeout: uploadDrainTimeout,
 		encParams:    d.EncParams,
 		regionKeys:   d.RegionKeys,
 		tenantKeys:   d.TenantKeys,
 		claims:       d.Claims,
-		releaseRetry: releaseRetry,
+		releaseRetry: cmp.Or(d.releaseRetry, releaseRetry),
 		releaseGrace: d.ReleaseGrace,
 		multipartTTL: d.MultipartSessionTTL,
 
@@ -383,7 +395,28 @@ func New(d Deps) *Backend {
 	b.multipartMetrics, b.multipartGauges = newMultipartMetrics(mp, b, logger)
 	b.journalGauges = newJournalGauges(mp, b, logger)
 	b.catalogGauges = newCatalogUsageGauges(mp, b, logger)
-	return b
+	if err := b.registerTasks(d.Tasks); err != nil {
+		_ = b.CloseMetrics()
+		return nil, fmt.Errorf("s3frontend: register tasks: %w", err)
+	}
+	return b, nil
+}
+
+// registerTasks registers every queue's handlers with r.
+func (b *Backend) registerTasks(r *taskrunner.Runner) error {
+	for _, register := range []func(*taskrunner.Runner) error{
+		b.registerUploadTasks,
+		b.registerShardTasks,
+		b.registerMultipartTasks,
+		b.registerBucketTasks,
+		b.registerReleaseTasks,
+		b.registerAcceptTasks,
+	} {
+		if err := register(r); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // String identifies this backend in versitygw logs.

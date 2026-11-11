@@ -69,9 +69,9 @@ type abortCall struct {
 	released []mh.Multihash
 }
 
-// RegisterMultipartTasks registers the queue-multipart-upload handlers with r.
+// registerMultipartTasks registers the queue-multipart-upload handlers with r.
 // Call it before r starts.
-func (b *Backend) RegisterMultipartTasks(r *taskrunner.Runner) error {
+func (b *Backend) registerMultipartTasks(r *taskrunner.Runner) error {
 	b.uploads = r
 	for action, h := range map[string]taskrunner.Handler{
 		registry.MultipartCreateAction:   b.runCreateUpload,

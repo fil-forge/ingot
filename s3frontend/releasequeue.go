@@ -9,19 +9,14 @@ import (
 	"time"
 
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
-	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
-	"github.com/fil-forge/ucantone/ucan"
-	"github.com/fil-forge/ucantone/ucan/container"
 	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 
-	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
-	"github.com/fil-forge/ingot/tokenstore"
 	"github.com/fil-forge/ingot/uploader"
 )
 
@@ -61,10 +56,10 @@ const releaseFlush = "flush"
 // release that found it claimed again returns none.
 var releasedResult = []byte("released")
 
-// RegisterReleaseTasks registers the queue-space-shard handlers with r: the
+// registerReleaseTasks registers the queue-space-shard handlers with r: the
 // release, a write's add and its expiry (shardref.go), and the no-op flush.
 // Call it before r starts.
-func (b *Backend) RegisterReleaseTasks(r *taskrunner.Runner) error {
+func (b *Backend) registerReleaseTasks(r *taskrunner.Runner) error {
 	b.releases = r
 	if err := r.Handle(registry.ReleaseQueue, registry.ReleaseAction, b.runRelease, taskrunner.WithRetry(b.releaseRetry)); err != nil {
 		return err
@@ -84,64 +79,13 @@ func (b *Backend) RegisterReleaseTasks(r *taskrunner.Runner) error {
 func (b *Backend) releaseAuthority(ctx context.Context, space did.DID) registry.ReleaseTask {
 	var args registry.ReleaseTask
 	var err error
-	if args.RemoveProofs, err = b.registrar.CaptureAuthority(ctx, space, blobcmds.Remove.Command); err != nil {
+	if args.RemoveProofs, err = b.proofs.Capture(ctx, space, blobcmds.Remove.Command); err != nil {
 		b.logger.Debug("no /blob/remove authority to queue with a release", zap.Stringer("space", space), zap.Error(err))
 	}
-	if args.AbortProofs, err = b.registrar.CaptureAuthority(ctx, space, blobcmds.Abort.Command); err != nil {
+	if args.AbortProofs, err = b.proofs.Capture(ctx, space, blobcmds.Abort.Command); err != nil {
 		b.logger.Debug("no /blob/abort authority to queue with a release", zap.Stringer("space", space), zap.Error(err))
 	}
 	return args
-}
-
-// withReleaseAuthority returns ctx carrying a proof store holding the
-// release's captured chains, which the network calls read before any
-// authority captured since. A store ctx carries already, one a bucket delete
-// lent for the space while it waits on the release (lendAuthority), is read
-// first, since it is fresh, and the captured chains only for a command it
-// holds none for. With none captured, ctx is returned as is.
-func withReleaseAuthority(ctx context.Context, args registry.ReleaseTask) (context.Context, error) {
-	store := tokenstore.NewMemStore()
-	found := false
-	for _, proofs := range [][]byte{args.RemoveProofs, args.AbortProofs} {
-		if len(proofs) == 0 {
-			continue
-		}
-		ct, err := container.Decode(proofs)
-		if err != nil {
-			return nil, fmt.Errorf("decode release authority: %w", err)
-		}
-		if dlgs := ct.Delegations(); len(dlgs) > 0 {
-			if err := store.AddDelegations(ctx, dlgs...); err != nil {
-				return nil, err
-			}
-			found = true
-		}
-	}
-	if !found {
-		return ctx, nil
-	}
-	var proofs ucanlib.ProofStore = store
-	if live, ok := ctx.Value(reqscope.ProofStoreKey()).(ucanlib.ProofStore); ok && live != nil {
-		proofs = proofStores{live, store}
-	}
-	return context.WithValue(ctx, reqscope.ProofStoreKey(), proofs), nil
-}
-
-// proofStores reads each store in turn, and returns the first chain found.
-type proofStores []ucanlib.ProofStore
-
-func (ps proofStores) ProofChain(ctx context.Context, aud did.DID, cmd ucan.Command, sub did.DID) ([]ucan.Delegation, []cid.Cid, error) {
-	var errs []error
-	for _, p := range ps {
-		dlgs, links, err := p.ProofChain(ctx, aud, cmd, sub)
-		if err == nil && len(dlgs) > 0 {
-			return dlgs, links, nil
-		}
-		if err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return nil, nil, errors.Join(errs...)
 }
 
 // runRelease is queue-space-shard.release: it unwinds one blob for one space,
@@ -199,7 +143,7 @@ func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrun
 	if err != nil {
 		return nil, fmt.Errorf("count other intents: %w", err)
 	}
-	netCtx, err := withReleaseAuthority(b.withLentAuthority(ctx, space), args)
+	netCtx, err := b.proofs.WithProofs(ctx, space, args.RemoveProofs, args.AbortProofs)
 	if err != nil {
 		return nil, taskrunner.Permanent(err)
 	}

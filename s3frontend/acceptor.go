@@ -45,9 +45,9 @@ var acceptConcludeTimeout = 2 * time.Minute
 // Complete, queues whatever is left again.
 var acceptRetry = taskrunner.RetryPolicy{First: 5 * time.Second, Max: time.Minute, Multiplier: 2, Attempts: 5}
 
-// RegisterAcceptTasks registers queue-multipart-upload.accept and
+// registerAcceptTasks registers queue-multipart-upload.accept and
 // queue-space-shard.accept with r. Call it before r starts.
-func (b *Backend) RegisterAcceptTasks(r *taskrunner.Runner) error {
+func (b *Backend) registerAcceptTasks(r *taskrunner.Runner) error {
 	if err := r.Handle(registry.MultipartQueue, registry.MultipartAcceptAction, b.runAccept, taskrunner.WithRetry(acceptRetry)); err != nil {
 		return err
 	}

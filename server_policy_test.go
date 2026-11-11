@@ -82,13 +82,15 @@ func TestBuildS3API_BucketPolicy(t *testing.T) {
 	mem := registry.NewPostgres(pgtest.New(t))
 	require.NoError(t, mem.Create(ctx, "photos", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}))
 	f := &fakeAuthority{}
-	backend := s3frontend.New(s3frontend.Deps{Registry: mem, CORS: corsCfg, Authority: f})
+	id, err := identity.New("", "did:web:ingot.test")
+	require.NoError(t, err)
+	tasks, err := provideTaskRunner(nil, id, zap.NewNop())
+	require.NoError(t, err)
+	backend, err := s3frontend.New(s3frontend.Deps{Tasks: tasks, Registry: mem, CORS: corsCfg, Authority: f})
+	require.NoError(t, err)
 	// New registers its gauges on the global meter provider; leaving them
 	// registered would leak this backend's into a later test's provider.
 	t.Cleanup(func() { _ = backend.CloseMetrics() })
-
-	id, err := identity.New("", "did:web:ingot.test")
-	require.NoError(t, err)
 	const secret = "policysecret"
 	svc := secretIAM{Service: iam.New(neverAuthorizer{}, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache()), secret: secret}
 	cfg := config.ServerConfig{Region: "us-east-1", MaxConnections: 16, MaxRequests: 16}
