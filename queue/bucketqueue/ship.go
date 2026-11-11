@@ -19,7 +19,8 @@ import (
 // bucket's subject, so it never runs beside a commit: a commit journals its
 // blocks under the segment it appended to, and the ship of that segment
 // drops them, without a lock between the two. The log seals on its own
-// trigger and reports each seal (QueueShip), and a ship ships every sealed
+// trigger and reports each seal (QueueShip, which New hands the log as its
+// SealReporter callback), and a ship ships every sealed
 // segment still unshipped, oldest first. The ship's authority is the one the
 // bucket's latest write captured (bucketop.ShipAuthority): a seal from the
 // log's age trigger has no request of its own.
@@ -32,6 +33,15 @@ var shipRetry = taskrunner.RetryPolicy{First: time.Second, Max: 5 * time.Minute,
 // BucketShipper is the slice of the catalog log a ship needs.
 type BucketShipper interface {
 	ShipBucket(ctx context.Context, bucket string) error
+}
+
+// SealReporter is the slice of the catalog log that reports its seals: the
+// queue hands it QueueShip when it is built. It is matched by a runtime type
+// assertion (the log is a blockstore.Log), which fails silently on a
+// signature drift; the compile-time assertion in the root package pins
+// *logstore.Manager to this shape so a drift is a build error instead.
+type SealReporter interface {
+	OnSealed(fn func(bucket string))
 }
 
 // registerShip registers queue-bucket.ship.

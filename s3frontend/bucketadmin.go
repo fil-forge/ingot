@@ -34,9 +34,3 @@ var errBucketClosing = s3err.APIError{
 	Description:    "A conflicting conditional operation is currently in progress against this resource. Please try again.",
 	HTTPStatusCode: http.StatusConflict,
 }
-
-// QueueShip queues a ship of bucket's sealed catalog segments. The log calls
-// it when a segment seals.
-func (b *Backend) QueueShip(bucket string) {
-	b.buckets.QueueShip(bucket)
-}

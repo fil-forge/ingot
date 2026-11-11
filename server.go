@@ -143,6 +143,10 @@ type ServerDeps struct {
 // release.
 var _ bucketqueue.SegmentDigestLister = (*logstore.Manager)(nil)
 
+// The bucket queue takes the log's seal callback through the same kind of
+// assertion.
+var _ bucketqueue.SealReporter = (*logstore.Manager)(nil)
+
 // Server is a fully-wired ingot S3 listener. Use Start/Stop for
 // lifecycle. fx callers wrap these in OnStart/OnStop hooks; tests
 // call them directly.
@@ -179,9 +183,8 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	// The log is segregated per bucket (each bucket's segments live under
 	// segments/<bucket>/ and ship to that bucket's Forge space); the manager
 	// stands in wherever the single global log stood. Its seals queue ships
-	// on the backend, which is built after the log: seals reported before
-	// then wait in ships.
-	ships := &shipRelay{}
+	// on the bucket queue, which takes the log's callback when the backend
+	// builds it: the log holds the seals reported before then.
 	log, err := logstore.OpenManager(ctx, logstore.ManagerConfig{
 		Dir:  SegmentsDir(cfg.DataDir),
 		Meta: deps.Meta,
@@ -194,8 +197,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		FlushFor: func(bucket string) logstore.FlushFunc {
 			return newBucketFlushFunc(deps.Uploader, deps.Registry, deps.Locations, deps.Inclusions, bucket, logger)
 		},
-		OnSealed: ships.queue,
-		Logger:   logger,
+		Logger: logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("ingot: logstore: %w", err)
@@ -255,7 +257,6 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		_ = log.Close(ctx)
 		return nil, fmt.Errorf("ingot: %w", err)
 	}
-	ships.attach(backend)
 
 	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, logger)
 	if err != nil {
@@ -566,37 +567,6 @@ func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations r
 			return nil, fmt.Errorf("record segment %d %s inclusions for %q: %w", seg.Seq(), plane, bucket, err)
 		}
 		return indexDigest, nil
-	}
-}
-
-// shipRelay hands the catalog log's seals to the backend's QueueShip, and
-// holds the buckets reported before the backend exists.
-type shipRelay struct {
-	mu      sync.Mutex
-	backend *s3frontend.Backend
-	early   []string
-}
-
-func (r *shipRelay) queue(bucket string) {
-	r.mu.Lock()
-	b := r.backend
-	if b == nil {
-		r.early = append(r.early, bucket)
-	}
-	r.mu.Unlock()
-	if b != nil {
-		b.QueueShip(bucket)
-	}
-}
-
-// attach forwards seals to b from now on, and the ones held so far.
-func (r *shipRelay) attach(b *s3frontend.Backend) {
-	r.mu.Lock()
-	early := r.early
-	r.backend, r.early = b, nil
-	r.mu.Unlock()
-	for _, bucket := range early {
-		b.QueueShip(bucket)
 	}
 }
 

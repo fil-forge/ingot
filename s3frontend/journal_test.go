@@ -51,7 +51,7 @@ func newJournalingBackend(t *testing.T, opts ...func(*Deps)) (*Backend, *testSto
 			},
 			OnSealed: func() {
 				if b := backend.Load(); b != nil {
-					b.QueueShip("bk")
+					b.buckets.QueueShip("bk")
 				}
 			},
 		},

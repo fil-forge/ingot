@@ -71,22 +71,19 @@ func openRebuildManager(t *testing.T, dir string, meta logstore.Meta, ship *ship
 func openManagerShipping(t *testing.T, dir string, meta logstore.Meta, ship *shipRecorder, shipping bool) (*logstore.Manager, error) {
 	t.Helper()
 	ships := &queueShips{}
-	var onSealed func(string)
-	if shipping {
-		onSealed = ships.sealed
-	}
 	m, err := logstore.OpenManager(context.Background(), logstore.ManagerConfig{
 		Dir:  dir,
 		Meta: meta,
 		// A small SealBytes makes the rebuild split across segments.
 		Catalog:  logstore.PlaneConfig{SealBytes: 8 << 10, SealAge: time.Hour, Ship: true, Retain: 100},
 		FlushFor: ship.forBucket,
-		OnSealed: onSealed,
 		Logger:   zaptest.NewLogger(t),
 	})
 	if err == nil {
 		t.Cleanup(func() { _ = m.Close(context.Background()) })
-		ships.start(t, m)
+		if shipping {
+			ships.start(t, m)
+		}
 	}
 	return m, err
 }
@@ -94,21 +91,9 @@ func openManagerShipping(t *testing.T, dir string, meta logstore.Meta, ship *shi
 // queueShips stands in for queue-bucket.ship: each seal it hears of ships the
 // bucket's log, retried until it succeeds or the test ends.
 type queueShips struct {
-	mu    sync.Mutex
-	m     *logstore.Manager
-	ctx   context.Context
-	early []string
-	wg    sync.WaitGroup
-}
-
-func (q *queueShips) sealed(bucket string) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.m == nil {
-		q.early = append(q.early, bucket)
-		return
-	}
-	q.ship(bucket)
+	m   *logstore.Manager
+	ctx context.Context
+	wg  sync.WaitGroup
 }
 
 // start ships the buckets reported while the manager opened, and every one
@@ -119,13 +104,8 @@ func (q *queueShips) start(t *testing.T, m *logstore.Manager) {
 		cancel()
 		q.wg.Wait()
 	})
-	q.mu.Lock()
-	defer q.mu.Unlock()
 	q.m, q.ctx = m, ctx
-	for _, bucket := range q.early {
-		q.ship(bucket)
-	}
-	q.early = nil
+	m.OnSealed(q.ship)
 }
 
 // ship runs one bucket's ship until it succeeds. q.mu is held.
