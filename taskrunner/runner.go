@@ -815,19 +815,32 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 	for {
 		if !r.frontOfLine(key, turn) {
 			// An older Run in this process goes first, and this task cannot
-			// start before it: wait for the turn without asking the database.
+			// start before it: wait for the turn without taking the lease.
 			d := r.opts.PollInterval
+			expired := false
 			if s.Expires != nil {
 				left := time.Until(*s.Expires)
-				if left <= 0 {
-					return nil, ErrExpired
-				}
+				expired = left <= 0
 				d = min(d, left)
 			}
-			if err := r.awaitTurn(ctx, id, turn, d); err != nil {
-				return nil, err
+			if !expired {
+				woken, err := r.awaitTurn(ctx, id, turn, d)
+				if err != nil {
+					return nil, err
+				}
+				if woken {
+					wait = newBackoff(r.opts.PollInterval)
+					continue
+				}
 			}
-			wait = newBackoff(r.opts.PollInterval)
+			// The task finished in this process, or the wait ran out: it may
+			// have been cancelled, here or on another instance.
+			if res, err, done := r.outcome(ctx, q, id); done {
+				return res, err
+			}
+			if expired {
+				return nil, ErrExpired
+			}
 			continue
 		}
 		h, _, err := r.tryLease(ctx, q, s.Subject, age)
@@ -835,6 +848,7 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 			return nil, err
 		}
 		if h != nil {
+			h.turn = turn
 			r.metrics.observeLeaseWait(ctx, q, start)
 			d := r.drainSync(ctx, q, h, seq, id)
 			r.endHold(ctx, h, d.stop)
@@ -878,7 +892,7 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 			}
 			d = min(d, left)
 		}
-		if err := r.awaitTurn(ctx, id, turn, d); err != nil {
+		if _, err := r.awaitTurn(ctx, id, turn, d); err != nil {
 			return nil, err
 		}
 	}

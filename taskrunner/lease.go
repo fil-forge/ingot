@@ -23,6 +23,10 @@ type hold struct {
 	// lost is set when renewal finds the lease taken over. Nothing more may
 	// run under it.
 	lost atomic.Bool
+	// turn is the place in the subject's line of the Run caller holding the
+	// lease, or nil for a worker or a tree's child. Releasing the lease does
+	// not wake it: it released the lease itself, and backs off.
+	turn *runTurn
 }
 
 func (h *hold) key() subjectKey { return subjectKey{h.q.name, h.subject} }
@@ -146,7 +150,9 @@ func (r *Runner) release(ctx context.Context, h *hold) {
 		close(sub.ch)
 		delete(r.freed, h.key())
 	}
-	r.wakeFront(h.key())
+	if line := r.lines[h.key()]; len(line) > 0 && line[0] != h.turn {
+		r.wakeFront(h.key())
+	}
 	r.mu.Unlock()
 }
 
@@ -218,8 +224,8 @@ func (r *Runner) wakeFront(key subjectKey) {
 }
 
 // awaitTurn waits until the task finishes in this process, t is woken, d
-// passes, or ctx ends.
-func (r *Runner) awaitTurn(ctx context.Context, id TaskID, t *runTurn, d time.Duration) error {
+// passes, or ctx ends. It reports whether t was woken.
+func (r *Runner) awaitTurn(ctx context.Context, id TaskID, t *runTurn, d time.Duration) (bool, error) {
 	ch := r.addWaiter(id)
 	defer r.removeWaiter(id, ch)
 	timer := time.NewTimer(d)
@@ -227,11 +233,12 @@ func (r *Runner) awaitTurn(ctx context.Context, id TaskID, t *runTurn, d time.Du
 	select {
 	case <-ch:
 	case <-t.wake:
+		return true, nil
 	case <-timer.C:
 	case <-ctx.Done():
-		return ctx.Err()
+		return false, ctx.Err()
 	}
-	return nil
+	return false, nil
 }
 
 // forget stops renewing h, leaving its row to expire.

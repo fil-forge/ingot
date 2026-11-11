@@ -2,6 +2,7 @@ package taskrunner_test
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -159,5 +160,76 @@ func TestRunCallerLeavingTheLineWakesTheNext(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the last caller was not woken when the callers ahead of it left the line")
+	}
+}
+
+// The caller at the front of the line backs off while a task ahead of its own
+// holds the subject: releasing the lease it took to find that out does not
+// wake it again at once.
+func TestRunCallerBacksOffBehindATaskAhead(t *testing.T) {
+	r, db := newCountingRunner(t, time.Second, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	elsewhere := "elsewhere"
+	if _, err := r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Node: &elsewhere}); err != nil {
+		t.Fatal(err)
+	}
+	before := db.leaseTries.Load()
+	expires := time.Now().Add(500 * time.Millisecond)
+	_, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Expires: &expires})
+	if !errors.Is(err, taskrunner.ErrExpired) {
+		t.Fatalf("Run behind another instance's task: %v, want ErrExpired", err)
+	}
+	tries := db.leaseTries.Load() - before
+	t.Logf("%d lease attempts in 500ms behind a task ahead", tries)
+	if tries > 20 {
+		t.Errorf("%d lease attempts in 500ms behind a task ahead; want at most 20", tries)
+	}
+}
+
+// A caller whose task is cancelled while it waits behind another caller
+// returns ErrCancelled at once, without waiting for its turn.
+func TestCancelledRunReturnsWhileOthersHoldTheSubject(t *testing.T) {
+	hold := make(chan struct{})
+	started := make(chan struct{}, 1)
+	r, _ := newCountingRunner(t, time.Minute, func(_ context.Context, _ *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if string(task.Args) == "first" {
+			started <- struct{}{}
+			<-hold
+		}
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	defer close(hold)
+	go func() {
+		_, _ = r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte("first")})
+	}()
+	<-started
+	second := make(chan error, 1)
+	go func() {
+		_, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Args: []byte("second")})
+		second <- err
+	}()
+
+	var ids []taskrunner.TaskID
+	for len(ids) < 2 {
+		pending, err := r.Pending(ctx, qTop, []string{"s"}, "step")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = pending["s"]
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := r.Cancel(ctx, qTop, ids[1]); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-second:
+		if !errors.Is(err, taskrunner.ErrCancelled) {
+			t.Fatalf("cancelled Run returned %v, want ErrCancelled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled Run still waiting behind the caller holding the subject")
 	}
 }
