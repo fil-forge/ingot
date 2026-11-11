@@ -450,7 +450,7 @@ func (b *Backend) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t tas
 		// throw them away. Nothing else would retract those roots — hilt's
 		// delete checks the space's blobs, not its content entries — so every
 		// object of a bucket emptied and deleted in one go would stay counted.
-		if err := b.DrainSpaceRegistrations(ctx, st.Space); err != nil {
+		if err := b.counts.Drain(ctx, st.Space); err != nil {
 			return fmt.Errorf("s3frontend: delete bucket: %w", err)
 		}
 

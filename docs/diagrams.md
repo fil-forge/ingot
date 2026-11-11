@@ -411,7 +411,7 @@ Sources: `s3frontend/object.go` (PutObject, ingestBody, concludeBody),
 `s3frontend/copy.go` (CopyObject, copySourceBucket),
 `s3frontend/version.go` (applyPut), `s3frontend/bucketqueue.go` (commit, runCommit, register),
 `registry/bucketcommit.go` (RootCommitWrites),
-`s3frontend/uploadqueue.go` (the queue-space-upload handlers), `bucketop/bucketop.go`,
+`queue/spaceuploadqueue/spaceuploadqueue.go` (the queue-space-upload handlers), `bucketop/bucketop.go`,
 `blockstore/staging.go`, `uploader/blob.go`, `uploader/forge.go`,
 `uploader/upload.go`. Review when these change.
 
@@ -1334,7 +1334,7 @@ sequenceDiagram
         Q->>U: /blob/remove (release the space's registration)
     end
     Q->>R: drainSpaceReleases: lend the request's authority for the space, Expedite its pending<br/>queue-space-shard.release tasks (subject space/*) and wait for the workers to run them (/blob/remove each)#59;<br/>a release still waiting fails the delete for the client to retry
-    Q->>U: DrainSpaceRegistrations: send the space's pending queue-space-upload changes,<br/>then resend its failed retractions with the request's authority
+    Q->>U: Drain: send the space's pending queue-space-upload changes,<br/>then resend its failed retractions with the request's authority
     Q->>H: /s3/bucket/delete with the signed S3 request (hilt refuses while registrations remain)#59;<br/>a refusal clears the closing mark, not found finishes the delete,<br/>a failed call leaves the bucket closing for a retry
     Q->>L: RemoveBucketLog, best-effort (directory + segment rows), while the row holds the name:<br/>the log is the name's, and a bucket created under it later runs under its own space
     Q->>R: reg.Delete (the local row, its catalog_journal rows cascading)
@@ -1357,7 +1357,7 @@ Sources: `s3frontend/bucket.go` (DeleteBucket, runDeleteBucket),
 `s3frontend/bucketqueue.go` (bucketSpec), `s3frontend/multipartqueue.go`
 (abortUpload, runAbort, reapNow, runReap),
 `s3frontend/releasequeue.go` (drainSpaceReleases),
-`s3frontend/uploadqueue.go` (DrainSpaceRegistrations),
+`queue/spaceuploadqueue/spaceuploadqueue.go` (Drain),
 `logstore/manager.go`. Review when these change.
 
 ## Package-to-diagram map
@@ -1373,7 +1373,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `s3frontend/acceptor.go`, `registry/accept.go` | multipart, part-states, blob-lifecycle |
 | `s3frontend/releasequeue.go` | put, multipart, part-states, blob-lifecycle, delete-bucket |
 | `s3frontend/shardref.go` | put, multipart, blob-lifecycle |
-| `s3frontend/uploadqueue.go` | put, delete-bucket |
+| `queue/spaceuploadqueue/spaceuploadqueue.go` | put, delete-bucket |
 | `queue/shardqueue/shardqueue.go`, `s3frontend/localblob_sweep.go` | put, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |

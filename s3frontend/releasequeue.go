@@ -262,7 +262,7 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 	if len(due) == 0 {
 		return nil
 	}
-	expires := time.Now().Add(drainTimeoutOr(b.drainTimeout))
+	expires := time.Now().Add(releaseDrainTimeout)
 	subjects := make([]string, 0, len(due))
 	for subject := range due {
 		subjects = append(subjects, subject)
@@ -283,10 +283,6 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 	return nil
 }
 
-// drainTimeoutOr returns d, or the upload drain's timeout when d is zero.
-func drainTimeoutOr(d time.Duration) time.Duration {
-	if d > 0 {
-		return d
-	}
-	return uploadDrainTimeout
-}
+// releaseDrainTimeout is how long a bucket delete waits for its space's
+// releases to finish before it fails, for the client to retry.
+const releaseDrainTimeout = 30 * time.Second

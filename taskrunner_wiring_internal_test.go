@@ -8,6 +8,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/s3frontend"
 )
 
@@ -27,7 +28,7 @@ func TestTaskRunnerHasTheBackendsQueues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewBlobCache: %v", err)
 	}
-	b, err := s3frontend.New(s3frontend.Deps{Tasks: r, Cache: cache})
+	b, err := s3frontend.New(s3frontend.Deps{Tasks: r, Registrar: testfakes.NopUploader{}, Cache: cache})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

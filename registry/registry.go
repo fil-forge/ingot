@@ -197,10 +197,10 @@ var (
 // (Registry.RootCommitWrites):
 // the rows that must exist exactly when the version does.
 type RootCommit struct {
-	// Registrations are the upload registrations the commit queues, as
-	// tasks in its transaction: the versions it publishes and retracts from
-	// the space's content-entry list.
-	Registrations []UploadRegistration
+	// Registrations are the queue-space-upload tasks the commit queues in
+	// its transaction: the versions it publishes and retracts from the
+	// space's content-entry list.
+	Registrations []taskrunner.Spec
 	// Claims are the new generation's claims, one per body digest. A claim
 	// with a Ref takes over the write's pending reference to the blob, and
 	// cancels the reference's expiry, in the same transaction; a reference

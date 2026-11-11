@@ -19,6 +19,7 @@ import (
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/logstore"
+	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
@@ -939,10 +940,10 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 	setup := registry.NewPostgres(setupPool)
 
 	space := testutil.RandomDID(t)
-	regs := []registry.UploadRegistration{{
+	regs := uploadSpecs(t, spaceuploadqueue.Registration{
 		Bucket: "cas-single-conn", ObjectKey: "k", Space: space,
-		Root: liveCid(t, "root"), Op: registry.UploadRegistrationAdd, Proofs: []byte("proofs"),
-	}}
+		Root: liveCid(t, "root"), Op: spaceuploadqueue.Add, Proofs: []byte("proofs"),
+	})
 
 	// A deadlock hangs rather than fails, so every call below is bounded.
 	bounded := func(name string, fn func(context.Context) error) error {
@@ -995,7 +996,7 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
 	t.Helper()
 	r, err := taskrunner.New(pool, taskrunner.Options{Schema: "ingot", Queues: []taskrunner.QueueOptions{
-		{Name: registry.UploadQueue}, {Name: registry.ReleaseQueue},
+		{Name: spaceuploadqueue.Name}, {Name: registry.ReleaseQueue},
 	}})
 	if err != nil {
 		t.Fatalf("task runner: %v", err)
@@ -1003,8 +1004,8 @@ func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
 	// Submitting a task needs its handler registered, though these tests
 	// never run one.
 	noop := func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil }
-	for _, op := range []registry.UploadRegistrationOp{registry.UploadRegistrationAdd, registry.UploadRegistrationRemove} {
-		if err := r.Handle(registry.UploadQueue, string(op), noop); err != nil {
+	for _, op := range []spaceuploadqueue.Op{spaceuploadqueue.Add, spaceuploadqueue.Remove} {
+		if err := r.Handle(spaceuploadqueue.Name, string(op), noop); err != nil {
 			t.Fatalf("register %s: %v", op, err)
 		}
 	}
@@ -1017,23 +1018,34 @@ func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
 	return r
 }
 
-// queuedUploads returns the space's pending registrations, in queue order.
-func queuedUploads(t *testing.T, pool *pgxpool.Pool, space did.DID) []registry.UploadRegistration {
+// uploadSpecs returns the tasks that carry regs.
+func uploadSpecs(t *testing.T, regs ...spaceuploadqueue.Registration) []taskrunner.Spec {
 	t.Helper()
-	tasks, err := taskrunnertest.Tasks(context.Background(), pool, "ingot", registry.UploadQueue)
+	out := make([]taskrunner.Spec, len(regs))
+	for i, reg := range regs {
+		spec, err := reg.Spec()
+		if err != nil {
+			t.Fatalf("registration spec: %v", err)
+		}
+		out[i] = spec
+	}
+	return out
+}
+
+// queuedUploads returns the space's pending registrations, in queue order, as
+// the tasks that carry them.
+func queuedUploads(t *testing.T, pool *pgxpool.Pool, space did.DID) []taskrunner.Spec {
+	t.Helper()
+	tasks, err := taskrunnertest.Tasks(context.Background(), pool, "ingot", spaceuploadqueue.Name)
 	if err != nil {
 		t.Fatalf("list queued uploads: %v", err)
 	}
-	var out []registry.UploadRegistration
+	var out []taskrunner.Spec
 	for _, q := range tasks {
 		if q.Subject != space.String() || q.State != "pending" {
 			continue
 		}
-		reg, err := registry.UploadRegistrationFromTask(taskrunner.Task{Subject: q.Subject, Action: q.Action, Args: q.Args})
-		if err != nil {
-			t.Fatalf("decode queued upload: %v", err)
-		}
-		out = append(out, reg)
+		out = append(out, taskrunner.Spec{Queue: spaceuploadqueue.Name, Subject: q.Subject, Action: q.Action, Args: q.Args})
 	}
 	return out
 }
@@ -1058,10 +1070,10 @@ func TestCommitRootQueuesUploadRegistrations(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.Delete(context.Background(), "queue-bucket", space) })
 
-	regs := []registry.UploadRegistration{
-		{Bucket: "queue-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "new"), Op: registry.UploadRegistrationAdd, Proofs: []byte("add proofs")},
-		{Bucket: "queue-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "old"), Op: registry.UploadRegistrationRemove, Proofs: []byte("remove proofs")},
-	}
+	regs := uploadSpecs(t,
+		spaceuploadqueue.Registration{Bucket: "queue-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "new"), Op: spaceuploadqueue.Add, Proofs: []byte("add proofs")},
+		spaceuploadqueue.Registration{Bucket: "queue-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "old"), Op: spaceuploadqueue.Remove, Proofs: []byte("remove proofs")},
+	)
 	if err := r.CommitRoot(ctx, "queue-bucket", liveCid(t, "stale"), liveCid(t, "root"), registry.RootCommit{Registrations: regs}); !errors.Is(err, registry.ErrConflict) {
 		t.Fatalf("stale commit: %v, want ErrConflict", err)
 	}
@@ -1089,7 +1101,7 @@ func TestCommitRootWithoutTasksRefusesRegistrations(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.Delete(context.Background(), "no-tasks-bucket", space) })
 	err := r.CommitRoot(ctx, "no-tasks-bucket", cid.Undef, liveCid(t, "root"), registry.RootCommit{
-		Registrations: []registry.UploadRegistration{{Bucket: "no-tasks-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "mf"), Op: registry.UploadRegistrationAdd}},
+		Registrations: uploadSpecs(t, spaceuploadqueue.Registration{Bucket: "no-tasks-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "mf"), Op: spaceuploadqueue.Add}),
 	})
 	if err == nil {
 		t.Fatal("a commit with registrations succeeded without a task runner")

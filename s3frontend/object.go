@@ -33,6 +33,7 @@ import (
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
+	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/uploader"
@@ -1191,7 +1192,7 @@ func (b *Backend) applyDeleteKey(ctx context.Context, sc *commitScope, key strin
 		}
 		b.dropClaims(sc, tx.State(), key, claimVersionID(oldVersionID, oldMf.Seq), oldDigests)
 		// The key is gone, so the space stops counting it.
-		b.register(sc, tx.State(), key, oldManifest, registry.UploadRegistrationRemove)
+		b.register(sc, tx.State(), key, oldManifest, spaceuploadqueue.Remove)
 		return t2.GetPointer(ctx, tx)
 	}()
 }
