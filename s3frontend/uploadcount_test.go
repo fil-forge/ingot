@@ -118,7 +118,6 @@ func newCountingBackend(t *testing.T) (*Backend, *recordingRegistrar) {
 		Registry:   mem,
 		Intents:    mem,
 		Locations:  mem,
-		GC:         mem,
 		Multipart:  mem,
 		Parks:      mem,
 		Reads:      blockstore.NewLayered(cache, log, testfakes.NopBaseReader{}),

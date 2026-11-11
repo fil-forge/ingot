@@ -158,8 +158,6 @@ type Deps struct {
 	Intents   registry.IntentStore
 	Locations registry.LocationStore
 
-	// GC records superseded MST/manifest CIDs. Same instance as Registry.
-	GC        registry.GCStore
 	Multipart registry.MultipartStore
 
 	// Reads is the layered read tier (local blobs → log → forge). Log is the

@@ -69,7 +69,6 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 		Registry:   mem,
 		Intents:    mem,
 		Locations:  mem,
-		GC:         mem,
 		Reads:      blockstore.NewLayered(cache, log, testfakes.NopBaseReader{}),
 		Log:        log,
 		Cache:      cache,
