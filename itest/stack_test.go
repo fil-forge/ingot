@@ -126,9 +126,8 @@ func forgeStack(t *testing.T, extra ...stack.Option) (*stack.Stack, string) {
 	// The blockchain image is pinned, not smelt's default moving :main tag:
 	// Anvil loads the chain state smelt commits beside its compose file only
 	// in a localdev image whose Anvil can parse it, and a republished :main
-	// need not. Drop the pin (and this override with it) once ingot bumps
-	// smelt to a version that pins its own image beside its state, or whose
-	// state matches the published image.
+	// need not. Remove the pin (and this override with it) once ingot depends
+	// on a smelt version that pins the localdev image beside its state.
 	blockchainImage := pinnedBlockchainImage
 	if img := os.Getenv("INGOT_ITEST_BLOCKCHAIN_IMAGE"); img != "" {
 		t.Logf("using blockchain image override: %s", img)
