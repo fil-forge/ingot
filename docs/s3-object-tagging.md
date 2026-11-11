@@ -171,7 +171,7 @@ design's out-of-scope list points here for object tagging, as does the lock desi
 | `s3frontend/objectlock.go` | the state-target resolution and state-write helpers take a require-lock flag (tagging passes false); the echo helper adds the tag count and fetches whenever the leaf carries state |
 | `s3frontend/object.go`, `copy.go`, `multipart.go` | header parse via `backend.ParseObjectTags` (§4), copy-directive handling, session carry, `TagCount` on Head/Get |
 | `migrations/sql/00012_object_tagging.sql` (new) | `multipart_sessions.tagging` (the raw header string) |
-| `registry/stores.go`, `stores_postgres.go`, `multipartqueue.go` | `MultipartSession.Tagging` |
+| `registry/stores.go`, `stores_postgres.go`, `registry/multipartqueue.go` | `MultipartSession.Tagging` |
 | `itest/versity_tagging_test.go` (new), `versity_{object,multipart,versioning}_test.go` | new categories, the versioning rows, promotions (§6) |
 | `docs/s3-versioning.md`, `docs/s3-object-lock.md` | out-of-scope lists point here |
 

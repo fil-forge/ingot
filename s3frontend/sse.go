@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
 
@@ -194,12 +195,20 @@ func (b *Backend) PutBucketEncryption(ctx context.Context, bucket string, config
 	default:
 		return errSSEArgument("The encryption method specified is not supported")
 	}
-	return b.setBucketConfig(ctx, bucket, registry.BucketSetEncryptionAction, []byte(enc))
+	return b.setBucketEncryption(ctx, bucket, enc)
 }
 
 // DeleteBucketEncryption clears the bucket's default encryption, returning
 // it to the unconfigured state: objects written from here on are encrypted,
 // and GetBucketEncryption answers not found. Idempotent.
 func (b *Backend) DeleteBucketEncryption(ctx context.Context, bucket string) error {
-	return b.setBucketConfig(ctx, bucket, registry.BucketSetEncryptionAction, []byte(registry.BucketEncryptionUnset))
+	return b.setBucketEncryption(ctx, bucket, registry.BucketEncryptionUnset)
+}
+
+// setBucketEncryption stores enc as the bucket's default encryption
+// (queue-bucket.set-encryption).
+func (b *Backend) setBucketEncryption(ctx context.Context, bucket string, enc registry.BucketEncryption) error {
+	return b.setBucket(ctx, bucket, func(ctx context.Context, space did.DID, name string) error {
+		return b.buckets.SetEncryption(ctx, space, name, enc)
+	})
 }

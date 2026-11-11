@@ -82,7 +82,7 @@ func putSweepObjects(t *testing.T, b *Backend, n int) []multihash.Multihash {
 // budgetToEvict sets the cache budget so the budget pass must evict exactly
 // n of blobs, each blobSize bytes, to reach its low watermark.
 func budgetToEvict(b *Backend, n int, blobSize int64) {
-	target := b.localUsage() - int64(n)*blobSize
+	target := b.cache.Usage() - int64(n)*blobSize
 	b.localBlobMaxBytes = (target/lowWatermarkPercent + 1) * 100
 }
 
@@ -171,8 +171,8 @@ func TestSweepLocalBlobs_UsageEndsAtOrBelowTheLowWatermark(t *testing.T) {
 
 	sweepLocalBlobs(t, b)
 
-	if target := b.localBlobMaxBytes * lowWatermarkPercent / 100; b.localUsage() > target {
-		t.Fatalf("usage after the sweep = %d, want at most %d", b.localUsage(), target)
+	if target := b.localBlobMaxBytes * lowWatermarkPercent / 100; b.cache.Usage() > target {
+		t.Fatalf("usage after the sweep = %d, want at most %d", b.cache.Usage(), target)
 	}
 }
 
@@ -236,7 +236,7 @@ func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
 		OnDisk      map[string]bool
 		OrphanFiles int64
 		Usage       int64
-	}{OnDisk: map[string]bool{}, OrphanFiles: stats.OrphanFiles, Usage: b.localUsage()}
+	}{OnDisk: map[string]bool{}, OrphanFiles: stats.OrphanFiles, Usage: b.cache.Usage()}
 	for name, path := range paths {
 		_, err := os.Stat(path)
 		got.OnDisk[name] = err == nil
@@ -442,7 +442,7 @@ func TestSweepLocalBlobs_LatchesResetAtTheLowWatermark(t *testing.T) {
 	for _, percent := range []int64{0, 95, 89} {
 		if percent > 0 {
 			// Usage is percent% of the budget.
-			b.localBlobMaxBytes = b.localUsage() * 100 / percent
+			b.localBlobMaxBytes = b.cache.Usage() * 100 / percent
 		}
 		sweepLocalBlobs(t, b)
 		got = append(got, latches{b.overBudgetWarned, b.timeLimitLogged})
@@ -479,15 +479,15 @@ func TestSweepLocalBlobs_OrphanPassCorrectsCountsAfterAManualRemoval(t *testing.
 	b, _ := newSweepBackend(t)
 	digests := putSweepObjects(t, b, 2)
 	size := blobSize(t, b, digests[0])
-	before := b.localUsage()
+	before := b.cache.Usage()
 	if err := os.Remove(localPath(b, digests[0])); err != nil {
 		t.Fatal(err)
 	}
-	stale := b.localUsage()
+	stale := b.cache.Usage()
 
 	sweepLocalBlobs(t, b)
 
-	if got, want := [2]int64{stale, b.localUsage()}, [2]int64{before, before - size}; got != want {
+	if got, want := [2]int64{stale, b.cache.Usage()}, [2]int64{before, before - size}; got != want {
 		t.Fatalf("usage [after the manual removal, after the sweep] = %v, want %v", got, want)
 	}
 }

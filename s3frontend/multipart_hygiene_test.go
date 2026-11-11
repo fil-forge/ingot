@@ -254,7 +254,7 @@ func TestCompleteFailsClosedOnMissingParamsRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPartTrees: %v", err)
 	}
-	if _, err := mem.PutPart(ctx, part, trees[1], registry.ReleaseTask{}); err != nil {
+	if _, err := mem.PutPart(ctx, part, trees[1]); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 
@@ -278,23 +278,23 @@ func TestCompleteFailsClosedOnMissingParamsRow(t *testing.T) {
 // otherwise stay registered behind the reader grace and hilt would refuse
 // the space deletion.
 func TestDrainSpaceReleasesIgnoresGrace(t *testing.T) {
-	b, mem, rm := newRefTestBackend(t)
+	// A live grace: the delete queues the blob's release an hour out, so
+	// neither a worker nor the ordinary sweep touches it.
+	mem := newTestStore(t)
+	b, _, rm := newRefTestBackendOver(t, mem, newRetainedLog(t, mem), 0, func(d *Deps) { d.ReleaseGrace = time.Hour })
 	ctx := context.Background()
 	data := testBody(1 << 10)
 
 	putObj(t, b, "k1", data)
 	d := blobDigestOf(t, b, "k1", "")
-	// A live grace: the delete queues the blob's release an hour out, so
-	// neither a worker nor the ordinary sweep touches it.
-	b.releaseGrace = time.Hour
 	deleteObj(t, b, "k1")
 
 	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 0 {
 		t.Fatalf("sweep executed %d releases (err=%v), want 0 — intent should not be due", n, err)
 	}
 
-	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
-		t.Fatalf("drainSpaceReleases: %v", err)
+	if err := b.blobs.DrainSpace(ctx, mem.bk()); err != nil {
+		t.Fatalf("drain the space's releases: %v", err)
 	}
 	if _, err := mem.GetEncryptionParams(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("enc-params row survived the space drain (err=%v)", err)
@@ -408,9 +408,9 @@ func TestCompleteWaitBudgetIsOperationAborted(t *testing.T) {
 		first <- err
 	}()
 	<-g.entered
-	saveBudget := replayWaitBudget
-	replayWaitBudget = 50 * time.Millisecond
-	t.Cleanup(func() { replayWaitBudget = saveBudget })
+	limits := storeFor(b).limits
+	saveBudget := limits.CompleteWait
+	limits.CompleteWait = 50 * time.Millisecond
 
 	_, err := mpComplete(t, b, key, uploadID, parts, nil)
 	var apiErr s3err.APIError
@@ -421,7 +421,7 @@ func TestCompleteWaitBudgetIsOperationAborted(t *testing.T) {
 	if err := <-first; err != nil {
 		t.Fatalf("first Complete: %v", err)
 	}
-	replayWaitBudget = saveBudget
+	limits.CompleteWait = saveBudget
 	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
 		t.Fatalf("repeated Complete: %v", err)
 	}
@@ -529,8 +529,7 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 		mod(&deps)
 	}
 	withStreaming(t, &deps, dir)
-	b := New(deps)
-	mem.start(t, b)
+	b := mem.newBackend(t, deps)
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
@@ -1193,7 +1192,7 @@ func TestAbortRecordsBlobAnotherAbortingSessionReferences(t *testing.T) {
 	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: bucket, Space: mem.bk(), ObjectKey: "other"}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil, registry.ReleaseTask{}); err != nil {
+	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 	if err := b.abortUpload(ctx, registry.MultipartSession{UploadID: other, Space: mem.bk()}); err != nil {
@@ -1232,7 +1231,7 @@ func TestReleaseWaitsForAnotherOpenSessionSharingTheBlob(t *testing.T) {
 	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: bucket, Space: mem.bk(), ObjectKey: "other"}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil, registry.ReleaseTask{}); err != nil {
+	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 
@@ -1465,12 +1464,12 @@ type failPutPart struct {
 	fails int
 }
 
-func (f *failPutPart) PartWrites(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree, release registry.ReleaseTask) (registry.CommitWrites, []multihash.Multihash, error) {
+func (f *failPutPart) PartWrites(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree) (registry.CommitWrites, error) {
 	if f.fails > 0 {
 		f.fails--
-		return registry.CommitWrites{}, nil, errors.New("parts table unavailable")
+		return registry.CommitWrites{}, errors.New("parts table unavailable")
 	}
-	return f.MultipartStore.PartWrites(ctx, p, tree, release)
+	return f.MultipartStore.PartWrites(ctx, p, tree)
 }
 
 // TestUploadPartFailedRowWriteReleasesItsBlobs: the part row write fails for
@@ -1633,8 +1632,8 @@ func TestSupersedeRecordsReleaseOfSharedBlob(t *testing.T) {
 	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
 		t.Fatalf("Abort: %v", err)
 	}
-	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
-		t.Fatalf("drainSpaceReleases: %v", err)
+	if err := b.blobs.DrainSpace(ctx, mem.bk()); err != nil {
+		t.Fatalf("drain the space's releases: %v", err)
 	}
 	if !pu.abortedDigests()[string(shared)] {
 		t.Fatalf("shared blob %x not released once the session ended", shared)
@@ -1775,8 +1774,8 @@ func TestConcurrentUploadsOfOnePartReleaseTheOverwrittenBlobs(t *testing.T) {
 		}
 	}
 
-	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
-		t.Fatalf("drainSpaceReleases: %v", err)
+	if err := b.blobs.DrainSpace(ctx, mem.bk()); err != nil {
+		t.Fatalf("drain the space's releases: %v", err)
 	}
 	for _, d := range orphans {
 		if !pu.abortedDigests()[string(d)] {

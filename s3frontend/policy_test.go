@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"path/filepath"
 	"testing"
 
 	hiltauth "github.com/fil-forge/hilt/pkg/rpc/service/auth"
@@ -14,11 +15,19 @@ import (
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/stretchr/testify/require"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/internal/reqscope"
+	"github.com/fil-forge/ingot/internal/testfakes"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
+	"github.com/fil-forge/ingot/queue/multipartqueue"
+	"github.com/fil-forge/ingot/queue/shardqueue"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
+	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // policyAuthority answers PolicyDocument with a canned result or error and
@@ -52,7 +61,23 @@ func policyBackend(t *testing.T, authority bucketauthority.BucketAuthority) *s3f
 	t.Helper()
 	reg := registry.NewPostgres(pgtest.New(t))
 	require.NoError(t, reg.Create(t.Context(), "photos", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}))
-	return s3frontend.New(s3frontend.Deps{Registry: reg, Authority: authority})
+	// The policy calls queue nothing, so the runner is never started.
+	tasks, err := taskrunner.New(nil, taskrunner.Options{
+		Schema: "ingot",
+		Queues: []taskrunner.QueueOptions{
+			{Name: multipartqueue.Name},
+			{Name: bucketqueue.Name},
+			{Name: spaceuploadqueue.Name},
+			{Name: spaceshardqueue.Name},
+			{Name: shardqueue.Name},
+		},
+	})
+	require.NoError(t, err)
+	cache, err := blockstore.NewBlobCache(filepath.Join(t.TempDir(), "cache"))
+	require.NoError(t, err)
+	b, err := s3frontend.New(s3frontend.Deps{Tasks: tasks, Registrar: testfakes.NopUploader{}, Registry: reg, Cache: cache, Authority: authority})
+	require.NoError(t, err)
+	return b
 }
 
 // requireS3Error asserts err is the S3 error code, as versitygw's

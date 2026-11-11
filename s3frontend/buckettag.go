@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/s3err"
 
 	"github.com/fil-forge/ingot/registry"
@@ -71,5 +72,7 @@ func (b *Backend) DeleteBucketTagging(ctx context.Context, bucket string) error 
 // setBucketTagging stores doc as the bucket's tag set
 // (queue-bucket.set-tagging).
 func (b *Backend) setBucketTagging(ctx context.Context, bucket string, doc []byte) error {
-	return b.setBucketConfig(ctx, bucket, registry.BucketSetTaggingAction, doc)
+	return b.setBucket(ctx, bucket, func(ctx context.Context, space did.DID, name string) error {
+		return b.buckets.SetTagging(ctx, space, name, doc)
+	})
 }

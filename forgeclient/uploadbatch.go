@@ -40,7 +40,7 @@ type UploadChange struct {
 // Every change in a batch must be independent of the others. Container
 // encoding sorts tokens bytewise, so the service sees no particular order
 // within a batch and may run them in any — which is why adds and retractions
-// of the same root can never share one (see s3frontend/uploadqueue.go).
+// of the same root can never share one (see queue/spaceuploadqueue).
 func (c *Client) UploadAddBatch(ctx context.Context, changes []UploadChange) ([]error, error) {
 	return c.uploadBatch(ctx, changes, uploadcmds.Add.Command, func(ch UploadChange, links []cid.Cid) (ucan.Invocation, error) {
 		return uploadcmds.Add.Invoke(

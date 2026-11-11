@@ -30,29 +30,13 @@ const uniqueViolation = "23505"
 // here are plain SQL and read nothing from ctx.
 type Postgres struct {
 	pool *pgxpool.Pool
-	// tasks queues a commit's upload registrations in its transaction.
-	tasks TaskSubmitter
-}
-
-// PostgresOption configures a Postgres registry.
-type PostgresOption func(*Postgres)
-
-// WithTasks queues each commit's upload registrations through ts, in the
-// commit's transaction. A registry without it refuses a commit that carries
-// any.
-func WithTasks(ts TaskSubmitter) PostgresOption {
-	return func(r *Postgres) { r.tasks = ts }
 }
 
 // NewPostgres wraps an existing pool. Callers are responsible for
 // running pkg/ingot/migrations.Up against the same pool before any
 // registry method is called.
-func NewPostgres(pool *pgxpool.Pool, opts ...PostgresOption) *Postgres {
-	r := &Postgres{pool: pool}
-	for _, o := range opts {
-		o(r)
-	}
-	return r
+func NewPostgres(pool *pgxpool.Pool) *Postgres {
+	return &Postgres{pool: pool}
 }
 
 // Compile-time assertion.
