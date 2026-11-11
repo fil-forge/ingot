@@ -103,9 +103,9 @@ func localIngotBinary(t *testing.T) string {
 	return builtBinary
 }
 
-// pinnedBlockchainImage is the filecoin-localdev image (its multi-arch index,
-// tagged 96e9d9e) that was :main before 2026-11-11; forgeStack explains why
-// it is pinned.
+// pinnedBlockchainImage is a filecoin-localdev image (its multi-arch index,
+// tagged 96e9d9e) whose Anvil loads the chain state of the smelt version
+// go.mod pins; forgeStack explains why it is pinned.
 const pinnedBlockchainImage = "ghcr.io/fil-forge/filecoin-localdev@sha256:96e72624eb71efb1c15de1d0729b780955e5ece700e840dd56291f5c522b4bee"
 
 // forgeStack boots the smelt stack with the working tree's ingot injected
@@ -123,6 +123,18 @@ func forgeStack(t *testing.T, extra ...stack.Option) (*stack.Stack, string) {
 		stack.WithPiriNodes(stack.PiriNodeConfig{Postgres: true}),
 		stack.WithServiceBinary("ingot", localIngotBinary(t)),
 	}
+	// The blockchain image is pinned, not smelt's default moving :main tag:
+	// Anvil loads the chain state smelt commits beside its compose file only
+	// in a localdev image whose Anvil can parse it, and a republished :main
+	// need not. Drop the pin (and this override with it) once ingot bumps
+	// smelt to a version that pins its own image beside its state, or whose
+	// state matches the published image.
+	blockchainImage := pinnedBlockchainImage
+	if img := os.Getenv("INGOT_ITEST_BLOCKCHAIN_IMAGE"); img != "" {
+		t.Logf("using blockchain image override: %s", img)
+		blockchainImage = img
+	}
+	opts = append(opts, stack.WithBlockchainImage(blockchainImage))
 	// Local-dev escape hatches: run against upload-service (sprue) / piri
 	// images the registry doesn't have yet — e.g. built from an unmerged
 	// branch. Unset (CI) uses the published defaults. These exist because the
@@ -130,18 +142,6 @@ func forgeStack(t *testing.T, extra ...stack.Option) (*stack.Stack, string) {
 	// tenant spaces, so both sprue (bucket create / catalog ship) and piri
 	// (the /content/retrieve read tier) must be able to resolve did:plc — a
 	// capability that lands in those services branch-by-branch.
-	// The blockchain image is pinned, not smelt's default moving :main tag:
-	// Anvil loads the chain state smelt commits beside its compose file only
-	// in the localdev image that wrote it, and the :main republished on
-	// 2026-11-11 can't parse the state of the smelt version pinned in go.mod.
-	// Drop the pin (and this override with it) once ingot bumps smelt to a
-	// version whose committed state matches the published image.
-	blockchainImage := pinnedBlockchainImage
-	if img := os.Getenv("INGOT_ITEST_BLOCKCHAIN_IMAGE"); img != "" {
-		t.Logf("using blockchain image override: %s", img)
-		blockchainImage = img
-	}
-	opts = append(opts, stack.WithBlockchainImage(blockchainImage))
 	if img := os.Getenv("INGOT_ITEST_UPLOAD_IMAGE"); img != "" {
 		t.Logf("using upload-service image override: %s", img)
 		opts = append(opts, stack.WithUploadImage(img))

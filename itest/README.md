@@ -54,10 +54,12 @@ yet — e.g. one built from an unmerged branch — point the stack at it:
 INGOT_ITEST_UPLOAD_IMAGE=<image> make itest
 ```
 
-The blockchain (Anvil) image is the exception: `forgeStack` pins
-`filecoin-localdev` by digest, because Anvil loads smelt's committed chain
-state only in the image that wrote it. `INGOT_ITEST_BLOCKCHAIN_IMAGE=<image>`
-overrides the pin.
+Unlike the other service images, the blockchain (Anvil) image is not a
+moving `:main` tag: `forgeStack` pins `filecoin-localdev` by digest, because
+Anvil loads smelt's committed chain state only in an image whose Anvil can
+parse it. `INGOT_ITEST_BLOCKCHAIN_IMAGE=<image>` overrides the pin; the image
+it names must load the state of the smelt version `go.mod` pins, or the
+blockchain container won't start.
 
 **Teardown-blocked XFail rows (historical):** before `DeleteObject` released
 network blobs (FIL-588), a bucket that ever held a non-empty object body
