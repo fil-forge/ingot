@@ -125,11 +125,13 @@ var emptySHA256 = func() string {
 
 // Load writes cfg.Buckets' objects until each holds cfg.Until bulk objects
 // and the real objects due by then, resuming from and recording progress in
-// cfg.StatePath. It returns the final report. When ctx ends first, Load
-// records the progress made and returns ctx's cause (context.Cause); a later
-// Load picks up from there. When that final record cannot be written, the
-// error also carries ErrStateNotSaved, and a later Load resumes from the
-// previous checkpoint.
+// cfg.StatePath. It returns the final report. When ctx ends while objects
+// are being written, Load records the progress made and returns ctx's cause
+// (context.Cause); a later Load picks up from there. When that final record
+// cannot be written, the error also carries ErrStateNotSaved, and a later
+// Load resumes from the previous checkpoint. When ctx ends during bucket
+// setup, Load returns that step's error and no report; each bucket set up
+// by then is already recorded.
 func Load(ctx context.Context, client S3, cfg Config) (*Report, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("preload: %w", err)
@@ -235,10 +237,16 @@ func newLoader(client S3, cfg Config, st *State) *loader {
 	return l
 }
 
-// setupBuckets creates each bucket not yet ready and sets its encryption.
+// setupBuckets creates each bucket not yet ready and sets its encryption. A
+// bucket already set up with another encryption is refused: setting it now
+// would change it part way through its objects.
 func (l *loader) setupBuckets(ctx context.Context) error {
 	for _, b := range l.buckets {
 		if b.state.Ready {
+			if b.state.Encryption != l.cfg.Encryption {
+				return fmt.Errorf("bucket %s was set up with encryption %q, not %q: load other buckets, with another state file",
+					b.name, b.state.Encryption, l.cfg.Encryption)
+			}
 			continue
 		}
 		_, err := l.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(b.name)})
@@ -263,6 +271,7 @@ func (l *loader) setupBuckets(ctx context.Context) error {
 		}
 		l.mu.Lock()
 		b.state.Ready = true
+		b.state.Encryption = l.cfg.Encryption
 		err = writeState(l.cfg.StatePath, l.state)
 		l.mu.Unlock()
 		if err != nil {

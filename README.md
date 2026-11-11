@@ -309,9 +309,11 @@ server writes them: 64 hex digits after an optional prefix, create-only, with
 the body's SHA-256. New buckets get the `none` default encryption, which needs
 `encryption.allow_none`. smelt's ingot doesn't allow it, so the example passes
 `--encryption ""` and keeps ingot's default; to try `none` on smelt, add
-`encryption: {allow_none: true}` to its `systems/ingot/config/config.yaml` and
-recreate ingot. Progress is saved in a state file, so a second `load` with a
-higher `--until` carries on from the first, and reports go to stdout and, as
+`encryption: {allow_none: true}` to its `systems/ingot/config/config.yaml`,
+recreate ingot, and load other buckets with another state file
+(`--bucket-prefix`, `--state`): a state file remembers each bucket's encryption
+and refuses another. Progress is saved in a state file, so a second `load` with
+a higher `--until` carries on from the first, and reports go to stdout and, as
 JSON lines, to a metrics file.
 
 Real objects at their default size add up. At estate scale, `--buckets 150

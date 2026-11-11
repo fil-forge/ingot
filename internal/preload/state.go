@@ -27,6 +27,9 @@ type State struct {
 type BucketState struct {
 	// Ready is set once the bucket exists and its encryption is set.
 	Ready bool `json:"ready"`
+	// Encryption is the default encryption set on the bucket, "" when the
+	// gateway's was left. A later load asking for another is refused.
+	Encryption string `json:"encryption,omitempty"`
 	// Bulk is the number of bulk objects written: every bulk object below
 	// it was. A load stopped part way may have written some at or above it.
 	Bulk uint64 `json:"bulk"`

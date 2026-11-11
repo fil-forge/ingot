@@ -141,6 +141,11 @@ func TestClientSendsThePackServersRequests(t *testing.T) {
 	}
 }
 
+// testAttemptTimeout bounds each PUT attempt in the tests that cut one off.
+// Only the attempt being cut off comes near it: a retry, even of a real
+// object's body under -race on a busy machine, takes a fraction of it.
+const testAttemptTimeout = 2 * time.Second
+
 // TestClientRetriesWhenNoResponseComes runs a load through the real SDK
 // client while the server, once, gives a PUT no response: it holds the
 // request past the attempt's timeout, or drops the connection. Either way
@@ -161,7 +166,7 @@ func TestClientRetriesWhenNoResponseComes(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			isolateAWSConfig(t)
 			cfg := testConfig(t, 1, 5)
-			cfg.AttemptTimeout = 300 * time.Millisecond
+			cfg.AttemptTimeout = testAttemptTimeout
 			victim := BulkKey(cfg.KeyPrefix, cfg.Seed, cfg.Buckets[0], 2)
 			var once sync.Once
 			srv := &packServerShape{t: t, bucket: cfg.Buckets[0], objects: map[string]bool{}}
@@ -193,20 +198,20 @@ func TestClientRetriesWhenNoResponseComes(t *testing.T) {
 }
 
 // TestClientResendsACutOffRealBody cuts off a real object's PUT part way
-// through its body, by holding it past the attempt's timeout or by dropping
+// through its body, by holding it until the attempt times out or by dropping
 // the connection. The retry must send the whole body again from its start,
 // which the server checks against the PUT's SHA-256.
 func TestClientResendsACutOffRealBody(t *testing.T) {
-	const (
-		timeout = 300 * time.Millisecond
-		cutAt   = 1<<20 + 17
-	)
+	const cutAt = 1<<20 + 17
+	// release ends the held attempt's handler once the test is done: a
+	// server notices a client leave only once it has read the whole body,
+	// so the handler can't wait for that, and the client's timeout alone
+	// decides when the attempt is cut off.
+	release := make(chan struct{})
 	for name, cutOff := range map[string]func(w http.ResponseWriter, r *http.Request){
 		"attempt times out": func(_ http.ResponseWriter, r *http.Request) {
 			io.CopyN(io.Discard, r.Body, cutAt)
-			// The server notices the client leave only once it reads the
-			// body, so it waits out the timeout first.
-			time.Sleep(2 * timeout)
+			<-release
 			io.Copy(io.Discard, r.Body)
 		},
 		"connection dropped": func(w http.ResponseWriter, r *http.Request) {
@@ -220,7 +225,7 @@ func TestClientResendsACutOffRealBody(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			isolateAWSConfig(t)
 			cfg := testConfig(t, 1, 5)
-			cfg.AttemptTimeout = timeout
+			cfg.AttemptTimeout = testAttemptTimeout
 			cfg.RealEvery = 5
 			cfg.RealMinSize, cfg.RealMaxSize = 3<<20+5, 3<<20+5
 			var once sync.Once
@@ -242,6 +247,9 @@ func TestClientResendsACutOffRealBody(t *testing.T) {
 				t.Fatal(err)
 			}
 			r, err := Load(t.Context(), client, cfg)
+			if name == "attempt times out" {
+				close(release) // before the deferred Close waits on the handler
+			}
 			if err != nil {
 				t.Fatal(err)
 			}

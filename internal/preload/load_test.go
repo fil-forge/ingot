@@ -313,6 +313,24 @@ func TestLoadCountsTakenKeysAsWritten(t *testing.T) {
 	checkBucket(t, f, cfg, b, 10, readTestState(t, cfg).Buckets[b])
 }
 
+// A bucket set up with one encryption is not quietly loaded under another.
+func TestLoadRefusesAnotherEncryption(t *testing.T) {
+	f := newFakeS3()
+	cfg := testConfig(t, 1, 5)
+	cfg.Encryption = ""
+	if _, err := Load(t.Context(), f, cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Encryption = "none"
+	cfg.Until = 10
+	if _, err := Load(t.Context(), f, cfg); err == nil || !strings.Contains(err.Error(), "encryption") {
+		t.Fatalf("load with another encryption returned %v", err)
+	}
+	if n := len(f.objects(cfg.Buckets[0])); n != 5 {
+		t.Fatalf("%d objects after the refused load, want 5", n)
+	}
+}
+
 func TestLoadRefusesAnotherSeedsState(t *testing.T) {
 	f := newFakeS3()
 	cfg := testConfig(t, 1, 5)
