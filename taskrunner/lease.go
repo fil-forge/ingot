@@ -238,11 +238,27 @@ type turnWait struct {
 // before expires, waits until the task finishes in this process, t is woken,
 // d passes, or ctx ends. It listens for the finish before it reads, as Wait
 // does, so a finish committed in between still wakes it.
-func (r *Runner) awaitTurn(ctx context.Context, q *queue, id TaskID, t *runTurn, d time.Duration, expires *time.Time) turnWait {
+//
+// ahead, when set, is a task the caller found due before its own. The wait
+// ends as well once that task is over in this process, as when it is
+// cancelled and no subject is released to wake t. It is read after the
+// listening starts, so one over since the caller saw it ends the wait at
+// once.
+func (r *Runner) awaitTurn(ctx context.Context, q *queue, id TaskID, t *runTurn, d time.Duration, expires *time.Time, ahead TaskID) turnWait {
 	ch := r.addWaiter(id)
 	defer r.removeWaiter(id, ch)
+	var gone chan struct{}
+	if ahead != (TaskID{}) {
+		gone = r.addWaiter(ahead)
+		defer r.removeWaiter(ahead, gone)
+	}
 	if res, err, done := r.outcome(ctx, q, id); done {
 		return turnWait{done: true, res: res, err: err}
+	}
+	if gone != nil {
+		if _, _, over := r.outcome(ctx, q, ahead); over {
+			return turnWait{}
+		}
 	}
 	// Past its Expires the task can no longer start: whoever takes the
 	// subject next records it as expired, so the caller can stop waiting.
@@ -257,6 +273,7 @@ func (r *Runner) awaitTurn(ctx context.Context, q *queue, id TaskID, t *runTurn,
 	defer timer.Stop()
 	select {
 	case <-ch:
+	case <-gone:
 	case <-t.wake:
 		return turnWait{woken: true}
 	case <-timer.C:

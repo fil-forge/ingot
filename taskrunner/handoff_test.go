@@ -279,6 +279,42 @@ func TestRunCallerBehindAWorkersTaskRunsOnceAWorkerFrees(t *testing.T) {
 	}
 }
 
+// A caller behind a task that is cancelled before any worker takes it runs at
+// once: no subject is released to wake it, so the cancel does.
+func TestRunCallerBehindACancelledTaskRunsAtOnce(t *testing.T) {
+	r, db := newCountingRunnerWithWorkers(t, time.Minute, 0, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	ahead, err := r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := db.leaseTries.Load()
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step"})
+		done <- err
+	}()
+	// The caller has taken the lease, found the task ahead and settled into
+	// its wait.
+	for db.leaseTries.Load() == before {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := r.Cancel(ctx, qTop, ahead); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run behind a cancelled task: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run still waits 5s after the task ahead of it was cancelled")
+	}
+}
+
 // A caller whose task is cancelled while it waits behind another caller
 // returns ErrCancelled at once, without waiting for its turn.
 func TestCancelledRunReturnsWhileOthersHoldTheSubject(t *testing.T) {
