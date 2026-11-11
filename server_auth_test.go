@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"strings"
 	"testing"
 	"time"
 
@@ -69,10 +68,7 @@ func TestBuildS3API_NoRootShortCircuit(t *testing.T) {
 		require.NoError(t, api.ShutDown())
 		select {
 		case err := <-serveErr:
-			// The serve loop reports its own listener closing after ShutDown.
-			if err != nil && !strings.Contains(err.Error(), "closed") {
-				t.Fatalf("s3api serve: %v", err)
-			}
+			require.NoError(t, err, "s3api serve")
 		case <-time.After(5 * time.Second):
 			t.Fatal("s3api did not stop")
 		}
