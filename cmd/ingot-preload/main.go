@@ -68,13 +68,17 @@ Every object's key is --key-prefix followed by 64 hex digits, and every PUT is
 create-only (If-None-Match: *) with an x-amz-checksum-sha256 header, as the
 pack server writes them.
 
-Buckets that do not exist are created, and their default encryption set to
---encryption ("none" needs the gateway's encryption.allow_none).
+Buckets that do not exist are created. Every bucket the --state file has not
+set up, an existing one included, gets --encryption as its default encryption
+("none" needs the gateway's encryption.allow_none), so a new --state over
+buckets an earlier load filled changes theirs part way through: use a new
+--bucket-prefix with a new --state.
 
 Progress goes to the --state file every --checkpoint-interval, and on exit.
-Running load again with the same --state, --seed and --key-prefix resumes:
-raise --until to load past a test point. A report goes to stdout and to the
---metrics file, as a line of JSON, every --report-interval.`,
+Running load again with the same --state, --seed, --key-prefix and
+--encryption resumes: raise --until to load past a test point. A report goes
+to stdout and to the --metrics file, as a line of JSON, every
+--report-interval.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg.Buckets = make([]string, buckets)
@@ -121,7 +125,7 @@ raise --until to load past a test point. A report goes to stdout and to the
 	f.Int64Var(&realMaxMiB, "real-max-mib", 240, "largest real object, in MiB")
 	f.IntVar(&cfg.RealWorkers, "real-workers", 4, "real PUTs in flight across all buckets")
 
-	f.StringVar(&cfg.Encryption, "encryption", "none", `default encryption set on each new bucket; "" leaves the gateway's`)
+	f.StringVar(&cfg.Encryption, "encryption", "none", `default encryption set on each bucket the state file has not set up; "" leaves the gateway's`)
 	f.StringVar(&cfg.StatePath, "state", "preload-state.json", "state file to resume from and record progress in")
 	f.StringVar(&metricsPath, "metrics", "preload-metrics.jsonl", "file the JSON reports are appended to; empty for none")
 	f.DurationVar(&cfg.CheckpointInterval, "checkpoint-interval", 10*time.Second, "how often the state file is written")

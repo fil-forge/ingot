@@ -203,18 +203,17 @@ func TestClientRetriesWhenNoResponseComes(t *testing.T) {
 // which the server checks against the PUT's SHA-256.
 func TestClientResendsACutOffRealBody(t *testing.T) {
 	const cutAt = 1<<20 + 17
-	// release ends the held attempt's handler once the test is done: a
+	// release ends the held attempt's handler once the subtest is done: a
 	// server notices a client leave only once it has read the whole body,
 	// so the handler can't wait for that, and the client's timeout alone
 	// decides when the attempt is cut off.
-	release := make(chan struct{})
-	for name, cutOff := range map[string]func(w http.ResponseWriter, r *http.Request){
-		"attempt times out": func(_ http.ResponseWriter, r *http.Request) {
+	for name, cutOff := range map[string]func(release <-chan struct{}, w http.ResponseWriter, r *http.Request){
+		"attempt times out": func(release <-chan struct{}, _ http.ResponseWriter, r *http.Request) {
 			io.CopyN(io.Discard, r.Body, cutAt)
 			<-release
 			io.Copy(io.Discard, r.Body)
 		},
-		"connection dropped": func(w http.ResponseWriter, r *http.Request) {
+		"connection dropped": func(_ <-chan struct{}, w http.ResponseWriter, r *http.Request) {
 			io.CopyN(io.Discard, r.Body, cutAt)
 			conn, _, err := w.(http.Hijacker).Hijack()
 			if err == nil {
@@ -228,6 +227,7 @@ func TestClientResendsACutOffRealBody(t *testing.T) {
 			cfg.AttemptTimeout = testAttemptTimeout
 			cfg.RealEvery = 5
 			cfg.RealMinSize, cfg.RealMaxSize = 3<<20+5, 3<<20+5
+			release := make(chan struct{})
 			var once sync.Once
 			srv := &packServerShape{t: t, bucket: cfg.Buckets[0], objects: map[string]bool{}}
 			srv.intercept = func(_ string, w http.ResponseWriter, r *http.Request) bool {
@@ -236,20 +236,20 @@ func TestClientResendsACutOffRealBody(t *testing.T) {
 					once.Do(func() { hit = true })
 				}
 				if hit {
-					cutOff(w, r)
+					cutOff(release, w, r)
 				}
 				return hit
 			}
 			hs := httptest.NewServer(srv)
 			defer hs.Close()
+			// Deferred after Close, so it runs first on every path, a panic
+			// included: Close waits for the held handler to return.
+			defer close(release)
 			client, err := NewClient(t.Context(), ClientConfig{Endpoint: hs.URL, Region: "us-east-1", Conns: 4})
 			if err != nil {
 				t.Fatal(err)
 			}
 			r, err := Load(t.Context(), client, cfg)
-			if name == "attempt times out" {
-				close(release) // before the deferred Close waits on the handler
-			}
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -49,9 +49,12 @@ type Config struct {
 	// RealWorkers is the number of real PUTs in flight across all buckets.
 	RealWorkers int
 
-	// Encryption, when set, is the SSEAlgorithm set as each new bucket's
-	// default encryption: "none" stores objects as received, as the pack
-	// server's buckets do.
+	// Encryption, when set, is the SSEAlgorithm set as the default
+	// encryption of each bucket the state file has not set up, an existing
+	// bucket included: "none" stores objects as received, as the pack
+	// server's buckets do. A bucket the state has set up keeps its own, and
+	// a load asking for another is refused; a fresh state file over buckets
+	// an earlier load filled resets theirs part way through their objects.
 	Encryption string
 
 	// StatePath is the state file the load resumes from and records its
@@ -244,8 +247,8 @@ func (l *loader) setupBuckets(ctx context.Context) error {
 	for _, b := range l.buckets {
 		if b.state.Ready {
 			if b.state.Encryption != l.cfg.Encryption {
-				return fmt.Errorf("bucket %s was set up with encryption %q, not %q: load other buckets, with another state file",
-					b.name, b.state.Encryption, l.cfg.Encryption)
+				return fmt.Errorf("bucket %s was set up with %s, not %s: load other buckets, with another state file",
+					b.name, encryptionName(b.state.Encryption), encryptionName(l.cfg.Encryption))
 			}
 			continue
 		}
@@ -279,6 +282,14 @@ func (l *loader) setupBuckets(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// encryptionName names a default encryption for a message.
+func encryptionName(algo string) string {
+	if algo == "" {
+		return "the gateway's default encryption"
+	}
+	return fmt.Sprintf("encryption %q", algo)
 }
 
 // bulkWorker writes b's bulk objects until the watermark's limit.
