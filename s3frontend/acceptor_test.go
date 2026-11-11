@@ -19,6 +19,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 
+	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
@@ -30,17 +31,17 @@ import (
 func cancelQueuedAccepts(t *testing.T, b *Backend, uploadID string) {
 	t.Helper()
 	ctx := context.Background()
-	tasks, err := storeFor(b).queued(ctx, registry.MultipartQueue)
+	tasks, err := storeFor(b).queued(ctx, multipartqueue.Name)
 	if err != nil {
 		t.Fatalf("queued accepts: %v", err)
 	}
 	var ids []taskrunner.TaskID
 	for _, task := range tasks {
-		if task.Subject == uploadID && task.Action == registry.MultipartAcceptAction && task.State == "pending" {
+		if task.Subject == uploadID && task.Action == multipartqueue.AcceptAction && task.State == "pending" {
 			ids = append(ids, task.ID)
 		}
 	}
-	if err := storeFor(b).tasks.Cancel(ctx, registry.MultipartQueue, ids...); err != nil {
+	if err := storeFor(b).tasks.Cancel(ctx, multipartqueue.Name, ids...); err != nil {
 		t.Fatalf("cancel queued accepts: %v", err)
 	}
 }
@@ -54,9 +55,9 @@ func runAccepts(t *testing.T, b *Backend, uploadID string) error {
 	cancelQueuedAccepts(t, b, uploadID)
 	ctx := context.Background()
 	if _, err := storeFor(b).tasks.Run(ctx, taskrunner.Spec{
-		Queue:   registry.MultipartQueue,
+		Queue:   multipartqueue.Name,
 		Subject: uploadID,
-		Action:  registry.MultipartAcceptAction,
+		Action:  multipartqueue.AcceptAction,
 	}); err != nil {
 		return err
 	}
@@ -78,7 +79,7 @@ func runAccepts(t *testing.T, b *Backend, uploadID string) error {
 	expires := time.Now().Add(10 * time.Second)
 	for _, p := range parts {
 		for _, d := range p.BlobDigests {
-			subject := registry.SpaceShardSubject(sess.Space, d)
+			subject := spaceshardqueue.Subject(sess.Space, d)
 			if len(due[subject]) == 0 {
 				continue
 			}
@@ -236,13 +237,13 @@ func TestUploadPartQueuesOneAccept(t *testing.T) {
 	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartParked) {
 		t.Fatalf("part states = %v, want all parked", states)
 	}
-	tasks, err := mem.queued(context.Background(), registry.MultipartQueue)
+	tasks, err := mem.queued(context.Background(), multipartqueue.Name)
 	if err != nil {
 		t.Fatalf("queued: %v", err)
 	}
 	pending := 0
 	for _, task := range tasks {
-		if task.Subject == uploadID && task.Action == registry.MultipartAcceptAction && task.State == "pending" {
+		if task.Subject == uploadID && task.Action == multipartqueue.AcceptAction && task.State == "pending" {
 			pending++
 		}
 	}
@@ -925,7 +926,7 @@ func TestAcceptsShareABlob(t *testing.T) {
 	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: "bk", Space: mem.bk(), ObjectKey: "other"}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, SpanLengths: []int64{1}}, nil, registry.ReleaseTask{}); err != nil {
+	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, SpanLengths: []int64{1}}, nil); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 

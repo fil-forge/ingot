@@ -98,7 +98,7 @@ type completeCall struct {
 // raising it cannot help.
 func (q *Queue) Complete(ctx context.Context, req CompleteRequest) (CompleteResult, error) {
 	call := &completeCall{req: req}
-	spec := uploadSpec(req.UploadID, registry.MultipartCompleteAction, nil)
+	spec := uploadSpec(req.UploadID, CompleteAction, nil)
 	expires := time.Now().Add(q.limits.CompleteWait)
 	spec.Expires = &expires
 	_, err := q.runner.Run(context.WithValue(ctx, completeKey{}, call), spec)
@@ -535,7 +535,7 @@ func (q *Queue) complete(ctx context.Context, ex *taskrunner.Exec, call *complet
 		return CompleteResult{}, err
 	}
 	if q.sessionTTL >= 0 {
-		spec := uploadSpec(uploadID, registry.MultipartReapAction, nil)
+		spec := uploadSpec(uploadID, ReapAction, nil)
 		at := time.Now().Add(q.sessionTTL)
 		spec.NotBefore = &at
 		if _, err := ex.Submit(ctx, spec); err != nil {

@@ -82,19 +82,19 @@ func encodeBucketTask(args cborArgs) ([]byte, error) {
 // registerAdmin registers the queue-bucket actions besides commit.
 func (q *Queue) registerAdmin(r *taskrunner.Runner) error {
 	for action, h := range map[string]taskrunner.Handler{
-		registry.BucketCreateAction:        q.runCreateBucket,
-		registry.BucketSetVersioningAction: q.runSetVersioning,
-		registry.BucketSetLockConfigAction: q.runSetLockConfig,
-		registry.BucketSetTaggingAction:    q.runSetConfig(registry.TaggingSet),
-		registry.BucketSetCORSAction:       q.runSetConfig(registry.CORSSet),
-		registry.BucketSetEncryptionAction: q.runSetConfig(func(name string, v []byte) registry.Statement {
+		CreateAction:        q.runCreateBucket,
+		SetVersioningAction: q.runSetVersioning,
+		SetLockConfigAction: q.runSetLockConfig,
+		SetTaggingAction:    q.runSetConfig(registry.TaggingSet),
+		SetCORSAction:       q.runSetConfig(registry.CORSSet),
+		SetEncryptionAction: q.runSetConfig(func(name string, v []byte) registry.Statement {
 			return registry.EncryptionSet(name, registry.BucketEncryption(v))
 		}),
-		registry.BucketCloseAction:       q.runCloseBucket,
-		registry.BucketAdmitUploadAction: q.runAdmitUpload,
-		registry.BucketDeleteAction:      q.runDeleteBucket,
+		CloseAction:       q.runCloseBucket,
+		AdmitUploadAction: q.runAdmitUpload,
+		DeleteAction:      q.runDeleteBucket,
 	} {
-		if err := r.Handle(registry.BucketQueue, action, h); err != nil {
+		if err := r.Handle(Name, action, h); err != nil {
 			return err
 		}
 	}
@@ -105,8 +105,8 @@ func (q *Queue) registerAdmin(r *taskrunner.Runner) error {
 // instance, which holds the bucket's catalog log.
 func (q *Queue) bucketSpec(space did.DID, action string, args []byte) taskrunner.Spec {
 	spec := taskrunner.Spec{
-		Queue:   registry.BucketQueue,
-		Subject: registry.BucketSubject(space),
+		Queue:   Name,
+		Subject: Subject(space),
 		Action:  action,
 		Args:    args,
 	}
@@ -130,39 +130,39 @@ func (q *Queue) runBucket(ctx context.Context, space did.DID, action string, arg
 // Create records bucket args.Name in space, whose space the bucket's
 // authority created for the request beforehand, with its empty root.
 func (q *Queue) Create(ctx context.Context, space did.DID, args BucketCreateTask) error {
-	return q.runBucket(ctx, space, registry.BucketCreateAction, &args)
+	return q.runBucket(ctx, space, CreateAction, &args)
 }
 
 // SetVersioning sets the versioning state of space's bucket name.
 func (q *Queue) SetVersioning(ctx context.Context, space did.DID, name string, state registry.VersioningState) error {
-	return q.runBucket(ctx, space, registry.BucketSetVersioningAction, &BucketSetVersioningTask{Name: name, State: string(state)})
+	return q.runBucket(ctx, space, SetVersioningAction, &BucketSetVersioningTask{Name: name, State: string(state)})
 }
 
 // SetLockConfig sets the object lock configuration of space's bucket name.
 func (q *Queue) SetLockConfig(ctx context.Context, space did.DID, name string, config []byte) error {
-	return q.runBucket(ctx, space, registry.BucketSetLockConfigAction, &BucketSetLockConfigTask{Name: name, Config: config})
+	return q.runBucket(ctx, space, SetLockConfigAction, &BucketSetLockConfigTask{Name: name, Config: config})
 }
 
 // SetTagging sets the tag set of space's bucket name; empty clears it.
 func (q *Queue) SetTagging(ctx context.Context, space did.DID, name string, tags []byte) error {
-	return q.runBucket(ctx, space, registry.BucketSetTaggingAction, &BucketSetConfigTask{Name: name, Value: tags})
+	return q.runBucket(ctx, space, SetTaggingAction, &BucketSetConfigTask{Name: name, Value: tags})
 }
 
 // SetCORS sets the CORS document of space's bucket name; empty clears it.
 func (q *Queue) SetCORS(ctx context.Context, space did.DID, name string, doc []byte) error {
-	return q.runBucket(ctx, space, registry.BucketSetCORSAction, &BucketSetConfigTask{Name: name, Value: doc})
+	return q.runBucket(ctx, space, SetCORSAction, &BucketSetConfigTask{Name: name, Value: doc})
 }
 
 // SetEncryption sets the default encryption of space's bucket name.
 func (q *Queue) SetEncryption(ctx context.Context, space did.DID, name string, enc registry.BucketEncryption) error {
-	return q.runBucket(ctx, space, registry.BucketSetEncryptionAction, &BucketSetConfigTask{Name: name, Value: []byte(enc)})
+	return q.runBucket(ctx, space, SetEncryptionAction, &BucketSetConfigTask{Name: name, Value: []byte(enc)})
 }
 
 // Close marks space's bucket name closing, the first step of its delete: it
 // then stays empty and gains no multipart upload while the request aborts
 // the ones in flight. It fails on a bucket that holds objects.
 func (q *Queue) Close(ctx context.Context, space did.DID, name string) error {
-	return q.runBucket(ctx, space, registry.BucketCloseAction, &BucketTask{Name: name})
+	return q.runBucket(ctx, space, CloseAction, &BucketTask{Name: name})
 }
 
 // AdmitUpload refuses a multipart upload to space's bucket name while it is
@@ -172,7 +172,7 @@ func (q *Queue) AdmitUpload(ctx context.Context, ex *taskrunner.Exec, space did.
 	if err != nil {
 		return err
 	}
-	_, err = ex.Run(ctx, q.bucketSpec(space, registry.BucketAdmitUploadAction, raw))
+	_, err = ex.Run(ctx, q.bucketSpec(space, AdmitUploadAction, raw))
 	return err
 }
 
@@ -180,7 +180,7 @@ func (q *Queue) AdmitUpload(ctx context.Context, ex *taskrunner.Exec, space did.
 // Close and the aborts of its multipart uploads, with the authority of the
 // S3 request in ctx.
 func (q *Queue) Delete(ctx context.Context, space did.DID, name string) error {
-	return q.runBucket(context.WithValue(ctx, deleteKey{}, name), space, registry.BucketDeleteAction, &BucketTask{Name: name})
+	return q.runBucket(context.WithValue(ctx, deleteKey{}, name), space, DeleteAction, &BucketTask{Name: name})
 }
 
 // runSetConfig returns the handler of a queue-bucket action that stores one

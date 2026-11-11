@@ -207,9 +207,9 @@ upload's `queue-multipart-upload.accept` (`queue/multipartqueue/accept.go`,
 accept pending. That accept runs on the upload's own subject, in turn with
 its other changes, and does nothing unless the session is `open`. It makes no network calls: it lists the upload's parked parts and
 queues, with its commit, a `queue-space-shard.accept` for each of their
-blobs (`registry.BlobAcceptSpec`), and marks a part with no blobs accepted.
+blobs (`spaceshardqueue.AcceptSpec`), and marks a part with no blobs accepted.
 
-A blob's accept runs under the blob's own subject (`registry.SpaceShardSubject`:
+A blob's accept runs under the blob's own subject (`spaceshardqueue.Subject`:
 the space and the digest), the one the blob's releases and a write's adds
 run under, so a blob's conclude never overlaps its release or a reference
 being taken. It is a replacement due now, so a blob has at most one accept

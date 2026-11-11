@@ -130,7 +130,7 @@ func New(r *taskrunner.Runner, d Deps) (*Queue, error) {
 	if q.ships.retryMax == 0 {
 		q.ships.retryMax = defaultShipRetryMax
 	}
-	if err := r.Handle(registry.BucketQueue, registry.BucketCommitAction, q.runCommit); err != nil {
+	if err := r.Handle(Name, CommitAction, q.runCommit); err != nil {
 		return nil, err
 	}
 	if err := q.registerAdmin(r); err != nil {
@@ -147,7 +147,7 @@ func New(r *taskrunner.Runner, d Deps) (*Queue, error) {
 type Authority struct {
 	// Release is the authority the releases of dropped claims remove their
 	// blobs with.
-	Release registry.ReleaseTask
+	Release spaceshardqueue.ReleaseTask
 	// RegisterAdd is the /upload/add chain the upload registrations a commit
 	// queues run with; empty when the request held none, and the
 	// registration is then skipped.
@@ -196,7 +196,7 @@ func (q *Queue) commitWith(ctx context.Context, run syncRunner, st *registry.Sta
 	if err := args.MarshalCBOR(&buf); err != nil {
 		return Outcome{}, fmt.Errorf("bucketqueue: encode commit: %w", err)
 	}
-	out, err := run.Run(ctx, q.bucketSpec(st.Space, registry.BucketCommitAction, buf.Bytes()))
+	out, err := run.Run(ctx, q.bucketSpec(st.Space, CommitAction, buf.Bytes()))
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -267,7 +267,7 @@ func (q *Queue) runCommit(ctx context.Context, ex *taskrunner.Exec, t taskrunner
 		if err != nil {
 			return nil, err
 		}
-		if err := w.Apply(ctx, ex); err != nil {
+		if err := spaceshardqueue.ApplyWrites(ctx, ex, w, args.Release); err != nil {
 			return nil, err
 		}
 		if err := q.queueAwaitedShip(ctx, ex, tx.State()); err != nil {

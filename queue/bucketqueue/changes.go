@@ -7,7 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
-	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/taskrunner"
 )
 
@@ -21,7 +21,7 @@ type BucketCommitTask struct {
 	Changes []KeyChange
 	// Release is the authority the releases of dropped claims remove their
 	// blobs with.
-	Release registry.ReleaseTask
+	Release spaceshardqueue.ReleaseTask
 	// RegisterAdd and RegisterRemove are the /upload/add and /upload/remove
 	// proofs the upload registrations a commit queues run with; empty when
 	// the request held none, and the registration is then skipped.

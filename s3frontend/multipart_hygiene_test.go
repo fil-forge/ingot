@@ -254,7 +254,7 @@ func TestCompleteFailsClosedOnMissingParamsRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPartTrees: %v", err)
 	}
-	if _, err := mem.PutPart(ctx, part, trees[1], registry.ReleaseTask{}); err != nil {
+	if _, err := mem.PutPart(ctx, part, trees[1]); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 
@@ -1192,7 +1192,7 @@ func TestAbortRecordsBlobAnotherAbortingSessionReferences(t *testing.T) {
 	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: bucket, Space: mem.bk(), ObjectKey: "other"}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil, registry.ReleaseTask{}); err != nil {
+	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 	if err := b.abortUpload(ctx, registry.MultipartSession{UploadID: other, Space: mem.bk()}); err != nil {
@@ -1231,7 +1231,7 @@ func TestReleaseWaitsForAnotherOpenSessionSharingTheBlob(t *testing.T) {
 	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: bucket, Space: mem.bk(), ObjectKey: "other"}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil, registry.ReleaseTask{}); err != nil {
+	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 
@@ -1464,12 +1464,12 @@ type failPutPart struct {
 	fails int
 }
 
-func (f *failPutPart) PartWrites(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree, release registry.ReleaseTask) (registry.CommitWrites, []multihash.Multihash, error) {
+func (f *failPutPart) PartWrites(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree) (registry.CommitWrites, error) {
 	if f.fails > 0 {
 		f.fails--
-		return registry.CommitWrites{}, nil, errors.New("parts table unavailable")
+		return registry.CommitWrites{}, errors.New("parts table unavailable")
 	}
-	return f.MultipartStore.PartWrites(ctx, p, tree, release)
+	return f.MultipartStore.PartWrites(ctx, p, tree)
 }
 
 // TestUploadPartFailedRowWriteReleasesItsBlobs: the part row write fails for

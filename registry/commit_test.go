@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 	"github.com/fil-forge/libforge/testutil"
@@ -71,16 +72,16 @@ type queuedRelease struct {
 // mustListReleases returns the space's pending releases, oldest first.
 func mustListReleases(t *testing.T, pool *pgxpool.Pool, space did.DID) []queuedRelease {
 	t.Helper()
-	tasks, err := taskrunnertest.Tasks(context.Background(), pool, "ingot", registry.SpaceShardQueue)
+	tasks, err := taskrunnertest.Tasks(context.Background(), pool, "ingot", spaceshardqueue.Name)
 	if err != nil {
 		t.Fatalf("list releases: %v", err)
 	}
 	var out []queuedRelease
 	for _, q := range tasks {
-		if q.Action != registry.ReleaseAction || q.State != "pending" {
+		if q.Action != spaceshardqueue.ReleaseAction || q.State != "pending" {
 			continue
 		}
-		sp, d, err := registry.ParseSpaceShardSubject(q.Subject)
+		sp, d, err := spaceshardqueue.ParseSubject(q.Subject)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -99,13 +99,13 @@ func TestTheNextWriteQueuesAShipThatFoundNoAuthority(t *testing.T) {
 // shipState is the state of bk's only queue-bucket.ship task.
 func shipState(t *testing.T, mem *testStore) string {
 	t.Helper()
-	tasks, err := mem.queued(context.Background(), registry.BucketQueue)
+	tasks, err := mem.queued(context.Background(), bucketqueue.Name)
 	if err != nil {
 		t.Fatalf("queued: %v", err)
 	}
 	state := ""
 	for _, task := range tasks {
-		if task.Action == registry.BucketShipAction {
+		if task.Action == bucketqueue.ShipAction {
 			if state != "" {
 				t.Fatal("more than one ship queued")
 			}
@@ -142,12 +142,12 @@ func TestAShipThatCannotBeQueuedIsRetried(t *testing.T) {
 	b.buckets.QueueShip("bk")
 
 	require.Eventually(t, func() bool {
-		tasks, err := mem.queued(context.Background(), registry.BucketQueue)
+		tasks, err := mem.queued(context.Background(), bucketqueue.Name)
 		if err != nil {
 			return false
 		}
 		for _, task := range tasks {
-			if task.Action == registry.BucketShipAction {
+			if task.Action == bucketqueue.ShipAction {
 				return true
 			}
 		}

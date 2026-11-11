@@ -28,13 +28,13 @@ func TestABucketTaskForAnotherSpaceIsNoSuchBucket(t *testing.T) {
 	ctx := context.Background()
 	old := testutil.RandomDID(t)
 
-	err := runBucketTask(ctx, mem, old, registry.BucketSetVersioningAction, &bucketqueue.BucketSetVersioningTask{Name: "bk", State: string(registry.VersioningEnabled)})
+	err := runBucketTask(ctx, mem, old, bucketqueue.SetVersioningAction, &bucketqueue.BucketSetVersioningTask{Name: "bk", State: string(registry.VersioningEnabled)})
 	wantNoSuchBucket(t, "set-versioning", err)
 	if st, _ := mem.Get(ctx, "bk"); st.Versioning == registry.VersioningEnabled {
 		t.Fatal("a task for another space set the bucket's versioning")
 	}
 
-	for _, action := range []string{registry.BucketCloseAction, registry.BucketAdmitUploadAction} {
+	for _, action := range []string{bucketqueue.CloseAction, bucketqueue.AdmitUploadAction} {
 		wantNoSuchBucket(t, action, runBucketTask(ctx, mem, old, action, &bucketqueue.BucketTask{Name: "bk"}))
 	}
 	if st, _ := mem.Get(ctx, "bk"); st.Closing {
@@ -47,7 +47,7 @@ func TestABucketTaskForAnotherSpaceIsNoSuchBucket(t *testing.T) {
 		t.Fatalf("the bucket after a delete for another space: %v", err)
 	}
 
-	wantNoSuchBucket(t, "commit", runBucketTask(ctx, mem, old, registry.BucketCommitAction, &bucketqueue.BucketCommitTask{Bucket: "bk"}))
+	wantNoSuchBucket(t, "commit", runBucketTask(ctx, mem, old, bucketqueue.CommitAction, &bucketqueue.BucketCommitTask{Bucket: "bk"}))
 }
 
 // A ship queued for an earlier bucket of the name, or for a bucket since
@@ -59,10 +59,10 @@ func TestAShipForAnotherBucketShipsNothing(t *testing.T) {
 		d.Log = log
 	})
 	ctx := context.Background()
-	if err := runBucketTask(ctx, mem, testutil.RandomDID(t), registry.BucketShipAction, &bucketqueue.BucketTask{Name: "bk"}); err != nil {
+	if err := runBucketTask(ctx, mem, testutil.RandomDID(t), bucketqueue.ShipAction, &bucketqueue.BucketTask{Name: "bk"}); err != nil {
 		t.Fatalf("ship for another space: %v", err)
 	}
-	if err := runBucketTask(ctx, mem, mem.bk(), registry.BucketShipAction, &bucketqueue.BucketTask{Name: "gone"}); err != nil {
+	if err := runBucketTask(ctx, mem, mem.bk(), bucketqueue.ShipAction, &bucketqueue.BucketTask{Name: "gone"}); err != nil {
 		t.Fatalf("ship of a deleted bucket: %v", err)
 	}
 	if n := log.ships.Load(); n != 0 {
@@ -80,10 +80,10 @@ func TestACreateRunAgainSucceeds(t *testing.T) {
 		t.Fatal(err)
 	}
 	create := &bucketqueue.BucketCreateTask{Name: "bk", Tenant: st.Tenant.String()}
-	if err := runBucketTask(ctx, mem, st.Space, registry.BucketCreateAction, create); err != nil {
+	if err := runBucketTask(ctx, mem, st.Space, bucketqueue.CreateAction, create); err != nil {
 		t.Fatalf("create run again: %v", err)
 	}
-	err = runBucketTask(ctx, mem, testutil.RandomDID(t), registry.BucketCreateAction, create)
+	err = runBucketTask(ctx, mem, testutil.RandomDID(t), bucketqueue.CreateAction, create)
 	var apiErr s3err.APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != "BucketAlreadyExists" {
 		t.Fatalf("create for another space: %v, want BucketAlreadyExists", err)
@@ -138,7 +138,7 @@ func TestACreateRemovesALeftoverLogOnce(t *testing.T) {
 	space := testutil.RandomDID(t)
 	create := &bucketqueue.BucketCreateTask{Name: "again", Tenant: st.Tenant.String()}
 	for range 2 {
-		if err := runBucketTask(ctx, mem, space, registry.BucketCreateAction, create); err != nil {
+		if err := runBucketTask(ctx, mem, space, bucketqueue.CreateAction, create); err != nil {
 			t.Fatalf("create: %v", err)
 		}
 	}
@@ -165,9 +165,9 @@ func TestBucketSettingsChangeOnlyTheirOwnBucket(t *testing.T) {
 		t.Fatal(err)
 	}
 	for action, value := range map[string]string{
-		registry.BucketSetTaggingAction:    `{"k":"v"}`,
-		registry.BucketSetCORSAction:       "<CORSConfiguration></CORSConfiguration>",
-		registry.BucketSetEncryptionAction: string(registry.BucketEncryptionNone),
+		bucketqueue.SetTaggingAction:    `{"k":"v"}`,
+		bucketqueue.SetCORSAction:       "<CORSConfiguration></CORSConfiguration>",
+		bucketqueue.SetEncryptionAction: string(registry.BucketEncryptionNone),
 	} {
 		err := runBucketTask(ctx, mem, st.Space, action, &bucketqueue.BucketSetConfigTask{Name: "bk", Value: []byte(value)})
 		wantAPIErr(t, err, s3err.ErrNoSuchBucket)
@@ -193,6 +193,6 @@ func runBucketTaskRaw(ctx context.Context, mem *testStore, space did.DID, action
 	if err := args.MarshalCBOR(&buf); err != nil {
 		return err
 	}
-	_, err := mem.tasks.Run(ctx, taskrunner.Spec{Queue: registry.BucketQueue, Subject: registry.BucketSubject(space), Action: action, Args: buf.Bytes()})
+	_, err := mem.tasks.Run(ctx, taskrunner.Spec{Queue: bucketqueue.Name, Subject: bucketqueue.Subject(space), Action: action, Args: buf.Bytes()})
 	return err
 }

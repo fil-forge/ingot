@@ -71,7 +71,7 @@ func (q *Queue) dropClaims(sc *commitScope, st *registry.State, key, claimID str
 	for _, d := range digestSet(digests) {
 		drops = append(drops, registry.ClaimDrop{Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: claimID, Space: st.Space})
 	}
-	sc.tx.DropClaims(drops, q.releaseGrace, sc.args.Release)
+	sc.tx.DropClaims(drops, q.releaseGrace)
 }
 
 // bodyDigests returns the digests of a stored body's blobs in order, loading

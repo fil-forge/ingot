@@ -46,7 +46,7 @@ func (t *AbortTask) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	// t.Release (registry.ReleaseTask) (struct)
+	// t.Release (spaceshardqueue.ReleaseTask) (struct)
 	if len("Release") > 1000000 {
 		return xerrors.Errorf("Value in field \"Release\" was too long")
 	}
@@ -123,7 +123,7 @@ func (t *AbortTask) UnmarshalCBOR(r io.Reader) (err error) {
 			default:
 				return fmt.Errorf("booleans are either major type 7, value 20 or 21 (got %d)", extra)
 			}
-			// t.Release (registry.ReleaseTask) (struct)
+			// t.Release (spaceshardqueue.ReleaseTask) (struct)
 		case "Release":
 
 			{

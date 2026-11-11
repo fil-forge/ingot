@@ -14,6 +14,7 @@ import (
 	mh "github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 )
@@ -89,7 +90,7 @@ func blobAccepts(space did.DID, parts []registry.MultipartPart) []taskrunner.Spe
 		for _, d := range p.BlobDigests {
 			if !seen[string(d)] {
 				seen[string(d)] = true
-				specs = append(specs, registry.BlobAcceptSpec(space, d))
+				specs = append(specs, spaceshardqueue.AcceptSpec(space, d))
 			}
 		}
 	}
@@ -183,7 +184,7 @@ func (q *Queue) awaitBlobAccepts(ctx context.Context, space did.DID, parts []reg
 	var subjects []string
 	for _, p := range parts {
 		for _, d := range p.BlobDigests {
-			subject := registry.SpaceShardSubject(space, d)
+			subject := spaceshardqueue.Subject(space, d)
 			if !seen[subject] {
 				seen[subject] = true
 				subjects = append(subjects, subject)

@@ -169,7 +169,7 @@ func newTestServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerDe
 	tasks, err := provideTaskRunner(pool, id, zaptest.NewLogger(t))
 	require.NoError(t, err)
 	require.NoError(t, tasks.Migrate(t.Context()))
-	mem := registry.NewPostgres(pool, registry.WithTasks(tasks))
+	mem := registry.NewPostgres(pool)
 	cfg.Addr = freeAddr(t)
 	cfg.DataDir = t.TempDir()
 	cfg.Region = "us-east-1"

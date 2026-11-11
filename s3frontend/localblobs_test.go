@@ -16,9 +16,11 @@ import (
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/internal/testfakes"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
+	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
-	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 )
@@ -37,10 +39,10 @@ func newShardFixture(t *testing.T, ttl time.Duration) *shardFixture {
 		Schema: env.Schema,
 		// New registers every queue's handlers; only queue-shard runs any.
 		Queues: []taskrunner.QueueOptions{
-			{Name: registry.MultipartQueue},
-			{Name: registry.BucketQueue},
+			{Name: multipartqueue.Name},
+			{Name: bucketqueue.Name},
 			{Name: spaceuploadqueue.Name},
-			{Name: registry.SpaceShardQueue},
+			{Name: spaceshardqueue.Name},
 			{Name: shardqueue.Name, Workers: 2},
 		},
 		Node:         "did:web:ingot.test",

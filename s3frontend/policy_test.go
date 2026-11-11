@@ -20,7 +20,10 @@ import (
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/internal/testfakes"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
+	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
@@ -62,10 +65,10 @@ func policyBackend(t *testing.T, authority bucketauthority.BucketAuthority) *s3f
 	tasks, err := taskrunner.New(nil, taskrunner.Options{
 		Schema: "ingot",
 		Queues: []taskrunner.QueueOptions{
-			{Name: registry.MultipartQueue},
-			{Name: registry.BucketQueue},
+			{Name: multipartqueue.Name},
+			{Name: bucketqueue.Name},
 			{Name: spaceuploadqueue.Name},
-			{Name: registry.SpaceShardQueue},
+			{Name: spaceshardqueue.Name},
 			{Name: shardqueue.Name},
 		},
 	})

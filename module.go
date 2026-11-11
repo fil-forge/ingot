@@ -68,7 +68,10 @@ import (
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/migrations"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
+	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
@@ -508,7 +511,7 @@ type registryResult struct {
 // create/delete/list are forwarded to Hilt, so forge mode needs
 // hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool, tasks *taskrunner.Runner) registryResult {
-	pg := registry.NewPostgres(pool, registry.WithTasks(tasks))
+	pg := registry.NewPostgres(pool)
 	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, GC: pg, Multipart: pg, Parks: pg, Claims: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Meta: pg}
 }
 
@@ -553,10 +556,10 @@ func provideTaskRunner(pool *pgxpool.Pool, id identity.Identity, logger *zap.Log
 		// In the RFC's queue order: a task may run sync children only on
 		// the queues after its own.
 		Queues: []taskrunner.QueueOptions{
-			{Name: registry.MultipartQueue, Workers: multipartWorkers},
-			{Name: registry.BucketQueue, Workers: bucketWorkers},
+			{Name: multipartqueue.Name, Workers: multipartWorkers},
+			{Name: bucketqueue.Name, Workers: bucketWorkers},
 			{Name: spaceuploadqueue.Name, Workers: uploadRegistrationWorkers},
-			{Name: registry.SpaceShardQueue, Workers: releaseWorkers},
+			{Name: spaceshardqueue.Name, Workers: releaseWorkers},
 			{Name: shardqueue.Name, Workers: shardWorkers},
 		},
 		Logger: logger.Named("tasks"),

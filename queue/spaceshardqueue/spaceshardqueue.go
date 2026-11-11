@@ -1,8 +1,8 @@
 // Package spaceshardqueue is queue-space-shard: the tasks on one blob in one
-// space, on the subject of the space and the digest (registry.SpaceShardSubject).
+// space, on the subject of the space and the digest (Subject).
 //
 // A write's use of a blob is a pending reference, taken by a sync
-// queue-space-shard.add on the blob's subject (registry.SpaceShardSubject)
+// queue-space-shard.add on the blob's subject (Subject)
 // and held until the write's commit claims it or its part row takes it over.
 // The add runs under the subject's lease, so it never overlaps a release of
 // the same blob: it waits for one running, and for its retries, and then
@@ -125,13 +125,13 @@ func New(r *taskrunner.Runner, d Deps) (*Queue, error) {
 		run    taskrunner.Handler
 		opts   []taskrunner.HandleOption
 	}{
-		{registry.AddAction, q.runAdd, nil},
-		{registry.ExpireAction, q.runExpire, []taskrunner.HandleOption{taskrunner.WithRetry(expireRetry)}},
-		{registry.ReleaseAction, q.runRelease, []taskrunner.HandleOption{taskrunner.WithRetry(cmp.Or(d.ReleaseRetry, defaultReleaseRetry))}},
-		{registry.BlobAcceptAction, q.runAccept, []taskrunner.HandleOption{taskrunner.WithRetry(acceptRetry)}},
+		{AddAction, q.runAdd, nil},
+		{ExpireAction, q.runExpire, []taskrunner.HandleOption{taskrunner.WithRetry(expireRetry)}},
+		{ReleaseAction, q.runRelease, []taskrunner.HandleOption{taskrunner.WithRetry(cmp.Or(d.ReleaseRetry, defaultReleaseRetry))}},
+		{AcceptAction, q.runAccept, []taskrunner.HandleOption{taskrunner.WithRetry(acceptRetry)}},
 		{releaseFlush, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil }, nil},
 	} {
-		if err := r.Handle(registry.SpaceShardQueue, h.action, h.run, h.opts...); err != nil {
+		if err := r.Handle(Name, h.action, h.run, h.opts...); err != nil {
 			return nil, err
 		}
 	}
@@ -141,7 +141,7 @@ func New(r *taskrunner.Runner, d Deps) (*Queue, error) {
 // ExpediteAccepts makes the space's pending blob accepts due now, and stops
 // their being replaced, returning them by subject.
 func (q *Queue) ExpediteAccepts(ctx context.Context, space did.DID) (map[string][]taskrunner.TaskID, error) {
-	return q.tasks.Expedite(ctx, registry.SpaceShardQueue, registry.SpaceShardSubjects(space), registry.BlobAcceptAction)
+	return q.tasks.Expedite(ctx, Name, SpaceSubjects(space), AcceptAction)
 }
 
 // The ways a write uses a blob (AddTask.Mode).
@@ -190,7 +190,7 @@ type AddTask struct {
 	Size int64
 	// Release is the authority the release an expiry queues removes the blob
 	// with.
-	Release registry.ReleaseTask
+	Release ReleaseTask
 }
 
 // addStreamKey carries a streamed blob's allocation to its add, which runs in
@@ -226,7 +226,7 @@ func decodeAddResult(b []byte) (addResult, error) {
 
 // A blob nothing in its space references any more is released by a
 // queue-space-shard.release task, whose subject is the space and the digest
-// (registry.SpaceShardSubject): the commit that drops the last claim queues it,
+// (Subject): the commit that drops the last claim queues it,
 // due after the reader grace, in its own transaction; a session teardown, a
 // superseded part or an expired pending reference queues it due at once.
 // Every reference a write takes enters through a queue-space-shard.add on the
@@ -280,11 +280,11 @@ var releasedResult = []byte("released")
 // A conclude of the blob in flight here defers it, without holding the
 // subject.
 func (q *Queue) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
-	space, digest, err := registry.ParseSpaceShardSubject(t.Subject)
+	space, digest, err := ParseSubject(t.Subject)
 	if err != nil {
 		return nil, taskrunner.Permanent(err)
 	}
-	args, err := registry.ReleaseTaskFrom(t)
+	args, err := releaseTaskFrom(t)
 	if err != nil {
 		return nil, taskrunner.Permanent(err)
 	}
@@ -405,7 +405,7 @@ func (q *Queue) ReleaseNow(ctx context.Context, space did.DID, digests []multiha
 	}
 	expires := time.Now().Add(releaseWaitLimit)
 	for _, d := range digests {
-		if err := q.Flush(ctx, registry.SpaceShardSubject(space, d), expires); err != nil {
+		if err := q.Flush(ctx, Subject(space, d), expires); err != nil {
 			return // the rest run in the background
 		}
 	}
@@ -416,7 +416,7 @@ func (q *Queue) ReleaseNow(ctx context.Context, space did.DID, digests []multiha
 func (q *Queue) Flush(ctx context.Context, subject string, expires time.Time) error {
 	ctx, cancel := context.WithDeadline(ctx, expires)
 	defer cancel()
-	_, err := q.tasks.Run(ctx, taskrunner.Spec{Queue: registry.SpaceShardQueue, Subject: subject, Action: releaseFlush, Expires: &expires})
+	_, err := q.tasks.Run(ctx, taskrunner.Spec{Queue: Name, Subject: subject, Action: releaseFlush, Expires: &expires})
 	return err
 }
 
@@ -428,7 +428,7 @@ func (q *Queue) Flush(ctx context.Context, subject string, expires time.Time) er
 // as one a conclude in flight defers does, fails the delete for the client to
 // retry.
 func (q *Queue) DrainSpace(ctx context.Context, space did.DID) error {
-	due, err := q.tasks.Expedite(ctx, registry.SpaceShardQueue, registry.SpaceShardSubjects(space), registry.ReleaseAction)
+	due, err := q.tasks.Expedite(ctx, Name, SpaceSubjects(space), ReleaseAction)
 	if err != nil {
 		return fmt.Errorf("expedite the space's releases: %w", err)
 	}
@@ -446,7 +446,7 @@ func (q *Queue) DrainSpace(ctx context.Context, space did.DID) error {
 			return fmt.Errorf("release the space's blobs: %w", err)
 		}
 	}
-	left, err := q.tasks.Pending(ctx, registry.SpaceShardQueue, subjects, registry.ReleaseAction)
+	left, err := q.tasks.Pending(ctx, Name, subjects, ReleaseAction)
 	if err != nil {
 		return fmt.Errorf("check the space's releases: %w", err)
 	}
@@ -465,7 +465,7 @@ const releaseDrainTimeout = 30 * time.Second
 // streamed and part modes; when the space already held the blob, the stream's
 // allocation is given up. release is the authority an expiry of the
 // reference releases the blob with.
-func (q *Queue) Add(ctx context.Context, space did.DID, bucket string, digest multihash.Multihash, size int64, mode string, sb *uploader.StreamedBlob, release registry.ReleaseTask) (taskrunner.TaskID, error) {
+func (q *Queue) Add(ctx context.Context, space did.DID, bucket string, digest multihash.Multihash, size int64, mode string, sb *uploader.StreamedBlob, release ReleaseTask) (taskrunner.TaskID, error) {
 	var buf bytes.Buffer
 	if err := (&AddTask{Mode: mode, Bucket: bucket, Size: size, Release: release}).MarshalCBOR(&buf); err != nil {
 		return uuid.Nil, fmt.Errorf("encode add: %w", err)
@@ -475,9 +475,9 @@ func (q *Queue) Add(ctx context.Context, space did.DID, bucket string, digest mu
 	}
 	expires := time.Now().Add(q.addWait)
 	out, err := q.tasks.Run(ctx, taskrunner.Spec{
-		Queue:   registry.SpaceShardQueue,
-		Subject: registry.SpaceShardSubject(space, digest),
-		Action:  registry.AddAction,
+		Queue:   Name,
+		Subject: Subject(space, digest),
+		Action:  AddAction,
 		Args:    buf.Bytes(),
 		Expires: &expires,
 	})
@@ -503,7 +503,7 @@ func (q *Queue) Add(ctx context.Context, space did.DID, bucket string, digest mu
 // pendingRefTTL. The reference and its expiry commit with the task; the
 // blob's rows are recorded as the steps that make them true finish.
 func (q *Queue) runAdd(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
-	space, digest, err := registry.ParseSpaceShardSubject(t.Subject)
+	space, digest, err := ParseSubject(t.Subject)
 	if err != nil {
 		return nil, taskrunner.Permanent(err)
 	}
@@ -526,9 +526,9 @@ func (q *Queue) runAdd(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Ta
 	}
 	deadline := time.Now().Add(pendingRefTTL)
 	expire, err := ex.Submit(ctx, taskrunner.Spec{
-		Queue:     registry.SpaceShardQueue,
+		Queue:     Name,
 		Subject:   t.Subject,
-		Action:    registry.ExpireAction,
+		Action:    ExpireAction,
 		Args:      release.Bytes(),
 		NotBefore: &deadline,
 	})
@@ -658,11 +658,11 @@ func (q *Queue) putIntent(ctx context.Context, space did.DID, digest multihash.M
 // expiry it is, unless the write has taken it over since, and queues the
 // blob's release, due at once, if nothing else in the space references it.
 func (q *Queue) runExpire(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
-	space, digest, err := registry.ParseSpaceShardSubject(t.Subject)
+	space, digest, err := ParseSubject(t.Subject)
 	if err != nil {
 		return nil, taskrunner.Permanent(err)
 	}
-	args, err := registry.ReleaseTaskFrom(t)
+	args, err := releaseTaskFrom(t)
 	if err != nil {
 		return nil, taskrunner.Permanent(err)
 	}
@@ -702,7 +702,7 @@ func (q *Queue) runExpire(ctx context.Context, ex *taskrunner.Exec, t taskrunner
 func (q *Queue) DropRefsNow(ctx context.Context, space did.DID, refs []taskrunner.TaskID, digests []multihash.Multihash) {
 	expiries, err := q.claims.ExpiriesOf(ctx, refs)
 	if err == nil {
-		err = q.tasks.ExpediteTasks(ctx, registry.SpaceShardQueue, expiries...)
+		err = q.tasks.ExpediteTasks(ctx, Name, expiries...)
 	}
 	if err != nil {
 		q.logger.Warn("expire a failed write's references; they expire at their deadline",
@@ -735,7 +735,7 @@ var acceptRetry = taskrunner.RetryPolicy{First: 5 * time.Second, Max: time.Minut
 // space references any more, as a dropped part's is: its release aborts the
 // allocation instead.
 func (q *Queue) runAccept(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) (_ []byte, err error) {
-	space, digest, err := registry.ParseSpaceShardSubject(t.Subject)
+	space, digest, err := ParseSubject(t.Subject)
 	if err != nil {
 		return nil, taskrunner.Permanent(err)
 	}

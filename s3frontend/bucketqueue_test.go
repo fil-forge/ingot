@@ -9,20 +9,19 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/fil-forge/ingot/queue/bucketqueue"
-	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // commitTasks counts the queue-bucket.commit tasks run so far.
 func commitTasks(t *testing.T, mem *testStore) int {
 	t.Helper()
-	tasks, err := mem.queued(context.Background(), registry.BucketQueue)
+	tasks, err := mem.queued(context.Background(), bucketqueue.Name)
 	if err != nil {
 		t.Fatalf("queued: %v", err)
 	}
 	n := 0
 	for _, task := range tasks {
-		if task.Action == registry.BucketCommitAction {
+		if task.Action == bucketqueue.CommitAction {
 			n++
 		}
 	}
@@ -73,7 +72,7 @@ func TestDeleteObjectsIsOneCommit(t *testing.T) {
 func TestDeleteBucketWithoutItsRequestDoesNothing(t *testing.T) {
 	_, mem, _ := newRefTestBackend(t)
 	ctx := context.Background()
-	err := runBucketTaskRaw(ctx, mem, mem.bk(), registry.BucketDeleteAction, &bucketqueue.BucketTask{Name: "bk"})
+	err := runBucketTaskRaw(ctx, mem, mem.bk(), bucketqueue.DeleteAction, &bucketqueue.BucketTask{Name: "bk"})
 	if !taskrunner.IsPermanent(err) {
 		t.Fatalf("delete without its request = %v, want a permanent failure", err)
 	}
