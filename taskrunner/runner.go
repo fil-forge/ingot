@@ -821,7 +821,7 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 			// start before it: wait for the turn without taking the lease. Each
 			// wait reads the task's outcome first, which finds a cancel here or
 			// on another instance.
-			w := r.awaitTurn(ctx, q, id, turn, r.opts.PollInterval, s.Expires)
+			w := r.awaitTurn(ctx, q, id, turn, r.opts.PollInterval, s.Expires, TaskID{})
 			if w.done {
 				return w.res, w.err
 			}
@@ -830,6 +830,11 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 			}
 			continue
 		}
+		// pause is how long to wait before looking at the subject again,
+		// when something other than the backoff sets it, and behind is the
+		// task due ahead of this one that the wait also ends with.
+		var pause time.Duration
+		var behind TaskID
 		h, _, err := r.tryLease(ctx, q, s.Subject, age)
 		if err != nil {
 			return nil, err
@@ -845,6 +850,7 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 			}
 			var die *dieError
 			var yield *yieldError
+			var ahead *aheadError
 			switch {
 			case d.stop == nil, errors.Is(d.stop, errLeaseLost), errors.Is(d.stop, errNotPending):
 				// Another holder ran the task first or took over the lease,
@@ -856,17 +862,25 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 				if err := r.waitTask(ctx, yield.id, key, r.opts.PollInterval); err != nil {
 					return nil, err
 				}
-			case errors.As(d.stop, new(*aheadError)):
+			case errors.As(d.stop, &ahead):
 				// A task due ahead is a worker's to run: wake them, and wait
-				// for this task's turn below.
+				// for this task's turn below. A worker here wakes this
+				// caller when it releases the subject, and a cancel here of
+				// the task ahead ends the wait too, so the caller looks
+				// again on its own only once a poll interval, for a task
+				// that another instance runs or cancels.
 				r.pokeQueue(q)
+				pause, behind = r.opts.PollInterval, ahead.id
 			case ctx.Err() != nil:
 				return nil, ctx.Err()
 			default:
 				return nil, d.stop
 			}
 		}
-		if w := r.awaitTurn(ctx, q, id, turn, wait.next(), s.Expires); w.done {
+		if pause == 0 {
+			pause = wait.next()
+		}
+		if w := r.awaitTurn(ctx, q, id, turn, pause, s.Expires, behind); w.done {
 			return w.res, w.err
 		}
 	}

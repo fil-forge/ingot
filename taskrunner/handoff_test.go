@@ -80,11 +80,18 @@ func (c *countingDB) Exec(ctx context.Context, sql string, args ...any) (pgconn.
 // workers poll every pollInterval.
 func newCountingRunner(t *testing.T, pollInterval time.Duration, h taskrunner.Handler) (*taskrunner.Runner, *countingDB) {
 	t.Helper()
+	return newCountingRunnerWithWorkers(t, pollInterval, 4, h)
+}
+
+// newCountingRunnerWithWorkers is newCountingRunner with the queue's worker
+// count given.
+func newCountingRunnerWithWorkers(t *testing.T, pollInterval time.Duration, workers int, h taskrunner.Handler) (*taskrunner.Runner, *countingDB) {
+	t.Helper()
 	env := taskrunnertest.NewEnv(t)
 	db := &countingDB{Pool: env.DB}
 	r, err := taskrunner.New(db, taskrunner.Options{
 		Schema:       env.Schema,
-		Queues:       []taskrunner.QueueOptions{{Name: qTop, Workers: 4}},
+		Queues:       []taskrunner.QueueOptions{{Name: qTop, Workers: workers}},
 		LeaseTTL:     5 * time.Second,
 		PollInterval: pollInterval,
 		Logger:       zaptest.NewLogger(t),
@@ -212,6 +219,99 @@ func TestRunCallerBacksOffBehindATaskAhead(t *testing.T) {
 	t.Logf("%d lease attempts in 500ms behind a task ahead", tries)
 	if tries > 20 {
 		t.Errorf("%d lease attempts in 500ms behind a task ahead; want at most 20", tries)
+	}
+}
+
+// A caller behind a task that is a worker's to run takes the subject's lease
+// once to find that out, then waits to be woken or for the poll interval: it
+// does not take and release the lease again and again while it waits.
+func TestRunCallerBehindAWorkersTaskDoesNotRetakeTheLease(t *testing.T) {
+	// No workers here: the task ahead is another instance's to run, and
+	// stays due for the whole of the caller's wait.
+	r, db := newCountingRunnerWithWorkers(t, time.Second, 0, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	if _, err := r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step"}); err != nil {
+		t.Fatal(err)
+	}
+	before := db.leaseTries.Load()
+	expires := time.Now().Add(500 * time.Millisecond)
+	_, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step", Expires: &expires})
+	if !errors.Is(err, taskrunner.ErrExpired) {
+		t.Fatalf("Run behind a task no worker here runs: %v, want ErrExpired", err)
+	}
+	tries := db.leaseTries.Load() - before
+	t.Logf("%d lease attempts in 500ms behind a worker's task", tries)
+	if tries > 2 {
+		t.Errorf("%d lease attempts in 500ms behind a worker's task; want at most 2", tries)
+	}
+}
+
+// A caller behind a task that found every worker busy runs as soon as a
+// worker frees up and runs the task ahead, long before the poll interval: the
+// worker wakes the caller when it releases the subject.
+func TestRunCallerBehindAWorkersTaskRunsOnceAWorkerFrees(t *testing.T) {
+	busy := make(chan struct{})
+	r, _ := newCountingRunnerWithWorkers(t, time.Minute, 1, func(_ context.Context, _ *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if string(task.Args) == "busy" {
+			close(busy)
+			time.Sleep(200 * time.Millisecond)
+		}
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	// The queue's one worker is busy on another subject when the task ahead
+	// is submitted and when the caller finds it.
+	if _, err := r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "other", Action: "step", Args: []byte("busy")}); err != nil {
+		t.Fatal(err)
+	}
+	<-busy
+	if _, err := r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step"}); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if _, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step"}); err != nil {
+		t.Fatalf("Run behind a worker's task: %v", err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("Run took %v behind a task a worker ran within a second; it waited for the poll interval", took)
+	}
+}
+
+// A caller behind a task that is cancelled before any worker takes it runs at
+// once: no subject is released to wake it, so the cancel does.
+func TestRunCallerBehindACancelledTaskRunsAtOnce(t *testing.T) {
+	r, db := newCountingRunnerWithWorkers(t, time.Minute, 0, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	ahead, err := r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := db.leaseTries.Load()
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "step"})
+		done <- err
+	}()
+	// The caller has taken the lease, found the task ahead and settled into
+	// its wait.
+	for db.leaseTries.Load() == before {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := r.Cancel(ctx, qTop, ahead); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run behind a cancelled task: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run still waits 5s after the task ahead of it was cancelled")
 	}
 }
 
