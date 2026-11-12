@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 
 	assertcmds "github.com/fil-forge/libforge/commands/assert"
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
@@ -123,7 +122,7 @@ func (u *Forge) ConcludeBlobs(ctx context.Context, space did.DID, parked []Uploa
 		locations[i] = &loc
 	}
 	if err != nil {
-		if allocationGone(err) {
+		if errors.Is(err, forgeclient.ErrAllocationGone) {
 			return locations, fmt.Errorf("uploader: conclude blobs: %w: %w", ErrAllocationGone, err)
 		}
 		return locations, fmt.Errorf("uploader: conclude blobs: %w", err)
@@ -136,27 +135,6 @@ func (u *Forge) ConcludeBlobs(ctx context.Context, space did.DID, parked []Uploa
 // the provider removed it after it expired. Concluding the blob again gets
 // the same answer; its bytes are uploaded again under a new allocation.
 var ErrAllocationGone = errors.New("uploader: the provider no longer holds the blob's allocation")
-
-// allocationGone reports whether err, or any error it wraps or joins, is a
-// /blob/accept failure saying the provider no longer holds the allocation.
-func allocationGone(err error) bool {
-	if err == nil {
-		return false
-	}
-	if named, ok := err.(ucanerrors.Named); ok {
-		switch named.Name() {
-		case blobcmds.AllocationExpiredErrorName, blobcmds.AllocationNotFoundErrorName:
-			return true
-		}
-	}
-	switch u := err.(type) {
-	case interface{ Unwrap() error }:
-		return allocationGone(u.Unwrap())
-	case interface{ Unwrap() []error }:
-		return slices.ContainsFunc(u.Unwrap(), allocationGone)
-	}
-	return false
-}
 
 // ErrBlobAccepted reports an abort the provider refused because the space
 // has accepted the blob. The blob is not parked any more, whatever the local
