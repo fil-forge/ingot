@@ -360,14 +360,14 @@ func TestPlaintextRelease_WaitIsBounded(t *testing.T) {
 	setNone(t, b)
 	data := testBody(8 << 10)
 	// The short wait bounds every write, so on a slow machine the write that
-	// sets up can be refused too: it retries, as a client would.
+	// sets up can be refused too: it retries for a while, as a client would.
 	var apiErr s3err.APIError
-	for bucket, key := "bk", "old"; ; {
+	for bucket, key, deadline := "bk", "old", time.Now().Add(10*time.Second); ; {
 		_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
 		if err == nil {
 			break
 		}
-		if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" {
+		if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" || time.Now().After(deadline) {
 			t.Fatalf("PutObject bk/old: %v", err)
 		}
 	}
