@@ -226,9 +226,6 @@ func Validate(ctx context.Context, client ValidateS3, cfg ValidateConfig) (*Vali
 		case StepWrite:
 			err = v.write(ctx)
 		}
-		if err == nil {
-			err = ctx.Err()
-		}
 		v.progress(step, err != nil)
 		if err != nil {
 			break
@@ -503,6 +500,11 @@ func (v *validator) list(ctx context.Context, b validateBucket) {
 		}
 		v.record(OpListPage, elapsed)
 		res.Pages++
+		if len(out.Contents) > 0 && res.Objects > 0 && aws.ToString(out.Contents[0].Key) <= last {
+			v.fail(ctx, "list %s: page %d starts at %s, not after %s, so the listing does not move on",
+				b.name, res.Pages, aws.ToString(out.Contents[0].Key), last)
+			return
+		}
 		for _, o := range out.Contents {
 			key := aws.ToString(o.Key)
 			if res.Objects > 0 && key <= last {
@@ -525,12 +527,12 @@ func (v *validator) list(ctx context.Context, b validateBucket) {
 		if !aws.ToBool(out.IsTruncated) {
 			break
 		}
-		next := aws.ToString(out.NextContinuationToken)
-		if len(out.Contents) == 0 || next == "" || next == aws.ToString(token) {
-			v.fail(ctx, "list %s: truncated page %d does not move the listing on (%d keys, next token %q)", b.name, res.Pages, len(out.Contents), next)
+		if len(out.Contents) == 0 || out.NextContinuationToken == nil {
+			v.fail(ctx, "list %s: truncated page %d has %d keys and no continuation token, so the listing does not move on",
+				b.name, res.Pages, len(out.Contents))
 			return
 		}
-		token = &next
+		token = out.NextContinuationToken
 	}
 	for _, key := range want {
 		missing(key)
@@ -574,10 +576,23 @@ func (v *validator) write(ctx context.Context) error {
 		}
 		return tasks
 	}
+	v.say("write  writing %d objects in each of %d buckets, run %s (each key is ValidateKey with this run)",
+		v.cfg.Samples, len(v.buckets), run)
+	// An interrupt stops new PUTs, but one already sent finishes, so that
+	// its delete follows its answer rather than racing it.
 	putErr := v.run(ctx, each(func(ctx context.Context, i int, o object) {
 		sent[i].Store(true)
-		v.put(ctx, o.bucket, o.key)
+		v.put(context.WithoutCancel(ctx), o.bucket, o.key)
 	}))
+	if putErr != nil {
+		n := 0
+		for i := range sent {
+			if sent[i].Load() {
+				n++
+			}
+		}
+		v.say("write  interrupted: deleting the %d objects written so far (run %s); interrupt again to leave them", n, run)
+	}
 	_ = v.run(context.WithoutCancel(ctx), each(func(ctx context.Context, i int, o object) {
 		if sent[i].Load() {
 			v.delete(ctx, o.bucket, o.key)
@@ -636,6 +651,16 @@ func (v *validator) checkGone(ctx context.Context, bucket, key string) {
 	case !errors.As(err, &re) || re.HTTPStatusCode() != 404:
 		v.fail(ctx, "head %s/%s after its delete: %v", bucket, key, err)
 	}
+}
+
+// say writes a line to the progress writer, if there is one.
+func (v *validator) say(format string, args ...any) {
+	if v.cfg.Progress == nil {
+		return
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	fmt.Fprintf(v.cfg.Progress, format+"\n", args...)
 }
 
 // progress writes a line with the latencies of step's operations, marking a

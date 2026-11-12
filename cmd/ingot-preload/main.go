@@ -4,9 +4,9 @@
 //
 // It is a plain S3 client: it needs the gateway's endpoint and region and an
 // access key that may create buckets and write, read, list and delete objects
-// in them, taken from the AWS SDK's usual sources (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or a
-// shared config profile such as the one smelt's `make s3-key` writes). It
-// never takes a secret as a flag.
+// in them, taken from the AWS SDK's usual sources (AWS_ACCESS_KEY_ID and
+// AWS_SECRET_ACCESS_KEY, or a shared config profile such as the one smelt's
+// `make s3-key` writes). It never takes a secret as a flag.
 package main
 
 import (
@@ -175,15 +175,17 @@ objects the load wrote from its --state file. The steps run in this order:
   get    reads a --range-kib range of every real object, and checks its bytes
   head   reads the metadata of --samples bulk objects per bucket
   list   lists the first --list-buckets buckets in full, and checks the keys
-         are in order and number at least those the load recorded
+         are in order and include every object the load recorded
   write  writes --samples new zero-byte objects per bucket the way the load
          does, deletes them, and checks they are gone
 
 It deletes only the objects it writes, and deletes them even when
-interrupted; the report's write_run tags their keys. --sample picks which
-objects and ranges are read: run once just after restarting the gateway,
-then again with the same --sample and --steps get,head. The second run finds
-the catalog and the authorization caches warm. Body bytes come from the
+interrupted; the run tag it prints, and the report's write_run, name their
+keys. --sample picks which objects and ranges are read: just after restarting
+the gateway, run --steps get,head, then the same again with the same
+--sample, then --steps list,write. The second run finds the catalog and the
+authorization caches warm; a full listing reads enough of the catalog to
+push the first run's reads out, so it comes last. Body bytes come from the
 gateway's local blob cache, which survives a restart, or from the storage
 provider, the same in both runs: the README says how to time either. Use the
 --buckets, --bucket-prefix, --seed, --key-prefix and --state the load used.

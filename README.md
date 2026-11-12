@@ -328,23 +328,30 @@ reads the metadata of a sample of bulk objects, lists a few buckets in full
 and checks every recorded object is there, and writes, deletes and re-checks
 new zero-byte objects shaped like the load's. Its access key must also be
 allowed to read, list and delete. It deletes only what it wrote, and deletes
-it even when interrupted; the report's `write_run` tags the keys. A test point
-is a load to that size, a gateway restart, then two runs with the same
-`--sample`:
+it even when interrupted; the run tag it prints when the write step starts,
+also the report's `write_run`, names the keys. A test point is a load to that
+size, a gateway restart, two reading runs with the same `--sample`, then the
+listing and writes:
 
 ```bash
 ingot-preload load --until 600000 --real-every 30000      # loaded to the test point
 # restart ingot
-ingot-preload validate --label 0.6M-cold
+ingot-preload validate --label 0.6M-cold --steps get,head
 ingot-preload validate --label 0.6M-warm --steps get,head
+ingot-preload validate --label 0.6M-list-write --steps list,write
 ```
 
 The restart empties the catalog's block cache and the authorization caches,
-so the first run reads them cold and the second warm. Body bytes are a
-different matter: a range is served from the local blob cache, which survives
-a restart and holds a blob for `cache_ttl` (1h by default) after it was
-written or last read, and otherwise from Piri, which reads don't copy back
-into the cache. Both runs read bodies from the same place. To time body reads
+so the first run reads them cold and the second warm. A full listing reads
+every listed key's manifest through that block cache (`read_cache_bytes`,
+256 MiB by default): three buckets at the 0.6M point come to an estimated
+0.6 GB, more than it holds, so the listing runs after the warm run.
+
+Body bytes are a different matter: a range is served from the local blob
+cache, which survives a restart and holds a blob for `cache_ttl` (1h by
+default) after it was written or last read, and otherwise from Piri, which
+reads don't copy back into the cache. Both reading runs read bodies from the
+same place. To time body reads
 from Piri, start the first run more than `cache_ttl` after the load wrote its
 last real object, or load with `cache_writes: false`.
 

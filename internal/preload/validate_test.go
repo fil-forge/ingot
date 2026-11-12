@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -70,7 +71,8 @@ func TestValidateChecksALoadedCatalog(t *testing.T) {
 	if !slices.Equal(r.Steps, ValidateSteps) || r.Interrupted || len(r.WriteRun) != 16 {
 		t.Fatalf("steps %v, interrupted %v, write run %q", r.Steps, r.Interrupted, r.WriteRun)
 	}
-	if lines := strings.Count(progress.String(), "\n"); lines != len(ValidateSteps) {
+	// A line per step, and one as the write step starts.
+	if lines := strings.Count(progress.String(), "\n"); lines != len(ValidateSteps)+1 || !strings.Contains(progress.String(), "run "+r.WriteRun) {
 		t.Fatalf("progress %q", progress.String())
 	}
 	// The objects the validation wrote are gone, and nothing else changed.
@@ -202,10 +204,18 @@ func TestValidateDeletesWhatItWroteWhenPutsFail(t *testing.T) {
 }
 
 // ctxS3 answers a request whose context has ended with that context's
-// error, as the SDK does.
-type ctxS3 struct{ *fakeS3 }
+// error, as the SDK does, and counts the PUTs and deletes it is sent.
+type ctxS3 struct {
+	*fakeS3
+	puts, deletes *atomic.Int64
+}
+
+func newCtxS3(f *fakeS3) ctxS3 {
+	return ctxS3{f, new(atomic.Int64), new(atomic.Int64)}
+}
 
 func (c ctxS3) PutObject(ctx context.Context, in *s3.PutObjectInput, o ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	c.puts.Add(1)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -213,6 +223,7 @@ func (c ctxS3) PutObject(ctx context.Context, in *s3.PutObjectInput, o ...func(*
 }
 
 func (c ctxS3) DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, o ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
+	c.deletes.Add(1)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -237,9 +248,19 @@ func TestValidateInterruptedWriteLeavesNothing(t *testing.T) {
 	cfg := validateConfig(load)
 	cfg.Steps = []string{StepHead, StepWrite}
 	cfg.Workers = 1
-	r, err := Validate(ctx, ctxS3{f}, cfg)
+	var progress strings.Builder
+	cfg.Progress = &progress
+	client := newCtxS3(f)
+	r, err := Validate(ctx, client, cfg)
 	if err == nil || !r.Interrupted || !slices.Equal(r.Steps, []string{StepHead}) || r.WriteRun == "" || r.Failures != 0 {
 		t.Fatalf("interrupted write: %v, report %+v", err, r)
+	}
+	// Each PUT sent gets a delete, and no other key does.
+	if puts, deletes := client.puts.Load(), client.deletes.Load(); puts >= 10 || deletes != puts {
+		t.Fatalf("%d PUTs and %d deletes, want fewer than 10 PUTs, each deleted", puts, deletes)
+	}
+	if out := progress.String(); !strings.Contains(out, "run "+r.WriteRun) || !strings.Contains(out, "interrupt again to leave them") {
+		t.Fatalf("progress %q", out)
 	}
 	for _, b := range load.Buckets {
 		if !maps.Equal(f.objects(b), before[b]) {
@@ -315,8 +336,7 @@ func TestValidateStopsOnAListingThatDoesNotMoveOn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The repeated page also arrives out of order, which counts too.
-	if r.Failures != 2 || !strings.Contains(strings.Join(r.FailureSample, "\n"), "does not move the listing on") || r.Latency[OpListPage].Count != 2 {
+	if r.Failures != 1 || !strings.Contains(r.FailureSample[0], "does not move on") || r.Latency[OpListPage].Count != 2 {
 		t.Fatalf("failures %v, pages %d", r.FailureSample, r.Latency[OpListPage].Count)
 	}
 }
