@@ -607,3 +607,57 @@ func TestHandlerStopsBeforeAnUnrenewedLeaseExpires(t *testing.T) {
 		t.Errorf("the handler was stopped after %v, long before its lease was due to expire", stopped)
 	}
 }
+
+// A batch handler reports a task's failure in its outcome, with no error of
+// its own. One stopped for its lease records no retry for the tasks it failed.
+func TestBatchStoppedForItsLeaseRecordsNoRetry(t *testing.T) {
+	f := newFixture(t, 1)
+	leases, tasks := f.env.Table(queueTable(qTop)+"_leases"), f.env.Table(queueTable(qTop)+"_tasks")
+	var runs atomic.Int32
+	if err := f.r.HandleBatch(qTop, "send", 5, func(ctx context.Context, ex *taskrunner.Exec, batch []taskrunner.Task) ([]taskrunner.Outcome, error) {
+		out := make([]taskrunner.Outcome, len(batch))
+		if runs.Add(1) > 1 {
+			return out, nil
+		}
+		// The lease goes unrenewed while its row is locked, and the handler
+		// is stopped before it expires, so its commit finds the lease held.
+		tx, err := f.env.DB.Begin(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(context.Background(), `SELECT 1 FROM `+leases+` WHERE subject = $1 FOR UPDATE`, batch[0].Subject); err != nil {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+			t.Error("the handler's context did not end though its lease went unrenewed")
+		}
+		if err := tx.Rollback(context.Background()); err != nil {
+			return nil, err
+		}
+		for i := range out {
+			out[i].Err = ctx.Err()
+		}
+		return out, nil
+	}, taskrunner.WithRetry(taskrunner.RetryPolicy{First: time.Hour})); err != nil {
+		t.Fatal(err)
+	}
+	f.start(t)
+
+	ctx := waitCtx(t)
+	id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "send"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.r.Wait(ctx, qTop, id); err != nil {
+		t.Fatalf("Wait: %v; want the task run again once its lease was free, not left to retry", err)
+	}
+	var attempts int
+	if err := f.env.DB.QueryRow(ctx, `SELECT attempts FROM `+tasks+` WHERE id = $1`, id).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 {
+		t.Errorf("attempts = %d, want 0: a run stopped for its lease records nothing", attempts)
+	}
+}

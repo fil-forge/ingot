@@ -542,9 +542,11 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 			herr = tr.failed
 		}
 		// A handler stopped for a lost lease failed for that, whatever error
-		// it returned. One that finished all the same goes on to its commit,
-		// which checks the leases in the database.
-		if herr != nil && lostTo != nil && !errors.As(herr, &die) {
+		// it returned, or gave any task of its batch. One that finished all
+		// the same goes on to its commit, which checks the leases in the
+		// database.
+		failed := herr != nil || slices.ContainsFunc(outcomes, func(o Outcome) bool { return o.Err != nil })
+		if failed && lostTo != nil && !errors.As(herr, &die) {
 			herr = lostTo
 		}
 		if herr != nil {

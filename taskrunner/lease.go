@@ -125,15 +125,20 @@ func (r *Runner) guardLeases(ctx context.Context, root *hold) *leaseGuard {
 	return g
 }
 
-// watch adds a sync child's lease to the guard. A lease just taken expires
-// later than any the timer is set for, so the timer stands.
+// watch adds a sync child's lease to the guard, and sets the timer again:
+// the statement that took the lease may have been slow to answer, and the
+// root's lease renewed meanwhile, so the child's can be the first to expire.
 func (g *leaseGuard) watch(h *hold) {
+	h.guard.Store(g)
 	g.mu.Lock()
 	g.children = append(g.children, h)
+	wait, lapsed := g.next(time.Now())
+	if lapsed == nil && !g.stopped {
+		g.timer.Reset(wait)
+	}
 	g.mu.Unlock()
-	h.guard.Store(g)
-	if h.lost.Load() {
-		g.trip(h)
+	if lapsed != nil {
+		g.trip(lapsed)
 	}
 }
 
