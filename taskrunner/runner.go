@@ -130,7 +130,7 @@ type Options struct {
 	Queues []QueueOptions
 	// LeaseTTL is how long a subject's lease lasts without renewal. A crashed
 	// process's tasks are resumed once it passes. Defaults to 30 seconds, and
-	// must be at least a millisecond.
+	// must be at least a millisecond; a fraction of one is dropped.
 	LeaseTTL time.Duration
 	// PollInterval is how often each queue is checked for due tasks, and the
 	// longest a waiter goes between checks of a task in another process.
@@ -278,10 +278,12 @@ func New(db DB, opts Options) (*Runner, error) {
 	if opts.LeaseTTL == 0 {
 		opts.LeaseTTL = 30 * time.Second
 	}
-	// Leases are stored to the millisecond.
+	// Leases are stored to the millisecond, so the TTL is cut to one: the
+	// runner then times a lease by the period the database gives it.
 	if opts.LeaseTTL < time.Millisecond {
 		return nil, fmt.Errorf("task runner: lease TTL %v is under a millisecond", opts.LeaseTTL)
 	}
+	opts.LeaseTTL = opts.LeaseTTL.Truncate(time.Millisecond)
 	if opts.PollInterval <= 0 {
 		opts.PollInterval = time.Second
 	}

@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -880,6 +881,84 @@ func TestPlaintextRelease_StalledRemoveTimesOut(t *testing.T) {
 	}
 	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 1 {
 		t.Fatalf("releases queued after the timed-out attempt = %d, want 1 to retry", len(pending))
+	}
+}
+
+// stallingIntents stalls a release once, after the last of its checks and
+// before it touches the network.
+type stallingIntents struct {
+	registry.IntentStore
+	once  sync.Once
+	stall func(ctx context.Context, space did.DID, digest multihash.Multihash)
+}
+
+func (s *stallingIntents) CountOtherIntents(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
+	s.once.Do(func() { s.stall(ctx, space, digest) })
+	// The release carries on as one that did not watch its context would.
+	return s.IntentStore.CountOtherIntents(context.WithoutCancel(ctx), space, digest)
+}
+
+// TestPlaintextRelease_LostLeaseSendsNoRemove: a release that passes its
+// checks and then loses its subject's lease to another consumer does not go
+// on to remove the blob: that consumer may have released it, and a write
+// added it again. The release runs once the lease is free.
+func TestPlaintextRelease_LostLeaseSendsNoRemove(t *testing.T) {
+	rm := &recordingRemover{}
+	var mem *testStore
+	stalled := make(chan struct{})
+	leases := "ingot." + strings.ReplaceAll(spaceshardqueue.Name, "-", "_") + "_leases"
+	const takenFor = 3 * time.Second
+	stall := func(ctx context.Context, space did.DID, digest multihash.Multihash) {
+		defer close(stalled)
+		tag, err := mem.pool.Exec(context.Background(), `UPDATE `+leases+`
+			SET owner = $2, expires = now() + $3 * interval '1 millisecond' WHERE subject = $1`,
+			spaceshardqueue.Subject(space, digest), uuid.New(), takenFor.Milliseconds())
+		if err != nil || tag.RowsAffected() != 1 {
+			t.Errorf("take the release's lease: %v, %d rows", err, tag.RowsAffected())
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(10 * time.Second):
+			t.Error("the release's context did not end after its lease was taken over")
+		}
+	}
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{},
+		func(d *Deps) { d.Remover = rm },
+		withBlobs(func(d *spaceshardqueue.Deps) { d.Intents = &stallingIntents{IntentStore: d.Intents, stall: stall} }))
+	setNone(t, b)
+
+	putIn(t, b, "bk", "old", testBody(8<<10))
+	deleteFrom(t, b, "bk", "old")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.SweepPendingReleases(context.Background())
+		done <- err
+	}()
+	select {
+	case <-stalled:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the release never reached its last check")
+	}
+	// The other consumer holds the lease for a while yet, so only the
+	// stalled run could send a remove now.
+	time.Sleep(takenFor / 3)
+	if n := len(rm.removedDigests()); n != 0 {
+		t.Fatalf("the release removed %d blobs after losing its lease, want none", n)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("SweepPendingReleases: %v", err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for len(rm.removedDigests()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the release did not run once its lease was free")
+		}
+		time.Sleep(50 * time.Millisecond)
+		drainReleases(t, b)
+	}
+	if n := len(rm.removed); n != 1 {
+		t.Fatalf("%d removes sent, want 1", n)
 	}
 }
 

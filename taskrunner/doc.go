@@ -22,6 +22,10 @@
 // only at the commit. taskrunnertest.CheckOwnWrites runs a tree both ways to
 // catch a handler that does.
 //
+// A handler's context ends when a lease its tree runs under is lost or is
+// about to expire unrenewed, so a handler that passes its context to its
+// network calls makes none once another consumer may hold its subject.
+//
 // The runner stores a task's arguments and result as opaque bytes and knows
 // nothing of what its handlers do.
 package taskrunner

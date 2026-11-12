@@ -29,7 +29,9 @@ type tree struct {
 	// commit. The root's lease belongs to whoever is draining its subject.
 	holds    map[subjectKey]*hold
 	rootHold *hold
-	writes   []write
+	// guard ends the handlers' context when one of the tree's leases is lost.
+	guard  *leaseGuard
+	writes []write
 	// spawned are the queues that received async tasks, poked after the
 	// commit.
 	spawned map[*queue]bool
@@ -43,6 +45,8 @@ type tree struct {
 	// savepoint of the sync child now running, or tx itself.
 	tx  pgx.Tx
 	cur pgx.Tx
+	// began is read just before tx began.
+	began time.Time
 	// failed is the first error a sync child returned. The tree fails with it
 	// even if a parent handler carries on.
 	failed error
@@ -256,6 +260,7 @@ func (tr *tree) lease(ctx context.Context, q *queue, subject string) error {
 		}
 		if h != nil {
 			tr.holds[key] = h
+			tr.guard.watch(h)
 			tr.r.metrics.observeLeaseWait(ctx, q, start)
 			return nil
 		}
@@ -333,9 +338,12 @@ func recoverHandler(t Task, err *error) {
 // lease it took. A root whose outcome carries an error is retried or failed
 // there; it returns those, to report once the commit has landed.
 func (tr *tree) commit(ctx context.Context, a *action, outcomes []Outcome) (*failures, error) {
-	tx := tr.tx
+	// The lease is extended a TTL from the transaction's start, which is what
+	// now() reads inside it, so sent is read before the transaction begins.
+	tx, sent := tr.tx, tr.began
 	if tx == nil {
 		var err error
+		sent = time.Now()
 		if tx, err = tr.r.db.Begin(ctx); err != nil {
 			return nil, err
 		}
@@ -398,7 +406,11 @@ func (tr *tree) commit(ctx context.Context, a *action, outcomes []Outcome) (*fai
 	}
 	root := tr.rootHold
 	if !root.releaseOnCommit {
-		return rec, tx.Commit(ctx)
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		root.extend(sent, tr.r.opts.LeaseTTL)
+		return rec, nil
 	}
 	// The commit deletes the lease row: stop renewing the hold first, as
 	// release does, so the renewer never finds the row gone and takes the
@@ -417,14 +429,16 @@ func (tr *tree) commit(ctx context.Context, a *action, outcomes []Outcome) (*fai
 // lease TTL from now, or returns errLeaseLost when another consumer owns it
 // now or it has expired, which leaves it free for one to take. Renewal skips
 // a row a commit holds locked (renew), so the extension is what keeps a long
-// commit's lease from lapsing under it.
+// commit's lease from lapsing under it. The extension lasts only if tx
+// commits, so the caller records it on h (extend) once it has, as running
+// from before tx began: now() in a transaction is the time it started.
 func lockLease(ctx context.Context, tx pgx.Tx, h *hold, ttl time.Duration) error {
 	var one int
 	err := tx.QueryRow(ctx, `UPDATE `+h.q.leases+` SET expires = now() + $3 * interval '1 millisecond'
 		WHERE subject = $1 AND owner = $2 AND expires >= now() RETURNING 1`,
 		h.subject, h.token, ttl.Milliseconds()).Scan(&one)
 	if errors.Is(err, pgx.ErrNoRows) {
-		h.lost.Store(true)
+		h.lose()
 		return errLeaseLost
 	}
 	return err
@@ -439,7 +453,7 @@ func deleteLease(ctx context.Context, tx pgx.Tx, h *hold) error {
 		WHERE subject = $1 AND owner = $2 AND expires >= now() RETURNING 1`,
 		h.subject, h.token).Scan(&one)
 	if errors.Is(err, pgx.ErrNoRows) {
-		h.lost.Store(true)
+		h.lose()
 		return errLeaseLost
 	}
 	return err
@@ -503,6 +517,7 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 		}
 		tr := &tree{r: r, roots: live, age: age, holds: map[subjectKey]*hold{}, rootHold: h, spawned: map[*queue]bool{}}
 		if r.opts.applyWritesImmediately {
+			tr.began = time.Now()
 			tx, err := r.db.Begin(ctx)
 			if err != nil {
 				return nil, nil, err
@@ -510,15 +525,20 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 			tr.tx, tr.cur = tx, tx
 		}
 		ex := &Exec{tr: tr, q: h.q, task: live[0], path: []actionKey{{first.Queue, first.Action}}}
+		// The handlers run under a context that ends when a lease of the
+		// tree's is lost.
+		tr.guard = r.guardLeases(ctx, h)
 		var outcomes []Outcome
 		var herr error
 		if a.batch != nil {
-			outcomes, herr = callBatch(ctx, a.batch, ex, live)
+			outcomes, herr = callBatch(tr.guard.ctx, a.batch, ex, live)
 		} else {
 			var res []byte
-			res, herr = callHandler(ctx, a.handler, ex, live[0])
+			res, herr = callHandler(tr.guard.ctx, a.handler, ex, live[0])
 			outcomes = []Outcome{{Result: res}}
 		}
+		lostTo := tr.guard.lostTo()
+		tr.guard.stop()
 		// A failed child fails the tree even if its parent carried on, and
 		// giving way to an older tree ends the run however the handler
 		// reported it.
@@ -526,6 +546,13 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 		var lost *childLostError
 		if tr.failed != nil && (herr == nil || errors.As(tr.failed, &die) || errors.As(tr.failed, &lost) || errors.Is(tr.failed, errLeaseLost)) {
 			herr = tr.failed
+		}
+		// A run whose context ended for a lost lease is discarded, whatever
+		// its handler returned: a handler may have treated a step the ending
+		// cut short as one it could skip, and reported success, or failed
+		// some task of its batch, without it.
+		if lostTo != nil && !errors.As(herr, &die) {
+			herr = lostTo
 		}
 		if herr != nil {
 			if tr.tx != nil {
@@ -537,7 +564,7 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 				return nil, nil, die
 			}
 			if errors.Is(herr, errLeaseLost) {
-				r.log.Warn("task's lease was taken over before a child could start", zapTask(first))
+				r.log.Warn("task stopped: its lease was lost", zapTask(first))
 				return nil, nil, errLeaseLost
 			}
 			if ctx.Err() != nil {
@@ -601,6 +628,7 @@ func (r *Runner) finish(ctx context.Context, h *hold, tasks []Task, state, msg s
 	if len(tasks) == 0 {
 		return nil
 	}
+	sent := time.Now() // before the transaction begins: see commit
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("record %s.%s as %s: %w", tasks[0].Queue, tasks[0].Action, state, err)
@@ -624,6 +652,7 @@ func (r *Runner) finish(ctx context.Context, h *hold, tasks []Task, state, msg s
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("record %s.%s as %s: %w", tasks[0].Queue, tasks[0].Action, state, err)
 	}
+	h.extend(sent, r.opts.LeaseTTL)
 	r.finished(ids...)
 	return nil
 }
