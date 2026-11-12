@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,9 +21,15 @@ type hold struct {
 	subject string
 	token   uuid.UUID
 	age     treeAge
-	// lost is set when renewal finds the lease taken over. Nothing more may
-	// run under it.
+	// lost is set when the lease is found taken over or expired. Nothing more
+	// may run under it. Set it with lose, which also stops a running handler.
 	lost atomic.Bool
+	// until is when the lease can first expire, on this process's clock (see
+	// extend).
+	until atomic.Int64
+	// guard is the guard of the tree whose handlers are running under the
+	// lease, or nil.
+	guard atomic.Pointer[leaseGuard]
 	// turn is the place in the subject's line of the Run caller holding the
 	// lease, or nil for a worker or a tree's child. Releasing the lease does
 	// not wake it: it released the lease itself, and backs off.
@@ -45,6 +52,168 @@ type hold struct {
 }
 
 func (h *hold) key() subjectKey { return subjectKey{h.q.name, h.subject} }
+
+// clockStart is the instant hold.until counts from, so that it is kept and
+// compared on the monotonic clock.
+var clockStart = time.Now()
+
+// extend records that a statement sent at sent set the lease to expire a TTL
+// from the database's now. The database ran it no earlier than sent, so the
+// lease lasts until at least sent plus the TTL by this process's clock,
+// whatever the two clocks read. Statements can finish out of order; the
+// latest expiry stands, as it does in the row.
+func (h *hold) extend(sent time.Time, ttl time.Duration) {
+	until := int64(sent.Add(ttl).Sub(clockStart))
+	for {
+		cur := h.until.Load()
+		if until <= cur || h.until.CompareAndSwap(cur, until) {
+			return
+		}
+	}
+}
+
+// heldUntil is when the lease can first expire if nothing extends it.
+func (h *hold) heldUntil() time.Time { return clockStart.Add(time.Duration(h.until.Load())) }
+
+// lose marks the lease lost and stops the handlers running under it.
+func (h *hold) lose() {
+	h.lost.Store(true)
+	if g := h.guard.Load(); g != nil {
+		g.trip(h)
+	}
+}
+
+// leaseMargin is how long before a lease can expire the handlers under it are
+// stopped: a sixth of the TTL, 5 seconds of the default 30. Renewal extends a
+// lease three times per TTL, so one renewal that fails changes nothing and a
+// second stops the handlers. The margin is the time a request a handler has
+// just sent has to arrive before another consumer can take the lease.
+func (r *Runner) leaseMargin() time.Duration { return r.opts.LeaseTTL / 6 }
+
+// leaseGuard ends the context a tree's handlers run under once any lease the
+// tree holds is lost, or comes within the margin of expiring without having
+// been extended. A handler's effects outside the database are not undone when
+// its tree fails to commit, so it must not go on making them once another
+// consumer may hold its subject. Renewal reports a lease taken over; the
+// guard's own timer covers a renewal that cannot reach the database, or that
+// the process was too stalled to send.
+type leaseGuard struct {
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	margin time.Duration
+	root   *hold
+
+	mu       sync.Mutex
+	children []*hold
+	timer    *time.Timer
+	stopped  bool
+}
+
+// guardLeases returns a guard over root, the lease a tree's root task runs
+// under. Its ctx is the one to run the tree's handlers with. Call stop once
+// they have returned.
+func (r *Runner) guardLeases(ctx context.Context, root *hold) *leaseGuard {
+	g := &leaseGuard{margin: r.leaseMargin(), root: root}
+	g.ctx, g.cancel = context.WithCancelCause(ctx)
+	root.guard.Store(g)
+	g.mu.Lock()
+	g.timer = time.AfterFunc(time.Until(root.heldUntil().Add(-g.margin)), g.tick)
+	g.mu.Unlock()
+	if root.lost.Load() {
+		g.trip(root)
+	}
+	return g
+}
+
+// watch adds a sync child's lease to the guard, and sets the timer again:
+// the statement that took the lease may have been slow to answer, and the
+// root's lease renewed meanwhile, so the child's can be the first to expire.
+func (g *leaseGuard) watch(h *hold) {
+	h.guard.Store(g)
+	g.mu.Lock()
+	g.children = append(g.children, h)
+	wait, lapsed := g.next(time.Now())
+	if lapsed == nil && !g.stopped {
+		g.timer.Reset(wait)
+	}
+	g.mu.Unlock()
+	if lapsed != nil {
+		g.trip(lapsed)
+	}
+}
+
+// trip ends the guard's context for the loss of h: with errLeaseLost for the
+// root's lease, whose task another consumer now runs, and a *childLostError
+// for a child's, which the tree can take afresh.
+func (g *leaseGuard) trip(h *hold) {
+	if h == g.root {
+		g.cancel(errLeaseLost)
+		return
+	}
+	g.cancel(&childLostError{h.key()})
+}
+
+// lostTo returns the loss that ended the guard's context, or nil when it has
+// not ended or ended for another reason, such as its parent ending.
+func (g *leaseGuard) lostTo() error {
+	if g.ctx.Err() == nil {
+		return nil
+	}
+	cause := context.Cause(g.ctx)
+	var child *childLostError
+	if errors.Is(cause, errLeaseLost) || errors.As(cause, &child) {
+		return cause
+	}
+	return nil
+}
+
+// next returns the first lease that is lost or within the margin of expiring
+// at now, or else how long until the earliest one will be. g.mu must be held.
+func (g *leaseGuard) next(now time.Time) (time.Duration, *hold) {
+	earliest := g.root.heldUntil()
+	for _, h := range append([]*hold{g.root}, g.children...) {
+		until := h.heldUntil()
+		if h.lost.Load() || !now.Before(until.Add(-g.margin)) {
+			return 0, h
+		}
+		if until.Before(earliest) {
+			earliest = until
+		}
+	}
+	return earliest.Add(-g.margin).Sub(now), nil
+}
+
+// tick is the guard's timer: it trips the guard, or sets the timer for the
+// time the leases, extended since it was set, now run to.
+func (g *leaseGuard) tick() {
+	g.mu.Lock()
+	if g.stopped {
+		g.mu.Unlock()
+		return
+	}
+	wait, lapsed := g.next(time.Now())
+	if lapsed == nil {
+		g.timer.Reset(wait)
+	}
+	g.mu.Unlock()
+	if lapsed != nil {
+		g.trip(lapsed)
+	}
+}
+
+// stop ends the guard once the tree's handlers have returned.
+func (g *leaseGuard) stop() {
+	g.mu.Lock()
+	g.stopped = true
+	g.timer.Stop()
+	children := g.children
+	g.mu.Unlock()
+	g.root.guard.CompareAndSwap(g, nil)
+	for _, h := range children {
+		h.guard.CompareAndSwap(g, nil)
+	}
+	g.cancel(nil)
+}
 
 // treeAge orders task trees for deadlock avoidance: the root task's creation
 // time, then its ID.
@@ -105,6 +274,7 @@ func (r *Runner) tryLease(ctx context.Context, q *queue, subject string, age tre
 	var holderID *uuid.UUID
 	takeCtx, cancel := r.takeCtx(ctx)
 	defer cancel()
+	sent := time.Now()
 	err := r.db.QueryRow(takeCtx, `
 WITH taken AS (
 	INSERT INTO `+q.leases+` AS l (subject, owner, expires, tree_created, tree_id)
@@ -136,6 +306,7 @@ SELECT false, false, tree_created, tree_id FROM `+q.leases+`
 		r.metrics.observeTakeover(ctx, q)
 	}
 	h := &hold{q: q, subject: subject, token: token, age: age}
+	h.extend(sent, r.opts.LeaseTTL)
 	r.mu.Lock()
 	r.holds[token] = h
 	r.mu.Unlock()
@@ -245,6 +416,7 @@ FROM (SELECT 1) one LEFT JOIN next ON true LEFT JOIN claimed ON true`,
 		r.metrics.observeTakeover(ctx, q)
 	}
 	h := &hold{q: q, subject: subject, token: token, age: age, releaseOnCommit: true}
+	h.extend(sent, r.opts.LeaseTTL)
 	r.mu.Lock()
 	r.holds[token] = h
 	r.mu.Unlock()
@@ -307,6 +479,7 @@ func (r *Runner) failedTake(ctx, takeCtx context.Context, q *queue, subject stri
 // starts with the whole of it: it returns errLeaseLost when another consumer
 // has taken the lease over or it has expired.
 func (r *Runner) setAge(ctx context.Context, h *hold, age treeAge) error {
+	sent := time.Now()
 	tag, err := r.db.Exec(ctx, `UPDATE `+h.q.leases+` SET tree_created = $3, tree_id = $4,
 		expires = now() + $5 * interval '1 millisecond'
 		WHERE subject = $1 AND owner = $2 AND expires >= now()`, h.subject, h.token, age.created, age.id, r.opts.LeaseTTL.Milliseconds())
@@ -314,9 +487,10 @@ func (r *Runner) setAge(ctx context.Context, h *hold, age treeAge) error {
 		return fmt.Errorf("record tree on lease %s/%s: %w", h.q.name, h.subject, err)
 	}
 	if tag.RowsAffected() == 0 {
-		h.lost.Store(true)
+		h.lose()
 		return errLeaseLost
 	}
+	h.extend(sent, r.opts.LeaseTTL)
 	h.age = age
 	return nil
 }
@@ -551,8 +725,9 @@ func (r *Runner) awaitFree(ctx context.Context, key subjectKey, d time.Duration)
 
 // renewLoop extends every lease this process holds and has not let expire, and every sync task's
 // claim that its caller is waiting, three times per TTL. A lease found taken
-// over is marked lost; the tree under it stops before its next attempt and
-// fails its commit.
+// over is marked lost: the handlers running under it are stopped (see
+// leaseGuard), and the tree under it stops before its next attempt and fails
+// its commit.
 func (r *Runner) renewLoop(ctx context.Context) {
 	defer close(r.renewDone)
 	t := time.NewTicker(r.opts.LeaseTTL / 3)
@@ -593,6 +768,7 @@ func (r *Runner) renew(ctx context.Context, q *queue, tokens []uuid.UUID) {
 	// this statement sees the expiry from before the commit extended it, which
 	// a long commit outlasts. Only a row renewal could lock is judged by its
 	// expiry.
+	sent := time.Now()
 	rows, err := r.db.Query(ctx, `WITH mine AS (
 			SELECT subject, owner, expires FROM `+q.leases+` WHERE owner = ANY($1)
 			FOR UPDATE SKIP LOCKED),
@@ -600,9 +776,9 @@ func (r *Runner) renew(ctx context.Context, q *queue, tokens []uuid.UUID) {
 			UPDATE `+q.leases+` l SET expires = now() + $2 * interval '1 millisecond'
 			FROM mine WHERE l.subject = mine.subject AND l.owner = mine.owner
 				AND mine.expires >= now() RETURNING l.owner)
-		SELECT owner FROM renewed
+		SELECT owner, true FROM renewed
 		UNION ALL
-		SELECT owner FROM `+q.leases+` WHERE owner = ANY($1)
+		SELECT owner, false FROM `+q.leases+` WHERE owner = ANY($1)
 			AND owner NOT IN (SELECT owner FROM mine)`, tokens, r.opts.LeaseTTL.Milliseconds())
 	if err != nil {
 		if ctx.Err() == nil {
@@ -610,11 +786,13 @@ func (r *Runner) renew(ctx context.Context, q *queue, tokens []uuid.UUID) {
 		}
 		return
 	}
+	// kept maps each lease still held to whether this statement extended it.
 	kept := map[uuid.UUID]bool{}
 	for rows.Next() {
 		var token uuid.UUID
-		if err := rows.Scan(&token); err == nil {
-			kept[token] = true
+		var renewed bool
+		if err := rows.Scan(&token, &renewed); err == nil {
+			kept[token] = renewed
 		}
 	}
 	rows.Close()
@@ -622,15 +800,22 @@ func (r *Runner) renew(ctx context.Context, q *queue, tokens []uuid.UUID) {
 		return
 	}
 	for _, token := range tokens {
-		if !kept[token] {
-			r.mu.Lock()
-			h := r.holds[token]
+		renewed, ok := kept[token]
+		r.mu.Lock()
+		h := r.holds[token]
+		if !ok {
 			delete(r.holds, token)
-			r.mu.Unlock()
-			if h != nil {
-				h.lost.Store(true)
-				r.log.Warn("lease lost to another consumer", zapSubject(q.name, h.subject))
-			}
+		}
+		r.mu.Unlock()
+		if h == nil {
+			continue
+		}
+		if renewed {
+			h.extend(sent, r.opts.LeaseTTL)
+		}
+		if !ok {
+			h.lose()
+			r.log.Warn("lease lost to another consumer", zapSubject(q.name, h.subject))
 		}
 	}
 }

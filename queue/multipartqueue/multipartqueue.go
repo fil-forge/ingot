@@ -37,9 +37,11 @@ import (
 // would leave an abandoned upload open, holding its parts' blobs.
 var abortRetry = taskrunner.RetryPolicy{First: time.Second, Max: 5 * time.Minute, Multiplier: 2}
 
-// acceptRetry retries a failed accept a few times. A later part's accept, or
-// Complete, queues whatever is left again.
-var acceptRetry = taskrunner.RetryPolicy{First: 5 * time.Second, Max: time.Minute, Multiplier: 2, Attempts: 5}
+// acceptRetry retries a failed accept with no attempt limit: once the client
+// has sent its last part, only Complete queues the parts' blobs for
+// acceptance again, and a blob left parked is lost when its provider expires
+// the allocation.
+var acceptRetry = taskrunner.RetryPolicy{First: 5 * time.Second, Max: 5 * time.Minute, Multiplier: 2}
 
 // DefaultSessionTTL is how long an upload stays open before its auto-abort,
 // and a completed one is kept for a repeated Complete before its reap.

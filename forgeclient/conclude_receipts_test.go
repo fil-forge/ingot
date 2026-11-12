@@ -86,6 +86,9 @@ type fakeSprue struct {
 	// reject holds the accept tasks the node refuses: each answers with a
 	// failure receipt while the rest of the batch is accepted.
 	reject map[cid.Cid]bool
+	// rejectAs names the failure a refused accept task answers with, in
+	// place of BlobNotFound.
+	rejectAs map[cid.Cid]string
 	// omit holds the accept tasks whose acceptance is left out of the
 	// response, as an upload service does when the full answer would not
 	// fit in one container; the client is expected to poll for those.
@@ -156,8 +159,12 @@ func (f *fakeSprue) conclude(req *binding.Request[*ucancmds.ConcludeArguments], 
 			continue
 		}
 		if f.reject[acceptTask] {
+			name := "BlobNotFound"
+			if as, ok := f.rejectAs[acceptTask]; ok {
+				name = as
+			}
 			accRcpt, err := receipt.IssueErr(f.node, acceptTask, datamodel.Map{
-				"name":    "BlobNotFound",
+				"name":    name,
 				"message": "the bytes never arrived",
 			})
 			if err != nil {
@@ -366,6 +373,31 @@ func TestBlobConcludeAllKeepsChunkAroundRefusedAccept(t *testing.T) {
 	require.NotNil(t, out[0].Location)
 	require.Nil(t, out[1].Location, "the refused blob is not located")
 	require.NotNil(t, out[2].Location, "a blob after the refused one is still resolved")
+}
+
+// TestBlobConcludeAllNamesALostAllocation: an accept the node refuses because
+// it no longer holds the allocation fails the conclude with ErrAllocationGone,
+// also when another blob of the chunk was refused for another reason first.
+// Any other refusal does not.
+func TestBlobConcludeAllNamesALostAllocation(t *testing.T) {
+	for _, name := range []string{blobcmds.AllocationExpiredErrorName, blobcmds.AllocationNotFoundErrorName} {
+		c, fake := concludeFixture(t)
+		parked := []AddedBlob{parkBlob(t, fake), parkBlob(t, fake), parkBlob(t, fake)}
+		fake.reject[parked[0].AcceptTask] = true
+		fake.reject[parked[2].AcceptTask] = true
+		fake.rejectAs = map[cid.Cid]string{parked[2].AcceptTask: name}
+
+		out, err := c.BlobConcludeAll(t.Context(), randomDID(t), parked)
+		require.ErrorIs(t, err, ErrAllocationGone, name)
+		require.NotNil(t, out[1].Location, "the blob between the refused ones is still resolved")
+	}
+
+	c, fake := concludeFixture(t)
+	parked := []AddedBlob{parkBlob(t, fake)}
+	fake.reject[parked[0].AcceptTask] = true
+	_, err := c.BlobConcludeAll(t.Context(), randomDID(t), parked)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrAllocationGone)
 }
 
 // TestBlobConcludeAllDrainsChunkPastFailedPoll pins what a chunk yields

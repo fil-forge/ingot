@@ -103,6 +103,11 @@ func localIngotBinary(t *testing.T) string {
 	return builtBinary
 }
 
+// pinnedBlockchainImage is a filecoin-localdev image (its multi-arch index,
+// tagged 96e9d9e) whose Anvil loads the chain state of the smelt version
+// go.mod pins; forgeStack explains why it is pinned.
+const pinnedBlockchainImage = "ghcr.io/fil-forge/filecoin-localdev@sha256:96e72624eb71efb1c15de1d0729b780955e5ece700e840dd56291f5c522b4bee"
+
 // forgeStack boots the smelt stack with the working tree's ingot injected
 // (plus any extra stack options), waits for ingot's S3 listener, and returns
 // the stack and ingot's host endpoint. Callers must provision a hilt tenant
@@ -118,6 +123,17 @@ func forgeStack(t *testing.T, extra ...stack.Option) (*stack.Stack, string) {
 		stack.WithPiriNodes(stack.PiriNodeConfig{Postgres: true}),
 		stack.WithServiceBinary("ingot", localIngotBinary(t)),
 	}
+	// The blockchain image is pinned, not smelt's default moving :main tag:
+	// Anvil loads the chain state smelt commits beside its compose file only
+	// in a localdev image whose Anvil can parse it, and a republished :main
+	// need not. Remove the pin (and this override with it) once ingot depends
+	// on a smelt version that pins the localdev image beside its state.
+	blockchainImage := pinnedBlockchainImage
+	if img := os.Getenv("INGOT_ITEST_BLOCKCHAIN_IMAGE"); img != "" {
+		t.Logf("using blockchain image override: %s", img)
+		blockchainImage = img
+	}
+	opts = append(opts, stack.WithBlockchainImage(blockchainImage))
 	// Local-dev escape hatches: run against upload-service (sprue) / piri
 	// images the registry doesn't have yet — e.g. built from an unmerged
 	// branch. Unset (CI) uses the published defaults. These exist because the

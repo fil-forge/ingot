@@ -160,7 +160,8 @@ func recordedParts(t *testing.T, b *Backend, uploadID string, parts int) map[int
 // single part (the digest is the part's own root), and a part copied from
 // another object.
 func TestMultipartTree(t *testing.T) {
-	b, _, _ := newRefTestBackend(t, 64<<10)
+	// Blobs of 1 MiB split each 5 MiB part into five.
+	b, _, _ := newRefTestBackend(t, 1<<20)
 	minPart := int(backend.MinPartSize)
 
 	t.Run("in order", func(t *testing.T) {
