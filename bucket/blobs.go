@@ -86,26 +86,48 @@ func (e *EnvelopedBlobExtent) UnmarshalCBOR(r io.Reader) error {
 	return nil
 }
 
-// headEntries and extentEntries are how many blobs BuildBlobList puts in a
-// body's Head and in each extent. Readers accept any split that validates;
-// tests shrink these to cross extent boundaries with small bodies.
-var (
-	headEntries   = 1024
-	extentEntries = 1024
-)
+// BlobListShape is how many blobs BuildBlobList puts in a body's Head and in
+// each extent. Readers accept any split that validates, so a writer may use
+// any shape; tests use small ones to cross extent boundaries with small
+// bodies.
+type BlobListShape struct {
+	// Head is how many blobs the manifest lists inline; zero for 1,024.
+	Head int
+	// Extent is how many blobs each extent lists; zero for 1,024.
+	Extent int
+}
+
+// defaultListEntries is how many blobs the Head and each extent hold when
+// the shape does not say.
+const defaultListEntries = 1024
+
+func (s BlobListShape) head() int {
+	if s.Head == 0 {
+		return defaultListEntries
+	}
+	return s.Head
+}
+
+func (s BlobListShape) extent() int {
+	if s.Extent == 0 {
+		return defaultListEntries
+	}
+	return s.Extent
+}
+
+// capacity is the most blobs a body of this shape can hold: a full Head and
+// every extent full.
+func (s BlobListShape) capacity() int { return s.head() + maxExtentRefs*s.extent() }
 
 // maxExtentRefs is how many extents a body can point to: cbor-gen's default
 // cap on a slice, which BlobList.Extents keeps.
 const maxExtentRefs = 8192
 
-// MaxBodyBlobs is the most blobs one body can hold: a full Head and every
-// extent full. At the default blob size that is far past S3's largest
+// MaxBodyBlobs is the most blobs one body can hold at the default shape: a
+// full Head and every extent full. At the default blob size that is far past S3's largest
 // object; it binds only a deployment whose max_blob_size is under about
 // 6.1 MiB.
-const MaxBodyBlobs = 1024 + maxExtentRefs*1024
-
-// blobCapacity is MaxBodyBlobs at the current writer constants.
-func blobCapacity() int { return headEntries + maxExtentRefs*extentEntries }
+const MaxBodyBlobs = defaultListEntries + maxExtentRefs*defaultListEntries
 
 // BlobRef is one blob of a body in memory: its digest and the inclusive
 // plaintext span [Start, End] it covers within the object (HTTP Range
@@ -197,14 +219,14 @@ func ReadBlobRefs(ctx context.Context, idx BlobIndex) (BlobRefs, error) {
 	return out, nil
 }
 
-// BuildBlobList cuts refs into a Head and extents, writing each extent
-// through w, and returns the list for the manifest. It runs inside the
+// BuildBlobList cuts refs into a Head and extents of the given shape, writing
+// each extent through w, and returns the list for the manifest. It runs inside the
 // commit's transaction, as the leaf's version and state trees are built, so
 // the extents are logged and shipped with the manifest that names them.
 // Identical refs give identical CIDs.
-func BuildBlobList(ctx context.Context, w blockstore.Writer, refs BlobRefs) (BlobList, error) {
-	if len(refs) > blobCapacity() {
-		return BlobList{}, fmt.Errorf("bucket: a body holds at most %d blobs, this one has %d", blobCapacity(), len(refs))
+func BuildBlobList(ctx context.Context, w blockstore.Writer, refs BlobRefs, shape BlobListShape) (BlobList, error) {
+	if len(refs) > shape.capacity() {
+		return BlobList{}, fmt.Errorf("bucket: a body holds at most %d blobs, this one has %d", shape.capacity(), len(refs))
 	}
 	var next int64
 	for i, b := range refs {
@@ -216,10 +238,10 @@ func BuildBlobList(ctx context.Context, w blockstore.Writer, refs BlobRefs) (Blo
 		}
 		next = b.End + 1
 	}
-	head := min(len(refs), headEntries)
+	head := min(len(refs), shape.head())
 	list := BlobList{Head: blobEntries(refs[:head])}
-	for i := head; i < len(refs); i += extentEntries {
-		chunk := refs[i:min(i+extentEntries, len(refs))]
+	for i := head; i < len(refs); i += shape.extent() {
+		chunk := refs[i:min(i+shape.extent(), len(refs))]
 		c, err := w.Put(ctx, &EnvelopedBlobExtent{Extent: &BlobExtent{Entries: blobEntries(chunk)}})
 		if err != nil {
 			return BlobList{}, fmt.Errorf("bucket: put blob extent: %w", err)
