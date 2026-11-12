@@ -13,7 +13,7 @@ import (
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/internal/testfakes"
-	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 )
@@ -113,7 +113,7 @@ func TestPendingReferenceHoldsTheBlobUntilItExpires(t *testing.T) {
 		t.Fatalf("the blob the copy references was removed %d times", n)
 	}
 
-	b.dropRefsNow(ctx, mem.bk(), []taskrunner.TaskID{refs[string(d)]}, []multihash.Multihash{d})
+	b.blobs.DropRefsNow(ctx, mem.bk(), []taskrunner.TaskID{refs[string(d)]}, []multihash.Multihash{d})
 	if n := rm.removedDigests()[string(d)]; n != 1 {
 		t.Fatalf("removes of %x once its reference expired = %d, want 1", d, n)
 	}
@@ -150,7 +150,7 @@ func TestAFailedWritesCleanupLeavesAnotherWritesReference(t *testing.T) {
 	deleteFrom(t, b, "bk", "k")
 	drainReleases(t, b)
 
-	b.dropRefsNow(ctx, mem.bk(), []taskrunner.TaskID{failed[string(d)]}, []multihash.Multihash{d})
+	b.blobs.DropRefsNow(ctx, mem.bk(), []taskrunner.TaskID{failed[string(d)]}, []multihash.Multihash{d})
 	if n, _ := mem.CountReferences(ctx, mem.bk(), d, uuid.Nil); n != 1 {
 		t.Fatalf("references to %x after one write's cleanup = %d, want the other write's", d, n)
 	}
@@ -165,13 +165,13 @@ func TestCommitCancelsItsReferencesExpiries(t *testing.T) {
 	b, mem := newDeferredBackend(t, testfakes.NopUploader{})
 	ctx := context.Background()
 	putIn(t, b, "bk", "k", testBody(4<<10))
-	tasks, err := taskrunnertest.Tasks(ctx, mem.pool, "ingot", registry.ReleaseQueue)
+	tasks, err := taskrunnertest.Tasks(ctx, mem.pool, "ingot", spaceshardqueue.Name)
 	if err != nil {
 		t.Fatal(err)
 	}
 	expiries := 0
 	for _, q := range tasks {
-		if q.Action != registry.ExpireAction {
+		if q.Action != spaceshardqueue.ExpireAction {
 			continue
 		}
 		expiries++
@@ -189,9 +189,9 @@ func TestCommitCancelsItsReferencesExpiries(t *testing.T) {
 func expireRefsTo(t *testing.T, b *Backend, space did.DID, digest multihash.Multihash) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := b.releases.Expedite(ctx, registry.ReleaseQueue, registry.ReleaseSubject(space, digest), registry.ExpireAction); err != nil {
+	if _, err := storeFor(b).tasks.Expedite(ctx, spaceshardqueue.Name, spaceshardqueue.Subject(space, digest), spaceshardqueue.ExpireAction); err != nil {
 		t.Fatalf("expedite the expiries: %v", err)
 	}
-	b.releaseNow(ctx, space, []multihash.Multihash{digest})
-	b.releaseNow(ctx, space, []multihash.Multihash{digest})
+	b.blobs.ReleaseNow(ctx, space, []multihash.Multihash{digest})
+	b.blobs.ReleaseNow(ctx, space, []multihash.Multihash{digest})
 }

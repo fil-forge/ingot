@@ -94,8 +94,11 @@ A batch may be empty of blocks: an MST mutation can produce a new root that
 points only at nodes already materialized in a prior segment, so `AppendBatch`
 is called with the op-root alone.
 
-The log seals on its own trigger and reports each seal through `OnSealed`;
-the owner (`s3frontend.Backend.QueueShip`) queues a `queue-bucket.ship` on
+The log seals on its own trigger and reports each seal to the callback its
+owner sets with `Manager.OnSealed`, holding the seals reported before then,
+those of the buckets the open recovered among them. The owner, the bucket
+queue (`bucketqueue.Queue.QueueShip`, which hands itself to the log when it
+is built), queues a `queue-bucket.ship` on
 the bucket's subject, and that task calls `ShipBucket`. A ship takes the
 bucket's unshipped sealed segments oldest first and stops at the first that
 fails, failing the task. The task retries with no attempt limit (backoff 1s
@@ -254,9 +257,12 @@ type ManagerConfig struct {
     Meta     Meta                          // persistence backend (registry.Postgres / fake)
     Catalog  PlaneConfig                   // pipeline template applied to every bucket store
     FlushFor func(bucket string) FlushFunc // per-bucket ship closure; required when Catalog.Ship
-    OnSealed func(bucket string)           // told when a bucket has a sealed segment to ship
     Logger   *zap.Logger
 }
+
+// OnSealed sets the callback told when a bucket has a sealed segment to
+// ship; seals reported before it is set are held and told to it then.
+func (m *Manager) OnSealed(fn func(bucket string))
 
 type PlaneConfig struct {
     SealBytes int64         // open-segment CAR size threshold (0 -> 64 MiB)

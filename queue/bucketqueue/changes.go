@@ -1,15 +1,13 @@
-package s3frontend
+package bucketqueue
 
 import (
-	"errors"
+	"strings"
 	"time"
 
-	"github.com/fil-forge/versitygw/backend"
-	"github.com/fil-forge/versitygw/s3err"
 	"github.com/google/uuid"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
-	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/taskrunner"
 )
 
@@ -23,7 +21,7 @@ type BucketCommitTask struct {
 	Changes []KeyChange
 	// Release is the authority the releases of dropped claims remove their
 	// blobs with.
-	Release registry.ReleaseTask
+	Release spaceshardqueue.ReleaseTask
 	// RegisterAdd and RegisterRemove are the /upload/add and /upload/remove
 	// proofs the upload registrations a commit queues run with; empty when
 	// the request held none, and the registration is then skipped.
@@ -116,7 +114,7 @@ type DeleteChange struct {
 	ETag    string
 }
 
-// DeletePreconditions are DeleteObject's If-Match, If-Match-Size and
+// DeletePreconditions are a delete's If-Match, If-Match-Size and
 // If-Match-Last-Modified-Time.
 type DeletePreconditions struct {
 	// HasIfMatch and IfMatch are If-Match.
@@ -170,120 +168,23 @@ type ChangeResult struct {
 	Err *ChangeError
 }
 
-// ChangeError is a change's failure on its own terms, carried as the S3
-// error it answers.
-type ChangeError struct {
-	// Kind says which error type it rebuilds as: "api",
-	// "precondition", "no-such-version", "invalid-argument", "reservation"
-	// or "reference-expired".
-	Kind string
-	// Code, Description and Status are the S3 error's.
-	Code        string
-	Description string
-	Status      int64
-	// Key and VersionID are a NoSuchVersion's.
-	Key       string
-	VersionID string
-	// ArgName and ArgValue are an InvalidArgument's.
-	ArgName  string
-	ArgValue string
-	// Condition is a PreconditionFailed's.
-	Condition string
+// check evaluates the preconditions against the version a delete removes
+// or supersedes, as S3 does: If-Match "*" matches any version, and the
+// modification time compares to the second.
+func (p *DeletePreconditions) check(mf *msbucket.ObjectManifest) error {
+	if p.HasIfMatch && p.IfMatch != "*" && p.IfMatch != strings.Trim(mf.QuotedETag(), `"`) {
+		return preconditionFailed(ConditionIfMatch)
+	}
+	if p.HasModTime && time.Unix(0, p.ModTime).Unix() != mf.Created {
+		return preconditionFailed(ConditionIfMatchLastModTime)
+	}
+	if p.HasSize && p.Size != mf.Body.Size {
+		return preconditionFailed(ConditionIfMatchSize)
+	}
+	return nil
 }
 
-// changeError classifies err as a change's own failure, or reports false for
-// one that fails the whole commit.
-func changeError(err error) (*ChangeError, bool) {
-	var pf s3err.PreconditionFailedError
-	if errors.As(err, &pf) {
-		return &ChangeError{Kind: "precondition", Code: pf.Code, Description: pf.Description, Status: int64(pf.HTTPStatusCode), Condition: string(pf.Condition)}, true
-	}
-	var nsv s3err.NoSuchVersionError
-	if errors.As(err, &nsv) {
-		return &ChangeError{Kind: "no-such-version", Key: nsv.Key, VersionID: nsv.VersionId}, true
-	}
-	var inv s3err.InvalidArgumentError
-	if errors.As(err, &inv) {
-		return &ChangeError{Kind: "invalid-argument", Description: inv.Description, ArgName: inv.ArgumentName, ArgValue: inv.ArgumentValue}, true
-	}
-	var api s3err.APIError
-	if errors.As(err, &api) {
-		return &ChangeError{Kind: "api", Code: api.Code, Description: api.Description, Status: int64(api.HTTPStatusCode)}, true
-	}
-	switch {
-	case errors.Is(err, errReservationSuperseded):
-		return &ChangeError{Kind: "reservation"}, true
-	case errors.Is(err, registry.ErrReferenceExpired):
-		return &ChangeError{Kind: "reference-expired"}, true
-	}
-	return nil, false
-}
-
-// err rebuilds the error the change failed with.
-func (e *ChangeError) err() error {
-	switch e.Kind {
-	case "precondition":
-		return s3err.PreconditionFailedError{APIError: s3err.APIError{Code: e.Code, Description: e.Description, HTTPStatusCode: int(e.Status)}, Condition: s3err.Condition(e.Condition)}
-	case "no-such-version":
-		return s3err.GetNoSuchVersionErr(e.Key, e.VersionID)
-	case "invalid-argument":
-		return s3err.InvalidArgumentError{Description: e.Description, ArgumentName: e.ArgName, ArgumentValue: e.ArgValue}
-	case "reservation":
-		return errReservationSuperseded
-	case "reference-expired":
-		return registry.ErrReferenceExpired
-	}
-	return s3err.APIError{Code: e.Code, Description: e.Description, HTTPStatusCode: int(e.Status)}
-}
-
-// deletePreconditions converts S3's delete preconditions for a change;
-// nil for none.
-func deletePreconditions(p *backend.ObjectDeletePreconditions) *DeletePreconditions {
-	if p == nil || (p.IfMatch == nil && p.IfMatchSize == nil && p.IfMatchLastModTime == nil) {
-		return nil
-	}
-	var out DeletePreconditions
-	if p.IfMatch != nil {
-		out.HasIfMatch, out.IfMatch = true, *p.IfMatch
-	}
-	if p.IfMatchSize != nil {
-		out.HasSize, out.Size = true, *p.IfMatchSize
-	}
-	if p.IfMatchLastModTime != nil {
-		out.HasModTime, out.ModTime = true, p.IfMatchLastModTime.UnixNano()
-	}
-	return &out
-}
-
-// preconditions converts a change's delete preconditions back for
-// backend.EvaluateObjectDeletePreconditions.
-func (p *DeletePreconditions) preconditions() backend.ObjectDeletePreconditions {
-	var out backend.ObjectDeletePreconditions
-	if p.HasIfMatch {
-		v := p.IfMatch
-		out.IfMatch = &v
-	}
-	if p.HasSize {
-		v := p.Size
-		out.IfMatchSize = &v
-	}
-	if p.HasModTime {
-		v := time.Unix(0, p.ModTime)
-		out.IfMatchLastModTime = &v
-	}
-	return out
-}
-
-// blobRefTasks converts a write's pending references for a change.
-func blobRefTasks(refs map[string]taskrunner.TaskID) []BlobRefTask {
-	out := make([]BlobRefTask, 0, len(refs))
-	for d, id := range refs {
-		out = append(out, BlobRefTask{Digest: []byte(d), Ref: append([]byte(nil), id[:]...)})
-	}
-	return out
-}
-
-// refMap is blobRefTasks' inverse.
+// refMap is the map of a put's pending references by digest.
 func refMap(refs []BlobRefTask) (map[string]taskrunner.TaskID, error) {
 	out := make(map[string]taskrunner.TaskID, len(refs))
 	for _, r := range refs {
@@ -305,4 +206,9 @@ func (p *PutChange) putBlobs() msbucket.BlobRefs {
 		return msbucket.BlobRefs{}
 	}
 	return msbucket.BlobRefs(p.Blobs)
+}
+
+// etagsEqual compares two ETags, quoted or not.
+func etagsEqual(a, b string) bool {
+	return strings.Trim(a, `"`) == strings.Trim(b, `"`)
 }

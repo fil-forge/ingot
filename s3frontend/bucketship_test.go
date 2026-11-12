@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 )
@@ -46,10 +47,7 @@ func TestShipWithoutAuthorityFailsForGood(t *testing.T) {
 				log.Log = d.Log
 				d.Log = log
 			})
-			ctx := context.Background()
-			if err := b.queueShip(ctx, "bk"); err != nil {
-				t.Fatalf("queue ship: %v", err)
-			}
+			b.buckets.QueueShip("bk")
 			deadline := time.Now().Add(10 * time.Second)
 			for log.ships.Load() == 0 || shipState(t, mem) == "pending" && tc.state == "failed" {
 				if time.Now().After(deadline) {
@@ -89,28 +87,25 @@ func TestTheNextWriteQueuesAShipThatFoundNoAuthority(t *testing.T) {
 		d.Log = log
 	})
 	log.b = b
-	if err := b.queueShip(context.Background(), "bk"); err != nil {
-		t.Fatalf("queue ship: %v", err)
-	}
+	b.buckets.QueueShip("bk")
 	require.Eventually(t, func() bool { return shipState(t, mem) == "failed" },
 		10*time.Second, 10*time.Millisecond, "the ship without authority never failed")
 
 	putObj(t, b, "k", []byte("brings authority"))
-	require.Eventually(t, func() bool { return !b.awaitingShip("bk") },
+	require.Eventually(t, func() bool { return log.ships.Load() == 2 },
 		10*time.Second, 10*time.Millisecond, "the write never shipped the bucket")
-	require.EqualValues(t, 2, log.ships.Load())
 }
 
 // shipState is the state of bk's only queue-bucket.ship task.
 func shipState(t *testing.T, mem *testStore) string {
 	t.Helper()
-	tasks, err := mem.queued(context.Background(), registry.BucketQueue)
+	tasks, err := mem.queued(context.Background(), bucketqueue.Name)
 	if err != nil {
 		t.Fatalf("queued: %v", err)
 	}
 	state := ""
 	for _, task := range tasks {
-		if task.Action == registry.BucketShipAction {
+		if task.Action == bucketqueue.ShipAction {
 			if state != "" {
 				t.Fatal("more than one ship queued")
 			}
@@ -137,24 +132,22 @@ func (f *flakyGet) Get(ctx context.Context, name string) (*registry.State, error
 // A ship notice that cannot be queued is retried until it is: an idle bucket
 // has no next seal to queue one.
 func TestAShipThatCannotBeQueuedIsRetried(t *testing.T) {
-	saved := shipNoticeFirst
-	shipNoticeFirst = 20 * time.Millisecond
-	t.Cleanup(func() { shipNoticeFirst = saved })
 	reg := &flakyGet{}
 	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
 		reg.Registry = d.Registry
 		d.Registry = reg
+		d.tuneBuckets = func(d *bucketqueue.Deps) { d.ShipRetryFirst = 20 * time.Millisecond }
 	})
 	reg.fails.Store(2)
-	b.QueueShip("bk")
+	b.buckets.QueueShip("bk")
 
 	require.Eventually(t, func() bool {
-		tasks, err := mem.queued(context.Background(), registry.BucketQueue)
+		tasks, err := mem.queued(context.Background(), bucketqueue.Name)
 		if err != nil {
 			return false
 		}
 		for _, task := range tasks {
-			if task.Action == registry.BucketShipAction {
+			if task.Action == bucketqueue.ShipAction {
 				return true
 			}
 		}

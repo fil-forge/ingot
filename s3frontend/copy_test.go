@@ -25,6 +25,7 @@ import (
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/internal/testfakes"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 )
@@ -335,8 +336,8 @@ func TestPinBlobsRefusesABlobTheSpaceNoLongerHolds(t *testing.T) {
 	}
 	var blobs msbucket.BlobRefs
 	blobs.Append(mustSum([]byte("released")), 8)
-	if _, err := b.pinBlobs(ctx, st, blobs); !errors.Is(err, errBlobGone) {
-		t.Fatalf("pinBlobs of an unlocated blob: err = %v, want errBlobGone", err)
+	if _, err := b.pinBlobs(ctx, st, blobs); !errors.Is(err, spaceshardqueue.ErrBlobGone) {
+		t.Fatalf("pinBlobs of an unlocated blob: err = %v, want spaceshardqueue.ErrBlobGone", err)
 	}
 }
 

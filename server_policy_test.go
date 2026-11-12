@@ -7,15 +7,18 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
 	awsv4 "github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/iam"
 	"github.com/fil-forge/ingot/internal/cors"
 	"github.com/fil-forge/ingot/internal/pgtest"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
 	s3 "github.com/fil-forge/libforge/commands/s3"
@@ -82,13 +85,17 @@ func TestBuildS3API_BucketPolicy(t *testing.T) {
 	mem := registry.NewPostgres(pgtest.New(t))
 	require.NoError(t, mem.Create(ctx, "photos", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}))
 	f := &fakeAuthority{}
-	backend := s3frontend.New(s3frontend.Deps{Registry: mem, CORS: corsCfg, Authority: f})
+	id, err := identity.New("", "did:web:ingot.test")
+	require.NoError(t, err)
+	tasks, err := provideTaskRunner(nil, id, zap.NewNop())
+	require.NoError(t, err)
+	cache, err := blockstore.NewBlobCache(filepath.Join(t.TempDir(), "cache"))
+	require.NoError(t, err)
+	backend, err := s3frontend.New(s3frontend.Deps{Tasks: tasks, Registrar: testfakes.NopUploader{}, Registry: mem, Cache: cache, CORS: corsCfg, Authority: f})
+	require.NoError(t, err)
 	// New registers its gauges on the global meter provider; leaving them
 	// registered would leak this backend's into a later test's provider.
 	t.Cleanup(func() { _ = backend.CloseMetrics() })
-
-	id, err := identity.New("", "did:web:ingot.test")
-	require.NoError(t, err)
 	const secret = "policysecret"
 	svc := secretIAM{Service: iam.New(neverAuthorizer{}, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache()), secret: secret}
 	cfg := config.ServerConfig{Region: "us-east-1", MaxConnections: 16, MaxRequests: 16}

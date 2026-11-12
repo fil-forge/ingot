@@ -3,13 +3,16 @@ package s3frontend
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3err"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/internal/cors"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -30,7 +33,15 @@ func TestGetBucketCors(t *testing.T) {
 		if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 			t.Fatalf("create bucket: %v", err)
 		}
-		return New(Deps{Registry: mem, CORS: corsCfg})
+		cache, err := blockstore.NewBlobCache(filepath.Join(t.TempDir(), "cache"))
+		if err != nil {
+			t.Fatalf("cache: %v", err)
+		}
+		b, err := New(Deps{Tasks: mem.tasks, Registrar: testfakes.NopUploader{}, Registry: mem, Cache: cache, CORS: corsCfg})
+		if err != nil {
+			t.Fatalf("backend: %v", err)
+		}
+		return b
 	}
 
 	// The document must survive New's marshalling into something

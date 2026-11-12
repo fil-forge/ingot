@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3err"
 
@@ -78,5 +79,7 @@ func (b *Backend) DeleteBucketCors(ctx context.Context, bucket string) error {
 // setCORSConfig stores doc as the bucket's own CORS document
 // (queue-bucket.set-cors).
 func (b *Backend) setCORSConfig(ctx context.Context, bucket string, doc []byte) error {
-	return b.setBucketConfig(ctx, bucket, registry.BucketSetCORSAction, doc)
+	return b.setBucket(ctx, bucket, func(ctx context.Context, space did.DID, name string) error {
+		return b.buckets.SetCORS(ctx, space, name, doc)
+	})
 }

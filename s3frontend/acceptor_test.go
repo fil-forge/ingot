@@ -19,8 +19,11 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 
+	"github.com/fil-forge/ingot/queue/multipartqueue"
+	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 	"github.com/fil-forge/ingot/uploader"
 )
 
@@ -29,17 +32,17 @@ import (
 func cancelQueuedAccepts(t *testing.T, b *Backend, uploadID string) {
 	t.Helper()
 	ctx := context.Background()
-	tasks, err := storeFor(b).queued(ctx, registry.MultipartQueue)
+	tasks, err := storeFor(b).queued(ctx, multipartqueue.Name)
 	if err != nil {
 		t.Fatalf("queued accepts: %v", err)
 	}
 	var ids []taskrunner.TaskID
 	for _, task := range tasks {
-		if task.Subject == uploadID && task.Action == registry.MultipartAcceptAction && task.State == "pending" {
+		if task.Subject == uploadID && task.Action == multipartqueue.AcceptAction && task.State == "pending" {
 			ids = append(ids, task.ID)
 		}
 	}
-	if err := b.uploads.Cancel(ctx, registry.MultipartQueue, ids...); err != nil {
+	if err := storeFor(b).tasks.Cancel(ctx, multipartqueue.Name, ids...); err != nil {
 		t.Fatalf("cancel queued accepts: %v", err)
 	}
 }
@@ -52,10 +55,10 @@ func runAccepts(t *testing.T, b *Backend, uploadID string) error {
 	t.Helper()
 	cancelQueuedAccepts(t, b, uploadID)
 	ctx := context.Background()
-	if _, err := b.uploads.Run(ctx, taskrunner.Spec{
-		Queue:   registry.MultipartQueue,
+	if _, err := storeFor(b).tasks.Run(ctx, taskrunner.Spec{
+		Queue:   multipartqueue.Name,
 		Subject: uploadID,
-		Action:  registry.MultipartAcceptAction,
+		Action:  multipartqueue.AcceptAction,
 	}); err != nil {
 		return err
 	}
@@ -70,7 +73,23 @@ func runAccepts(t *testing.T, b *Backend, uploadID string) error {
 	if err != nil {
 		return err
 	}
-	return b.awaitBlobAccepts(ctx, sess.Space, parts, time.Now().Add(10*time.Second))
+	due, err := b.blobs.ExpediteAccepts(ctx, sess.Space)
+	if err != nil {
+		return err
+	}
+	expires := time.Now().Add(10 * time.Second)
+	for _, p := range parts {
+		for _, d := range p.BlobDigests {
+			subject := spaceshardqueue.Subject(sess.Space, d)
+			if len(due[subject]) == 0 {
+				continue
+			}
+			if err := b.blobs.Flush(ctx, subject, expires); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // countingConcluder is a parking uploader that records what each conclude
@@ -189,7 +208,7 @@ func TestAcceptAcceptsPartsWhileUploading(t *testing.T) {
 // else run.
 func TestUploadedPartsAreAcceptedInTheBackground(t *testing.T) {
 	b, mem := newDeferredBackend(t, &countingConcluder{})
-	b.acceptDelay = 0
+	storeFor(b).limits.AcceptDelay = 0
 	key := "accept-in-background"
 	uploadID := mpCreate(t, b, key, "", "")
 	uploadDistinctParts(t, b, key, uploadID, 2)
@@ -219,13 +238,13 @@ func TestUploadPartQueuesOneAccept(t *testing.T) {
 	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartParked) {
 		t.Fatalf("part states = %v, want all parked", states)
 	}
-	tasks, err := mem.queued(context.Background(), registry.MultipartQueue)
+	tasks, err := mem.queued(context.Background(), multipartqueue.Name)
 	if err != nil {
 		t.Fatalf("queued: %v", err)
 	}
 	pending := 0
 	for _, task := range tasks {
-		if task.Subject == uploadID && task.Action == registry.MultipartAcceptAction && task.State == "pending" {
+		if task.Subject == uploadID && task.Action == multipartqueue.AcceptAction && task.State == "pending" {
 			pending++
 		}
 	}
@@ -453,12 +472,11 @@ func TestCompleteWaitsForARunningAccept(t *testing.T) {
 // leaves the upload open, so a client that retries on its own commits once
 // the accept is done (botocore clients do not retry it).
 func TestCompleteOverTheWaitBudgetLeavesTheUploadOpen(t *testing.T) {
-	saved := acceptWaitBudget
-	acceptWaitBudget = 20 * time.Millisecond
-	t.Cleanup(func() { acceptWaitBudget = saved })
-
 	g := newGatedConcluder()
 	b, mem := newDeferredBackend(t, g)
+	limits := storeFor(b).limits
+	saved := limits.AcceptWait
+	limits.AcceptWait = 20 * time.Millisecond
 	ctx := context.Background()
 	key := "complete-over-budget"
 	uploadID := mpCreate(t, b, key, "", "")
@@ -481,17 +499,23 @@ func TestCompleteOverTheWaitBudgetLeavesTheUploadOpen(t *testing.T) {
 	}
 	// The retry's accept starts once the background one's lease is free,
 	// which a loaded machine can take longer than the shrunk budget to see.
-	acceptWaitBudget = saved
+	limits.AcceptWait = saved
 	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
 		t.Fatalf("retry Complete: %v", err)
 	}
 }
 
-// TestCompleteFailsWhileTheConcludeFails: a part whose blob's accept fails
-// fails the request, which clients retry, and the retry commits.
-func TestCompleteFailsWhileTheConcludeFails(t *testing.T) {
+// TestCompleteWaitsThroughAFailedConclude: a part whose blob's accept fails
+// and waits to retry holds Complete for the rest of its wait budget, which
+// then answers OperationAborted and leaves the upload open. The client's
+// retry brings the accept's retry forward, and commits.
+func TestCompleteWaitsThroughAFailedConclude(t *testing.T) {
 	cc := &countingConcluder{fails: 1}
-	b, _ := newDeferredBackend(t, cc)
+	b, mem := newDeferredBackend(t, cc)
+	limits := storeFor(b).limits
+	saved := limits.AcceptWait
+	limits.AcceptWait = 500 * time.Millisecond
+	ctx := context.Background()
 	key := "complete-conclude-failing"
 	uploadID := mpCreate(t, b, key, "", "")
 	parts := uploadDistinctParts(t, b, key, uploadID, 1)
@@ -499,11 +523,54 @@ func TestCompleteFailsWhileTheConcludeFails(t *testing.T) {
 
 	_, err := mpComplete(t, b, key, uploadID, parts, nil)
 	var apiErr s3err.APIError
-	if err == nil || (errors.As(err, &apiErr) && apiErr.Code == "OperationAborted") {
-		t.Fatalf("Complete against a failing conclude: err = %v, want the conclude's error", err)
+	if !errors.As(err, &apiErr) || apiErr.Code != "OperationAborted" {
+		t.Fatalf("Complete against a failing conclude: err = %v, want OperationAborted", err)
 	}
+	cc.mu.Lock()
+	concludes := len(cc.calls)
+	cc.mu.Unlock()
+	if concludes != 1 {
+		t.Fatalf("concludes while Complete waited = %d, want the one that failed", concludes)
+	}
+	if sess, err := mem.GetSession(ctx, uploadID); err != nil || sess.State != registry.SessionOpen {
+		t.Fatalf("session after the refused Complete = %+v, %v; want open", sess, err)
+	}
+
+	limits.AcceptWait = saved
 	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
 		t.Fatalf("retry Complete: %v", err)
+	}
+}
+
+// TestCompleteBringsARetryingAcceptForward: a blob's accept has failed and
+// waits to retry. Complete queues no second accept beside it: it brings the
+// waiting one forward, which succeeds, and commits without waiting out the
+// backoff.
+func TestCompleteBringsARetryingAcceptForward(t *testing.T) {
+	cc := &countingConcluder{fails: 1}
+	b, mem := newDeferredBackend(t, cc)
+	key := "complete-retrying-accept"
+	uploadID := mpCreate(t, b, key, "", "")
+	parts := uploadDistinctParts(t, b, key, uploadID, 1)
+	d := hygienePartDigests(t, mem, uploadID, 1)[0]
+	// The blob's accept fails once and waits to retry.
+	if err := runAccepts(t, b, uploadID); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+
+	start := time.Now()
+	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if took := time.Since(start); took > 4*time.Second {
+		t.Errorf("Complete took %v: it waited out the accept's backoff", took)
+	}
+	blobAccept(t, mem, d) // fails the test unless the blob has exactly one accept
+	cc.mu.Lock()
+	concludes := len(cc.calls)
+	cc.mu.Unlock()
+	if concludes != 2 {
+		t.Fatalf("concludes = %d, want 2: the one that failed and its retry", concludes)
 	}
 }
 
@@ -523,16 +590,13 @@ func (s *stallingConcluder) ConcludeBlobs(ctx context.Context, space did.DID, pa
 }
 
 // TestAcceptConcludeTimesOut: a conclude that never answers ends at
-// acceptConcludeTimeout, failing the blob's accept so its retry can run,
+// its time limit, failing the blob's accept so its retry can run,
 // rather than holding the blob's subject for good.
 func TestAcceptConcludeTimesOut(t *testing.T) {
-	saved := acceptConcludeTimeout
-	acceptConcludeTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { acceptConcludeTimeout = saved })
-
 	sc := &stallingConcluder{}
 	sc.stalled.Store(true)
-	b, mem := newDeferredBackend(t, sc)
+	b, mem := newDeferredBackend(t, sc,
+		withBlobs(func(d *spaceshardqueue.Deps) { d.ConcludeTimeout = 50 * time.Millisecond }))
 	key := "accept-conclude-timeout"
 	uploadID := mpCreate(t, b, key, "", "")
 	uploadDistinctParts(t, b, key, uploadID, 1)
@@ -912,7 +976,7 @@ func TestAcceptsShareABlob(t *testing.T) {
 	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: "bk", Space: mem.bk(), ObjectKey: "other"}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, SpanLengths: []int64{1}}, nil, registry.ReleaseTask{}); err != nil {
+	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, SpanLengths: []int64{1}}, nil); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 
@@ -1059,5 +1123,240 @@ func TestAcceptKeepsAParkThatReplacesALocation(t *testing.T) {
 	}
 	if states := partStates(t, mem, uploadID); states[1] != registry.PartParked {
 		t.Fatalf("part state = %q, want parked", states[1])
+	}
+}
+
+// blobAccept returns the one queue-space-shard.accept queued for d in the
+// test bucket's space.
+func blobAccept(t *testing.T, mem *testStore, d multihash.Multihash) taskrunnertest.QueuedTask {
+	t.Helper()
+	tasks, err := mem.queued(context.Background(), spaceshardqueue.Name)
+	if err != nil {
+		t.Fatalf("queued blob accepts: %v", err)
+	}
+	subject := spaceshardqueue.Subject(mem.bk(), d)
+	var found []taskrunnertest.QueuedTask
+	for _, task := range tasks {
+		if task.Subject == subject && task.Action == spaceshardqueue.AcceptAction {
+			found = append(found, task)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("accepts queued for the blob = %d, want 1", len(found))
+	}
+	return found[0]
+}
+
+// TestAcceptRetriesUntilTheConcludeSucceeds: a blob's accept whose conclude
+// keeps failing stays queued to retry however often it has failed, with no
+// later part or Complete to queue it again, and accepts the part once the
+// upload service answers.
+func TestAcceptRetriesUntilTheConcludeSucceeds(t *testing.T) {
+	const failures = 8
+	cc := &countingConcluder{fails: failures}
+	b, mem := newDeferredBackend(t, cc)
+	ctx := context.Background()
+	key := "accept-keeps-retrying"
+	uploadID := mpCreate(t, b, key, "", "")
+	uploadDistinctParts(t, b, key, uploadID, 1)
+	d := hygienePartDigests(t, mem, uploadID, 1)[0]
+	// The blob's accept fails once and waits to retry.
+	if err := runAccepts(t, b, uploadID); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+
+	// Each retry is brought forward in place of waiting out its backoff. A
+	// task's attempts count its failures.
+	bringForward := func() {
+		t.Helper()
+		if _, err := b.blobs.ExpediteAccepts(ctx, mem.bk()); err != nil {
+			t.Fatalf("bring the accept forward: %v", err)
+		}
+	}
+	for failed := 2; failed <= failures; failed++ {
+		bringForward()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			task := blobAccept(t, mem, d)
+			if task.State != "pending" {
+				t.Fatalf("the accept is %s after %d failures, want it waiting to retry", task.State, task.Attempts)
+			}
+			if task.Attempts >= failed {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("failure %d did not happen: %+v", failed, task)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	bringForward()
+	deadline := time.Now().Add(10 * time.Second)
+	for !allIn(partStates(t, mem, uploadID), registry.PartAccepted) {
+		if time.Now().After(deadline) {
+			t.Fatalf("part states = %v after the conclude succeeded, want accepted; accept = %+v",
+				partStates(t, mem, uploadID), blobAccept(t, mem, d))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// goneConcluder concludes like the parking uploader, except that the
+// provider no longer holds the allocation of a digest marked gone.
+type goneConcluder struct {
+	parkingUploader
+	gmu  sync.Mutex
+	gone map[string]bool
+	// refusing runs, when set, as the provider refuses a conclude.
+	refusing func()
+}
+
+func (g *goneConcluder) setGone(digests ...multihash.Multihash) {
+	g.gmu.Lock()
+	defer g.gmu.Unlock()
+	g.gone = map[string]bool{}
+	for _, d := range digests {
+		g.gone[string(d)] = true
+	}
+}
+
+func (g *goneConcluder) ConcludeBlobs(ctx context.Context, space did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
+	g.gmu.Lock()
+	for _, p := range parked {
+		if g.gone[string(p.Digest)] {
+			refusing := g.refusing
+			g.gmu.Unlock()
+			if refusing != nil {
+				refusing()
+			}
+			return make([]*uploader.BlobLocation, len(parked)), fmt.Errorf("conclude: %w", uploader.ErrAllocationGone)
+		}
+	}
+	g.gmu.Unlock()
+	return g.parkingUploader.ConcludeBlobs(ctx, space, parked)
+}
+
+// TestAcceptFailsForGoodWhenTheAllocationIsGone: the provider no longer holds
+// a parked part's allocation, so its blob's accept fails without a retry and
+// drops the park. Complete refuses the part with InvalidPart, and the same
+// bytes uploaded again park a new allocation, which Complete accepts.
+func TestAcceptFailsForGoodWhenTheAllocationIsGone(t *testing.T) {
+	gc := &goneConcluder{}
+	b, mem := newDeferredBackend(t, gc)
+	setNone(t, b)
+	ctx := context.Background()
+	key := "accept-allocation-gone"
+	part := testBody(int(backend.MinPartSize))
+	d := digestOf(t, part)
+	uploadID, parts := uploadOnePart(t, b, "bk", key, part)
+	gc.setGone(d)
+
+	if err := runAccepts(t, b, uploadID); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if task := blobAccept(t, mem, d); task.State != "failed" {
+		t.Fatalf("the blob's accept is %s, want failed with no retry", task.State)
+	}
+	if _, err := mem.GetPark(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("park of the lost blob: err = %v, want it gone", err)
+	}
+	if states := partStates(t, mem, uploadID); states[1] != registry.PartParked {
+		t.Fatalf("part state = %q, want parked", states[1])
+	}
+	_, err := mpComplete(t, b, key, uploadID, parts, nil)
+	var apiErr s3err.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "InvalidPart" {
+		t.Fatalf("Complete of the lost part: err = %v, want InvalidPart", err)
+	}
+
+	gc.setGone()
+	out, err := mpUploadPart(t, b, key, uploadID, 1, part, nil)
+	if err != nil {
+		t.Fatalf("UploadPart again: %v", err)
+	}
+	if got := hygienePartDigests(t, mem, uploadID, 1)[0]; !bytes.Equal(got, d) {
+		t.Fatalf("the part uploaded again is stored under %x, want %x", got, d)
+	}
+	if _, err := mem.GetPark(ctx, mem.bk(), d); err != nil {
+		t.Fatalf("park of the part uploaded again: %v", err)
+	}
+	n := int32(1)
+	if _, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{ETag: out.ETag, PartNumber: &n}}, nil); err != nil {
+		t.Fatalf("Complete after the part was uploaded again: %v", err)
+	}
+}
+
+// TestALostAllocationsAcceptLeavesAReplacementPark: while the provider
+// refuses a conclude because the allocation is gone, another allocation of
+// the same bytes replaces the park, as a part uploaded again does once the
+// attempt has outlived its lease. The accept that fails drops only the park
+// it concluded: the replacement stays for its own accept.
+func TestALostAllocationsAcceptLeavesAReplacementPark(t *testing.T) {
+	gc := &goneConcluder{}
+	b, mem := newDeferredBackend(t, gc)
+	ctx := context.Background()
+	key := "lost-allocation-replacement-park"
+	uploadID := mpCreate(t, b, key, "", "")
+	uploadDistinctParts(t, b, key, uploadID, 1)
+	d := hygienePartDigests(t, mem, uploadID, 1)[0]
+
+	h, err := multihash.Sum([]byte("replacement allocation"), multihash.SHA2_256, -1)
+	if err != nil {
+		t.Fatalf("multihash: %v", err)
+	}
+	replacement := cid.NewCidV1(cid.Raw, h)
+	gc.setGone(d)
+	gc.refusing = func() {
+		if err := mem.DeletePark(ctx, mem.bk(), d); err != nil {
+			t.Errorf("DeletePark: %v", err)
+		}
+		if ok, err := mem.PutPark(ctx, registry.BlobPark{Space: mem.bk(), Digest: d, AddTask: replacement.Bytes(), AcceptTask: replacement.Bytes(), PutInvocation: []byte{1}, Size: 1}); err != nil || !ok {
+			t.Errorf("PutPark (replacement) = %v, %v", ok, err)
+		}
+	}
+	if err := runAccepts(t, b, uploadID); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if task := blobAccept(t, mem, d); task.State != "failed" {
+		t.Fatalf("the blob's accept is %s, want failed", task.State)
+	}
+	if park, err := mem.GetPark(ctx, mem.bk(), d); err != nil || !bytes.Equal(park.AddTask, replacement.Bytes()) {
+		t.Fatalf("replacement park after the failed accept = %+v, %v; want it kept", park, err)
+	}
+}
+
+// TestAFailingAcceptIsNotQueuedAgain: while a blob's accept keeps failing
+// and waits to retry, the parts uploaded after it and the Completes the
+// client sends queue no further accept of that blob.
+func TestAFailingAcceptIsNotQueuedAgain(t *testing.T) {
+	cc := &countingConcluder{fails: 1 << 30}
+	b, mem := newDeferredBackend(t, cc)
+	limits := storeFor(b).limits
+	limits.AcceptWait = 300 * time.Millisecond
+	key := "failing-accept-queued-once"
+	uploadID := mpCreate(t, b, key, "", "")
+	var parts []types.CompletedPart
+	for i := int32(1); i <= 3; i++ {
+		body := testBody(int(backend.MinPartSize))
+		body[0] = byte(i)
+		out, err := mpUploadPart(t, b, key, uploadID, i, body, nil)
+		if err != nil {
+			t.Fatalf("UploadPart %d: %v", i, err)
+		}
+		num := i
+		parts = append(parts, types.CompletedPart{PartNumber: &num, ETag: out.ETag})
+		if err := runAccepts(t, b, uploadID); err != nil {
+			t.Fatalf("accept after part %d: %v", i, err)
+		}
+	}
+	for range 2 {
+		_, err := mpComplete(t, b, key, uploadID, parts, nil)
+		var apiErr s3err.APIError
+		if !errors.As(err, &apiErr) || apiErr.Code != "OperationAborted" {
+			t.Fatalf("Complete against a failing upload service: err = %v, want OperationAborted", err)
+		}
+	}
+	for n := 1; n <= 3; n++ {
+		blobAccept(t, mem, hygienePartDigests(t, mem, uploadID, n)[0]) // exactly one accept each
 	}
 }

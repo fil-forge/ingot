@@ -1,18 +1,21 @@
 package s3frontend
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"slices"
 	"testing"
 
 	cmds3 "github.com/fil-forge/libforge/commands/s3"
 	"github.com/fil-forge/libforge/testutil"
+	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/s3err"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/reqscope"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 )
@@ -25,61 +28,41 @@ func TestABucketTaskForAnotherSpaceIsNoSuchBucket(t *testing.T) {
 	ctx := context.Background()
 	old := testutil.RandomDID(t)
 
-	err := b.runBucket(ctx, old, registry.BucketSetVersioningAction, &BucketSetVersioningTask{Name: "bk", State: string(registry.VersioningEnabled)})
+	err := runBucketTask(ctx, mem, old, bucketqueue.SetVersioningAction, &bucketqueue.BucketSetVersioningTask{Name: "bk", State: string(registry.VersioningEnabled)})
 	wantNoSuchBucket(t, "set-versioning", err)
 	if st, _ := mem.Get(ctx, "bk"); st.Versioning == registry.VersioningEnabled {
 		t.Fatal("a task for another space set the bucket's versioning")
 	}
 
-	for _, action := range []string{registry.BucketCloseAction, registry.BucketAdmitUploadAction} {
-		wantNoSuchBucket(t, action, b.runBucket(ctx, old, action, &BucketTask{Name: "bk"}))
+	for _, action := range []string{bucketqueue.CloseAction, bucketqueue.AdmitUploadAction} {
+		wantNoSuchBucket(t, action, runBucketTask(ctx, mem, old, action, &bucketqueue.BucketTask{Name: "bk"}))
 	}
 	if st, _ := mem.Get(ctx, "bk"); st.Closing {
 		t.Fatal("a close for another space closed the bucket")
 	}
 
-	args, err := encodeBucketTask(&BucketTask{Name: "bk"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	del := context.WithValue(context.WithValue(ctx, reqscope.RequestKey(), cmds3.Request{}), deleteKey{}, "bk")
-	_, err = b.runDeleteBucket(del, nil, taskrunner.Task{Subject: old.String(), Args: args})
-	wantNoSuchBucket(t, "delete", err)
+	del := context.WithValue(ctx, reqscope.RequestKey(), cmds3.Request{})
+	wantNoSuchBucket(t, "delete", mapBucketError(b.buckets.Delete(del, old, "bk"), "delete"))
 	if _, err := mem.Get(ctx, "bk"); err != nil {
 		t.Fatalf("the bucket after a delete for another space: %v", err)
 	}
 
-	commit, err := encodeBucketTask(&BucketCommitTask{Bucket: "bk"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = b.runCommit(ctx, nil, taskrunner.Task{Subject: old.String(), Args: commit})
-	if !errors.Is(err, bucketop.ErrBucketNotFound) {
-		t.Fatalf("commit for another space: %v, want the bucket not found", err)
-	}
+	wantNoSuchBucket(t, "commit", runBucketTask(ctx, mem, old, bucketqueue.CommitAction, &bucketqueue.BucketCommitTask{Bucket: "bk"}))
 }
 
 // A ship queued for an earlier bucket of the name, or for a bucket since
 // deleted, ships nothing.
 func TestAShipForAnotherBucketShipsNothing(t *testing.T) {
 	log := &shipFails{}
-	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+	_, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
 		log.Log = d.Log
 		d.Log = log
 	})
 	ctx := context.Background()
-	args, err := encodeBucketTask(&BucketTask{Name: "bk"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := b.runShip(ctx, nil, taskrunner.Task{Subject: testutil.RandomDID(t).String(), Args: args}); err != nil {
+	if err := runBucketTask(ctx, mem, testutil.RandomDID(t), bucketqueue.ShipAction, &bucketqueue.BucketTask{Name: "bk"}); err != nil {
 		t.Fatalf("ship for another space: %v", err)
 	}
-	gone, err := encodeBucketTask(&BucketTask{Name: "gone"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := b.runShip(ctx, nil, taskrunner.Task{Subject: mem.bk().String(), Args: gone}); err != nil {
+	if err := runBucketTask(ctx, mem, mem.bk(), bucketqueue.ShipAction, &bucketqueue.BucketTask{Name: "gone"}); err != nil {
 		t.Fatalf("ship of a deleted bucket: %v", err)
 	}
 	if n := log.ships.Load(); n != 0 {
@@ -90,17 +73,17 @@ func TestAShipForAnotherBucketShipsNothing(t *testing.T) {
 // A create run again after it recorded the bucket succeeds; one for a name
 // another space's bucket holds is BucketAlreadyExists.
 func TestACreateRunAgainSucceeds(t *testing.T) {
-	b, mem := newDeferredBackend(t, &parkingUploader{})
+	_, mem := newDeferredBackend(t, &parkingUploader{})
 	ctx := context.Background()
 	st, err := mem.Get(ctx, "bk")
 	if err != nil {
 		t.Fatal(err)
 	}
-	create := &BucketCreateTask{Name: "bk", Tenant: st.Tenant.String()}
-	if err := b.runBucket(ctx, st.Space, registry.BucketCreateAction, create); err != nil {
+	create := &bucketqueue.BucketCreateTask{Name: "bk", Tenant: st.Tenant.String()}
+	if err := runBucketTask(ctx, mem, st.Space, bucketqueue.CreateAction, create); err != nil {
 		t.Fatalf("create run again: %v", err)
 	}
-	err = b.runBucket(ctx, testutil.RandomDID(t), registry.BucketCreateAction, create)
+	err = runBucketTask(ctx, mem, testutil.RandomDID(t), bucketqueue.CreateAction, create)
 	var apiErr s3err.APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != "BucketAlreadyExists" {
 		t.Fatalf("create for another space: %v, want BucketAlreadyExists", err)
@@ -143,7 +126,7 @@ func (l *logRemovals) RemoveBucketLog(_ context.Context, bucket string) error {
 // the name left behind; one run again after recording it leaves the log alone.
 func TestACreateRemovesALeftoverLogOnce(t *testing.T) {
 	log := &logRemovals{}
-	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+	_, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
 		log.Log = d.Log
 		d.Log = log
 	})
@@ -153,9 +136,9 @@ func TestACreateRemovesALeftoverLogOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	space := testutil.RandomDID(t)
-	create := &BucketCreateTask{Name: "again", Tenant: st.Tenant.String()}
+	create := &bucketqueue.BucketCreateTask{Name: "again", Tenant: st.Tenant.String()}
 	for range 2 {
-		if err := b.runBucket(ctx, space, registry.BucketCreateAction, create); err != nil {
+		if err := runBucketTask(ctx, mem, space, bucketqueue.CreateAction, create); err != nil {
 			t.Fatalf("create: %v", err)
 		}
 	}
@@ -169,7 +152,7 @@ func TestACreateRemovesALeftoverLogOnce(t *testing.T) {
 // another space, is NoSuchBucket, and leaves the new bucket's settings as
 // they were.
 func TestBucketSettingsChangeOnlyTheirOwnBucket(t *testing.T) {
-	b, mem := newDeferredBackend(t, &parkingUploader{})
+	_, mem := newDeferredBackend(t, &parkingUploader{})
 	ctx := context.Background()
 	st, err := mem.Get(ctx, "bk")
 	if err != nil {
@@ -182,11 +165,11 @@ func TestBucketSettingsChangeOnlyTheirOwnBucket(t *testing.T) {
 		t.Fatal(err)
 	}
 	for action, value := range map[string]string{
-		registry.BucketSetTaggingAction:    `{"k":"v"}`,
-		registry.BucketSetCORSAction:       "<CORSConfiguration></CORSConfiguration>",
-		registry.BucketSetEncryptionAction: string(registry.BucketEncryptionNone),
+		bucketqueue.SetTaggingAction:    `{"k":"v"}`,
+		bucketqueue.SetCORSAction:       "<CORSConfiguration></CORSConfiguration>",
+		bucketqueue.SetEncryptionAction: string(registry.BucketEncryptionNone),
 	} {
-		err := b.runBucket(ctx, st.Space, action, &BucketSetConfigTask{Name: "bk", Value: []byte(value)})
+		err := runBucketTask(ctx, mem, st.Space, action, &bucketqueue.BucketSetConfigTask{Name: "bk", Value: []byte(value)})
 		wantAPIErr(t, err, s3err.ErrNoSuchBucket)
 	}
 	now, err := mem.Get(ctx, "bk")
@@ -196,4 +179,20 @@ func TestBucketSettingsChangeOnlyTheirOwnBucket(t *testing.T) {
 	if now.BucketTagging != nil || now.CORSConfig != nil || now.Encryption != registry.BucketEncryptionUnset {
 		t.Fatalf("the new bucket's settings changed: tagging %q, cors %q, encryption %q", now.BucketTagging, now.CORSConfig, now.Encryption)
 	}
+}
+
+// runBucketTask runs a queue-bucket action on space's bucket through mem's
+// runner, answering as a request would.
+func runBucketTask(ctx context.Context, mem *testStore, space did.DID, action string, args interface{ MarshalCBOR(io.Writer) error }) error {
+	return mapBucketError(runBucketTaskRaw(ctx, mem, space, action, args), action)
+}
+
+// runBucketTaskRaw is runBucketTask answering with the task's own error.
+func runBucketTaskRaw(ctx context.Context, mem *testStore, space did.DID, action string, args interface{ MarshalCBOR(io.Writer) error }) error {
+	var buf bytes.Buffer
+	if err := args.MarshalCBOR(&buf); err != nil {
+		return err
+	}
+	_, err := mem.tasks.Run(ctx, taskrunner.Spec{Queue: bucketqueue.Name, Subject: bucketqueue.Subject(space), Action: action, Args: buf.Bytes()})
+	return err
 }

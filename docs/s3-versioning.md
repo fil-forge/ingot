@@ -53,7 +53,7 @@ Take `GET photos/cat.jpg?versionId=<token>` against a key holding versions with 
 
 1. Read the key's leaf from the top MST.
 2. Parse the token; its low 64 bits give 7.
-3. `Current.Seq` is 9, so seek the prev tree directly: `prev.Get(revSeqKey(7))`. The seek is
+3. `Current.Seq` is 9, so seek the prev tree directly: `prev.Get(RevSeqKey(7))`. The seek is
    O(log n); nothing is scanned.
 4. Fetch the manifest that entry points at and confirm its stored `VersionID` equals the token
    (§6.1). This guard exists because step 2 trusts nothing: any well-formed ULID parses, so a
@@ -189,7 +189,7 @@ catalog block the read cache absorbs.
 Noncurrent versions live in a **per-key sub-MST** (the same forked `mst` package, same space, same
 blockstore — its nodes are ordinary catalog-plane blocks):
 
-- **key** — `revSeqKey(seq)`: fixed-width 16-char lowercase hex of `math.MaxUint64 − seq`.
+- **key** — `RevSeqKey(seq)`: fixed-width 16-char lowercase hex of `math.MaxUint64 − seq`.
   Because the MST iterates forward-only (`WalkLeavesFrom`, `mst/mst.go`), the inversion makes
   iteration **newest-first**. Scoped to one object key, the key is *just an integer rendered
   order-preservingly*, valid under `mst.IsValidKey` (hex is UTF-8, NUL-free, short).
@@ -200,7 +200,7 @@ blockstore — its nodes are ordinary catalog-plane blocks):
   a prev entry fetches the manifest anyway (list rendering needs ETag/size/mtime;
   version-scoped reads need the body).
 
-A direct version-scoped seek is `prev.Get(revSeqKey(seq))` — O(log n), no scan.
+A direct version-scoped seek is `prev.Get(RevSeqKey(seq))` — O(log n), no scan.
 
 ### 2.3 Manifest identity fields
 
@@ -341,7 +341,7 @@ reports ids — `"null"` for null versions — regardless of state.
 
 One commit step implements every version-creating mutation — `PutObject`, `CopyObject`
 (destination), `CompleteMultipartUpload`, and delete-marker insertion: the Put change
-(`applyPut`, `s3frontend/version.go`) of a `queue-bucket.commit`.
+(`applyPut`, `queue/bucketqueue/version.go`) of a `queue-bucket.commit`.
 
 ### 5.1 Sequence allocation
 
@@ -392,7 +392,7 @@ if key exists:
     retain := (state == Enabled) || (superseded.VersionID != "null")
     if retain:
         if value is a manifest: leaf = {Prev: empty}  // first supersession: create the leaf
-        prev.Put(revSeqKey(superseded.Seq), superseded.Manifest)
+        prev.Put(RevSeqKey(superseded.Seq), superseded.Manifest)
         if superseded.VersionID == "null": leaf.NullSeq = superseded.Seq
     else:
         discards += superseded                     // replace the null in place; the value stays a manifest
@@ -400,7 +400,7 @@ if key exists:
 if leaf exists:
     if new.VersionID == "null" && leaf.NullSeq != 0:  // only one null per key: evict prev null
         discards += prev entry at NullSeq             // (fetch its manifest for digests, §8)
-        prev.Delete(revSeqKey(leaf.NullSeq))
+        prev.Delete(RevSeqKey(leaf.NullSeq))
         leaf.NullSeq = 0
     leaf.Current = {seq, vid, manifestCID}
     write leaf block; value = CID(leaf arm)
@@ -466,7 +466,7 @@ value is a leaf:
                     else if leaf.NullSeq != 0 → prev entry at NullSeq
                     else → NoSuchVersion
     case ULID(seq): if leaf.Current.Seq == seq → leaf.Current
-                    else → prev.Get(revSeqKey(seq)), miss → NoSuchVersion
+                    else → prev.Get(RevSeqKey(seq)), miss → NoSuchVersion
     fetch manifest; for the ULID case verify manifest.VersionID == token, else NoSuchVersion
 ```
 
@@ -529,9 +529,9 @@ else if target == leaf.Current:
         head := first prev entry (newest-first walk)      // max remaining seq
         fetch head manifest → {Seq, VersionID}
         if head.Seq == leaf.NullSeq: leaf.NullSeq = 0     // the null becomes current
-        prev.Delete(revSeqKey(head.Seq)); leaf.Current = head
+        prev.Delete(RevSeqKey(head.Seq)); leaf.Current = head
 else:
-    prev.Delete(revSeqKey(target.Seq))
+    prev.Delete(RevSeqKey(target.Seq))
     if target.Seq == leaf.NullSeq: leaf.NullSeq = 0
 ```
 
@@ -666,10 +666,10 @@ the one instance that holds its catalog log. Object lock / retention / legal hol
 | `bucket/leaf.go` (new) + `gen/main.go` + `make gen` | `ObjectLeaf`, `VersionNode`, `ValueUnion` (cborgen-registered); the strict `ObjectValue` / `EnvelopedManifest` / `EnvelopedLeaf` wrappers (§2.1) |
 | `bucket/manifest.go` | `Seq`, `VersionID` fields (§2.3) |
 | `registry/registry.go`, `postgres.go`, `bucketcommit.go` | `State.Versioning`, `VersioningState`, `VersioningSet`, `AllocVersionSeq` (§4.1) |
-| `s3frontend/version.go` (new) | token mint/parse/classify (§3), `revSeqKey`, the value-union dispatch (§2.1), `resolveVersion` (§6.1), the write rule (`applyPut`, §5.2), version reservation (§5.1), `applyDeleteVersion` and `spliceLeaf` (§7.2), prev-tree helpers |
+| `queue/bucketqueue/version.go`, `s3frontend/version.go` (new) | token mint/parse/classify (§3), `RevSeqKey`, the value-union dispatch (§2.1), `resolveVersion` (§6.1, in `s3frontend`), the write rule (`applyPut`, §5.2), version reservation (§5.1), `applyDeleteVersion` and `spliceLeaf` (§7.2), prev-tree helpers |
 | `s3frontend/object.go` | `PutObject` splice → write rule; reads resolve via `resolveVersion`; `GetObject`/`HeadObject` versionId + marker semantics + output ids; `DeleteObject`/`applyDeleteKey`/`DeleteObjects` (§7); `addClaims` / `dropClaims` call sites carry real version ids (§8); `listWalk` marker skip (§9.1) |
 | `s3frontend/copy.go`, `multipart.go`, `uploadpartcopy.go` | commits through the write rule (a Put change); source-version resolution for `CopyObject` and `UploadPartCopy`; `CopySourceVersionId` on both; Complete's `versionid` return |
-| `s3frontend/bucket.go`, `bucketadmin.go` | `PutBucketVersioning` (`queue-bucket.set-versioning`), `GetBucketVersioning`, versioned `DeleteBucket` guard (§7) |
+| `s3frontend/bucket.go`, `queue/bucketqueue/admin.go` | `PutBucketVersioning` (`queue-bucket.set-versioning`), `GetBucketVersioning`, versioned `DeleteBucket` guard (§7) |
 | `s3frontend/listversions.go` (new) | `ListObjectVersions` (§9.2) |
 | `s3frontend/conditions.go` | `currentObjectETag` resolves the current version via `resolveVersion` |
 | unit tests | token codec + classification; union codec round-trip + unknown-key and pre-union-block rejection; write-rule table tests (all four supersession rows + first-supersession leaf creation + null eviction + non-existent-key marker); promotion; per-version claim add/release on the `refindex_test.go` harness; list pagination |

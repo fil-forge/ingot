@@ -187,8 +187,8 @@ github.com/fil-forge/hilt v0.0.1-0.20261105112400-954887b96d96 h1:Imsj9KQ1jDy63C
 github.com/fil-forge/hilt v0.0.1-0.20261105112400-954887b96d96/go.mod h1:RtLGz8chmf8bKt1JKwLgtbzlggLw457d7JduarIrXrA=
 github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e h1:+A26/La8EgF1bsGhSGicYV97ckec1SJwNYLWee3Xo8g=
 github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e/go.mod h1:hrry50c9bNciNj9Z63O2QFrzidnTjkYYG2UgH4/rmVo=
-github.com/fil-forge/libforge v0.0.0-20261022121207-bcdd5eacc465 h1:y7EPy1Fbn/LWQMy7iYKoZ1G0Pi88a4Z8tVw7uFOBjLA=
-github.com/fil-forge/libforge v0.0.0-20261022121207-bcdd5eacc465/go.mod h1:ZtPwUgXm7gqQSmjmIcfMy5AwWpFIR02WMZvbgNOwi/4=
+github.com/fil-forge/libforge v0.0.0-20261111172920-ff407324a982 h1:dguWFiI+DyusXOx5ezqpi5A79EkEVozizBuMYerAcnA=
+github.com/fil-forge/libforge v0.0.0-20261111172920-ff407324a982/go.mod h1:ZtPwUgXm7gqQSmjmIcfMy5AwWpFIR02WMZvbgNOwi/4=
 github.com/fil-forge/smelt v0.0.0-20261021123053-359a84935c40 h1:Meq7loWqQvwCVtlUGP173VfULpOM33YtSyej5507USU=
 github.com/fil-forge/smelt v0.0.0-20261021123053-359a84935c40/go.mod h1:Zz67XgtRsLViFDCVMxpXwRcge9Y3dbUA9rvZqAF93vg=
 github.com/fil-forge/swarf v0.0.1-0.20261105200428-4b21d0214d80 h1:Ceg1afUxLDvk+e2tjc6J+0663GCSZMhvQKAVP6TBSpU=
@@ -331,6 +331,8 @@ github.com/hashicorp/go-uuid v1.0.3 h1:2gKiV6YVmrJ1i2CKKa9obLvRieoRGviZFL26PcT/C
 github.com/hashicorp/go-uuid v1.0.3/go.mod h1:6SBZvOh/SIDV7/2o3Jml5SYk/TvGqwFJ/bN7x4byOro=
 github.com/hashicorp/go-version v1.9.0 h1:CeOIz6k+LoN3qX9Z0tyQrPtiB1DFYRPfCIBtaXPSCnA=
 github.com/hashicorp/go-version v1.9.0/go.mod h1:fltr4n8CU8Ke44wwGCBoEymUuxUHl09ZGVZPK5anwXA=
+github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs4luLUK2k=
+github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
 github.com/hashicorp/hcl v1.0.1-vault-7 h1:ag5OxFVy3QYTFTJODRzTKVZ6xvdfLLCA1cy/Y6xGI0I=
 github.com/hashicorp/hcl v1.0.1-vault-7/go.mod h1:XYhtn6ijBSAj6n4YqAaf7RBPS4I06AItNorpy+MoQNM=
 github.com/hashicorp/vault-client-go v0.4.3 h1:zG7STGVgn/VK6rnZc0k8PGbfv2x/sJExRKHSUg3ljWc=

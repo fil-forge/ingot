@@ -24,7 +24,6 @@ var (
 	_ EncryptionParamsStore = (*Postgres)(nil)
 	_ InclusionStore        = (*Postgres)(nil)
 	_ MultipartStore        = (*Postgres)(nil)
-	_ GCStore               = (*Postgres)(nil)
 	_ CatalogUsageStore     = (*Postgres)(nil)
 	_ RevocationCursorStore = (*Postgres)(nil)
 )
@@ -75,34 +74,6 @@ const countReferencesSQL = `SELECT
 	+ (SELECT count(*) FROM ingot.multipart_parts p
 	     JOIN ingot.multipart_sessions s ON s.upload_id = p.upload_id
 	    WHERE p.blob_digests @> ARRAY[$2::bytea] AND s.space = $1 AND s.state = $4)`
-
-func (r *Postgres) QueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time, release ReleaseTask) error {
-	if len(digests) == 0 {
-		return nil
-	}
-	if r.tasks == nil {
-		return fmt.Errorf("registry: releases to queue but the registry has no task runner")
-	}
-	specs := make([]taskrunner.Spec, len(digests))
-	for i, d := range digests {
-		var err error
-		if specs[i], err = release.Spec(space, d, notBefore); err != nil {
-			return err
-		}
-	}
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("registry: queue releases: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := r.tasks.SubmitAllTx(ctx, tx, specs); err != nil {
-		return fmt.Errorf("registry: queue releases: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("registry: queue releases: commit: %w", err)
-	}
-	return nil
-}
 
 // IntentStore ================================================================
 
@@ -445,6 +416,15 @@ func (r *Postgres) DeletePark(ctx context.Context, space did.DID, digest multiha
 	return nil
 }
 
+func (r *Postgres) DeleteParkOf(ctx context.Context, space did.DID, digest multihash.Multihash, addTask []byte) error {
+	_, err := r.pool.Exec(ctx,
+		`DELETE FROM ingot.blob_parks WHERE space = $1 AND digest = $2 AND add_task = $3`, space, digest, addTask)
+	if err != nil {
+		return fmt.Errorf("registry: delete park: %w", err)
+	}
+	return nil
+}
+
 // InclusionStore =============================================================
 
 func (r *Postgres) PutInclusions(ctx context.Context, incs []BlobInclusion) error {
@@ -718,19 +698,6 @@ func (r *Postgres) CountPartRefs(ctx context.Context, digest multihash.Multihash
 		return 0, fmt.Errorf("registry: count part refs: %w", err)
 	}
 	return n, nil
-}
-
-// GCStore ====================================================================
-
-func (r *Postgres) AddGCCandidate(ctx context.Context, cidBytes []byte, bucket string) error {
-	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.gc_candidates (cid, bucket) VALUES ($1, $2)
-		 ON CONFLICT (cid) DO NOTHING`,
-		cidBytes, nullString(bucket))
-	if err != nil {
-		return fmt.Errorf("registry: add gc candidate: %w", err)
-	}
-	return nil
 }
 
 // RevocationCursorStore ======================================================

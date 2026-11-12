@@ -106,7 +106,7 @@ reconstruct, and that trade deserves review before it hardens. Appendix A holds 
 shapes.
 
 **The version-state tree (this design).** Each key's leaf gains a second sub-tree beside
-`Prev`: a per-key MST mapping `revSeqKey(seq)` to a small per-version state block. The
+`Prev`: a per-key MST mapping `RevSeqKey(seq)` to a small per-version state block. The
 strongest case is recovery and portability paired with intact invariants: every version's
 protections ride the catalog plane, ship to Forge, and are reconstructable without the
 registry, while state mutations rewrite only positional blocks, so invariant 5 holds
@@ -163,15 +163,15 @@ type VersionState struct {
 
 // ObjectLeaf gains, beside Prev:
 //
-// State is the root of the per-key version-state MST: revSeqKey(seq) → the
+// State is the root of the per-key version-state MST: RevSeqKey(seq) → the
 // version's VersionState block CID. Nil when no version of this key carries
 // explicit state, which is what makes state-free keys free to read (§6, §8).
 State *cid.Cid `cborgen:"st"`
 ```
 
 The tree is the same forked `mst` package, the same space, the same
-`revSeqKey` rendering the prev tree uses (`s3frontend/version.go`); its nodes and the
-state blocks are ordinary catalog-plane blocks. Point lookups are `state.Get(revSeqKey(seq))`.
+`RevSeqKey` rendering the prev tree uses (`queue/bucketqueue/version.go`); its nodes and the
+state blocks are ordinary catalog-plane blocks. Point lookups are `state.Get(RevSeqKey(seq))`.
 A bucket default retention materializes nothing here (§7), so the tree holds exactly the
 versions that received explicit state.
 
@@ -283,7 +283,7 @@ All four run the same check order:
 3. `State.ObjectLockConfig` nil or not Enabled: `ErrMissingObjectLockConfiguration`. This
    and step 2's precedence are the only lock-specific parts of the order; the rest is the
    skeleton any per-version state operation runs.
-4. `classifyVersionID` rejects the token: `InvalidArgument` (`InvalidArgVersionId`).
+4. `ClassifyVersionID` rejects the token: `InvalidArgument` (`InvalidArgVersionId`).
 5. The named version resolves per the §6.1 grammar of the versioning design (the current
    version for an empty versionId); a miss is `GetNoSuchVersionErr`.
 6. The resolved version is a delete marker: `ErrMethodNotAllowed` (pinned by
@@ -292,7 +292,7 @@ All four run the same check order:
 **Reads** run it lock-free over `resolveVersion` (`s3frontend/version.go`), which already
 has the leaf in hand, then seek the state tree:
 
-- A manifest-arm key, a nil `State`, a tree miss at `revSeqKey(node.Seq)`, or a nil/zero
+- A manifest-arm key, a nil `State`, a tree miss at `RevSeqKey(node.Seq)`, or a nil/zero
   lock field in the fetched `VersionState` all answer `ErrNoSuchObjectLockConfiguration`.
 - **GetObjectRetention** returns `VersionState.Retention` verbatim. An expired retention is
   returned as stored; expiry is the controller's judgment.
@@ -310,7 +310,7 @@ read-modify-write below is serialized against every other mutation of the key):
    The controller has already run `IsObjectLockRetentionPutAllowed` against the currently
    stored document (fetched through `GetObjectRetention`), so mode-transition policy never
    reaches the backend.
-4. Write the state block, upsert `state.Add/Update(revSeqKey(seq), stateCid)`, queue the
+4. Write the state block, upsert `state.Add/Update(RevSeqKey(seq), stateCid)`, queue the
    replaced state block and old leaf for GC, rewrite the leaf with the new tree root, splice
    the top MST.
 
@@ -369,7 +369,7 @@ walks carry no lock fields.
 Enforcement happened in the controller before the backend was called, so the delete paths
 change only in cleanup, and the cleanup rule is general: **a commit that permanently removes
 a version also removes its state entry in the same commit.** A version-scoped delete that
-removes version `S` from a leaf with a state tree runs `state.Delete(revSeqKey(S))` (a miss
+removes version `S` from a leaf with a state tree runs `state.Delete(RevSeqKey(S))` (a miss
 is a no-op), queues the removed state block for GC, and drops `State` to nil when the tree
 empties. Promotion and noncurrent removal already rebuild the leaf through `spliceLeaf`; the
 state tree threads through it beside the prev tree. The rule also covers the write-rule
@@ -505,8 +505,8 @@ lock.
 | `migrations/sql/00011_object_lock.sql` (new) | `buckets.object_lock_config`, `multipart_sessions` lock columns (§4.2) |
 | `registry/registry.go`, `postgres.go`, `bucketcommit.go` | `State.ObjectLockConfig`, `LockConfigSet`, `Create` initial state (§4.2) |
 | `s3frontend/objectlock.go` (new) | the four per-version methods: the §6 check order, the state-tree read and commit paths, the Head/Get echo helper (§8) |
-| `s3frontend/version.go` | `applyPut` in-commit stamping incl. forced leaf (§7); `applyDeleteVersion` + `spliceLeaf` state-tree threading and cleanup (§9) |
-| `s3frontend/bucket.go`, `bucketadmin.go` | `CreateBucket` lock header (§5), `PutObjectLockConfiguration` and its versioning gate (`queue-bucket.set-object-lock-config`), `GetObjectLockConfiguration`, `PutBucketVersioning` suspend guard (`queue-bucket.set-versioning`) |
+| `queue/bucketqueue/version.go` | `applyPut` in-commit stamping incl. forced leaf (§7); `applyDeleteVersion` + `spliceLeaf` state-tree threading and cleanup (§9) |
+| `s3frontend/bucket.go`, `queue/bucketqueue/admin.go` | `CreateBucket` lock header (§5), `PutObjectLockConfiguration` and its versioning gate (`queue-bucket.set-object-lock-config`), `GetObjectLockConfiguration`, `PutBucketVersioning` suspend guard (`queue-bucket.set-versioning`) |
 | `s3frontend/object.go`, `copy.go`, `multipart.go` | lock-header validation + stamping via the Put change (`applyPut`, §7), Head/Get echo (§8), session carry (§7) |
 | `itest/versity_lock_test.go` (new), `versity_{object,bucket,multipart,versioning}_test.go` | new categories, promotions, exclusions (§11) |
 | `docs/s3-versioning.md` | §10 drops lock from out-of-scope, pointing here |

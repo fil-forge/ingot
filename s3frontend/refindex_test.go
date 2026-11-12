@@ -63,6 +63,13 @@ func newRefTestBackendOn(t *testing.T, mem *testStore, maxBlob ...int64) (*Backe
 	if len(maxBlob) > 0 {
 		mbs = maxBlob[0]
 	}
+	return newRefTestBackendOver(t, mem, newRetainedLog(t, mem), mbs)
+}
+
+// newRetainedLog is a catalog log over mem that retains its segments
+// locally, closed with the test.
+func newRetainedLog(t *testing.T, mem *testStore) blockstore.Log {
+	t.Helper()
 	ctx := context.Background()
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(t.TempDir(), "segments"),
@@ -74,7 +81,7 @@ func newRefTestBackendOn(t *testing.T, mem *testStore, maxBlob ...int64) (*Backe
 		t.Fatalf("logstore: %v", err)
 	}
 	t.Cleanup(func() { _ = log.Close(ctx) })
-	return newRefTestBackendOver(t, mem, log, mbs)
+	return log
 }
 
 // newRefTestBackendOver is newRefTestBackend over a given catalog log. Each
@@ -94,7 +101,6 @@ func newRefTestBackendOver(t *testing.T, mem *testStore, log blockstore.Log, mbs
 		Registry:   mem,
 		Intents:    mem,
 		Locations:  mem,
-		GC:         mem,
 		Multipart:  mem,
 		Parks:      mem,
 		Reads:      blockstore.NewLayered(cache, log, testfakes.NopBaseReader{}),
@@ -115,8 +121,7 @@ func newRefTestBackendOver(t *testing.T, mem *testStore, log blockstore.Log, mbs
 		opt(&deps)
 	}
 	withStreaming(t, &deps, dir)
-	b := New(deps)
-	mem.start(t, b)
+	b := mem.newBackend(t, deps)
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
