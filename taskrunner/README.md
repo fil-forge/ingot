@@ -329,16 +329,7 @@ A worker or sync caller holds its subject's lease while it runs tasks there. The
 
 The old holder's handlers stop as well. A handler's context ends when renewal finds a lease of its tree taken over, and when a lease comes within a sixth of the TTL (5 seconds by default) of expiring without having been extended, as when renewal cannot reach the database. The runner times each lease on its own clock from when it sent the statement that last extended it, so the handler stops before the lease can expire in the database whatever the two clocks read. A run stopped this way records nothing: no failure and no retry.
 
-A handler's effects outside the database are not undone when its commit fails, so pass the handler's context to every network call. Before an effect that must never happen under a lost lease, call `ex.LeaseHeld()` and return its error:
-
-```go
-if err := ex.LeaseHeld(); err != nil {
-	return nil, err
-}
-err := provider.Remove(ctx, blob)
-```
-
-The check reads the clock directly, so it holds even when the process has just come out of a long pause and the context's timer has not fired yet. A request already sent when the lease is lost still arrives. The margin gives it time to do so before another consumer can take the lease.
+A handler's effects outside the database are not undone when its commit fails, so pass the handler's context to every network call. A request already sent when the lease is lost still arrives. The margin gives it time to do so before another consumer can take the lease.
 
 A worker makes at most `Options.DrainLimit` handler runs on one subject, 100 by default and a batch counting as one, before it releases the lease. Each queue is checked for due subjects every `Options.PollInterval`, 1 second by default, and at once when this process submits a task to it or a worker frees up with more due.
 

@@ -148,19 +148,6 @@ func (g *leaseGuard) trip(h *hold) {
 	g.cancel(&childLostError{h.key()})
 }
 
-// check trips the guard if a lease is lost or within the margin of expiring,
-// and returns why the guard's context has ended, or nil while every lease is
-// held.
-func (g *leaseGuard) check() error {
-	g.mu.Lock()
-	_, lapsed := g.next(time.Now())
-	g.mu.Unlock()
-	if lapsed != nil {
-		g.trip(lapsed)
-	}
-	return g.lostTo()
-}
-
 // lostTo returns the loss that ended the guard's context, or nil when it has
 // not ended or ended for another reason, such as its parent ending.
 func (g *leaseGuard) lostTo() error {

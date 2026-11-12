@@ -25,7 +25,6 @@
 // A handler's context ends when a lease its tree runs under is lost or is
 // about to expire unrenewed, so a handler that passes its context to its
 // network calls makes none once another consumer may hold its subject.
-// Exec.LeaseHeld checks the same directly.
 //
 // The runner stores a task's arguments and result as opaque bytes and knows
 // nothing of what its handlers do.

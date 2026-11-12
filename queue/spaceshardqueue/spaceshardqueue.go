@@ -389,12 +389,6 @@ func (q *Queue) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrunne
 	netCtx, cancel := context.WithTimeout(netCtx, q.attemptLimit)
 	defer cancel()
 
-	// Nothing below is undone if the task fails to commit, so none of it may
-	// happen once the subject's lease is lost: another node may then have
-	// released the blob, and a write added it again.
-	if err := ex.LeaseHeld(); err != nil {
-		return nil, err
-	}
 	if err := q.encParams.DeleteEncryptionParams(ctx, space, digest); err != nil {
 		return nil, fmt.Errorf("crypto-shred (delete encryption params): %w", err)
 	}
@@ -418,9 +412,6 @@ func (q *Queue) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrunne
 		switch {
 		case aerr == nil:
 		case errors.Is(aerr, uploader.ErrBlobAccepted):
-			if err := ex.LeaseHeld(); err != nil {
-				return nil, err
-			}
 			if err := q.remover.RemoveBlob(netCtx, space, digest); err != nil {
 				return nil, fmt.Errorf("network remove of an accepted blob: %w", err)
 			}

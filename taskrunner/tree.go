@@ -73,14 +73,6 @@ func (ex *Exec) DB() Querier {
 	return ex.tr.r.db
 }
 
-// LeaseHeld returns nil while every lease the task's tree runs under is
-// held, and an error once one is lost or about to expire. The handler's
-// context ends then as well; a handler calls LeaseHeld straight before an
-// effect outside the database that must not happen once another consumer may
-// hold the subject, so the check does not wait on the context's timer. It
-// returns the error to stop.
-func (ex *Exec) LeaseHeld() error { return ex.tr.guard.check() }
-
 // Write adds a statement to the tree's write list.
 func (ex *Exec) Write(ctx context.Context, sql string, args ...any) error {
 	return ex.tr.add(ctx, write{sql: sql, args: args})

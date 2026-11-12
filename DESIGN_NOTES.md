@@ -576,11 +576,10 @@ releases with its own commit.
 A release acts only while it holds the subject's lease. The task runner ends
 a handler's context when its lease is taken over, or is 5 s from expiring
 without having been renewed (a stalled process, or one with no route to
-Postgres), and the release checks the lease itself straight before its
-crypto-shred and network step (`Exec.LeaseHeld`). Without that, a release
-that stalled after its checks could wake after another node had released the
-blob and a write had added it again, and remove the copy the new object
-needs. A `/blob/remove` already sent when the lease is lost still arrives;
+Postgres), and the release passes that context to its crypto-shred and its
+network step. Without that, a release that stalled after its checks could
+wake after another node had released the blob and a write had added it
+again, and remove the copy the new object needs. A `/blob/remove` already sent when the lease is lost still arrives;
 the 5 s are the time it has to do so before another node can take the lease.
 The upload service cannot tell the two copies apart, since a remove names
 only the space and the digest.

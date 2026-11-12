@@ -537,17 +537,11 @@ func TestHandlerStopsWhenItsLeaseIsTakenOver(t *testing.T) {
 		if runs.Add(1) > 1 {
 			return []byte("ok"), nil
 		}
-		if err := ex.LeaseHeld(); err != nil {
-			t.Errorf("LeaseHeld = %v under a lease just taken", err)
-		}
 		f.stealLease(t, qTop, task.Subject, 500*time.Millisecond)
 		select {
 		case <-ctx.Done():
 		case <-time.After(5 * time.Second):
 			t.Error("the handler's context did not end after its lease was taken over")
-		}
-		if err := ex.LeaseHeld(); err == nil {
-			t.Error("LeaseHeld = nil after the lease was taken over")
 		}
 		return nil, ctx.Err()
 	})
@@ -597,9 +591,6 @@ func TestHandlerStopsBeforeAnUnrenewedLeaseExpires(t *testing.T) {
 			t.Error("the handler's context did not end though its lease went unrenewed")
 		}
 		stopped = time.Since(start)
-		if err := ex.LeaseHeld(); err == nil {
-			t.Error("LeaseHeld = nil for a lease about to expire")
-		}
 		return nil, ctx.Err()
 	})
 	f.start(t)
