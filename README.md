@@ -320,6 +320,26 @@ Real objects at their default size add up. At estate scale, `--buckets 150
 --until 600000 --real-every 30000` writes 20 per bucket, about 540 GiB of
 bodies in all.
 
+`ingot-preload validate` then times requests against the loaded buckets and
+checks every answer, reading which objects exist from the load's state file
+(pass the load's `--seed`, `--key-prefix` and `--state`). It reads a range of
+every real object and checks its bytes, reads the metadata of a sample of bulk
+objects, lists a few buckets in full, and writes, deletes and re-checks new
+zero-byte objects shaped like the load's. It deletes only what it wrote. A
+test point is a load to that size, a gateway restart, then two runs with the
+same `--sample`, the first cold and the second warm:
+
+```bash
+ingot-preload load --until 600000 --real-every 30000      # loaded to the test point
+# restart ingot
+ingot-preload validate --label 0.6M-cold
+ingot-preload validate --label 0.6M-warm --steps get,head
+```
+
+Each step's latencies go to stdout as it ends, and the whole report to a JSON
+lines file (`--report`). A request that failed or answered wrongly is listed
+there and makes the command exit non-zero.
+
 ## Build & test
 
 ```bash

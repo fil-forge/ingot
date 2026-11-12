@@ -37,6 +37,19 @@ func BulkKey(prefix, seed, bucket string, n uint64) string {
 	return prefix + hex.EncodeToString(h.Sum(nil))
 }
 
+// ValidateKey returns the key of object i a validation run writes in bucket:
+// prefix followed by the lowercase hex SHA-256 of the seed, the bucket, the
+// run and i, shaped like the load's keys and distinct from all of them.
+func ValidateKey(prefix, seed, bucket, run string, i uint64) string {
+	h := sha256.New()
+	writeField(h, "validate")
+	writeField(h, seed)
+	writeField(h, bucket)
+	writeField(h, run)
+	writeUint(h, i)
+	return prefix + hex.EncodeToString(h.Sum(nil))
+}
+
 // RealKey returns the key of an object whose body hashes to sum: prefix
 // followed by the digest in lowercase hex, as the pack server names a pack.
 func RealKey(prefix string, sum [sha256.Size]byte) string {

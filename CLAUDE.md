@@ -111,8 +111,9 @@ Internal:
   measuring it: zero-byte bulk objects plus a few pack-sized ones with
   deterministic pseudo-random bodies, keys and PUTs shaped as the pack
   server's (create-only, `x-amz-checksum-sha256`), progress in a state file it
-  resumes from, reports as JSON lines. `internal/preload` imports nothing else
-  from ingot.
+  resumes from, reports as JSON lines (`load`); then timed, checked reads,
+  listings, writes and deletes against what the state file says was loaded
+  (`validate`). `internal/preload` imports nothing else from ingot.
 - **`s3frontend/`** — versitygw `backend.Backend`: `object.go`
   (Put/Get/Head/Delete/List), `version.go` (resolveVersion, reading the
   per-key version tree), `bucketqueue.go` (the requests' commits through

@@ -15,4 +15,7 @@
 // load records how far each bucket got in a state file, and a later load
 // resumes from there. A PUT the earlier load completed but did not record
 // finds its key taken, and counts as written.
+//
+// Validate then times requests against what a load wrote, as its state file
+// records it, and checks each answer. It deletes only the objects it writes.
 package preload
