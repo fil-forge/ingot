@@ -180,10 +180,12 @@ objects the load wrote from its --state file. The steps run in this order:
          does, deletes them, and checks they are gone
 
 It deletes only the objects it writes, and deletes them even after an
-interrupt; a second interrupt stops it at once, and a later listing counts
-what it left as extra keys. --sample picks which objects and ranges are read: just after restarting
-the gateway, run --steps get,head, then the same again with the same
---sample, then --steps list,write. The second run finds the catalog and the
+interrupt; a second interrupt stops it at once, and a later listing of a
+bucket counts what it left there as extra keys.
+
+--sample picks which objects and ranges are read: just after restarting the
+gateway, run --steps get,head, then the same again with the same --sample,
+then --steps list,write. The second run finds the catalog and the
 authorization caches warm; a full listing reads enough of the catalog to
 push the first run's reads out, so it comes last. Body bytes come from the
 gateway's local blob cache, which survives a restart, or from the storage

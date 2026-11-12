@@ -329,9 +329,9 @@ and checks every recorded object is there, and writes, deletes and re-checks
 new zero-byte objects shaped like the load's. Its access key must also be
 allowed to read, list and delete. It deletes only what it wrote, and deletes
 it even after an interrupt; a second interrupt stops it at once, and a later
-listing counts what it left as extra keys. A test point is a load to that
-size, a gateway restart, two reading runs with the same `--sample`, then the
-listing and writes:
+listing of a bucket counts what it left there as extra keys. A test point is a
+load to that size, a gateway restart, two reading runs with the same
+`--sample`, then the listing and writes:
 
 ```bash
 ingot-preload load --until 600000 --real-every 30000      # loaded to the test point

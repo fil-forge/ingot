@@ -2,6 +2,7 @@ package preload
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -62,7 +63,7 @@ func TestValidateChecksALoadedCatalog(t *testing.T) {
 		}
 	}
 	if len(r.Lists) != 2 || r.Lists[0].Bucket != load.Buckets[0] || r.Lists[0].Objects != 52 || r.Lists[1].Pages != 8 ||
-		r.Lists[0].Missing != 0 || r.Lists[0].Extra != 0 {
+		r.Lists[0].Missing != 0 || r.Lists[0].Extra != 0 || !r.Lists[0].Complete {
 		t.Fatalf("lists %+v", r.Lists)
 	}
 	if p := r.Point; p.Buckets != 3 || p.MinBulk != 50 || p.MaxBulk != 50 || p.Real != 6 {
@@ -347,10 +348,17 @@ func TestValidateStopsOnAListingThatDoesNotMoveOn(t *testing.T) {
 
 // misplacedKey moves the first page's first key to its end, and continues
 // after it, as a gateway whose next page starts after the last key returned
-// would. Every page after that is the first page again.
-type misplacedKey struct{ *fakeS3 }
+// would. Every page after that is the first page again, until it gives up
+// after a few, so a listing that doesn't stop fails rather than hangs.
+type misplacedKey struct {
+	*fakeS3
+	pages *atomic.Int64
+}
 
 func (m misplacedKey) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, o ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
+	if m.pages.Add(1) > 10 {
+		return nil, errors.New("misplacedKey: the listing went on for 10 pages")
+	}
 	first := *in
 	first.ContinuationToken = nil
 	out, err := m.fakeS3.ListObjectsV2(ctx, &first, o...)
@@ -367,12 +375,49 @@ func TestValidateStopsAtAKeyOutOfOrder(t *testing.T) {
 	load := loadForValidation(t, f, 1)
 	cfg := validateConfig(load)
 	cfg.Steps = []string{StepList}
-	r, err := Validate(t.Context(), misplacedKey{f}, cfg)
+	r, err := Validate(t.Context(), misplacedKey{f, new(atomic.Int64)}, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if r.Failures != 1 || !strings.Contains(r.FailureSample[0], "out of order") || r.Latency[OpListPage].Count != 1 {
 		t.Fatalf("failures %v, pages %d", r.FailureSample, r.Latency[OpListPage].Count)
+	}
+	// The key that came late isn't reported missing.
+	if len(r.Lists) != 1 || r.Lists[0].Complete || r.Lists[0].Missing != 0 {
+		t.Fatalf("lists %+v", r.Lists)
+	}
+}
+
+// failingLaterPages fails every listing page after the first.
+type failingLaterPages struct{ *fakeS3 }
+
+func (f failingLaterPages) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, o ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
+	if in.ContinuationToken != nil {
+		return nil, &statusError{503}
+	}
+	return f.fakeS3.ListObjectsV2(ctx, in, o...)
+}
+
+// A listing that fails part way still reports the recorded keys missing
+// from what it listed before it failed.
+func TestValidateReportsMissingKeysBeforeAFailedPage(t *testing.T) {
+	f := newFakeS3()
+	load := loadForValidation(t, f, 1)
+	b := load.Buckets[0]
+	keys := slices.Sorted(maps.Keys(f.objects(b)))
+	delete(f.buckets[b].objects, keys[0])
+	cfg := validateConfig(load)
+	cfg.Steps = []string{StepList}
+	r, err := Validate(t.Context(), failingLaterPages{f}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := strings.Join(r.FailureSample, "\n")
+	if r.Failures != 2 || !strings.Contains(all, keys[0]+" is missing") || !strings.Contains(all, "status 503") {
+		t.Fatalf("failures %d:\n%s", r.Failures, all)
+	}
+	if len(r.Lists) != 1 || r.Lists[0].Complete || r.Lists[0].Missing != 1 {
+		t.Fatalf("lists %+v", r.Lists)
 	}
 }
 
