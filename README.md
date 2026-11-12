@@ -321,13 +321,16 @@ Real objects at their default size add up. At estate scale, `--buckets 150
 bodies in all.
 
 `ingot-preload validate` then times requests against the loaded buckets and
-checks every answer, reading which objects exist from the load's state file
-(pass the load's `--seed`, `--key-prefix` and `--state`). It reads a range of
-every real object and checks its bytes, reads the metadata of a sample of bulk
-objects, lists a few buckets in full, and writes, deletes and re-checks new
-zero-byte objects shaped like the load's. It deletes only what it wrote. A
-test point is a load to that size, a gateway restart, then two runs with the
-same `--sample`, the first cold and the second warm:
+checks every answer, reading which objects exist from the load's state file:
+pass it the load's `--buckets`, `--bucket-prefix`, `--seed`, `--key-prefix`
+and `--state`. It reads a range of every real object and checks its bytes,
+reads the metadata of a sample of bulk objects, lists a few buckets in full
+and checks every recorded object is there, and writes, deletes and re-checks
+new zero-byte objects shaped like the load's. Its access key must also be
+allowed to read, list and delete. It deletes only what it wrote, and deletes
+it even when interrupted; the report's `write_run` tags the keys. A test point
+is a load to that size, a gateway restart, then two runs with the same
+`--sample`:
 
 ```bash
 ingot-preload load --until 600000 --real-every 30000      # loaded to the test point
@@ -335,6 +338,15 @@ ingot-preload load --until 600000 --real-every 30000      # loaded to the test p
 ingot-preload validate --label 0.6M-cold
 ingot-preload validate --label 0.6M-warm --steps get,head
 ```
+
+The restart empties the catalog's block cache and the authorization caches,
+so the first run reads them cold and the second warm. Body bytes are a
+different matter: a range is served from the local blob cache, which survives
+a restart and holds a blob for `cache_ttl` (1h by default) after it was
+written or last read, and otherwise from Piri, which reads don't copy back
+into the cache. Both runs read bodies from the same place. To time body reads
+from Piri, start the first run more than `cache_ttl` after the load wrote its
+last real object, or load with `cache_writes: false`.
 
 Each step's latencies go to stdout as it ends, and the whole report to a JSON
 lines file (`--report`). A request that failed or answered wrongly is listed

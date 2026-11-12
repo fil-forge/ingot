@@ -136,7 +136,7 @@ func TestValidateCommand(t *testing.T) {
 	validate := func(label string) (string, error) {
 		return run("validate", "--label", label, "--steps", "head,write", "--samples", "6", "--report", report)
 	}
-	if out, err := validate("all-there"); err != nil || !strings.Contains(out, "Buckets: 1, holding 6 to 6 bulk objects each. Failed or wrong: 0.") {
+	if out, err := validate("all-there"); err != nil || !strings.Contains(out, "steps finished: head,write. Buckets: 1, holding 6 to 6 bulk objects each. Failed or wrong: 0.") {
 		t.Fatalf("validate: %v\n%s", err, out)
 	}
 	srv.mu.Lock()

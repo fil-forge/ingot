@@ -3,8 +3,8 @@
 // github.com/fil-forge/ingot/internal/preload.
 //
 // It is a plain S3 client: it needs the gateway's endpoint and region and an
-// access key that may create buckets and write to them, taken from the AWS
-// SDK's usual sources (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or a
+// access key that may create buckets and write, read, list and delete objects
+// in them, taken from the AWS SDK's usual sources (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or a
 // shared config profile such as the one smelt's `make s3-key` writes). It
 // never takes a secret as a flag.
 package main
@@ -29,6 +29,12 @@ import (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// The first signal asks a command to stop and tidy up; a second one
+	// ends the process at once.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 	if err := newRootCmd().ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "ingot-preload:", err)
 		os.Exit(1)
@@ -173,10 +179,14 @@ objects the load wrote from its --state file. The steps run in this order:
   write  writes --samples new zero-byte objects per bucket the way the load
          does, deletes them, and checks they are gone
 
-It deletes only the objects it writes. --sample picks which objects and
-ranges are read: run once just after restarting the gateway, then again with
-the same --sample and --steps get,head, to time cold reads and then warm
-ones. Use the --seed and --key-prefix the load used.
+It deletes only the objects it writes, and deletes them even when
+interrupted; the report's write_run tags their keys. --sample picks which
+objects and ranges are read: run once just after restarting the gateway,
+then again with the same --sample and --steps get,head. The second run finds
+the catalog and the authorization caches warm. Body bytes come from the
+gateway's local blob cache, which survives a restart, or from the storage
+provider, the same in both runs: the README says how to time either. Use the
+--buckets, --bucket-prefix, --seed, --key-prefix and --state the load used.
 
 The report goes to stdout a step at a time and to the --report file as a
 line of JSON. A request that failed or answered wrongly is counted there,
@@ -199,8 +209,12 @@ and makes the command exit non-zero once it has finished.`,
 				if werr := appendReport(reportPath, r); werr != nil {
 					return errors.Join(err, werr)
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "%s: done in %.0fs. Buckets: %d, holding %d to %d bulk objects each. Failed or wrong: %d.\n",
-					r.Label, r.ElapsedS, r.Point.Buckets, r.Point.MinBulk, r.Point.MaxBulk, r.Failures)
+				end := "done"
+				if r.Interrupted {
+					end = "interrupted"
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "%s: %s after %.0fs, steps finished: %s. Buckets: %d, holding %d to %d bulk objects each. Failed or wrong: %d.\n",
+					r.Label, end, r.ElapsedS, strings.Join(r.Steps, ","), r.Point.Buckets, r.Point.MinBulk, r.Point.MaxBulk, r.Failures)
 				for _, s := range r.FailureSample {
 					fmt.Fprintln(cmd.OutOrStdout(), "  "+s)
 				}

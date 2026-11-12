@@ -60,14 +60,15 @@ func TestValidateChecksALoadedCatalog(t *testing.T) {
 			t.Errorf("%s: %d timed, want %d", op, got, want)
 		}
 	}
-	if len(r.Lists) != 2 || r.Lists[0].Bucket != load.Buckets[0] || r.Lists[0].Objects != 52 || r.Lists[1].Pages != 8 {
+	if len(r.Lists) != 2 || r.Lists[0].Bucket != load.Buckets[0] || r.Lists[0].Objects != 52 || r.Lists[1].Pages != 8 ||
+		r.Lists[0].Missing != 0 || r.Lists[0].Extra != 0 {
 		t.Fatalf("lists %+v", r.Lists)
 	}
 	if p := r.Point; p.Buckets != 3 || p.MinBulk != 50 || p.MaxBulk != 50 || p.Real != 6 {
 		t.Fatalf("test point %+v", p)
 	}
-	if !slices.Equal(r.Steps, ValidateSteps) {
-		t.Fatalf("steps %v", r.Steps)
+	if !slices.Equal(r.Steps, ValidateSteps) || r.Interrupted || len(r.WriteRun) != 16 {
+		t.Fatalf("steps %v, interrupted %v, write run %q", r.Steps, r.Interrupted, r.WriteRun)
 	}
 	if lines := strings.Count(progress.String(), "\n"); lines != len(ValidateSteps) {
 		t.Fatalf("progress %q", progress.String())
@@ -155,7 +156,7 @@ func TestValidateFindsWrongAnswers(t *testing.T) {
 		"not the ones written",
 		fmt.Sprintf("head %s/%s: status 404", b, BulkKey(load.KeyPrefix, load.Seed, b, 7)),
 		"3 bytes, want an empty object",
-		"51 objects, the load recorded 52",
+		fmt.Sprintf("list %s: %s is missing", b, BulkKey(load.KeyPrefix, load.Seed, b, 7)),
 		"after its delete: still there",
 	} {
 		if !strings.Contains(all, want) {
@@ -197,6 +198,147 @@ func TestValidateDeletesWhatItWroteWhenPutsFail(t *testing.T) {
 		if !maps.Equal(f.objects(b), before[b]) {
 			t.Fatalf("%s changed", b)
 		}
+	}
+}
+
+// ctxS3 answers a request whose context has ended with that context's
+// error, as the SDK does.
+type ctxS3 struct{ *fakeS3 }
+
+func (c ctxS3) PutObject(ctx context.Context, in *s3.PutObjectInput, o ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return c.fakeS3.PutObject(ctx, in, o...)
+}
+
+func (c ctxS3) DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, o ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return c.fakeS3.DeleteObject(ctx, in, o...)
+}
+
+func TestValidateInterruptedWriteLeavesNothing(t *testing.T) {
+	f := newFakeS3()
+	load := loadForValidation(t, f, 2)
+	before := map[string]map[string]int64{}
+	for _, b := range load.Buckets {
+		before[b] = f.objects(b)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	base := f.stored
+	f.after = func(stored int) {
+		if stored == base+7 {
+			cancel()
+		}
+	}
+	cfg := validateConfig(load)
+	cfg.Steps = []string{StepHead, StepWrite}
+	cfg.Workers = 1
+	r, err := Validate(ctx, ctxS3{f}, cfg)
+	if err == nil || !r.Interrupted || !slices.Equal(r.Steps, []string{StepHead}) || r.WriteRun == "" || r.Failures != 0 {
+		t.Fatalf("interrupted write: %v, report %+v", err, r)
+	}
+	for _, b := range load.Buckets {
+		if !maps.Equal(f.objects(b), before[b]) {
+			t.Fatalf("%s: %d objects left, want %d", b, len(f.objects(b)), len(before[b]))
+		}
+	}
+}
+
+// cancelingHead ends the run's context part way through a HEAD, after the
+// step has handed out its last request, then answers it.
+type cancelingHead struct {
+	*fakeS3
+	cancel context.CancelFunc
+}
+
+func (c cancelingHead) HeadObject(ctx context.Context, in *s3.HeadObjectInput, o ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
+	time.Sleep(50 * time.Millisecond)
+	c.cancel()
+	return &s3.HeadObjectOutput{ContentLength: new(int64)}, nil
+}
+
+// An interrupt during the last requests of the last step still marks the run
+// interrupted: their answers are not counted, so the run is not complete.
+func TestValidateCountsAnInterruptDuringTheLastRequests(t *testing.T) {
+	f := newFakeS3()
+	load := loadForValidation(t, f, 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	cfg := validateConfig(load)
+	cfg.Steps = []string{StepWrite}
+	cfg.Samples = 1
+	cfg.Workers = 1
+	r, err := Validate(ctx, cancelingHead{f, cancel}, cfg)
+	if err == nil || !r.Interrupted || len(r.Steps) != 0 {
+		t.Fatalf("validate: %v, report %+v", err, r)
+	}
+}
+
+func TestValidateListNeedsEveryRecordedObject(t *testing.T) {
+	f := newFakeS3()
+	load := loadForValidation(t, f, 1)
+	b := load.Buckets[0]
+	for n := range uint64(3) {
+		delete(f.buckets[b].objects, BulkKey(load.KeyPrefix, load.Seed, b, n))
+		f.buckets[b].objects[ValidateKey(load.KeyPrefix, load.Seed, b, "left", n)] = 0
+	}
+	cfg := validateConfig(load)
+	cfg.Steps = []string{StepList}
+	r, err := Validate(t.Context(), f, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Lists) != 1 || r.Lists[0].Objects != 52 || r.Lists[0].Missing != 3 || r.Lists[0].Extra != 3 || r.Failures != 3 {
+		t.Fatalf("lists %+v, failures %v", r.Lists, r.FailureSample)
+	}
+}
+
+// stuckListing ignores the continuation token, so every page is the first.
+type stuckListing struct{ *fakeS3 }
+
+func (s stuckListing) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, o ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
+	first := *in
+	first.ContinuationToken = nil
+	return s.fakeS3.ListObjectsV2(ctx, &first, o...)
+}
+
+func TestValidateStopsOnAListingThatDoesNotMoveOn(t *testing.T) {
+	f := newFakeS3()
+	load := loadForValidation(t, f, 1)
+	cfg := validateConfig(load)
+	cfg.Steps = []string{StepList}
+	r, err := Validate(t.Context(), stuckListing{f}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The repeated page also arrives out of order, which counts too.
+	if r.Failures != 2 || !strings.Contains(strings.Join(r.FailureSample, "\n"), "does not move the listing on") || r.Latency[OpListPage].Count != 2 {
+		t.Fatalf("failures %v, pages %d", r.FailureSample, r.Latency[OpListPage].Count)
+	}
+}
+
+// noLength answers a HEAD without a Content-Length.
+type noLength struct{ *fakeS3 }
+
+func (noLength) HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
+	return &s3.HeadObjectOutput{}, nil
+}
+
+func TestValidateNeedsAContentLength(t *testing.T) {
+	f := newFakeS3()
+	load := loadForValidation(t, f, 1)
+	cfg := validateConfig(load)
+	cfg.Steps = []string{StepHead}
+	r, err := Validate(t.Context(), noLength{f}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Failures != uint64(cfg.Samples) || !strings.Contains(r.FailureSample[0], "no Content-Length") {
+		t.Fatalf("failures %v", r.FailureSample)
 	}
 }
 

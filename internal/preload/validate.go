@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -127,11 +128,17 @@ func (c *ValidateConfig) runs(step string) bool {
 
 // ValidateReport is what a validation found.
 type ValidateReport struct {
-	Time     time.Time `json:"time"`
-	Label    string    `json:"label"`
-	Sample   string    `json:"sample"`
-	Steps    []string  `json:"steps"`
-	ElapsedS float64   `json:"elapsed_s"`
+	Time   time.Time `json:"time"`
+	Label  string    `json:"label"`
+	Sample string    `json:"sample"`
+	// Steps are the steps that ran to the end. Interrupted marks a run that
+	// stopped before the rest of those asked for.
+	Steps       []string `json:"steps"`
+	Interrupted bool     `json:"interrupted,omitempty"`
+	ElapsedS    float64  `json:"elapsed_s"`
+	// WriteRun tags the keys of the objects the write step wrote: object i
+	// of a bucket is ValidateKey(prefix, seed, bucket, WriteRun, i).
+	WriteRun string `json:"write_run,omitempty"`
 	// Point is the catalog the validation ran against, as the load's state
 	// file records it.
 	Point TestPoint `json:"test_point"`
@@ -155,8 +162,14 @@ type TestPoint struct {
 
 // ListResult is one bucket's full listing.
 type ListResult struct {
-	Bucket    string  `json:"bucket"`
-	Objects   uint64  `json:"objects"`
+	Bucket  string `json:"bucket"`
+	Objects uint64 `json:"objects"`
+	// Missing counts the objects the load recorded that the listing lacked,
+	// each also a failure. Extra counts listed objects the load did not
+	// record, which a load stopped part way, or a validation stopped part
+	// way, can leave.
+	Missing   uint64  `json:"missing"`
+	Extra     uint64  `json:"extra"`
 	Pages     int     `json:"pages"`
 	DurationS float64 `json:"duration_s"`
 }
@@ -164,13 +177,14 @@ type ListResult struct {
 // Validate times reads, listings, writes and deletes against the catalog a
 // load built, and checks each answer: a bulk object is there and empty, a
 // range of a real object holds the bytes the load wrote, a listing is in
-// order and holds at least the objects the load recorded, a new object can
-// be written create-only, and once deleted it is gone. It deletes only the
-// objects it wrote itself.
+// order and holds every object the load recorded, a new object can be written
+// create-only, and once deleted it is gone. It deletes only the objects it
+// wrote itself, and deletes them even when ctx ends.
 //
 // A request that fails or answers wrongly is counted in the report, not
 // returned as an error: Validate returns an error only when it cannot start,
-// or when ctx ends, in which case the report covers the steps run so far.
+// or when ctx ends, in which case the report is marked interrupted and lists
+// the steps that ran to the end.
 func Validate(ctx context.Context, client ValidateS3, cfg ValidateConfig) (*ValidateReport, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("validate: %w", err)
@@ -180,14 +194,10 @@ func Validate(ctx context.Context, client ValidateS3, cfg ValidateConfig) (*Vali
 		return nil, err
 	}
 	v := &validator{client: client, cfg: cfg, hist: make(map[string]*Histogram)}
-	steps := cfg.Steps
-	if steps == nil {
-		steps = ValidateSteps
-	}
 	v.report = &ValidateReport{
 		Label:  cfg.Label,
 		Sample: cfg.Sample,
-		Steps:  slices.Clone(steps),
+		Steps:  []string{},
 		Point:  TestPoint{Buckets: len(cfg.Buckets), MinBulk: ^uint64(0)},
 	}
 	for _, name := range cfg.Buckets {
@@ -216,11 +226,16 @@ func Validate(ctx context.Context, client ValidateS3, cfg ValidateConfig) (*Vali
 		case StepWrite:
 			err = v.write(ctx)
 		}
-		v.progress(step)
+		if err == nil {
+			err = ctx.Err()
+		}
+		v.progress(step, err != nil)
 		if err != nil {
 			break
 		}
+		v.report.Steps = append(v.report.Steps, step)
 	}
+	v.report.Interrupted = err != nil
 	v.finish(start)
 	return v.report, err
 }
@@ -241,7 +256,8 @@ type validator struct {
 }
 
 // run runs tasks with cfg.Workers of them in flight, until all have run or
-// ctx ends.
+// ctx ends. It returns once every task it started has finished, with ctx's
+// error as it stands then.
 func (v *validator) run(ctx context.Context, tasks []func(context.Context)) error {
 	ch := make(chan func(context.Context))
 	var wg sync.WaitGroup
@@ -252,15 +268,16 @@ func (v *validator) run(ctx context.Context, tasks []func(context.Context)) erro
 			}
 		})
 	}
-	defer wg.Wait()
-	defer close(ch)
+feed:
 	for _, t := range tasks {
 		select {
 		case ch <- t:
 		case <-ctx.Done():
-			return ctx.Err()
+			break feed
 		}
 	}
+	close(ch)
+	wg.Wait()
 	return ctx.Err()
 }
 
@@ -430,8 +447,11 @@ func (v *validator) headBulk(ctx context.Context, bucket, key string) {
 		return
 	}
 	v.record(OpHead, elapsed)
-	if size := aws.ToInt64(out.ContentLength); size != 0 {
-		v.fail(ctx, "head %s/%s: %d bytes, want an empty object", bucket, key, size)
+	switch {
+	case out.ContentLength == nil:
+		v.fail(ctx, "head %s/%s: no Content-Length", bucket, key)
+	case *out.ContentLength != 0:
+		v.fail(ctx, "head %s/%s: %d bytes, want an empty object", bucket, key, *out.ContentLength)
 	}
 }
 
@@ -445,16 +465,27 @@ func (v *validator) listTasks() []func(context.Context) {
 }
 
 // list pages through b's keys under the key prefix, timing each page, and
-// checks the keys arrive in order and number at least those the load
-// recorded. A load stopped part way may have written a few more.
+// checks the keys arrive in order and include every object the load
+// recorded. Keys the load did not record are counted but allowed: a load
+// stopped part way may have written a few past its record.
 func (v *validator) list(ctx context.Context, b validateBucket) {
+	want := make([]string, 0, b.state.Bulk+uint64(len(b.state.Real)))
+	for n := range b.state.Bulk {
+		want = append(want, BulkKey(v.cfg.KeyPrefix, v.cfg.Seed, b.name, n))
+	}
+	for _, r := range b.state.Real {
+		want = append(want, r.Key)
+	}
+	slices.Sort(want)
+
 	start := time.Now()
-	var (
-		token   *string
-		last    string
-		objects uint64
-		pages   int
-	)
+	res := ListResult{Bucket: b.name}
+	missing := func(key string) {
+		res.Missing++
+		v.fail(ctx, "list %s: %s is missing", b.name, key)
+	}
+	var token *string
+	var last string
 	for {
 		var out *s3.ListObjectsV2Output
 		elapsed, err := v.call(ctx, func(ctx context.Context) error {
@@ -467,50 +498,64 @@ func (v *validator) list(ctx context.Context, b validateBucket) {
 			return err
 		})
 		if err != nil {
-			v.fail(ctx, "list %s after %d objects: %v", b.name, objects, err)
+			v.fail(ctx, "list %s after %d objects: %v", b.name, res.Objects, err)
 			return
 		}
 		v.record(OpListPage, elapsed)
-		pages++
+		res.Pages++
 		for _, o := range out.Contents {
 			key := aws.ToString(o.Key)
-			if objects > 0 && key <= last {
+			if res.Objects > 0 && key <= last {
 				v.fail(ctx, "list %s: %s follows %s", b.name, key, last)
 			}
 			last = key
-			objects++
+			res.Objects++
+			// Both lists are sorted, so a recorded key below this one that
+			// has not been seen is missing.
+			for len(want) > 0 && want[0] < key {
+				missing(want[0])
+				want = want[1:]
+			}
+			if len(want) > 0 && want[0] == key {
+				want = want[1:]
+			} else {
+				res.Extra++
+			}
 		}
 		if !aws.ToBool(out.IsTruncated) {
 			break
 		}
-		if out.NextContinuationToken == nil {
-			v.fail(ctx, "list %s: page %d is truncated but has no continuation token", b.name, pages)
+		next := aws.ToString(out.NextContinuationToken)
+		if len(out.Contents) == 0 || next == "" || next == aws.ToString(token) {
+			v.fail(ctx, "list %s: truncated page %d does not move the listing on (%d keys, next token %q)", b.name, res.Pages, len(out.Contents), next)
 			return
 		}
-		token = out.NextContinuationToken
+		token = &next
 	}
-	if want := b.state.Bulk + uint64(len(b.state.Real)); objects < want {
-		v.fail(ctx, "list %s: %d objects, the load recorded %d", b.name, objects, want)
+	for _, key := range want {
+		missing(key)
 	}
+	res.DurationS = time.Since(start).Seconds()
 	v.mu.Lock()
-	v.report.Lists = append(v.report.Lists, ListResult{
-		Bucket:    b.name,
-		Objects:   objects,
-		Pages:     pages,
-		DurationS: time.Since(start).Seconds(),
-	})
+	v.report.Lists = append(v.report.Lists, res)
 	v.mu.Unlock()
 }
 
 // write writes cfg.Samples new zero-byte objects in each bucket, deletes
 // them, and checks they are gone. Their keys are fresh on every run, so a
-// run never meets a key another left behind.
+// run never meets a key another left behind, and the run's tag is in the
+// report, so they can be found again. The deletes run even when ctx ends,
+// each still bounded by the request timeout, so that an interrupted run
+// leaves nothing behind.
 func (v *validator) write(ctx context.Context) error {
 	var tag [8]byte
 	if _, err := rand.Read(tag[:]); err != nil {
 		return err
 	}
 	run := hex.EncodeToString(tag[:])
+	v.mu.Lock()
+	v.report.WriteRun = run
+	v.mu.Unlock()
 	type object struct{ bucket, key string }
 	var objects []object
 	for _, b := range v.buckets {
@@ -518,23 +563,33 @@ func (v *validator) write(ctx context.Context) error {
 			objects = append(objects, object{b.name, ValidateKey(v.cfg.KeyPrefix, v.cfg.Seed, b.name, run, uint64(i))})
 		}
 	}
-	each := func(f func(ctx context.Context, o object)) []func(context.Context) {
+	// sent marks the objects whose PUT went out. Each of those gets a
+	// delete, whatever its PUT's answer: a delete of an object that was
+	// never written does nothing.
+	sent := make([]atomic.Bool, len(objects))
+	each := func(f func(ctx context.Context, i int, o object)) []func(context.Context) {
 		tasks := make([]func(context.Context), len(objects))
 		for i, o := range objects {
-			tasks[i] = func(ctx context.Context) { f(ctx, o) }
+			tasks[i] = func(ctx context.Context) { f(ctx, i, o) }
 		}
 		return tasks
 	}
-	// Whatever happens to the PUTs, the deletes run, so the run leaves
-	// nothing behind; only ctx ending stops them.
-	putErr := v.run(ctx, each(func(ctx context.Context, o object) { v.put(ctx, o.bucket, o.key) }))
-	if err := v.run(ctx, each(func(ctx context.Context, o object) { v.delete(ctx, o.bucket, o.key) })); err != nil {
-		return err
-	}
+	putErr := v.run(ctx, each(func(ctx context.Context, i int, o object) {
+		sent[i].Store(true)
+		v.put(ctx, o.bucket, o.key)
+	}))
+	_ = v.run(context.WithoutCancel(ctx), each(func(ctx context.Context, i int, o object) {
+		if sent[i].Load() {
+			v.delete(ctx, o.bucket, o.key)
+		}
+	}))
 	if putErr != nil {
 		return putErr
 	}
-	return v.run(ctx, each(func(ctx context.Context, o object) { v.checkGone(ctx, o.bucket, o.key) }))
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return v.run(ctx, each(func(ctx context.Context, _ int, o object) { v.checkGone(ctx, o.bucket, o.key) }))
 }
 
 func (v *validator) put(ctx context.Context, bucket, key string) {
@@ -583,8 +638,9 @@ func (v *validator) checkGone(ctx context.Context, bucket, key string) {
 	}
 }
 
-// progress writes a line with the latencies of step's operations.
-func (v *validator) progress(step string) {
+// progress writes a line with the latencies of step's operations, marking a
+// step that ctx ended part way.
+func (v *validator) progress(step string, interrupted bool) {
 	if v.cfg.Progress == nil {
 		return
 	}
@@ -604,7 +660,13 @@ func (v *validator) progress(step string) {
 		}
 		line += fmt.Sprintf("  %s %d, p50 %.1fms p99 %.1fms max %.1fms", op, s.Count, s.P50, s.P99, s.Max)
 	}
+	if step == StepWrite {
+		line += "  run " + v.report.WriteRun
+	}
 	line += fmt.Sprintf("  failures so far %d", v.report.Failures)
+	if interrupted {
+		line += "  (interrupted)"
+	}
 	fmt.Fprintln(v.cfg.Progress, line)
 }
 
