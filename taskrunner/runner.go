@@ -121,6 +121,13 @@ type QueueOptions struct {
 	FailedRetention time.Duration
 }
 
+// TasksTable returns the quoted name of queueName's tasks table in schema,
+// for a reader outside the runner, such as a measurement of the queue. The
+// columns are the runner's own and change only by a migration step.
+func TasksTable(schema, queueName string) string {
+	return pgx.Identifier{schema, strings.ReplaceAll(queueName, "-", "_") + "_tasks"}.Sanitize()
+}
+
 // Options configures a Runner.
 type Options struct {
 	// Schema is the Postgres schema the queue tables are created in.
@@ -337,7 +344,7 @@ func New(db DB, opts Options) (*Runner, error) {
 			name:            qo.Name,
 			idx:             i,
 			table:           table,
-			tasks:           pgx.Identifier{opts.Schema, table + "_tasks"}.Sanitize(),
+			tasks:           TasksTable(opts.Schema, qo.Name),
 			leases:          pgx.Identifier{opts.Schema, table + "_leases"}.Sanitize(),
 			workers:         qo.Workers,
 			retention:       cmp.Or(qo.Retention, 24*time.Hour),

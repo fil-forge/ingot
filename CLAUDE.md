@@ -104,7 +104,9 @@ Internal:
   `Blake3` attribute, over `blake3tree`), `catalog usage` (each bucket's
   catalog bytes on Forge, dead on arrival, and live via
   `logstore.WalkCatalog`, which reads segments retired from disk from Forge
-  with an access key from the environment, as JSON, for benchmark runs);
+  with an access key from the environment, as JSON, for benchmark runs),
+  `footprint` (the `ingot` schema's tables, the WAL position, `data_dir`'s
+  entries, and the release queue's timings and backlog, as JSON);
   `deps.go` (agent identity from the PEM key + optional did:web, pgx pool).
 - **`cmd/ingot-preload/`** + **`internal/preload`** — a separate binary, a
   plain S3 client that loads a gateway's catalog to estate scale for

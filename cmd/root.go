@@ -36,6 +36,7 @@ func newRootCmd() *cobra.Command {
 		newVersionCmd(),
 		newBlake3Cmd(),
 		newCatalogCmd(),
+		newFootprintCmd(),
 	)
 	return root
 }

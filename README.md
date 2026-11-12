@@ -359,6 +359,17 @@ Each step's latencies go to stdout as it ends, and the whole report to a JSON
 lines file (`--report`). A request that failed or answered wrongly is listed
 there and makes the command exit non-zero.
 
+`ingot footprint`, run where the daemon runs and with its config, prints what
+the node keeps, as JSON: each table of the `ingot` schema with its bytes and
+estimated rows, the database's size and the server's write-ahead log position,
+each entry under `data_dir` with its files and bytes, and how blob releases
+keep up when objects with bodies are deleted or overwritten: how long the
+finished ones took from the change that queued them, the release grace
+included, and how many are still pending, past their grace or failed. Run it
+and `ingot catalog usage` before a load and at each test point. The difference
+in `wal_bytes` between two reports is the WAL written in between, and each
+table's and directory's growth per object loaded is what a projection scales.
+
 ## Build & test
 
 ```bash
