@@ -536,6 +536,12 @@ func (c *Client) awaitAccept(ctx context.Context, acceptTask cid.Cid) (ucan.Invo
 	return locationFromAccept(accRcpt, indexAccepts(accMeta))
 }
 
+// ErrAllocationGone is wrapped by the failure of an accept the storage
+// provider refused because it no longer holds the blob's allocation: it
+// expired before the bytes arrived, or the provider removed it after it
+// expired. Concluding the blob again gets the same answer.
+var ErrAllocationGone = errors.New("the provider no longer holds the blob's allocation")
+
 // locationFromAccept unpacks an accept receipt and returns the
 // /assert/location commitment it issued, found in the accompanying container
 // by the link the receipt names (AcceptOK.Site is the commitment invocation's
@@ -549,6 +555,10 @@ func locationFromAccept(accRcpt ucan.Receipt, meta acceptIndex) (ucan.Invocation
 		var model edm.ErrorModel
 		if err := model.UnmarshalCBOR(bytes.NewReader(x)); err != nil {
 			return nil, fmt.Errorf("executing invocation")
+		}
+		switch model.ErrorName {
+		case blobcmds.AllocationExpiredErrorName, blobcmds.AllocationNotFoundErrorName:
+			return nil, fmt.Errorf("failure in accept receipt: %w: %w", ErrAllocationGone, model)
 		}
 		return nil, fmt.Errorf("failure in accept receipt: %w", model)
 	}
