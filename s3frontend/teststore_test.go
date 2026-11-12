@@ -443,6 +443,30 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 			return 0, err
 		}
 	}
+	// A release that leaves no other space's intent evicts the cached copy
+	// in an async queue-shard task: wait for each digest's due queue-shard
+	// tasks too, as settleCache does, so a caller sees the copy gone.
+	settled := map[string]bool{}
+	for _, subject := range subjects {
+		_, d, err := spaceshardqueue.ParseSubject(subject)
+		if err != nil {
+			return 0, err
+		}
+		shard := hex.EncodeToString(d)
+		if settled[shard] {
+			continue
+		}
+		settled[shard] = true
+		// An eviction that fails waits to retry holding the subject, so the
+		// wait is bounded, and running out of time fails the sweep.
+		expires := time.Now().Add(5 * time.Second)
+		runCtx, cancel := context.WithDeadline(ctx, expires)
+		_, err = s.tasks.Run(runCtx, taskrunner.Spec{Queue: shardqueue.Name, Subject: shard, Action: shardFlush, Expires: &expires})
+		cancel()
+		if err != nil {
+			return 0, fmt.Errorf("settle the cache tasks of %s: %w", shard, err)
+		}
+	}
 	if tasks, err = s.queued(ctx, spaceshardqueue.Name); err != nil {
 		return 0, err
 	}
