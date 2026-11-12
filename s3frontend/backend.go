@@ -42,6 +42,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
+	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/authority"
@@ -368,6 +369,7 @@ func New(d Deps) (*Backend, error) {
 		}
 		b.blobs, err = spaceshardqueue.New(d.Tasks, bd)
 	}
+	var blobList msbucket.BlobListSizes
 	if err == nil {
 		bd := bucketqueue.Deps{
 			Registry:     d.Registry,
@@ -386,6 +388,7 @@ func New(d Deps) (*Backend, error) {
 		if d.tuneBuckets != nil {
 			d.tuneBuckets(&bd)
 		}
+		blobList = bd.BlobList
 		b.buckets, err = bucketqueue.New(d.Tasks, bd)
 	}
 	if err == nil {
@@ -401,7 +404,7 @@ func New(d Deps) (*Backend, error) {
 			Capture:          b.commitAuthority,
 			ReleaseGrace:     d.ReleaseGrace,
 			SessionTTL:       d.MultipartSessionTTL,
-			Limits:           &multipartqueue.Limits{RehashBudget: d.RehashBudget},
+			Limits:           &multipartqueue.Limits{RehashBudget: d.RehashBudget, MaxBodyBlobs: blobList.MaxBlobs()},
 			CompleteDeferred: b.multipartMetrics.completeDeferred,
 			Logger:           logger,
 		}

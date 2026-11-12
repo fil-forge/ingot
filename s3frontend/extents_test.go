@@ -209,6 +209,17 @@ func TestExtents_MultipartPartNumberAcrossExtents(t *testing.T) {
 	assertObjectTree(t, b, key, whole)
 }
 
+// TestExtents_CompleteCapFollowsListSizes: a Complete refuses what the
+// backend's blob lists cannot hold, whatever their sizes.
+func TestExtents_CompleteCapFollowsListSizes(t *testing.T) {
+	for _, sizes := range []msbucket.BlobListSizes{{}, smallLists} {
+		b, _, _ := newRefTestBackendOn(t, newSmallListStore(t, sizes), extentBlobSize)
+		if got, want := storeFor(b).limits.MaxBodyBlobs, sizes.MaxBlobs(); got != want {
+			t.Fatalf("lists of %+v: a Complete takes %d blobs, the lists hold %d", sizes, got, want)
+		}
+	}
+}
+
 // TestExtents_CompleteRefusesTooManyBlobs: an upload whose parts hold more
 // blobs than one manifest can list is refused before the session latches,
 // so it stays open and its blobs unaccepted.
