@@ -477,10 +477,10 @@ func (v *validator) list(ctx context.Context, b validateBucket) {
 
 	start := time.Now()
 	res := ListResult{Bucket: b.name}
-	missing := func(key string) {
-		res.Missing++
-		v.fail(ctx, "list %s: %s is missing", b.name, key)
-	}
+	// gone collects the recorded keys the listing passed without returning.
+	// They are reported only once the listing has run to its end in order:
+	// a listing cut short or out of order says nothing reliable about them.
+	var gone []string
 	var token *string
 	var last string
 	for {
@@ -500,22 +500,21 @@ func (v *validator) list(ctx context.Context, b validateBucket) {
 		}
 		v.record(OpListPage, elapsed)
 		res.Pages++
-		if len(out.Contents) > 0 && res.Objects > 0 && aws.ToString(out.Contents[0].Key) <= last {
-			v.fail(ctx, "list %s: page %d starts at %s, not after %s, so the listing does not move on",
-				b.name, res.Pages, aws.ToString(out.Contents[0].Key), last)
-			return
-		}
 		for _, o := range out.Contents {
 			key := aws.ToString(o.Key)
+			// A key out of order ends the listing: what follows it can't be
+			// matched against the recorded keys, and a gateway whose next
+			// page starts after it may return the same keys forever.
 			if res.Objects > 0 && key <= last {
-				v.fail(ctx, "list %s: %s follows %s", b.name, key, last)
+				v.fail(ctx, "list %s: page %d has %s after %s, out of order", b.name, res.Pages, key, last)
+				return
 			}
 			last = key
 			res.Objects++
 			// Both lists are sorted, so a recorded key below this one that
 			// has not been seen is missing.
 			for len(want) > 0 && want[0] < key {
-				missing(want[0])
+				gone = append(gone, want[0])
 				want = want[1:]
 			}
 			if len(want) > 0 && want[0] == key {
@@ -534,8 +533,9 @@ func (v *validator) list(ctx context.Context, b validateBucket) {
 		}
 		token = out.NextContinuationToken
 	}
-	for _, key := range want {
-		missing(key)
+	for _, key := range append(gone, want...) {
+		res.Missing++
+		v.fail(ctx, "list %s: %s is missing", b.name, key)
 	}
 	res.DurationS = time.Since(start).Seconds()
 	v.mu.Lock()
@@ -576,11 +576,26 @@ func (v *validator) write(ctx context.Context) error {
 		}
 		return tasks
 	}
-	v.say("write  writing %d objects in each of %d buckets, run %s (each key is ValidateKey with this run)",
-		v.cfg.Samples, len(v.buckets), run)
+	v.say("write  writing %d objects in each of %d buckets, run %s", v.cfg.Samples, len(v.buckets), run)
+	announced := make(chan struct{})
+	stopAnnounce := context.AfterFunc(ctx, func() {
+		defer close(announced)
+		v.say("write  interrupted: finishing the PUTs in flight, then deleting every object sent (run %s); interrupt again to stop at once and leave them", run)
+	})
+	// The line is said once the step returns, or not at all.
+	defer func() {
+		if !stopAnnounce() {
+			<-announced
+		}
+	}()
 	// An interrupt stops new PUTs, but one already sent finishes, so that
-	// its delete follows its answer rather than racing it.
+	// its delete follows its answer. A PUT the client gives up on at the
+	// request timeout has no answer, so the gateway may still commit it after
+	// its delete.
 	putErr := v.run(ctx, each(func(ctx context.Context, i int, o object) {
+		if ctx.Err() != nil {
+			return
+		}
 		sent[i].Store(true)
 		v.put(context.WithoutCancel(ctx), o.bucket, o.key)
 	}))
@@ -591,7 +606,7 @@ func (v *validator) write(ctx context.Context) error {
 				n++
 			}
 		}
-		v.say("write  interrupted: deleting the %d objects written so far (run %s); interrupt again to leave them", n, run)
+		v.say("write  deleting the %d objects whose PUT was sent (run %s)", n, run)
 	}
 	_ = v.run(context.WithoutCancel(ctx), each(func(ctx context.Context, i int, o object) {
 		if sent[i].Load() {

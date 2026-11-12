@@ -255,12 +255,16 @@ func TestValidateInterruptedWriteLeavesNothing(t *testing.T) {
 	if err == nil || !r.Interrupted || !slices.Equal(r.Steps, []string{StepHead}) || r.WriteRun == "" || r.Failures != 0 {
 		t.Fatalf("interrupted write: %v, report %+v", err, r)
 	}
-	// Each PUT sent gets a delete, and no other key does.
-	if puts, deletes := client.puts.Load(), client.deletes.Load(); puts >= 10 || deletes != puts {
-		t.Fatalf("%d PUTs and %d deletes, want fewer than 10 PUTs, each deleted", puts, deletes)
+	// No PUT goes out after the interrupt, and each one sent gets a
+	// delete.
+	if puts, deletes := client.puts.Load(), client.deletes.Load(); puts != 7 || deletes != 7 {
+		t.Fatalf("%d PUTs and %d deletes, want 7 of each", puts, deletes)
 	}
-	if out := progress.String(); !strings.Contains(out, "run "+r.WriteRun) || !strings.Contains(out, "interrupt again to leave them") {
-		t.Fatalf("progress %q", out)
+	out := progress.String()
+	for _, want := range []string{"run " + r.WriteRun, "interrupt again to stop at once", "deleting the 7 objects whose PUT was sent"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("progress %q lacks %q", out, want)
+		}
 	}
 	for _, b := range load.Buckets {
 		if !maps.Equal(f.objects(b), before[b]) {
@@ -336,8 +340,89 @@ func TestValidateStopsOnAListingThatDoesNotMoveOn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Failures != 1 || !strings.Contains(r.FailureSample[0], "does not move on") || r.Latency[OpListPage].Count != 2 {
+	if r.Failures != 1 || !strings.Contains(r.FailureSample[0], "out of order") || r.Latency[OpListPage].Count != 2 {
 		t.Fatalf("failures %v, pages %d", r.FailureSample, r.Latency[OpListPage].Count)
+	}
+}
+
+// misplacedKey moves the first page's first key to its end, and continues
+// after it, as a gateway whose next page starts after the last key returned
+// would. Every page after that is the first page again.
+type misplacedKey struct{ *fakeS3 }
+
+func (m misplacedKey) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, o ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
+	first := *in
+	first.ContinuationToken = nil
+	out, err := m.fakeS3.ListObjectsV2(ctx, &first, o...)
+	if err != nil {
+		return nil, err
+	}
+	out.Contents = append(out.Contents[1:], out.Contents[0])
+	out.NextContinuationToken = out.Contents[len(out.Contents)-1].Key
+	return out, nil
+}
+
+func TestValidateStopsAtAKeyOutOfOrder(t *testing.T) {
+	f := newFakeS3()
+	load := loadForValidation(t, f, 1)
+	cfg := validateConfig(load)
+	cfg.Steps = []string{StepList}
+	r, err := Validate(t.Context(), misplacedKey{f}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Failures != 1 || !strings.Contains(r.FailureSample[0], "out of order") || r.Latency[OpListPage].Count != 1 {
+		t.Fatalf("failures %v, pages %d", r.FailureSample, r.Latency[OpListPage].Count)
+	}
+}
+
+// lateCommit is a gateway that commits a PUT even when the client has given
+// up on it, a little after the client went away, as a server that doesn't
+// cancel a handler when its client disconnects may. The PUT during which
+// cancel ends the run is the one it holds.
+type lateCommit struct {
+	*fakeS3
+	cancel context.CancelFunc
+	once   sync.Once
+	late   sync.WaitGroup
+}
+
+func (l *lateCommit) PutObject(ctx context.Context, in *s3.PutObjectInput, o ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	held := false
+	l.once.Do(func() { held = true })
+	if !held {
+		return l.fakeS3.PutObject(ctx, in, o...)
+	}
+	l.cancel()
+	time.Sleep(20 * time.Millisecond)
+	if err := ctx.Err(); err != nil {
+		l.late.Go(func() {
+			time.Sleep(50 * time.Millisecond)
+			l.fakeS3.PutObject(context.Background(), in, o...)
+		})
+		return nil, err
+	}
+	return l.fakeS3.PutObject(ctx, in, o...)
+}
+
+// A PUT in flight at an interrupt runs to its answer before its delete is
+// sent, so a gateway can't commit it after the delete.
+func TestValidateFinishesAPutInFlightBeforeItsDelete(t *testing.T) {
+	f := newFakeS3()
+	load := loadForValidation(t, f, 1)
+	before := f.objects(load.Buckets[0])
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	client := &lateCommit{fakeS3: f, cancel: cancel}
+	cfg := validateConfig(load)
+	cfg.Steps = []string{StepWrite}
+	cfg.Workers = 1
+	if _, err := Validate(ctx, client, cfg); err == nil {
+		t.Fatal("validate was not interrupted")
+	}
+	client.late.Wait()
+	if after := f.objects(load.Buckets[0]); !maps.Equal(after, before) {
+		t.Fatalf("%d objects, want %d", len(after), len(before))
 	}
 }
 

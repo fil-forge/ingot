@@ -179,9 +179,9 @@ objects the load wrote from its --state file. The steps run in this order:
   write  writes --samples new zero-byte objects per bucket the way the load
          does, deletes them, and checks they are gone
 
-It deletes only the objects it writes, and deletes them even when
-interrupted; the run tag it prints, and the report's write_run, name their
-keys. --sample picks which objects and ranges are read: just after restarting
+It deletes only the objects it writes, and deletes them even after an
+interrupt; a second interrupt stops it at once, and a later listing counts
+what it left as extra keys. --sample picks which objects and ranges are read: just after restarting
 the gateway, run --steps get,head, then the same again with the same
 --sample, then --steps list,write. The second run finds the catalog and the
 authorization caches warm; a full listing reads enough of the catalog to
