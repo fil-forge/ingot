@@ -1193,10 +1193,10 @@ harness (`make itest`); unit tests cover libraries and pure logic only:
   adopts it under its digest once the provider holds it, before the PUT answers. A cached copy
   stays for `cache_ttl` after it was cached or last read: a `queue-shard.cache` task schedules a
   `queue-shard.evict` for when the time runs out, and a read with less than half left schedules a
-  later one in its place. With `local_blob_max_bytes` set
+  later one in its place. With a nonzero `local_blob_max_bytes`
   (`SweepLocalBlobs`), every 30s the sweeper also evicts cached copies, the least recently
   renewed first, down to 90% of the budget; hourly it deletes unfinished `.tmp-*` writes older
-  than `local_blob_orphan_age` (default 24 h). The budget is off by default. A release frees a deleted object's cached copies, and a multipart part
+  than `local_blob_orphan_age` (default 24 h). The key has no default: a config sets it unless `cache_writes` is false, and `0` is no budget. A release frees a deleted object's cached copies, and a multipart part
   keeps none. Local blob storage reports its usage, budget, stalled uploads, removals by reason
   and reads by tier as OpenTelemetry metrics (`ingot.local_blobs.*`). With `cache_writes: false`,
   a write keeps no copy, giving up the read-after-write copy ([§5](#5-the-data-layer)): safe while reads

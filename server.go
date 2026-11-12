@@ -291,6 +291,7 @@ func (s *Server) Start(ctx context.Context) error {
 		zap.String("region", s.cfg.Region),
 		zap.String("data_dir", s.cfg.DataDir),
 		zap.Int64("max_blob_size", s.cfg.MaxBlobSize),
+		zap.Int64("local_blob_max_bytes", s.cfg.LocalBlobMaxBytes),
 	)
 	go func() {
 		if err := s.api.ServeMultiPort([]string{s.cfg.Addr}); err != nil {
@@ -325,7 +326,7 @@ const localBlobSweepLogInterval = 10 * time.Minute
 
 // startLocalBlobSweeper spawns the local blob sweeper: every
 // localBlobSweepInterval it evicts cached blobs down to LocalBlobMaxBytes
-// (when set), and hourly it deletes orphan files (see
+// (when nonzero), and hourly it deletes orphan files (see
 // Backend.SweepLocalBlobs).
 func (s *Server) startLocalBlobSweeper() {
 	s.goSweep(func() {
