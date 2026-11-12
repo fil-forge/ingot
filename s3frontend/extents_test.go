@@ -22,16 +22,16 @@ import (
 // a megabyte or two passes the 1,024 blobs a manifest keeps inline.
 const extentBlobSize = 1 << 10
 
-// smallLists is a blob list shape that puts a body of a few dozen blobs
+// smallLists are blob list sizes that put a body of a few dozen blobs
 // across several extents.
-var smallLists = msbucket.BlobListShape{Head: 8, Extent: 8}
+var smallLists = msbucket.BlobListSizes{Head: 8, Extent: 8}
 
 // newSmallListStore is a test store whose backend writes blob lists of the
-// given shape.
-func newSmallListStore(t *testing.T, shape msbucket.BlobListShape) *testStore {
+// given sizes.
+func newSmallListStore(t *testing.T, sizes msbucket.BlobListSizes) *testStore {
 	t.Helper()
 	mem := newTestStore(t)
-	mem.blobList = shape
+	mem.blobList = sizes
 	return mem
 }
 
@@ -65,7 +65,7 @@ func assertExtentsIn(t *testing.T, b *Backend, bucket, key string, extents int) 
 // TestExtents_PutObjectReadsBack: an object past the inline list reads back
 // whole and in ranges inside the head, across the head/extent boundary, and
 // inside an extent, decrypting through extent-by-extent prefetch. It writes
-// lists of the default shape, so one path runs at the sizes production does.
+// lists of the default sizes, so one path runs as production does.
 func TestExtents_PutObjectReadsBack(t *testing.T) {
 	b, _, _ := newRefTestBackend(t, extentBlobSize)
 	data := testBody(1100*extentBlobSize + 300) // 1,101 blobs
@@ -178,7 +178,7 @@ func TestExtents_MultipartPartNumberAcrossExtents(t *testing.T) {
 	// A part before the last is at least 5 MiB, so the blobs are large and
 	// the lists short: part 1 fills the head and four extents, and part 2
 	// shares the fifth with part 1's last blob.
-	b, _, _ := newRefTestBackendOn(t, newSmallListStore(t, msbucket.BlobListShape{Head: 2, Extent: 2}), 512<<10)
+	b, _, _ := newRefTestBackendOn(t, newSmallListStore(t, msbucket.BlobListSizes{Head: 2, Extent: 2}), 512<<10)
 	part1 := testBody(5 << 20)                           // 10 blobs
 	part2 := bytes.Repeat([]byte("second part "), 30000) // 1 blob
 	key := "mp"

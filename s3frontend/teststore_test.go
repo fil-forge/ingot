@@ -43,9 +43,9 @@ type testStore struct {
 	// limits are the backend's multipart limits, which a test may change
 	// while it runs.
 	limits *multipartqueue.Limits
-	// blobList is the shape of the blob lists the backend's commits write,
+	// blobList is the sizes of the blob lists the backend's commits write,
 	// which a test sets before it builds the backend.
-	blobList msbucket.BlobListShape
+	blobList msbucket.BlobListSizes
 }
 
 // stores maps each test backend to the store it runs on, for helpers that
