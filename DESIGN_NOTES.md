@@ -573,6 +573,18 @@ through an add on the subject, so a release that may have acted never finds
 one afterwards. A release runs only as a task: Complete queues its orphans'
 releases with its own commit.
 
+A release acts only while it holds the subject's lease. The task runner ends
+a handler's context when its lease is taken over, or is 5 s from expiring
+without having been renewed (a stalled process, or one with no route to
+Postgres), and the release checks the lease itself straight before its
+crypto-shred and network step (`Exec.LeaseHeld`). Without that, a release
+that stalled after its checks could wake after another node had released the
+blob and a write had added it again, and remove the copy the new object
+needs. A `/blob/remove` already sent when the lease is lost still arrives;
+the 5 s are the time it has to do so before another node can take the lease.
+The upload service cannot tell the two copies apart, since a remove names
+only the space and the digest.
+
 In a plaintext bucket, a write of a deleted object's bytes while that
 object's release is still within its reader grace keeps the blob: the
 write's add takes a reference, and the release is stale when it runs. If the

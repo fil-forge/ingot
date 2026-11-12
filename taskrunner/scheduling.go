@@ -416,6 +416,7 @@ func (r *Runner) failOrRetry(ctx context.Context, h *hold, a *action, tasks []Ta
 		return fmt.Errorf("record failure of %s.%s: %w", tasks[0].Queue, tasks[0].Action, err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	sent := time.Now()
 	if err := lockLease(ctx, tx, h, r.opts.LeaseTTL); err != nil {
 		return err
 	}
@@ -430,6 +431,7 @@ func (r *Runner) failOrRetry(ctx context.Context, h *hold, a *action, tasks []Ta
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("record failure of %s.%s: %w", tasks[0].Queue, tasks[0].Action, err)
 	}
+	h.extend(sent, r.opts.LeaseTTL)
 	rec.report(ctx, r, start)
 	return nil
 }

@@ -528,3 +528,91 @@ func TestALongCommitStopsNoRenewal(t *testing.T) {
 		t.Fatalf("renewal took %d leases for lost during the slow commit", n)
 	}
 }
+
+func TestHandlerStopsWhenItsLeaseIsTakenOver(t *testing.T) {
+	f := newFixture(t, 1)
+	tasks := f.env.Table(queueTable(qTop) + "_tasks")
+	var runs atomic.Int32
+	f.handle(t, qTop, "slow", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if runs.Add(1) > 1 {
+			return []byte("ok"), nil
+		}
+		if err := ex.LeaseHeld(); err != nil {
+			t.Errorf("LeaseHeld = %v under a lease just taken", err)
+		}
+		f.stealLease(t, qTop, task.Subject, 500*time.Millisecond)
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+			t.Error("the handler's context did not end after its lease was taken over")
+		}
+		if err := ex.LeaseHeld(); err == nil {
+			t.Error("LeaseHeld = nil after the lease was taken over")
+		}
+		return nil, ctx.Err()
+	})
+	f.start(t)
+
+	ctx := waitCtx(t)
+	id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "slow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res, err := f.r.Wait(ctx, qTop, id); err != nil || string(res) != "ok" {
+		t.Fatalf("Wait = %q, %v; want the result of the run under a held lease", res, err)
+	}
+	var attempts int
+	if err := f.env.DB.QueryRow(ctx, `SELECT attempts FROM `+tasks+` WHERE id = $1`, id).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 {
+		t.Errorf("attempts = %d, want 0: a run stopped for a lost lease records nothing", attempts)
+	}
+}
+
+// A lease renewal cannot extend stops its handler before it can expire, with
+// nobody having taken it: the renewer skips a row another transaction holds
+// locked, as it would fail to reach a database it had no route to.
+func TestHandlerStopsBeforeAnUnrenewedLeaseExpires(t *testing.T) {
+	f := newFixture(t, 0)
+	leases := f.env.Table(queueTable(qTop) + "_leases")
+	var runs atomic.Int32
+	var stopped time.Duration
+	f.handle(t, qTop, "slow", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if runs.Add(1) > 1 {
+			return []byte("ok"), nil
+		}
+		start := time.Now()
+		tx, err := f.env.DB.Begin(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+		if _, err := tx.Exec(context.Background(), `SELECT 1 FROM `+leases+` WHERE subject = $1 FOR UPDATE`, task.Subject); err != nil {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+			t.Error("the handler's context did not end though its lease went unrenewed")
+		}
+		stopped = time.Since(start)
+		if err := ex.LeaseHeld(); err == nil {
+			t.Error("LeaseHeld = nil for a lease about to expire")
+		}
+		return nil, ctx.Err()
+	})
+	f.start(t)
+
+	res, err := f.r.Run(waitCtx(t), taskrunner.Spec{Queue: qTop, Subject: "s", Action: "slow"})
+	if err != nil || string(res) != "ok" {
+		t.Fatalf("Run = %q, %v; want the result of the run under a lease taken afresh", res, err)
+	}
+	// The lease lasts a second from when the handler started, at the earliest.
+	if stopped >= time.Second {
+		t.Errorf("the handler was stopped after %v, once its lease could have expired", stopped)
+	}
+	if stopped < 500*time.Millisecond {
+		t.Errorf("the handler was stopped after %v, long before its lease was due to expire", stopped)
+	}
+}
