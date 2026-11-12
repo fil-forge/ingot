@@ -66,6 +66,9 @@ type Deps struct {
 	// ReleaseGrace is how long after a commit a blob it drops the last
 	// claim on is released.
 	ReleaseGrace time.Duration
+	// BlobList is the sizes of the blob lists commits write; the zero value
+	// for the default.
+	BlobList msbucket.BlobListSizes
 	// ShipRetryFirst is the first wait before a ship that could not be
 	// queued is queued again; zero for a second.
 	ShipRetryFirst time.Duration
@@ -95,6 +98,7 @@ type Queue struct {
 	blobs        *spaceshardqueue.Queue
 	counts       *spaceuploadqueue.Queue
 	releaseGrace time.Duration
+	blobList     msbucket.BlobListSizes
 	logger       *zap.Logger
 	ships        ships
 }
@@ -118,6 +122,7 @@ func New(r *taskrunner.Runner, d Deps) (*Queue, error) {
 		blobs:        d.Blobs,
 		counts:       d.Counts,
 		releaseGrace: d.ReleaseGrace,
+		blobList:     d.BlobList,
 		logger:       d.Logger,
 		ships:        ships{retryFirst: d.ShipRetryFirst, retryMax: d.ShipRetryMax},
 	}

@@ -77,7 +77,9 @@ type DeferredBodyUploader interface {
 	// On error the slice still has one entry per blob. A non-nil entry is a
 	// blob the upload service accepted before the failure, which the caller
 	// must record so it is neither concluded again nor aborted as parked; a
-	// nil entry is a blob still parked.
+	// nil entry is a blob still parked. The error wraps [ErrAllocationGone]
+	// when the provider refused a blob because it no longer holds the blob's
+	// allocation: that blob can never be concluded.
 	ConcludeBlobs(ctx context.Context, space did.DID, parked []UploadedBlob) ([]*BlobLocation, error)
 	// AbortBlob releases a parked blob on its provider. A blob the space has
 	// already accepted cannot be aborted: the error wraps [ErrBlobAccepted]
@@ -120,10 +122,19 @@ func (u *Forge) ConcludeBlobs(ctx context.Context, space did.DID, parked []Uploa
 		locations[i] = &loc
 	}
 	if err != nil {
+		if errors.Is(err, forgeclient.ErrAllocationGone) {
+			return locations, fmt.Errorf("uploader: conclude blobs: %w: %w", ErrAllocationGone, err)
+		}
 		return locations, fmt.Errorf("uploader: conclude blobs: %w", err)
 	}
 	return locations, nil
 }
+
+// ErrAllocationGone reports a conclude the provider refused because it no
+// longer holds the blob's allocation: it expired before the bytes arrived, or
+// the provider removed it after it expired. Concluding the blob again gets
+// the same answer; its bytes are uploaded again under a new allocation.
+var ErrAllocationGone = errors.New("uploader: the provider no longer holds the blob's allocation")
 
 // ErrBlobAccepted reports an abort the provider refused because the space
 // has accepted the blob. The blob is not parked any more, whatever the local

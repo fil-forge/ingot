@@ -473,8 +473,10 @@ queue-space-shard.accept (subject = space/digest: never beside the blob's releas
      parked → conclude it (one /ucan/conclude, 2 min timeout); writes commit with the task:
         park → location while the concluded park stands; intent → accepted;
         take the blob off its parts' lists of blobs still to accept; a part left with none → accepted
-     a failed conclude fails the task, which records nothing; it runs at most 5 times,
-        retrying from 5 s, up to 1 min apart
+     a failed conclude fails the task, which records nothing; it retries with no attempt
+        limit, from 5 s, up to 5 min apart
+     the provider no longer holds the allocation → drop the park and fail for good;
+        Complete answers InvalidPart for the part, and the client uploads it again
 CompleteMultipartUpload([parts]) → queue-multipart-upload.complete
      waiting > 10 s behind the upload's other changes → 409 OperationAborted
      upload already completed → replay its ETag and version id

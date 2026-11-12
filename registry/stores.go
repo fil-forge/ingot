@@ -413,6 +413,10 @@ type ParkStore interface {
 	// GetPark returns ErrNotFound when the space has no park row for digest.
 	GetPark(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobPark, error)
 	DeletePark(ctx context.Context, space did.DID, digest multihash.Multihash) error
+	// DeleteParkOf deletes the space's park of digest while it is still the
+	// allocation addTask made, in one statement: a park another allocation
+	// has replaced since is left.
+	DeleteParkOf(ctx context.Context, space did.DID, digest multihash.Multihash, addTask []byte) error
 }
 
 // InclusionStore is the local shard-inclusion table (§8): block digest →

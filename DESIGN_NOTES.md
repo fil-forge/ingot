@@ -207,7 +207,11 @@ upload's `queue-multipart-upload.accept` (`queue/multipartqueue/accept.go`,
 accept pending. That accept runs on the upload's own subject, in turn with
 its other changes, and does nothing unless the session is `open`. It makes no network calls: it lists the upload's parked parts and
 queues, with its commit, a `queue-space-shard.accept` for each of their
-blobs (`spaceshardqueue.AcceptSpec`), and marks a part with no blobs accepted.
+blobs that has none pending (`spaceshardqueue.AcceptSpecs`), and marks a part
+with no blobs accepted. A pending accept is left to do the work: one that has
+failed and waits to retry is not replaced by a new submission, so queueing
+another beside it on every part and every Complete would multiply the
+concludes sent to an upload service that is already failing.
 
 A blob's accept runs under the blob's own subject (`spaceshardqueue.Subject`:
 the space and the digest), the one the blob's releases and a write's adds
@@ -243,15 +247,24 @@ and a part replaced or dropped meanwhile is not there to mark. A park of
 the same bytes recorded since by another write names another allocation,
 and stays for its own conclude. A failed conclude fails the blob's accept,
 and nothing it wrote is recorded; the retry concludes again, which the
-upload service treats as a repeat. A blob's accept retries 5 times, from
-5 s, doubling, up to 1 minute (`acceptRetry`); a later part's accept, or
-Complete's, queues whatever is left. `ingot.multipart.parked_age` (read from
+upload service treats as a repeat. A blob's accept retries with no attempt
+limit, from 5 s, doubling, up to 5 minutes (`acceptRetry`), as does the
+upload's accept that queues it: once the client has sent its last part
+nothing else queues an accept again, and a provider expires an allocation
+that is not accepted within a day. The retries end when the conclude
+succeeds, or when the blob's park or its references go, as an abort takes
+them. They also end when the provider answers that it no longer holds the
+allocation (`AllocationExpired` or `AllocationNotFound` on the
+`/blob/accept` receipt, `uploader.ErrAllocationGone`): the accept drops the
+park and fails for good, leaving its parts parked with no park behind them.
+Complete answers InvalidPart for such a part, and the part uploaded again
+parks a new allocation. `ingot.multipart.parked_age` (read from
 the part rows when it is collected), `ingot.multipart.accept_passes` (blob
 concludes, by outcome) and `ingot.multipart.complete_deferred` report the
 queue's health; the README lists them.
 
 Complete queues the accept of each blob of the parts it names that are still
-parked, then brings those blobs' pending accepts forward from any retry's
+parked and have no accept pending, then brings those blobs' pending accepts forward from any retry's
 backoff and waits for each of those accepts to be over, within the accept
 wait (30 s, `multipartqueue.DefaultAcceptWait`). An accept that fails and
 waits to retry is not over, so Complete waits through its retries, unless a
@@ -559,6 +572,17 @@ can take a digest again once `/blob/remove` has its receipt). Every reference en
 through an add on the subject, so a release that may have acted never finds
 one afterwards. A release runs only as a task: Complete queues its orphans'
 releases with its own commit.
+
+A release acts only while it holds the subject's lease. The task runner ends
+a handler's context when its lease is taken over, or is 5 s from expiring
+without having been renewed (a stalled process, or one with no route to
+Postgres), and the release passes that context to its crypto-shred and its
+network step. Without that, a release that stalled after its checks could
+wake after another node had released the blob and a write had added it
+again, and remove the copy the new object needs. A `/blob/remove` already sent when the lease is lost still arrives;
+the 5 s are the time it has to do so before another node can take the lease.
+The upload service cannot tell the two copies apart, since a remove names
+only the space and the digest.
 
 In a plaintext bucket, a write of a deleted object's bytes while that
 object's release is still within its reader grace keeps the blob: the

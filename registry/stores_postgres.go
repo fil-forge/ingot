@@ -416,6 +416,15 @@ func (r *Postgres) DeletePark(ctx context.Context, space did.DID, digest multiha
 	return nil
 }
 
+func (r *Postgres) DeleteParkOf(ctx context.Context, space did.DID, digest multihash.Multihash, addTask []byte) error {
+	_, err := r.pool.Exec(ctx,
+		`DELETE FROM ingot.blob_parks WHERE space = $1 AND digest = $2 AND add_task = $3`, space, digest, addTask)
+	if err != nil {
+		return fmt.Errorf("registry: delete park: %w", err)
+	}
+	return nil
+}
+
 // InclusionStore =============================================================
 
 func (r *Postgres) PutInclusions(ctx context.Context, incs []BlobInclusion) error {
