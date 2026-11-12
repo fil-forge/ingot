@@ -74,7 +74,10 @@ func (q *Queue) runAccept(ctx context.Context, ex *taskrunner.Exec, t taskrunner
 			}
 		}
 	}
-	specs := blobAccepts(sess.Space, parked)
+	specs, err := q.blobAccepts(ctx, sess.Space, parked)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := ex.SubmitAll(ctx, specs); err != nil {
 		return nil, err
 	}
@@ -82,25 +85,30 @@ func (q *Queue) runAccept(ctx context.Context, ex *taskrunner.Exec, t taskrunner
 }
 
 // blobAccepts returns the queue-space-shard.accept of each blob of parts in
-// space, each once: parts can share a blob.
-func blobAccepts(space did.DID, parts []registry.MultipartPart) []taskrunner.Spec {
+// space that has no accept pending, each once: parts can share a blob.
+func (q *Queue) blobAccepts(ctx context.Context, space did.DID, parts []registry.MultipartPart) ([]taskrunner.Spec, error) {
 	seen := map[string]bool{}
-	var specs []taskrunner.Spec
+	var digests []mh.Multihash
 	for _, p := range parts {
 		for _, d := range p.BlobDigests {
 			if !seen[string(d)] {
 				seen[string(d)] = true
-				specs = append(specs, spaceshardqueue.AcceptSpec(space, d))
+				digests = append(digests, d)
 			}
 		}
 	}
-	return specs
+	specs, err := q.blobs.AcceptSpecs(ctx, space, digests)
+	if err != nil {
+		return nil, fmt.Errorf("blobs with no accept pending: %w", err)
+	}
+	return specs, nil
 }
 
 // acceptRequested makes sure every part Complete names has its blobs
 // accepted on Forge. The upload's accept has been queueing its parts' blobs
 // for acceptance while the client uploaded them; Complete queues the accept
-// of each blob of the parts it names that are still parked, after the
+// of each blob of the parts it names that are still parked and have none
+// pending, after the
 // response's headers have gone out, and then waits for each of those blobs'
 // accepts, brought forward from any retry's backoff. It queues them and waits
 // outside its own commit: the accepts' writes commit before Complete reads
@@ -166,7 +174,11 @@ func (q *Queue) acceptAndWait(ctx context.Context, space did.DID, requested []re
 			parked = append(parked, p)
 		}
 	}
-	if _, err := q.runner.SubmitAll(ctx, blobAccepts(space, parked)); err != nil {
+	specs, err := q.blobAccepts(ctx, space, parked)
+	if err != nil {
+		return err
+	}
+	if _, err := q.runner.SubmitAll(ctx, specs); err != nil {
 		return err
 	}
 	return q.awaitBlobAccepts(ctx, space, requested, expires)
@@ -180,7 +192,7 @@ func (q *Queue) acceptAndWait(ctx context.Context, space did.DID, requested []re
 // space are due now already, so bringing them forward too changes nothing
 // for them. An accept that fails and waits to retry is waited for through
 // its retries: Complete succeeds if one of them does within the wait. A blob
-// with two accepts, one queued here beside an earlier one waiting to retry,
+// with two accepts, queued by two submitters that each found none pending,
 // is waited for until either succeeds.
 func (q *Queue) awaitBlobAccepts(ctx context.Context, space did.DID, parts []registry.MultipartPart, expires time.Time) error {
 	due, err := q.blobs.ExpediteAccepts(ctx, space)
