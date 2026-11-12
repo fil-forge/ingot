@@ -411,12 +411,12 @@ func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64
 // and herr is not permanent, and the rest fail.
 func (r *Runner) failOrRetry(ctx context.Context, h *hold, a *action, tasks []Task, herr error, start time.Time) error {
 	// A batch's outcomes commit together, under its lease, like its success.
+	sent := time.Now() // before the transaction begins: see tree.commit
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("record failure of %s.%s: %w", tasks[0].Queue, tasks[0].Action, err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	sent := time.Now()
 	if err := lockLease(ctx, tx, h, r.opts.LeaseTTL); err != nil {
 		return err
 	}

@@ -568,7 +568,10 @@ func TestHandlerStopsWhenItsLeaseIsTakenOver(t *testing.T) {
 // nobody having taken it: the renewer skips a row another transaction holds
 // locked, as it would fail to reach a database it had no route to.
 func TestHandlerStopsBeforeAnUnrenewedLeaseExpires(t *testing.T) {
-	f := newFixture(t, 0)
+	// The stop is due a sixth of the TTL before the lease can expire: half a
+	// second here, for the timer to fire in on a busy machine.
+	const ttl = 3 * time.Second
+	f := newFixture(t, 0, func(o *taskrunner.Options) { o.LeaseTTL = ttl })
 	leases := f.env.Table(queueTable(qTop) + "_leases")
 	var runs atomic.Int32
 	var stopped time.Duration
@@ -599,11 +602,11 @@ func TestHandlerStopsBeforeAnUnrenewedLeaseExpires(t *testing.T) {
 	if err != nil || string(res) != "ok" {
 		t.Fatalf("Run = %q, %v; want the result of the run under a lease taken afresh", res, err)
 	}
-	// The lease lasts a second from when the handler started, at the earliest.
-	if stopped >= time.Second {
+	// The lease lasts a TTL from when the handler started, at the earliest.
+	if stopped >= ttl {
 		t.Errorf("the handler was stopped after %v, once its lease could have expired", stopped)
 	}
-	if stopped < 500*time.Millisecond {
+	if stopped < ttl/2 {
 		t.Errorf("the handler was stopped after %v, long before its lease was due to expire", stopped)
 	}
 }
