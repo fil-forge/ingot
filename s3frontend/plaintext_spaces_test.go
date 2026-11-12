@@ -182,6 +182,7 @@ func TestPlaintextSpaces_ReleaseInOneSpaceKeepsTheOther(t *testing.T) {
 	if _, err := mem.GetIntent(ctx, space2, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("the last intent survived its release (err=%v)", err)
 	}
+	settleCache(t, b, d) // the release queues the eviction as its own task
 	if localCopyExists(b, d) {
 		t.Fatalf("the local copy survived the last intent")
 	}
@@ -609,6 +610,7 @@ func TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile(t *testing.T) {
 			t.Fatalf("intent in %s survived (err=%v)", sp, err)
 		}
 	}
+	settleCache(t, b, d) // the release queues the eviction as its own task
 	if localCopyExists(b, d) {
 		t.Fatalf("the shared file survived both releases")
 	}

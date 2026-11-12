@@ -7,11 +7,11 @@ import (
 	"github.com/google/uuid"
 	"io"
 	"testing"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/versitygw/s3response"
 
+	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
@@ -21,6 +21,19 @@ import (
 // extentBlobSize splits a body into blobs small enough that a test body of
 // a megabyte or two passes the 1,024 blobs a manifest keeps inline.
 const extentBlobSize = 1 << 10
+
+// smallLists are blob list sizes that put a body of a few dozen blobs
+// across several extents.
+var smallLists = msbucket.BlobListSizes{Head: 8, Extent: 8}
+
+// newSmallListStore is a test store whose backend writes blob lists of the
+// given sizes.
+func newSmallListStore(t *testing.T, sizes msbucket.BlobListSizes) *testStore {
+	t.Helper()
+	mem := newTestStore(t)
+	mem.blobList = sizes
+	return mem
+}
 
 // assertExtents checks that key's stored list has a full Head and the given
 // number of extents.
@@ -36,8 +49,12 @@ func assertExtentsIn(t *testing.T, b *Backend, bucket, key string, extents int) 
 	if err != nil {
 		t.Fatalf("resolve %s: %v", key, err)
 	}
-	if got := len(rv.mf.Body.Blobs.Head); got != 1024 {
-		t.Fatalf("%s: Head holds %d blobs, want 1024", key, got)
+	head := storeFor(b).blobList.Head
+	if head == 0 {
+		head = 1024
+	}
+	if got := len(rv.mf.Body.Blobs.Head); got != head {
+		t.Fatalf("%s: Head holds %d blobs, want %d", key, got, head)
 	}
 	if got := len(rv.mf.Body.Blobs.Extents); got != extents {
 		t.Fatalf("%s: %d extents, want %d", key, got, extents)
@@ -47,7 +64,8 @@ func assertExtentsIn(t *testing.T, b *Backend, bucket, key string, extents int) 
 
 // TestExtents_PutObjectReadsBack: an object past the inline list reads back
 // whole and in ranges inside the head, across the head/extent boundary, and
-// inside an extent, decrypting through extent-by-extent prefetch.
+// inside an extent, decrypting through extent-by-extent prefetch. It writes
+// lists of the default sizes, so one path runs as production does.
 func TestExtents_PutObjectReadsBack(t *testing.T) {
 	b, _, _ := newRefTestBackend(t, extentBlobSize)
 	data := testBody(1100*extentBlobSize + 300) // 1,101 blobs
@@ -75,19 +93,19 @@ func TestExtents_PutObjectReadsBack(t *testing.T) {
 }
 
 // TestExtents_DeleteReleasesEveryBlob: deleting an object drops the claim on
-// every blob, including the ones listed only in its extent.
+// every blob, including the ones listed only in its extents.
 func TestExtents_DeleteReleasesEveryBlob(t *testing.T) {
-	b, mem, _ := newRefTestBackend(t, extentBlobSize)
+	b, mem, _ := newRefTestBackendOn(t, newSmallListStore(t, smallLists), extentBlobSize)
 	ctx := context.Background()
-	data := testBody(1100 * extentBlobSize)
+	data := testBody(20 * extentBlobSize) // a head of 8, extents of 8 and 4
 	bucket, key := "bk", "big"
 	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)}); err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
-	rv := assertExtents(t, b, key, 1)
+	rv := assertExtents(t, b, key, 2)
 	digests := storedBlobs(t, b, rv).DigestList()
-	if len(digests) != 1100 {
-		t.Fatalf("%d blobs, want 1100", len(digests))
+	if len(digests) != 20 {
+		t.Fatalf("%d blobs, want 20", len(digests))
 	}
 	for _, d := range digests {
 		if n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil); n != 1 {
@@ -110,7 +128,7 @@ func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 	// One log per bucket, as in production, so dropping the source bucket's
 	// catalog drops every block only it holds.
 	ctx := context.Background()
-	mem := newTestStore(t)
+	mem := newSmallListStore(t, smallLists)
 	logs, err := logstore.OpenManager(ctx, logstore.ManagerConfig{Dir: t.TempDir(), Meta: mem, Logger: zaptest.NewLogger(t)})
 	if err != nil {
 		t.Fatalf("logstore: %v", err)
@@ -123,7 +141,7 @@ func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 			t.Fatalf("create bucket %s: %v", name, err)
 		}
 	}
-	data := testBody(1100 * extentBlobSize)
+	data := testBody(20 * extentBlobSize) // a head of 8, extents of 8 and 4
 	bucket, key := "src", "big"
 	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)}); err != nil {
 		t.Fatalf("PutObject: %v", err)
@@ -132,7 +150,7 @@ func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 	if _, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dstBucket, Key: &dst, CopySource: &src}); err != nil {
 		t.Fatalf("CopyObject: %v", err)
 	}
-	rv := assertExtentsIn(t, b, dstBucket, dst, 1)
+	rv := assertExtentsIn(t, b, dstBucket, dst, 2)
 	for _, d := range storedBlobs(t, b, rv).DigestList() {
 		if n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil); n != 1 {
 			t.Fatalf("blob %x: %d claims in the copy's space, want the copy's", d, n)
@@ -157,14 +175,12 @@ func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 // TestExtents_MultipartPartNumberAcrossExtents: a multipart object whose
 // parts span several extents serves ?partNumber and ranges from them.
 func TestExtents_MultipartPartNumberAcrossExtents(t *testing.T) {
-	// Complete accepts each of the parts' thousands of tiny blobs on its own.
-	// Complete holds the upload's lease while it waits on those accepts, long
-	// enough under the race detector for a late renewal to lapse a
-	// one-second lease.
-	b, _, _ := newRefTestBackendOn(t, newTestStoreWithLease(t, 10*time.Second), extentBlobSize)
-	storeFor(b).limits.AcceptWait = 5 * time.Minute
-	part1 := testBody(5 << 20) // 5,120 blobs
-	part2 := bytes.Repeat([]byte("second part "), 30000)
+	// A part before the last is at least 5 MiB, so the blobs are large and
+	// the lists short: part 1 fills the head and four extents, and part 2
+	// shares the fifth with part 1's last blob.
+	b, _, _ := newRefTestBackendOn(t, newSmallListStore(t, msbucket.BlobListSizes{Head: 2, Extent: 2}), 512<<10)
+	part1 := testBody(5 << 20)                           // 10 blobs
+	part2 := bytes.Repeat([]byte("second part "), 30000) // 1 blob
 	key := "mp"
 	whole := completeAll(t, b, key, [][]byte{part1, part2}, []int32{1, 2})
 	rv := assertExtents(t, b, key, 5)

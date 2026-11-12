@@ -43,6 +43,9 @@ type testStore struct {
 	// limits are the backend's multipart limits, which a test may change
 	// while it runs.
 	limits *multipartqueue.Limits
+	// blobList is the sizes of the blob lists the backend's commits write,
+	// which a test sets before it builds the backend.
+	blobList msbucket.BlobListSizes
 }
 
 // stores maps each test backend to the store it runs on, for helpers that
@@ -114,6 +117,13 @@ func (s *testStore) newBackend(t testing.TB, deps Deps) *Backend {
 		d.ReleaseRetry = taskrunner.RetryPolicy{First: time.Hour, Max: time.Hour, HoldsSubject: true}
 		if tune != nil {
 			tune(d)
+		}
+	}
+	tuneBuckets := deps.tuneBuckets
+	deps.tuneBuckets = func(d *bucketqueue.Deps) {
+		d.BlobList = s.blobList
+		if tuneBuckets != nil {
+			tuneBuckets(d)
 		}
 	}
 	s.limits = &multipartqueue.Limits{AcceptDelay: time.Hour}

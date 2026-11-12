@@ -220,7 +220,7 @@ func (q *Queue) applyPut(ctx context.Context, sc *commitScope, key string, p *Pu
 		// The body's blob list: Head inline, the rest as extent blocks
 		// written in this commit beside the manifest that names them.
 		if blobs != nil {
-			if mf.Body.Blobs, err = msbucket.BuildBlobList(ctx, tx, blobs); err != nil {
+			if mf.Body.Blobs, err = msbucket.BuildBlobList(ctx, tx, blobs, q.blobList); err != nil {
 				return cid.Undef, fmt.Errorf("blob list: %w", err)
 			}
 		}
