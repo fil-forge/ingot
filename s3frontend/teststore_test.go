@@ -130,6 +130,7 @@ func (s *testStore) newBackend(t testing.TB, deps Deps) *Backend {
 	tuneUploads := deps.tuneUploads
 	deps.tuneUploads = func(d *multipartqueue.Deps) {
 		s.limits.RehashBudget = d.Limits.RehashBudget
+		s.limits.MaxBodyBlobs = d.Limits.MaxBodyBlobs
 		d.Limits = s.limits
 		if tuneUploads != nil {
 			tuneUploads(d)

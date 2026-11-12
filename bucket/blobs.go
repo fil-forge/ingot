@@ -131,9 +131,9 @@ func (s BlobListSizes) validate() error {
 	return nil
 }
 
-// capacity is the most blobs a body of these sizes can hold: a full Head and
+// MaxBlobs is the most blobs a body of these sizes can hold: a full Head and
 // every extent full.
-func (s BlobListSizes) capacity() int { return s.head() + maxExtentRefs*s.extent() }
+func (s BlobListSizes) MaxBlobs() int { return s.head() + maxExtentRefs*s.extent() }
 
 // maxExtentRefs is how many extents a body can point to: cbor-gen's default
 // cap on a slice, which BlobList.Extents keeps.
@@ -244,8 +244,8 @@ func BuildBlobList(ctx context.Context, w blockstore.Writer, refs BlobRefs, size
 	if err := sizes.validate(); err != nil {
 		return BlobList{}, err
 	}
-	if len(refs) > sizes.capacity() {
-		return BlobList{}, fmt.Errorf("bucket: a body holds at most %d blobs, this one has %d", sizes.capacity(), len(refs))
+	if len(refs) > sizes.MaxBlobs() {
+		return BlobList{}, fmt.Errorf("bucket: a body holds at most %d blobs, this one has %d", sizes.MaxBlobs(), len(refs))
 	}
 	var next int64
 	for i, b := range refs {

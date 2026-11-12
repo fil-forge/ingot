@@ -304,11 +304,11 @@ func TestBuildBlobList_Rejects(t *testing.T) {
 	ctx := context.Background()
 	t.Run("over capacity", func(t *testing.T) {
 		sizes := BlobListSizes{Head: 1, Extent: 1}
-		_, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, sizes.capacity()+1, 1), sizes)
+		_, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, sizes.MaxBlobs()+1, 1), sizes)
 		if err == nil || !strings.Contains(err.Error(), "at most") {
 			t.Fatalf("err = %v, want the capacity refusal", err)
 		}
-		if _, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, sizes.capacity(), 1), sizes); err != nil {
+		if _, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, sizes.MaxBlobs(), 1), sizes); err != nil {
 			t.Fatalf("at capacity: %v", err)
 		}
 	})
@@ -346,7 +346,7 @@ func TestBuildBlobList_Rejects(t *testing.T) {
 
 // TestMaxBodyBlobs is the capacity at the default sizes.
 func TestMaxBodyBlobs(t *testing.T) {
-	if got := (BlobListSizes{}).capacity(); MaxBodyBlobs != got {
+	if got := (BlobListSizes{}).MaxBlobs(); MaxBodyBlobs != got {
 		t.Fatalf("MaxBodyBlobs = %d, capacity at the default sizes %d", MaxBodyBlobs, got)
 	}
 }
