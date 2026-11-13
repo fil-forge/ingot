@@ -179,6 +179,9 @@ func appConfig(t *testing.T, dsn string) *config.Config {
 		// The tenant key source is required too; it makes no network calls at
 		// construction, so an unreachable directory is fine here.
 		TenantKey: config.TenantKeyConfig{PLCDirectoryURL: "http://127.0.0.1:2582"},
+		// The local blob budget is required while writes are cached; 0 is
+		// none.
+		LocalBlobMaxBytes: new(int64),
 	}
 }
 

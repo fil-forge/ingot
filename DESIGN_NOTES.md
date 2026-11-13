@@ -408,8 +408,9 @@ the file's modification time, which orders the budget pass. A read on a
 node that has restarted renews on its first read, since the record is lost.
 
 The cache keeps a running byte count of its blob files, and counts writes
-in progress as their bytes land. With `local_blob_max_bytes` set, a sweeper
-checks the total every 30 seconds and, when it is over the budget, evicts
+in progress as their bytes land. `local_blob_max_bytes` is required unless
+`cache_writes` is false, and `0` means no budget. With a nonzero budget, a
+sweeper checks the total every 30 seconds and, when it is over the budget, evicts
 cached copies, oldest modification time first, until usage is at 90% of the
 budget, however much of their time to live is left: a time to live does not
 bound the disk, and a burst of writes can fill it before anything expires.
@@ -659,9 +660,9 @@ draws the chains and the stores.
 
 - **No HA.** A bucket's `queue-bucket` tasks are placed on the instance
   that holds its catalog log, and no other instance runs them.
-- **Local blob storage is bounded only when configured** (#48): with
-  `local_blob_max_bytes` set, the sweeper evicts cached blobs down to the
-  budget. A delete frees its blobs' cached copies once their release runs,
+- **Local blob storage is bounded only with a budget** (#48): with a
+  nonzero `local_blob_max_bytes`, the sweeper evicts cached blobs down to
+  the budget. A delete frees its blobs' cached copies once their release runs,
   and a multipart part keeps none.
 - **Crash recovery is not built**: a write that dies after its
   `queue-space-shard.add` tasks commit leaves pending references, which
