@@ -50,6 +50,25 @@ func ValidateKey(prefix, seed, bucket, run string, i uint64) string {
 	return prefix + hex.EncodeToString(h.Sum(nil))
 }
 
+// validateRealBody returns the body of real object i a validation run writes
+// in bucket, between min and max bytes inclusive: distinct from every load's
+// real objects and from every other run's, and the same for the same run.
+func validateRealBody(seed, bucket, run string, i uint64, min, max int64) *Body {
+	h := sha256.New()
+	writeField(h, "validate-real")
+	writeField(h, seed)
+	writeField(h, bucket)
+	writeField(h, run)
+	writeUint(h, i)
+	var bodySeed [32]byte
+	h.Sum(bodySeed[:0])
+	size := min
+	if max > min {
+		size += int64(binary.BigEndian.Uint64(bodySeed[:8]) % uint64(max-min+1))
+	}
+	return NewBody(bodySeed, size)
+}
+
 // RealKey returns the key of an object whose body hashes to sum: prefix
 // followed by the digest in lowercase hex, as the pack server names a pack.
 func RealKey(prefix string, sum [sha256.Size]byte) string {

@@ -67,9 +67,9 @@ releases keep up, as JSON:
     oldest_due_seconds     how long past its due time the oldest due one is
     failed                 those that failed for good, kept until resubmitted
 
-A catalog loaded by ingot-preload queues no releases: it writes each object
-once, and the only objects it deletes have no body. Delete or overwrite
-objects with bodies to time them.
+ingot-preload's load queues no releases, since it writes each object once.
+Its validate queues one for each real object its write step deletes, due once
+the release grace has passed.
 
 Shipped catalog segments are counted by "ingot catalog usage". The command
 only reads, and can run beside a live daemon: a file removed while it runs is

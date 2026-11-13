@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -100,6 +101,7 @@ func (s *keyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodPut:
+		_, _ = io.Copy(io.Discard, r.Body)
 		s.keys[path] = true
 	case http.MethodDelete:
 		delete(s.keys, path)
@@ -134,7 +136,8 @@ func TestValidateCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	validate := func(label string) (string, error) {
-		return run("validate", "--label", label, "--steps", "head,write", "--samples", "6", "--report", report)
+		return run("validate", "--label", label, "--steps", "head,write", "--samples", "6",
+			"--write-real", "2", "--real-min-mib", "1", "--real-max-mib", "1", "--report", report)
 	}
 	if out, err := validate("all-there"); err != nil || !strings.Contains(out, "steps finished: head,write. Buckets: 1, holding 6 to 6 bulk objects each. Failed or wrong: 0.") {
 		t.Fatalf("validate: %v\n%s", err, out)
@@ -159,7 +162,8 @@ func TestValidateCommand(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[1]), &last); err != nil {
 		t.Fatal(err)
 	}
-	if last.Label != "one-missing" || last.Failures != 1 || last.Latency[preload.OpPut].Count != 6 {
+	if last.Label != "one-missing" || last.Failures != 1 || last.Latency[preload.OpPut].Count != 6 ||
+		last.Latency[preload.OpPutReal].Count != 2 || last.Latency[preload.OpDeleteReal].Count != 2 {
 		t.Fatalf("report %+v", last)
 	}
 	if len(srv.keys) != 6 {

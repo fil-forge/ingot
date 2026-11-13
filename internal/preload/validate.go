@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -39,21 +40,24 @@ const (
 	StepHead = "head"
 	// StepList lists whole buckets.
 	StepList = "list"
-	// StepWrite writes new zero-byte objects create-only, as the pack server
-	// would, then deletes them.
+	// StepWrite writes new zero-byte objects and a few real ones
+	// create-only, as the pack server would, then deletes them.
 	StepWrite = "write"
 )
 
 // ValidateSteps lists every step, in the order a validation runs them.
 var ValidateSteps = []string{StepGet, StepHead, StepList, StepWrite}
 
-// Operation names, as a validation report keys its latencies by them.
+// Operation names, as a validation report keys its latencies by them. The
+// write step's real objects are timed apart from its zero-byte ones, their
+// PUTs under the load's OpPutReal.
 const (
-	OpGetRange = "get_range"
-	OpHead     = "head"
-	OpListPage = "list_page"
-	OpPut      = "put"
-	OpDelete   = "delete"
+	OpGetRange   = "get_range"
+	OpHead       = "head"
+	OpListPage   = "list_page"
+	OpPut        = "put"
+	OpDelete     = "delete"
+	OpDeleteReal = "delete_real"
 )
 
 // maxFailureSample bounds the failures a report spells out.
@@ -79,9 +83,14 @@ type ValidateConfig struct {
 	// Steps are the steps to run; nil runs every one.
 	Steps []string
 
-	// Samples is the number of bulk objects read, and of new objects written
-	// and deleted, in each bucket.
+	// Samples is the number of bulk objects read, and of new zero-byte
+	// objects written and deleted, in each bucket.
 	Samples int
+	// WriteReal is the number of new real objects written and deleted, over
+	// the buckets in turn from the first, each from RealMinSize to
+	// RealMaxSize bytes as the load sizes its own.
+	WriteReal                int
+	RealMinSize, RealMaxSize int64
 	// RangeSize is the length of each ranged read of a real object.
 	RangeSize int64
 	// ListBuckets is the number of buckets listed in full, from the first.
@@ -105,6 +114,10 @@ func (c *ValidateConfig) validate() error {
 		return errors.New("no label")
 	case c.Samples < 1:
 		return errors.New("samples must be at least 1")
+	case c.WriteReal < 0:
+		return errors.New("real objects written must not be negative")
+	case c.WriteReal > 0 && (c.RealMinSize < 1 || c.RealMaxSize < c.RealMinSize):
+		return fmt.Errorf("real object sizes %d to %d are not a range of positive sizes", c.RealMinSize, c.RealMaxSize)
 	case c.RangeSize < 1:
 		return errors.New("range size must be at least 1 byte")
 	case c.ListBuckets < 0:
@@ -136,8 +149,9 @@ type ValidateReport struct {
 	Steps       []string `json:"steps"`
 	Interrupted bool     `json:"interrupted,omitempty"`
 	ElapsedS    float64  `json:"elapsed_s"`
-	// WriteRun tags the keys of the objects the write step wrote: object i
-	// of a bucket is ValidateKey(prefix, seed, bucket, WriteRun, i).
+	// WriteRun is different on every run, so the objects the write step
+	// writes are too: zero-byte object i of a bucket is ValidateKey(prefix,
+	// seed, bucket, WriteRun, i), and a real object's body depends on it.
 	WriteRun string `json:"write_run,omitempty"`
 	// Point is the catalog the validation ran against, as the load's state
 	// file records it.
@@ -180,8 +194,8 @@ type ListResult struct {
 // Validate times reads, listings, writes and deletes against the catalog a
 // load built, and checks each answer: a bulk object is there and empty, a
 // range of a real object holds the bytes the load wrote, a listing is in
-// order and holds every object the load recorded, a new object can be written
-// create-only, and once deleted it is gone. It deletes only the objects it
+// order and holds every object the load recorded, new objects, zero-byte and
+// real, can be written create-only, and once deleted they are gone. It deletes only the objects it
 // wrote itself, and deletes them even when ctx ends.
 //
 // A request that fails or answers wrongly is counted in the report, not
@@ -561,11 +575,12 @@ func (v *validator) list(ctx context.Context, b validateBucket) {
 	done(true, true)
 }
 
-// write writes cfg.Samples new zero-byte objects in each bucket, deletes
-// them, and checks they are gone. Their keys are fresh on every run, so a
-// run never meets a key another left behind. The deletes run even when ctx
-// ends, each still bounded by the request timeout, so that an interrupted
-// run leaves nothing behind.
+// write writes cfg.Samples new zero-byte objects in each bucket and
+// cfg.WriteReal real ones over the buckets in turn, deletes them, and checks
+// they are gone. They are new on every run, so a run never meets an object
+// another left behind. The deletes run even when ctx ends, each still
+// bounded by the request timeout, so that an interrupted run leaves nothing
+// behind.
 func (v *validator) write(ctx context.Context) error {
 	var tag [8]byte
 	if _, err := rand.Read(tag[:]); err != nil {
@@ -575,25 +590,36 @@ func (v *validator) write(ctx context.Context) error {
 	v.mu.Lock()
 	v.report.WriteRun = run
 	v.mu.Unlock()
-	type object struct{ bucket, key string }
+	// A real object's key is its body's digest, as the pack server names a
+	// pack, so its PUT task sets it once it has hashed the body. Each task
+	// sets only its own object's key, and later steps read the keys after
+	// every PUT task has returned.
+	type object struct {
+		bucket, key string
+		real        bool
+		index       uint64
+	}
 	var objects []object
 	for _, b := range v.buckets {
 		for i := range v.cfg.Samples {
-			objects = append(objects, object{b.name, ValidateKey(v.cfg.KeyPrefix, v.cfg.Seed, b.name, run, uint64(i))})
+			objects = append(objects, object{bucket: b.name, key: ValidateKey(v.cfg.KeyPrefix, v.cfg.Seed, b.name, run, uint64(i))})
 		}
+	}
+	for k := range v.cfg.WriteReal {
+		objects = append(objects, object{bucket: v.buckets[k%len(v.buckets)].name, real: true, index: uint64(k)})
 	}
 	// sent marks the objects whose PUT went out. Each of those gets a
 	// delete, whatever its PUT's answer: a delete of an object that was
 	// never written does nothing.
 	sent := make([]atomic.Bool, len(objects))
-	each := func(f func(ctx context.Context, i int, o object)) []func(context.Context) {
+	each := func(f func(ctx context.Context, i int, o *object)) []func(context.Context) {
 		tasks := make([]func(context.Context), len(objects))
-		for i, o := range objects {
-			tasks[i] = func(ctx context.Context) { f(ctx, i, o) }
+		for i := range objects {
+			tasks[i] = func(ctx context.Context) { f(ctx, i, &objects[i]) }
 		}
 		return tasks
 	}
-	v.say("write  writing %d objects in each of %d buckets, run %s", v.cfg.Samples, len(v.buckets), run)
+	v.say("write  writing %d zero-byte objects in each of %d buckets and %d real ones, run %s", v.cfg.Samples, len(v.buckets), v.cfg.WriteReal, run)
 	// An interrupt during the PUTs or the deletes is announced at once.
 	announced := make(chan struct{})
 	stopAnnounce := context.AfterFunc(ctx, func() {
@@ -604,12 +630,23 @@ func (v *validator) write(ctx context.Context) error {
 	// its delete follows its answer. A PUT the client gives up on at the
 	// request timeout has no answer, so the gateway may still commit it after
 	// its delete.
-	putErr := v.run(ctx, each(func(ctx context.Context, i int, o object) {
+	putErr := v.run(ctx, each(func(ctx context.Context, i int, o *object) {
+		var body *Body
+		var sum [sha256.Size]byte
+		if o.real {
+			body = validateRealBody(v.cfg.Seed, o.bucket, run, o.index, v.cfg.RealMinSize, v.cfg.RealMaxSize)
+			var err error
+			if sum, err = body.SHA256(); err != nil {
+				v.fail(ctx, "hash real object %d of run %s: %v", o.index, run, err)
+				return
+			}
+			o.key = RealKey(v.cfg.KeyPrefix, sum)
+		}
 		if ctx.Err() != nil {
 			return
 		}
 		sent[i].Store(true)
-		v.put(context.WithoutCancel(ctx), o.bucket, o.key)
+		v.put(context.WithoutCancel(ctx), o.bucket, o.key, body, sum)
 	}))
 	if putErr != nil {
 		// ctx has ended and the announcement is still armed, so it runs;
@@ -623,9 +660,9 @@ func (v *validator) write(ctx context.Context) error {
 		}
 		v.say("write  deleting the %d objects whose PUT was sent (run %s)", n, run)
 	}
-	_ = v.run(context.WithoutCancel(ctx), each(func(ctx context.Context, i int, o object) {
+	_ = v.run(context.WithoutCancel(ctx), each(func(ctx context.Context, i int, o *object) {
 		if sent[i].Load() {
-			v.delete(ctx, o.bucket, o.key)
+			v.delete(ctx, o.bucket, o.key, o.real)
 		}
 	}))
 	if !stopAnnounce() {
@@ -637,29 +674,43 @@ func (v *validator) write(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return v.run(ctx, each(func(ctx context.Context, _ int, o object) { v.checkGone(ctx, o.bucket, o.key) }))
+	return v.run(ctx, each(func(ctx context.Context, i int, o *object) {
+		if sent[i].Load() {
+			v.checkGone(ctx, o.bucket, o.key)
+		}
+	}))
 }
 
-func (v *validator) put(ctx context.Context, bucket, key string) {
+// put writes key create-only: body, which hashes to sum, or a zero-byte
+// object when body is nil.
+func (v *validator) put(ctx context.Context, bucket, key string, body *Body, sum [sha256.Size]byte) {
+	in := &s3.PutObjectInput{
+		Bucket:         aws.String(bucket),
+		Key:            aws.String(key),
+		Body:           bytes.NewReader(nil),
+		ContentLength:  aws.Int64(0),
+		IfNoneMatch:    aws.String("*"),
+		ChecksumSHA256: aws.String(emptySHA256),
+	}
+	op := OpPut
+	if body != nil {
+		in.Body, in.ContentLength = body, aws.Int64(body.Size())
+		in.ChecksumSHA256 = aws.String(base64.StdEncoding.EncodeToString(sum[:]))
+		op = OpPutReal
+	}
 	elapsed, err := v.call(ctx, func(ctx context.Context) error {
-		_, err := v.client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:         aws.String(bucket),
-			Key:            aws.String(key),
-			Body:           bytes.NewReader(nil),
-			ContentLength:  aws.Int64(0),
-			IfNoneMatch:    aws.String("*"),
-			ChecksumSHA256: aws.String(emptySHA256),
-		})
+		_, err := v.client.PutObject(ctx, in)
 		return err
 	})
 	if err != nil {
 		v.fail(ctx, "put %s/%s: %v", bucket, key, err)
 		return
 	}
-	v.record(OpPut, elapsed)
+	v.record(op, elapsed)
 }
 
-func (v *validator) delete(ctx context.Context, bucket, key string) {
+// delete deletes key, timing it as a real object's when real is set.
+func (v *validator) delete(ctx context.Context, bucket, key string, real bool) {
 	elapsed, err := v.call(ctx, func(ctx context.Context) error {
 		_, err := v.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
 		return err
@@ -668,7 +719,11 @@ func (v *validator) delete(ctx context.Context, bucket, key string) {
 		v.fail(ctx, "delete %s/%s: %v", bucket, key, err)
 		return
 	}
-	v.record(OpDelete, elapsed)
+	op := OpDelete
+	if real {
+		op = OpDeleteReal
+	}
+	v.record(op, elapsed)
 }
 
 // checkGone fails unless a HEAD of a deleted object finds nothing.
@@ -706,8 +761,11 @@ func (v *validator) progress(step string, interrupted bool) {
 		StepGet:   {OpGetRange},
 		StepHead:  {OpHead},
 		StepList:  {OpListPage},
-		StepWrite: {OpPut, OpDelete},
+		StepWrite: {OpPut, OpDelete, OpPutReal, OpDeleteReal},
 	}[step]
+	if step == StepWrite && v.cfg.WriteReal == 0 {
+		ops = ops[:2]
+	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	line := fmt.Sprintf("%-6s", step)

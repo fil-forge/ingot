@@ -322,16 +322,18 @@ bodies in all.
 
 `ingot-preload validate` then times requests against the loaded buckets and
 checks every answer, reading which objects exist from the load's state file:
-pass it the load's `--buckets`, `--bucket-prefix`, `--seed`, `--key-prefix`
-and `--state`. It reads a range of every real object and checks its bytes,
-reads the metadata of a sample of bulk objects, lists a few buckets in full
-and checks every recorded object is there, and writes, deletes and re-checks
-new zero-byte objects shaped like the load's. Its access key must also be
-allowed to read, list and delete. It deletes only what it wrote, and deletes
-it even after an interrupt; a second interrupt stops it at once, and a later
-listing of a bucket counts what it left there as extra keys. A test point is a
-load to that size, a gateway restart, two reading runs with the same
-`--sample`, then the listing and writes:
+pass it the load's `--buckets`, `--bucket-prefix`, `--seed`, `--key-prefix` and
+`--state`. It reads a range of every real object and checks its bytes, reads
+the metadata of a sample of bulk objects, lists a few buckets in full and
+checks every recorded object is there, and writes, deletes and re-checks new
+objects shaped like the load's: zero-byte ones in every bucket, and
+`--write-real` real ones (20 by default, sized as the load's, about 3.6 GiB
+uploaded) over the buckets in turn. Its access key must also be allowed to
+read, list and delete. It deletes only what it wrote, and deletes it even after
+an interrupt; a second interrupt stops it at once, and a later listing of a
+bucket counts what it left there as extra keys. A test point is a load to that
+size, a gateway restart, two reading runs with the same `--sample`, then the
+listing and writes:
 
 ```bash
 ingot-preload load --until 600000 --real-every 30000      # loaded to the test point
@@ -371,11 +373,10 @@ It also reports how blob releases keep up: how long the finished ones took from
 the change that queued them, any grace included, how far past their due time
 they ran, and how many are still pending, past due or failed. Finished releases
 are kept for a day, the task runner's retention for finished tasks, so those
-figures are a rolling window, not totals to subtract. The load and `validate`
-queue none: the load writes each object once, and `validate` deletes only
-zero-byte objects, which have no blob. To time releases, delete or overwrite
-some real objects after the last test point's reads, since a later `get` step
-reads every real object the state file records.
+figures are a rolling window, not totals to subtract. The load queues no
+releases, since it writes each object once. `validate`'s write step queues one
+for each real object it deletes, due once the release grace has passed, so run
+`ingot footprint` after that to see them finished.
 
 Neither command is listed in `ingot --help` unless `INGOT_DEV_COMMANDS` is set
 to `1` or `true`; both run either way.

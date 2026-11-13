@@ -2,9 +2,12 @@ package preload
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -12,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -40,6 +44,9 @@ func validateConfig(load Config) ValidateConfig {
 		ListBuckets:    2,
 		Workers:        4,
 		RequestTimeout: time.Minute,
+		WriteReal:      4,
+		RealMinSize:    load.RealMinSize,
+		RealMaxSize:    load.RealMaxSize,
 	}
 }
 
@@ -57,7 +64,7 @@ func TestValidateChecksALoadedCatalog(t *testing.T) {
 		t.Fatalf("%d failures: %v", r.Failures, r.FailureSample)
 	}
 	// 52 objects a bucket at seven a page is eight pages.
-	for op, want := range map[string]uint64{OpGetRange: 6, OpHead: 15, OpListPage: 16, OpPut: 15, OpDelete: 15} {
+	for op, want := range map[string]uint64{OpGetRange: 6, OpHead: 15, OpListPage: 16, OpPut: 15, OpDelete: 15, OpPutReal: 4, OpDeleteReal: 4} {
 		if got := r.Latency[op].Count; got != want {
 			t.Errorf("%s: %d timed, want %d", op, got, want)
 		}
@@ -78,6 +85,79 @@ func TestValidateChecksALoadedCatalog(t *testing.T) {
 	}
 	// The objects the validation wrote are gone, and nothing else changed.
 	st := readTestState(t, load)
+	for _, b := range load.Buckets {
+		checkBucket(t, f, load, b, 50, st.Buckets[b])
+	}
+}
+
+// realPuts records the real objects a validation writes.
+type realPuts struct {
+	*fakeS3
+	mu   sync.Mutex
+	puts []realPut
+}
+
+type realPut struct {
+	bucket, key, sum string
+	size             int64
+}
+
+func (r *realPuts) PutObject(ctx context.Context, in *s3.PutObjectInput, opts ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	if n := aws.ToInt64(in.ContentLength); n > 0 {
+		r.mu.Lock()
+		sum, _ := base64.StdEncoding.DecodeString(aws.ToString(in.ChecksumSHA256))
+		r.puts = append(r.puts, realPut{aws.ToString(in.Bucket), aws.ToString(in.Key), hex.EncodeToString(sum), n})
+		r.mu.Unlock()
+	}
+	return r.fakeS3.PutObject(ctx, in, opts...)
+}
+
+// TestValidateWritesRealObjects: the write step writes its real objects over
+// the buckets in turn, each named by its body's digest as the load names its
+// own, sized as the load sizes them, and new on every run.
+func TestValidateWritesRealObjects(t *testing.T) {
+	f := newFakeS3()
+	load := loadForValidation(t, f, 3)
+	st := readTestState(t, load)
+	cfg := validateConfig(load)
+	cfg.Steps = []string{StepWrite}
+	var progress strings.Builder
+	cfg.Progress = &progress
+	keyRE := regexp.MustCompile("^" + regexp.QuoteMeta(load.KeyPrefix) + "[0-9a-f]{64}$")
+	runs := map[string]bool{}
+	for range 2 {
+		rec := &realPuts{fakeS3: f}
+		r, err := Validate(t.Context(), rec, cfg)
+		if err != nil || r.Failures != 0 {
+			t.Fatalf("validate: %v, failures %v", err, r.FailureSample)
+		}
+		slices.SortFunc(rec.puts, func(a, b realPut) int { return strings.Compare(a.bucket, b.bucket) })
+		var buckets []string
+		for _, p := range rec.puts {
+			buckets = append(buckets, p.bucket)
+			// The fake checks the body against its checksum, so a key that
+			// ends in the checksum names the body's digest.
+			if !keyRE.MatchString(p.key) || !strings.HasSuffix(p.key, p.sum) || p.size < load.RealMinSize || p.size > load.RealMaxSize {
+				t.Errorf("real object %s/%s of %d bytes", p.bucket, p.key, p.size)
+			}
+			for _, o := range st.Buckets[p.bucket].Real {
+				if o.Key == p.key {
+					t.Errorf("wrote the load's object %s/%s", p.bucket, p.key)
+				}
+			}
+			if runs[p.key] {
+				t.Errorf("wrote %s/%s on an earlier run too", p.bucket, p.key)
+			}
+			runs[p.key] = true
+		}
+		b := load.Buckets
+		if want := []string{b[0], b[0], b[1], b[2]}; !slices.Equal(buckets, want) {
+			t.Errorf("real objects went to %v, want %v", buckets, want)
+		}
+		if !strings.Contains(progress.String(), OpPutReal+" 4") || !strings.Contains(progress.String(), OpDeleteReal+" 4") {
+			t.Errorf("progress %q", progress.String())
+		}
+	}
 	for _, b := range load.Buckets {
 		checkBucket(t, f, load, b, 50, st.Buckets[b])
 	}
@@ -167,7 +247,7 @@ func TestValidateFindsWrongAnswers(t *testing.T) {
 		}
 	}
 	// One read, two heads, one listing, and every written object kept.
-	if want := uint64(4 + cfg.Samples); r.Failures != want {
+	if want := uint64(4 + cfg.Samples + cfg.WriteReal); r.Failures != want {
 		t.Fatalf("%d failures, want %d:\n%s", r.Failures, want, all)
 	}
 }
@@ -194,8 +274,10 @@ func TestValidateDeletesWhatItWroteWhenPutsFail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Failures != 5 || r.Latency[OpPut].Count != 5 || r.Latency[OpDelete].Count != 10 {
-		t.Fatalf("failures %d, puts %d, deletes %d", r.Failures, r.Latency[OpPut].Count, r.Latency[OpDelete].Count)
+	// Half of the 14 PUTs fail, and all 14 objects get a delete.
+	timed := r.Latency[OpPut].Count + r.Latency[OpPutReal].Count
+	if r.Failures != 7 || timed != 7 || r.Latency[OpDelete].Count != 10 || r.Latency[OpDeleteReal].Count != 4 {
+		t.Fatalf("failures %d, puts %d, deletes %d and %d", r.Failures, timed, r.Latency[OpDelete].Count, r.Latency[OpDeleteReal].Count)
 	}
 	for _, b := range load.Buckets {
 		if !maps.Equal(f.objects(b), before[b]) {

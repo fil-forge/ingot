@@ -376,7 +376,7 @@ func TestClientValidatesThroughTheSDK(t *testing.T) {
 		t.Fatalf("%d failures: %v", r.Failures, r.FailureSample)
 	}
 	// Twelve objects at four a page is three pages.
-	for op, want := range map[string]uint64{OpGetRange: 3, OpHead: 5, OpListPage: 3, OpPut: 5, OpDelete: 5} {
+	for op, want := range map[string]uint64{OpGetRange: 3, OpHead: 5, OpListPage: 3, OpPut: 5, OpDelete: 5, OpPutReal: 4, OpDeleteReal: 4} {
 		if got := r.Latency[op].Count; got != want {
 			t.Errorf("%s: %d timed, want %d", op, got, want)
 		}

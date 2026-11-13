@@ -164,6 +164,8 @@ func newValidateCmd() *cobra.Command {
 		steps        []string
 		rangeKiB     int64
 		reportPath   string
+		realMinMiB   int64
+		realMaxMiB   int64
 		cfg          preload.ValidateConfig
 	)
 	c := &cobra.Command{
@@ -176,8 +178,9 @@ objects the load wrote from its --state file. The steps run in this order:
   head   reads the metadata of --samples bulk objects per bucket
   list   lists the first --list-buckets buckets in full, and checks the keys
          are in order and include every object the load recorded
-  write  writes --samples new zero-byte objects per bucket the way the load
-         does, deletes them, and checks they are gone
+  write  writes --samples new zero-byte objects per bucket and --write-real
+         real ones over the buckets in turn, the way the load does, deletes
+         them, and checks they are gone
 
 It deletes only the objects it writes, and deletes them even after an
 interrupt; a second interrupt stops it at once, and a later listing of a
@@ -202,6 +205,7 @@ and makes the command exit non-zero once it has finished.`,
 				cfg.Steps = steps
 			}
 			cfg.RangeSize = rangeKiB << 10
+			cfg.RealMinSize, cfg.RealMaxSize = realMinMiB<<20, realMaxMiB<<20
 			cfg.Progress = cmd.OutOrStdout()
 			client.Conns = cfg.Workers
 			s3c, err := preload.NewClient(cmd.Context(), client)
@@ -244,7 +248,10 @@ and makes the command exit non-zero once it has finished.`,
 	f.StringVar(&cfg.Label, "label", "", "name of this run in the report, such as 0.6M-cold (required)")
 	f.StringVar(&cfg.Sample, "sample", "sample", "picks the objects and ranges read; the same value reads the same ones")
 	f.StringSliceVar(&steps, "steps", nil, "steps to run, of "+strings.Join(preload.ValidateSteps, ",")+" (default all)")
-	f.IntVar(&cfg.Samples, "samples", 20, "bulk objects read, and new objects written and deleted, per bucket")
+	f.IntVar(&cfg.Samples, "samples", 20, "bulk objects read, and new zero-byte objects written and deleted, per bucket")
+	f.IntVar(&cfg.WriteReal, "write-real", 20, "new real objects written and deleted, over the buckets in turn")
+	f.Int64Var(&realMinMiB, "real-min-mib", 128, "smallest real object written, in MiB")
+	f.Int64Var(&realMaxMiB, "real-max-mib", 240, "largest real object written, in MiB")
 	f.Int64Var(&rangeKiB, "range-kib", 1024, "length of each ranged read of a real object, in KiB")
 	f.IntVar(&cfg.ListBuckets, "list-buckets", 3, "buckets listed in full, from the first")
 	f.IntVar(&cfg.Workers, "workers", 8, "requests in flight")
