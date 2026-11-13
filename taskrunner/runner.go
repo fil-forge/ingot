@@ -438,6 +438,7 @@ func (r *Runner) Start(ctx context.Context) error {
 }
 
 // Stop cancels the workers and the Run calls in progress, and waits for them.
+// A lease take one has in flight runs on for up to the lease TTL first.
 // A Stop that returns early because ctx ended leaves the shutdown running: a
 // later Stop waits for it, and Start fails until it has finished.
 // A task interrupted by Stop stays pending and is resumed by the next process
@@ -772,9 +773,12 @@ func (r *Runner) submit(ctx context.Context, db execer, s Spec) (TaskID, error) 
 // one.
 //
 // If ctx ends first, Run returns ctx's error and the task stays submitted,
-// for a worker to run later unless its Expires passes first. Give a sync task
-// an Expires, or a ctx with a deadline, whenever a caller that has given up
-// must not see the task take effect later.
+// for a worker to run later unless its Expires passes first. A lease take in
+// flight when ctx ends runs on for up to the lease TTL first, so that a
+// lease it took is handed back rather than left to block the subject until
+// it expires; a take not finished by then can still leave one to expire.
+// Give a sync task an Expires, or a ctx with a deadline, whenever a caller
+// that has given up must not see the task take effect later.
 func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 	ctx, leave, err := r.enterInline(ctx)
 	if err != nil {
@@ -849,6 +853,13 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 		h, task, stop, err := r.takeTurn(ctx, q, s.Subject, age, seq, id)
 		if err != nil {
 			return nil, err
+		}
+		if h != nil && ctx.Err() != nil {
+			// The take landed after the caller gave up: hand the lease back
+			// rather than start the task for no one.
+			h.turn = turn
+			r.endHold(ctx, h, nil)
+			return nil, ctx.Err()
 		}
 		if h != nil || stop != nil {
 			d := drained{stop: stop}

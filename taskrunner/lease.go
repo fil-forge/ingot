@@ -260,13 +260,22 @@ type freeSub struct {
 // tryLease takes the subject's lease for a tree of the given age, or reports
 // the age of the tree holding it. Both results are nil when the holder's age
 // could not be read.
+//
+// A take in flight when ctx ends runs on for up to the lease TTL (see
+// takeCtx), so that the runner learns whether it took the lease.
 func (r *Runner) tryLease(ctx context.Context, q *queue, subject string, age treeAge) (*hold, *treeAge, error) {
+	// A caller that has already gone needs no lease.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	token := uuid.New()
 	var taken, tookOver bool
 	var holderCreated *time.Time
 	var holderID *uuid.UUID
+	takeCtx, cancel := r.takeCtx(ctx)
+	defer cancel()
 	sent := time.Now()
-	err := r.db.QueryRow(ctx, `
+	err := r.db.QueryRow(takeCtx, `
 WITH taken AS (
 	INSERT INTO `+q.leases+` AS l (subject, owner, expires, tree_created, tree_id)
 	VALUES ($1, $2, now() + $3 * interval '1 millisecond', $4, $5)
@@ -287,7 +296,7 @@ SELECT false, false, tree_created, tree_id FROM `+q.leases+`
 		// The holder committed after this statement's snapshot was taken.
 		return nil, nil, nil
 	case err != nil:
-		return nil, nil, fmt.Errorf("take lease %s/%s: %w", q.name, subject, err)
+		return nil, nil, r.failedTake(ctx, takeCtx, q, subject, token, err)
 	}
 	if !taken {
 		return nil, &treeAge{*holderCreated, *holderID}, nil
@@ -316,7 +325,14 @@ SELECT false, false, tree_created, tree_id FROM `+q.leases+`
 // hold alone for the caller to claim under afresh, as claim does: the
 // statement's view of the tasks is as old as the statement, and taking the
 // lease may have waited for a commit that changed them.
+//
+// As with tryLease, a take in flight when ctx ends runs on for up to the
+// lease TTL.
 func (r *Runner) takeTurn(ctx context.Context, q *queue, subject string, age treeAge, upTo int64, target TaskID) (_ *hold, _ *Task, ahead, err error) {
+	// A caller that has already gone needs no lease.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
 	token := uuid.New()
 	var taken, tookOver bool
 	var next *uuid.UUID
@@ -334,6 +350,8 @@ func (r *Runner) takeTurn(ctx context.Context, q *queue, subject string, age tre
 		node               *string
 	}
 	sent := time.Now()
+	takeCtx, cancel := r.takeCtx(ctx)
+	defer cancel()
 	// Every part reads the snapshot the statement started with. A write in
 	// a WITH runs whether or not anything reads it, so the lease is taken
 	// from mine, which is empty unless the caller's task is next, and the
@@ -344,7 +362,7 @@ func (r *Runner) takeTurn(ctx context.Context, q *queue, subject string, age tre
 	// The claim runs whether or not the lease was taken, and names its task
 	// by subject and sequence number as well as ID, so whichever index the
 	// planner picks finds the one row rather than scanning pending tasks.
-	err = r.db.QueryRow(ctx, `
+	err = r.db.QueryRow(takeCtx, `
 WITH prior AS (
 	SELECT 1 FROM `+q.leases+` WHERE subject = $1
 ), next AS (
@@ -379,7 +397,9 @@ FROM (SELECT 1) one LEFT JOIN next ON true LEFT JOIN claimed ON true`,
 	).Scan(&taken, &tookOver, &next, &waited, &backingOff, &node,
 		&c.seq, &c.id, &c.action, &c.created, &c.notBefore, &c.expires, &c.args, &c.sync, &c.attempts, &c.node)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("take lease %s/%s: %w", q.name, subject, err)
+		// A claim the statement made stays: the task keeps its started time
+		// but stays pending, for whoever takes the lease next.
+		return nil, nil, nil, r.failedTake(ctx, takeCtx, q, subject, token, err)
 	}
 	if !taken {
 		switch {
@@ -409,6 +429,48 @@ FROM (SELECT 1) one LEFT JOIN next ON true LEFT JOIN claimed ON true`,
 		NotBefore: c.notBefore, Expires: c.expires, Args: c.args, sync: *c.sync,
 		Attempt: *c.attempts, Node: c.node, seq: *c.seq,
 	}, nil, nil
+}
+
+// takeCtx returns the context a lease take runs on: ctx's values, and its
+// end delayed by the lease TTL. pgx answers a caller whose ctx ends at once,
+// while the statement may still run on the server and take the lease; a
+// lease taken for a caller that has given up would then be held by no one,
+// and block the subject until it expired. Given the TTL's grace, a take in
+// flight when ctx ends reports whether it took the lease, and a hold it
+// returns to a caller whose ctx has ended is released as every hold is.
+//
+// The grace covers the wait for a pool connection too, since the pool
+// acquires one on the context it is given. A take sent before ctx ended has
+// expired any lease it wrote by the time the grace ends. One that waited
+// for a connection and was sent late in the grace can still be running when
+// it ends, and its lease is then left to expire on its own, as before.
+func (r *Runner) takeCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	takeCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stop := context.AfterFunc(ctx, func() { time.AfterFunc(r.opts.LeaseTTL, cancel) })
+	return takeCtx, func() { stop(); cancel() }
+}
+
+// failedTake handles a lease take that failed with err. The take may have
+// written the lease anyway, as when its answer was lost on the way back, so
+// it deletes any lease under the take's token and wakes this process's
+// waiters on the subject, as release does. The delete runs on takeCtx, so it
+// too ends within the TTL's grace after ctx; a take that failed with its
+// connection may still be running on the server and land after the delete,
+// and that lease expires on its own. When the caller's ctx has ended, the
+// error wraps ctx's error, with the take's own error beside it.
+func (r *Runner) failedTake(ctx, takeCtx context.Context, q *queue, subject string, token uuid.UUID, err error) error {
+	tag, derr := r.db.Exec(takeCtx, `DELETE FROM `+q.leases+` WHERE subject = $1 AND owner = $2`, subject, token)
+	switch {
+	case derr != nil:
+		r.log.Warn("drop a lease a failed take may have written; it expires on its own",
+			zapSubject(q.name, subject), zapErr(derr))
+	case tag.RowsAffected() > 0:
+		r.wakeReleased(&hold{q: q, subject: subject})
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("take lease %s/%s: %w (take: %v)", q.name, subject, cerr, err)
+	}
+	return fmt.Errorf("take lease %s/%s: %w", q.name, subject, err)
 }
 
 // setAge records the tree about to run under h, for other trees' wait-or-die

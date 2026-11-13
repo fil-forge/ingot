@@ -292,15 +292,19 @@ func (s *Server) Start(ctx context.Context) error {
 		zap.String("data_dir", s.cfg.DataDir),
 		zap.Int64("max_blob_size", s.cfg.MaxBlobSize),
 	)
-	go func() {
-		if err := s.api.ServeMultiPort([]string{s.cfg.Addr}); err != nil {
-			s.logger.Error("ingot listener error", zap.Error(err))
-		}
-	}()
+	go s.serve()
 	s.sweepCtx, s.sweepCancel = context.WithCancel(context.Background())
 	s.startLocalBlobSweeper()
 	s.startCatalogUsageSweeper()
 	return nil
+}
+
+// serve runs the S3 listener until Stop closes it. Stop's close returns nil,
+// so any error is a listener failure.
+func (s *Server) serve() {
+	if err := s.api.ServeMultiPort([]string{s.cfg.Addr}); err != nil {
+		s.logger.Error("ingot listener error", zap.Error(err))
+	}
 }
 
 // goSweep runs fn in a sweeper goroutine that Stop waits for. fn must return
