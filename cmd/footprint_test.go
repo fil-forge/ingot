@@ -178,7 +178,11 @@ func TestFootprintPostgres(t *testing.T) {
 	if !ordered(lag) || took == nil || lag.Max < (wait-slack).Seconds() || lag.Max > took.Max+slack.Seconds() || lag.P50 > (grace-slack).Seconds() {
 		t.Errorf("release lag = %+v, want ordered quantiles up to the %v wait, none above %+v", lag, wait, took)
 	}
-	if rel.OldestDueSeconds < (wait-slack).Seconds() || rel.OldestDueSeconds > (wait+500*time.Millisecond).Seconds() {
+	// The report's own queries take some of the headroom. It must stay under
+	// the second registry.DueNow sets a release back, or measuring from that
+	// time instead of from when it was queued would pass too.
+	const headroom = 500 * time.Millisecond
+	if rel.OldestDueSeconds < (wait-slack).Seconds() || rel.OldestDueSeconds > (wait+headroom).Seconds() {
 		t.Errorf("oldest due = %v seconds, want about the %v wait", rel.OldestDueSeconds, wait)
 	}
 
