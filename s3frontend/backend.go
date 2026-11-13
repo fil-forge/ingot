@@ -119,6 +119,8 @@ type Backend struct {
 	// not registered).
 	multipartMetrics multipartMetrics
 	multipartGauges  metric.Registration
+	// transferMetrics counts object body bytes sent and received.
+	transferMetrics transferMetrics
 	// journalGauges is the registration of the catalog journal gauges (nil
 	// when not registered).
 	journalGauges metric.Registration
@@ -344,6 +346,7 @@ func New(d Deps) (*Backend, error) {
 	b.multipartMetrics, b.multipartGauges = newMultipartMetrics(mp, b, logger)
 	b.journalGauges = newJournalGauges(mp, b, logger)
 	b.catalogGauges = newCatalogUsageGauges(mp, b, logger)
+	b.transferMetrics = newTransferMetrics(mp, logger)
 	var counts *spaceuploadqueue.Queue
 	var err error
 	if b.shards, err = shardqueue.New(d.Tasks, shardqueue.Deps{Cache: d.Cache, TTL: d.CacheTTL, Removed: b.cacheRemoved, Logger: logger}); err == nil {

@@ -596,6 +596,7 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 	}
 
 	opts := []s3api.Option{
+		s3api.WithServerHeader(serverHeader),
 		s3api.WithQuiet(),
 		s3api.WithHealth("/health"),
 		s3api.WithConcurrencyLimiter(cfg.MaxConnections, cfg.MaxRequests),
@@ -644,6 +645,9 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 	}
 	return api, nil
 }
+
+// serverHeader is the Server response header on every response.
+const serverHeader = "Ingot"
 
 // policyHeaders adds what versitygw's bucket policy controllers leave out of
 // a ?policy response, since the backend seam returns only the document: the

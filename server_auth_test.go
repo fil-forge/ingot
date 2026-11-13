@@ -3,6 +3,7 @@ package ingot
 import (
 	"context"
 	"errors"
+	"github.com/fil-forge/versitygw/s3api"
 	"net"
 	"testing"
 	"time"
@@ -61,19 +62,7 @@ func TestBuildS3API_NoRootShortCircuit(t *testing.T) {
 	api, err := buildS3API(ctx, nil, cfg, rec, id, zap.NewNop())
 	require.NoError(t, err)
 
-	addr := freeAddr(t)
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- api.ServeMultiPort([]string{addr}) }()
-	t.Cleanup(func() {
-		require.NoError(t, api.ShutDown())
-		select {
-		case err := <-serveErr:
-			require.NoError(t, err, "s3api serve")
-		case <-time.After(5 * time.Second):
-			t.Fatal("s3api did not stop")
-		}
-	})
-	waitListening(t, addr)
+	addr := serveS3API(t, api)
 
 	_, err = ingottesting.ListKeys(ctx, ingottesting.Config{
 		Endpoint:  "http://" + addr,
@@ -98,6 +87,26 @@ func (neverAuthorizer) AuthorizeRequest(context.Context, s3.Request, ...hiltclie
 
 func (neverAuthorizer) BucketInfo(context.Context, string, did.DID, ...hiltclient.MethodOption) (*s3bkt.InfoOK, ucan.Container, error) {
 	return nil, nil, errors.New("hilt must not be consulted for a malformed access key")
+}
+
+// serveS3API serves api on a loopback port until the test ends and returns
+// its address.
+func serveS3API(t *testing.T, api *s3api.S3ApiServer) string {
+	t.Helper()
+	addr := freeAddr(t)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- api.ServeMultiPort([]string{addr}) }()
+	t.Cleanup(func() {
+		require.NoError(t, api.ShutDown())
+		select {
+		case err := <-serveErr:
+			require.NoError(t, err, "s3api serve")
+		case <-time.After(5 * time.Second):
+			t.Fatal("s3api did not stop")
+		}
+	})
+	waitListening(t, addr)
+	return addr
 }
 
 // freeAddr reserves and releases a loopback port for the server under test.
