@@ -112,8 +112,16 @@ func TestFootprintPostgres(t *testing.T) {
 	if err := r.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// The releases that remove a blob wait out a grace, so their time from
+	// queued to finished is at least that, and their lag is that much less.
+	const grace = 300 * time.Millisecond
 	for _, subject := range []string{"released-1", "released-2", "stale", "broken"} {
-		id, err := r.Submit(ctx, taskrunner.Spec{Queue: spaceshardqueue.Name, Subject: subject, Action: spaceshardqueue.ReleaseAction})
+		spec := taskrunner.Spec{Queue: spaceshardqueue.Name, Subject: subject, Action: spaceshardqueue.ReleaseAction}
+		if strings.HasPrefix(subject, "released") {
+			due := time.Now().Add(grace)
+			spec.NotBefore = &due
+		}
+		id, err := r.Submit(ctx, spec)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -142,8 +150,17 @@ func TestFootprintPostgres(t *testing.T) {
 	if rel.Released != 2 || rel.Pending != 2 || rel.Due != 1 || rel.Failed != 1 {
 		t.Errorf("releases = %+v, want 2 released, 2 pending, 1 due, 1 failed", rel)
 	}
-	if s := rel.Seconds; s == nil || s.P50 < 0 || s.P50 > s.P90 || s.P90 > s.P99 || s.P99 > s.Max {
-		t.Errorf("release seconds = %+v, want ordered quantiles", s)
+	ordered := func(s *releaseSeconds) bool {
+		return s != nil && s.P50 >= 0 && s.P50 <= s.P90 && s.P90 <= s.P99 && s.P99 <= s.Max
+	}
+	// Allow for the database's clock and the test's to differ a little.
+	const slack = 50 * time.Millisecond
+	took, lag := rel.Seconds, rel.LagSeconds
+	if !ordered(took) || took.P50 < (grace-slack).Seconds() {
+		t.Errorf("release seconds = %+v, want ordered quantiles of at least the %v grace", took, grace)
+	}
+	if !ordered(lag) || took == nil || lag.Max > took.Max-(grace-slack).Seconds() {
+		t.Errorf("release lag = %+v, want ordered quantiles the %v grace below %+v", lag, grace, took)
 	}
 	if rel.OldestDueSeconds < 0 {
 		t.Errorf("oldest due = %v seconds, want at least 0", rel.OldestDueSeconds)
@@ -181,7 +198,7 @@ func TestFootprintJSON(t *testing.T) {
 	b, err := json.Marshal(footprintReport{
 		Postgres: postgresFootprint{Tables: []tableFootprint{{}}},
 		Disk:     diskFootprint{Entries: []diskEntry{{}}},
-		Releases: releaseFootprint{Seconds: &releaseSeconds{}},
+		Releases: releaseFootprint{Seconds: &releaseSeconds{}, LagSeconds: &releaseSeconds{}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -191,12 +208,15 @@ func TestFootprintJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string][]string{
-		"postgres":         {"database_bytes", "wal_bytes", "schema_bytes", "tables"},
-		"postgres.tables":  {"name", "total_bytes", "table_bytes", "index_bytes", "live_rows", "dead_rows"},
-		"disk":             {"entries", "total"},
-		"disk.entries":     {"name", "files", "bytes"},
-		"releases":         {"released", "seconds", "pending", "due", "oldest_due_seconds", "failed"},
-		"releases.seconds": {"p50", "p90", "p99", "max"},
+		"":                     {"time", "postgres", "disk", "releases"},
+		"postgres":             {"database_bytes", "wal_bytes", "schema_bytes", "tables"},
+		"postgres.tables":      {"name", "total_bytes", "table_bytes", "index_bytes", "live_rows", "dead_rows"},
+		"disk":                 {"entries", "total"},
+		"disk.entries":         {"name", "files", "bytes"},
+		"disk.total":           {"files", "bytes"},
+		"releases":             {"released", "seconds", "lag_seconds", "pending", "due", "oldest_due_seconds", "failed"},
+		"releases.seconds":     {"p50", "p90", "p99", "max"},
+		"releases.lag_seconds": {"p50", "p90", "p99", "max"},
 	}
 	for path, keys := range want {
 		obj := lookup(t, got, path)
@@ -215,6 +235,9 @@ func TestFootprintJSON(t *testing.T) {
 // element of an array.
 func lookup(t *testing.T, v map[string]any, path string) map[string]any {
 	t.Helper()
+	if path == "" {
+		return v
+	}
 	cur := any(v)
 	for _, k := range strings.Split(path, ".") {
 		m, ok := cur.(map[string]any)
@@ -281,5 +304,61 @@ func TestFootprintCommand(t *testing.T) {
 
 	if _, err := execute("postgres_dsn: " + dsn + "\n"); err == nil || !strings.Contains(err.Error(), "needs data_dir") {
 		t.Errorf("footprint without data_dir: %v, want a refusal", err)
+	}
+}
+
+// TestDevCommandsListed: the measurement commands are left out of the help
+// unless INGOT_DEV_COMMANDS asks for them, and run either way.
+func TestDevCommandsListed(t *testing.T) {
+	help := func() string {
+		t.Helper()
+		root := newRootCmd()
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetArgs([]string{"--help"})
+		if err := root.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	listed := func(out, name string) bool {
+		for _, line := range strings.Split(out, "\n") {
+			if f := strings.Fields(line); len(f) > 0 && f[0] == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, value := range []string{"", "0", "false", "no"} {
+		t.Setenv(devCommandsEnv, value)
+		out := help()
+		for _, name := range []string{"catalog", "footprint"} {
+			if listed(out, name) {
+				t.Errorf("%s=%q: help lists %s:\n%s", devCommandsEnv, value, name, out)
+			}
+		}
+		if !listed(out, "serve") {
+			t.Errorf("%s=%q: help lacks serve:\n%s", devCommandsEnv, value, out)
+		}
+	}
+
+	t.Setenv(devCommandsEnv, "1")
+	out := help()
+	for _, name := range []string{"catalog", "footprint"} {
+		if !listed(out, name) {
+			t.Errorf("%s=1: help lacks %s:\n%s", devCommandsEnv, name, out)
+		}
+	}
+
+	t.Setenv(devCommandsEnv, "")
+	for _, args := range [][]string{{"footprint", "--help"}, {"catalog", "usage", "--help"}} {
+		root := newRootCmd()
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetArgs(args)
+		if err := root.Execute(); err != nil || !strings.Contains(out.String(), "as JSON") {
+			t.Errorf("ingot %v while unlisted: %v\n%s", args, err, out.String())
+		}
 	}
 }

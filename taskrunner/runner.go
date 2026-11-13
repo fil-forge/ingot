@@ -125,7 +125,12 @@ type QueueOptions struct {
 // for a reader outside the runner, such as a measurement of the queue. The
 // columns are the runner's own and change only by a migration step.
 func TasksTable(schema, queueName string) string {
-	return pgx.Identifier{schema, strings.ReplaceAll(queueName, "-", "_") + "_tasks"}.Sanitize()
+	return pgx.Identifier{schema, tableStem(queueName) + "_tasks"}.Sanitize()
+}
+
+// tableStem is the stem of queueName's table and index names.
+func tableStem(queueName string) string {
+	return strings.ReplaceAll(queueName, "-", "_")
 }
 
 // Options configures a Runner.
@@ -339,7 +344,7 @@ func New(db DB, opts Options) (*Runner, error) {
 		if qo.Retention < 0 || qo.FailedRetention < 0 {
 			return nil, fmt.Errorf("task runner: queue %q has a negative retention", qo.Name)
 		}
-		table := strings.ReplaceAll(qo.Name, "-", "_")
+		table := tableStem(qo.Name)
 		q := &queue{
 			name:            qo.Name,
 			idx:             i,

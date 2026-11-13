@@ -2,7 +2,10 @@
 //   - `serve` runs the S3 gateway;
 //   - `whoami` and `version` report the agent and the build;
 //   - `blake3` hashes and verifies object data against ingot's BLAKE3 CIDs;
-//   - `catalog usage` measures each bucket's catalog storage, for benchmarks.
+//   - `catalog usage` measures each bucket's catalog storage, and `footprint`
+//     what the node keeps in Postgres and on disk, for benchmarks and
+//     estate-scale runs. Both are left out of the help unless
+//     INGOT_DEV_COMMANDS is set to a true value.
 package cmd
 
 import (
@@ -10,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/fil-forge/ingot/config"
 	"github.com/spf13/cobra"
@@ -19,6 +23,18 @@ import (
 
 // cfgFile is bound to the persistent --config flag.
 var cfgFile string
+
+// devCommandsEnv, set to a true value, lists the measurement commands in the
+// help. They run whether or not it is set: it only keeps them out of the way
+// of operators who don't need them.
+const devCommandsEnv = "INGOT_DEV_COMMANDS"
+
+// devCommandsListed reports whether devCommandsEnv asks for the measurement
+// commands in the help.
+func devCommandsListed() bool {
+	listed, _ := strconv.ParseBool(os.Getenv(devCommandsEnv))
+	return listed
+}
 
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
@@ -35,9 +51,11 @@ func newRootCmd() *cobra.Command {
 		newWhoamiCmd(),
 		newVersionCmd(),
 		newBlake3Cmd(),
-		newCatalogCmd(),
-		newFootprintCmd(),
 	)
+	for _, c := range []*cobra.Command{newCatalogCmd(), newFootprintCmd()} {
+		c.Hidden = !devCommandsListed()
+		root.AddCommand(c)
+	}
 	return root
 }
 

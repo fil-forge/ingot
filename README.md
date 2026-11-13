@@ -362,13 +362,23 @@ there and makes the command exit non-zero.
 `ingot footprint`, run where the daemon runs and with its config, prints what
 the node keeps, as JSON: each table of the `ingot` schema with its bytes and
 estimated rows, the database's size and the server's write-ahead log position,
-each entry under `data_dir` with its files and bytes, and how blob releases
-keep up when objects with bodies are deleted or overwritten: how long the
-finished ones took from the change that queued them, the release grace
-included, and how many are still pending, past their grace or failed. Run it
-and `ingot catalog usage` before a load and at each test point. The difference
-in `wal_bytes` between two reports is the WAL written in between, and each
-table's and directory's growth per object loaded is what a projection scales.
+and each entry under `data_dir` with its files and bytes. Run it and
+`ingot catalog usage` before a load and at each test point. The difference in
+`wal_bytes` between two reports is the WAL written in between, and each table's
+and directory's growth per object loaded is what a projection scales.
+
+It also reports how blob releases keep up: how long the finished ones took from
+the change that queued them, the release grace included, how far past their due
+time they ran, and how many are still pending, past due or failed. Finished
+releases are kept for the queue's retention, a day by default, so those figures
+are a rolling window, not totals to subtract. The load and `validate` queue
+none: the load writes each object once, and `validate` deletes only zero-byte
+objects, which have no blob. To time releases, delete or overwrite some real
+objects after the last test point's reads, since a later `get` step reads every
+real object the state file records.
+
+Neither command is listed in `ingot --help` unless `INGOT_DEV_COMMANDS` is set
+to a true value, such as `1`; both run either way.
 
 ## Build & test
 
