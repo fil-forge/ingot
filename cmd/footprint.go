@@ -48,16 +48,19 @@ releases keep up, as JSON:
                            any more, queued by the change that dropped the
                            last reference. One a DELETE or an overwrite
                            queued waits out the release grace; others can be
-                           due at once:
+                           due at once, and deleting a bucket brings its
+                           releases forward:
     released               those that removed a blob, of the finished ones
-                           the queue keeps (for its retention of finished
-                           tasks, a day by default): a rolling window, not a
-                           running total
+                           the queue keeps (for a day, the task runner's
+                           retention of finished tasks): a rolling window,
+                           not a running total
     seconds                their time from queued to finished, any grace
                            included: p50, p90, p99 and max, or null when no
                            release removed a blob
     lag_seconds            their time from due to finished, how far the
-                           queue ran behind: the same quantiles
+                           queue ran behind, a failed attempt's backoff
+                           included: the same quantiles. A release brought
+                           forward is due from when it was queued
     pending                those not yet finished
     due                    pending ones past their due time, running or
                            waiting
@@ -265,7 +268,7 @@ func releaseUsage(ctx context.Context, pool *pgxpool.Pool) (releaseFootprint, er
 	)
 	if err := pool.QueryRow(ctx, `SELECT count(*), `+quantiles("took")+`, `+quantiles("lag")+`
 	FROM (SELECT extract(epoch FROM finished - created)::float8 AS took,
-			extract(epoch FROM finished - coalesce(not_before, created))::float8 AS lag
+			extract(epoch FROM finished - greatest(not_before, created))::float8 AS lag
 		FROM `+tasks+`
 		WHERE action = $1 AND state = 'succeeded' AND result = $2) released`,
 		spaceshardqueue.ReleaseAction, []byte(spaceshardqueue.ReleasedResult),
@@ -275,9 +278,9 @@ func releaseUsage(ctx context.Context, pool *pgxpool.Pool) (releaseFootprint, er
 	r.Seconds, r.LagSeconds = seconds(took), seconds(lag)
 	if err := pool.QueryRow(ctx, `SELECT
 		count(*) FILTER (WHERE state = 'pending'),
-		count(*) FILTER (WHERE state = 'pending' AND coalesce(not_before, created) <= now()),
-		coalesce(extract(epoch FROM now() - min(coalesce(not_before, created))
-			FILTER (WHERE state = 'pending' AND coalesce(not_before, created) <= now())), 0)::float8,
+		count(*) FILTER (WHERE state = 'pending' AND greatest(not_before, created) <= now()),
+		coalesce(extract(epoch FROM now() - min(greatest(not_before, created))
+			FILTER (WHERE state = 'pending' AND greatest(not_before, created) <= now())), 0)::float8,
 		count(*) FILTER (WHERE state = 'failed')
 	FROM `+tasks+` WHERE action = $1`, spaceshardqueue.ReleaseAction,
 	).Scan(&r.Pending, &r.Due, &r.OldestDueSeconds, &r.Failed); err != nil {

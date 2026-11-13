@@ -17,6 +17,7 @@ import (
 
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
+	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 )
 
@@ -109,11 +110,23 @@ func TestFootprintPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A release due at once, as a commit with no grace queues it, waits
+	// before the runner starts, so it runs that long behind.
+	const wait = 200 * time.Millisecond
+	dueNow := registry.DueNow()
+	late, err := r.Submit(ctx, taskrunner.Spec{Queue: spaceshardqueue.Name, Subject: "released-late", Action: spaceshardqueue.ReleaseAction, NotBefore: &dueNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(wait)
 	if err := r.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// The releases that remove a blob wait out a grace, so their time from
-	// queued to finished is at least that, and their lag is that much less.
+	if _, err := r.Wait(ctx, spaceshardqueue.Name, late); err != nil {
+		t.Fatal(err)
+	}
+	// Two more wait out a grace, so their time from queued to finished is at
+	// least that, and they run hardly behind.
 	const grace = 300 * time.Millisecond
 	for _, subject := range []string{"released-1", "released-2", "stale", "broken"} {
 		spec := taskrunner.Spec{Queue: spaceshardqueue.Name, Subject: subject, Action: spaceshardqueue.ReleaseAction}
@@ -132,14 +145,15 @@ func TestFootprintPostgres(t *testing.T) {
 	if err := r.Stop(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// With the runner stopped, one release is due and one waits out its
-	// grace.
+	// With the runner stopped, one release has been due for the wait, and
+	// one waits out its grace.
 	later := time.Now().Add(time.Hour)
 	for subject, notBefore := range map[string]*time.Time{"due": nil, "waiting": &later} {
 		if _, err := r.Submit(ctx, taskrunner.Spec{Queue: spaceshardqueue.Name, Subject: subject, Action: spaceshardqueue.ReleaseAction, NotBefore: notBefore}); err != nil {
 			t.Fatal(err)
 		}
 	}
+	time.Sleep(wait)
 
 	report, err := footprint(ctx, pool, t.TempDir())
 	if err != nil {
@@ -147,8 +161,8 @@ func TestFootprintPostgres(t *testing.T) {
 	}
 
 	rel := report.Releases
-	if rel.Released != 2 || rel.Pending != 2 || rel.Due != 1 || rel.Failed != 1 {
-		t.Errorf("releases = %+v, want 2 released, 2 pending, 1 due, 1 failed", rel)
+	if rel.Released != 3 || rel.Pending != 2 || rel.Due != 1 || rel.Failed != 1 {
+		t.Errorf("releases = %+v, want 3 released, 2 pending, 1 due, 1 failed", rel)
 	}
 	ordered := func(s *releaseSeconds) bool {
 		return s != nil && s.P50 >= 0 && s.P50 <= s.P90 && s.P90 <= s.P99 && s.P99 <= s.Max
@@ -159,11 +173,13 @@ func TestFootprintPostgres(t *testing.T) {
 	if !ordered(took) || took.P50 < (grace-slack).Seconds() {
 		t.Errorf("release seconds = %+v, want ordered quantiles of at least the %v grace", took, grace)
 	}
-	if !ordered(lag) || took == nil || lag.Max > took.Max-(grace-slack).Seconds() {
-		t.Errorf("release lag = %+v, want ordered quantiles the %v grace below %+v", lag, grace, took)
+	// The late release ran the wait behind, and no lag outruns the time
+	// from queued to finished. The others ran hardly behind.
+	if !ordered(lag) || took == nil || lag.Max < (wait-slack).Seconds() || lag.Max > took.Max+slack.Seconds() || lag.P50 > (grace-slack).Seconds() {
+		t.Errorf("release lag = %+v, want ordered quantiles up to the %v wait, none above %+v", lag, wait, took)
 	}
-	if rel.OldestDueSeconds < 0 {
-		t.Errorf("oldest due = %v seconds, want at least 0", rel.OldestDueSeconds)
+	if rel.OldestDueSeconds < (wait - slack).Seconds() {
+		t.Errorf("oldest due = %v seconds, want at least the %v wait", rel.OldestDueSeconds, wait)
 	}
 
 	pg := report.Postgres

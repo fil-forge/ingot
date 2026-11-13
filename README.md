@@ -368,17 +368,17 @@ and each entry under `data_dir` with its files and bytes. Run it and
 and directory's growth per object loaded is what a projection scales.
 
 It also reports how blob releases keep up: how long the finished ones took from
-the change that queued them, the release grace included, how far past their due
-time they ran, and how many are still pending, past due or failed. Finished
-releases are kept for the queue's retention, a day by default, so those figures
-are a rolling window, not totals to subtract. The load and `validate` queue
-none: the load writes each object once, and `validate` deletes only zero-byte
-objects, which have no blob. To time releases, delete or overwrite some real
-objects after the last test point's reads, since a later `get` step reads every
-real object the state file records.
+the change that queued them, any grace included, how far past their due time
+they ran, and how many are still pending, past due or failed. Finished releases
+are kept for a day, the task runner's retention for finished tasks, so those
+figures are a rolling window, not totals to subtract. The load and `validate`
+queue none: the load writes each object once, and `validate` deletes only
+zero-byte objects, which have no blob. To time releases, delete or overwrite
+some real objects after the last test point's reads, since a later `get` step
+reads every real object the state file records.
 
 Neither command is listed in `ingot --help` unless `INGOT_DEV_COMMANDS` is set
-to a true value, such as `1`; both run either way.
+to `1` or `true`; both run either way.
 
 ## Build & test
 
