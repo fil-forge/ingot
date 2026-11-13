@@ -249,7 +249,9 @@ func (tr *tree) lease(ctx context.Context, q *queue, subject string) error {
 		if h.lost.Load() {
 			return &childLostError{key}
 		}
-		return nil
+		// A hold a take stored after the tree's ctx ended runs nothing on
+		// a second call either.
+		return ctx.Err()
 	}
 	start := time.Now()
 	wait := newBackoff(tr.r.opts.PollInterval)
@@ -262,7 +264,9 @@ func (tr *tree) lease(ctx context.Context, q *queue, subject string) error {
 			tr.holds[key] = h
 			tr.guard.watch(h)
 			tr.r.metrics.observeLeaseWait(ctx, q, start)
-			return nil
+			// A take that landed after the tree's ctx ended runs nothing:
+			// the tree fails, and releases the lease with its children.
+			return ctx.Err()
 		}
 		if holder != nil && holder.olderThan(tr.age) {
 			return &dieError{key}

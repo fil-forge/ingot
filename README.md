@@ -233,6 +233,14 @@ blob by a `queue-space-shard.accept` task the upload's
 | `ingot.multipart.accept_passes` | Part blobs concluded, by `outcome`: `accepted` or `failed` (the blob's accept retries; a timed-out conclude included) |
 | `ingot.multipart.complete_deferred` | CompleteMultipartUpload requests answered OperationAborted because the parts' accepts did not finish in time. Botocore clients (the AWS CLI) treat that as a failed upload |
 
+Object traffic is counted in body bytes. Copies stay inside Ingot and count
+as neither:
+
+| Metric | Meaning |
+| -- | -- |
+| `ingot.s3.object_egress_bytes` | Bytes GetObject sent to clients: those read from the body before it closed, so an abandoned download counts what went out |
+| `ingot.s3.object_ingress_bytes` | Bytes PutObject and UploadPart received, whether or not the write succeeded |
+
 Each commit also journals its catalog blocks in Postgres until their segment
 ships (see `logstore/README.md`), so a copy of the database holds the
 catalog only this host's disk would otherwise hold. The journal reports:

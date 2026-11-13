@@ -7,6 +7,7 @@ import (
 	"github.com/exaring/otelpgx"
 	"github.com/fil-forge/libforge/identity"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/fx"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/config"
@@ -41,6 +42,20 @@ func openPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 		pool.Close()
 		return nil, fmt.Errorf("pinging postgres: %w", err)
 	}
+	return pool, nil
+}
+
+// providePool is the app's constructor for the pool: it opens the pool (see
+// openPool) and closes it when the app stops. fx appends a constructor's
+// hooks as it builds the value, before it builds anything that depends on
+// it, and runs stop hooks in reverse order, so the pool closes after
+// everything that uses it has stopped.
+func providePool(ctx context.Context, lc fx.Lifecycle, dsn string) (*pgxpool.Pool, error) {
+	pool, err := openPool(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	lc.Append(fx.StopHook(pool.Close))
 	return pool, nil
 }
 
