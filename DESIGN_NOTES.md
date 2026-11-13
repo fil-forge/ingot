@@ -628,6 +628,11 @@ releases at once both leave is reclaimed by the cache's time to live.
   same cache's action sets ride along (`reqscope.Permits`) for the one check
   hilt cannot make from the URL: a `DeleteObjects` entry naming a version
   needs `s3:DeleteObjectVersion`, beyond the request's `s3:DeleteObject`.
+  A request with a missing or masked proof store cannot borrow either uploader
+  capture. A revocation-cursor reset also retires every existing key-store
+  generation, including held/evicted pointers and their action sets, until a
+  new request obtains current authority from Hilt. Explicit tenant-issued durable
+  cleanup grants are separate from these access-key caches.
 - There is **no root account**: versitygw's built-in root user is disabled
   (an empty `RootUserConfig`), so every access key resolves through hilt. A
   key hilt has not issued is rejected as InvalidAccessKeyId.

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
+	"github.com/fil-forge/libforge/commands/s3"
 	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/multikey"
@@ -216,6 +217,77 @@ func TestForgeShipProofsRequestScopeWins(t *testing.T) {
 	require.True(t, ok)
 	require.Same(t, scoped, got)
 	require.NotSame(t, captured, got)
+}
+
+func TestForgeRequestCannotBorrowAnotherKeysCapturedAuthority(t *testing.T) {
+	fg := newTestForge(t)
+	space, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	keyA, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	keyB, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	keys := iam.NewKeyProofs()
+	storeA := keys.For(keyA.DID())
+	for _, cmd := range []ucan.Command{blobcmds.Add.Command, blobcmds.Remove.Command, blobcmds.Abort.Command} {
+		root, err := delegation.Delegate(space, keyA.DID(), space.DID(), cmd, delegation.WithNoExpiration())
+		require.NoError(t, err)
+		leaf, err := delegation.Delegate(keyA, fg.client.Issuer().DID(), space.DID(), cmd, delegation.WithNoExpiration())
+		require.NoError(t, err)
+		require.True(t, storeA.Add(root, leaf))
+	}
+	requestA := s3.Request{Method: "PUT", URL: "/bucket/object", Headers: map[string]string{"Authorization": keyA.DID().String()}}
+	ctxA := context.WithValue(borrowable(storeA), reqscope.RequestKey(), requestA)
+	fg.captureShipProofs(ctxA, space.DID())
+	fg.CaptureShipAuthority(ctxA, space.DID())
+
+	requestB := s3.Request{Method: "DELETE", URL: "/bucket", Headers: map[string]string{"Authorization": keyB.DID().String()}}
+	ctxB := context.WithValue(context.Background(), reqscope.RequestKey(), requestB)
+	for _, ctx := range []context.Context{ctxB, context.WithValue(ctxB, reqscope.ProofStoreKey(), struct{}{})} {
+		_, ok := fg.shipProofStore(ctx, space.DID())
+		require.False(t, ok, "request B borrowed A's upload capture")
+		_, ok = fg.catalogShipStore(ctx, space.DID())
+		require.False(t, ok, "request B borrowed A's commit capture")
+		require.ErrorContains(t, fg.RemoveBlob(ctx, space.DID(), nil), "no proof store")
+		require.ErrorContains(t, fg.AbortBlob(ctx, space.DID(), cid.Undef), "no proof store")
+	}
+	storeB := keys.For(keyB.DID())
+	ctxB = context.WithValue(ctxB, reqscope.ProofStoreKey(), ucanlib.ProofStore(storeB))
+	for _, cmd := range []ucan.Command{blobcmds.Remove.Command, blobcmds.Abort.Command} {
+		_, _, err := fg.authorityFor(ctxB, space.DID(), cmd)
+		require.ErrorIs(t, err, errNoChain, "B's empty store must not fall back to A")
+	}
+
+	// An explicit task authority stays valid. This chain is rooted at the
+	// tenant rather than either access key, as durable cleanup is designed to be.
+	tenant, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	cleanup := tokenstore.NewMemStore()
+	for _, cmd := range []ucan.Command{blobcmds.Remove.Command, blobcmds.Abort.Command} {
+		root, err := delegation.Delegate(space, tenant.DID(), space.DID(), cmd, delegation.WithNoExpiration())
+		require.NoError(t, err)
+		leaf, err := delegation.Delegate(tenant, fg.client.Issuer().DID(), space.DID(), cmd, delegation.WithNoExpiration())
+		require.NoError(t, err)
+		require.NoError(t, cleanup.AddDelegations(context.Background(), root, leaf))
+	}
+	task := context.WithValue(context.Background(), reqscope.ProofStoreKey(), ucanlib.ProofStore(cleanup))
+	for _, cmd := range []ucan.Command{blobcmds.Remove.Command, blobcmds.Abort.Command} {
+		store, chain, err := fg.authorityFor(task, space.DID(), cmd)
+		require.NoError(t, err)
+		require.Same(t, cleanup, store)
+		require.Len(t, chain, 2)
+	}
+	// Background catalog shipping may still use a current captured grant.
+	_, ok := fg.catalogShipStore(context.Background(), space.DID())
+	require.True(t, ok)
+	keys.ClearAll()
+	_, _, err = fg.authorityFor(context.Background(), space.DID(), blobcmds.Remove.Command)
+	require.ErrorIs(t, err, errNoChain)
+	// catalogShipStore may return the invalidated upload fallback; its chain
+	// must still be refused before SubmitShard reads or uploads any bytes.
+	shard := CARShard{Size: 1, Positions: map[cid.Cid]blockstore.BlockLoc{cid.Undef: {}}}
+	_, _, err = fg.SubmitShard(context.Background(), blockstore.PlaneCatalog, space.DID(), shard)
+	require.ErrorIs(t, err, ErrNoShipAuthority)
 }
 
 // chainStore is a ProofStore that answers every lookup with chain: one that
