@@ -313,46 +313,64 @@ func (c ctxS3) DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, o ...
 	return c.fakeS3.DeleteObject(ctx, in, o...)
 }
 
+// TestValidateInterruptedWriteLeavesNothing interrupts the write step among
+// its zero-byte PUTs and after its first real one: two buckets of five
+// zero-byte objects come first, then the real ones.
 func TestValidateInterruptedWriteLeavesNothing(t *testing.T) {
-	f := newFakeS3()
-	load := loadForValidation(t, f, 2)
-	before := map[string]map[string]int64{}
-	for _, b := range load.Buckets {
-		before[b] = f.objects(b)
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	base := f.stored
-	f.after = func(stored int) {
-		if stored == base+7 {
-			cancel()
-		}
-	}
-	cfg := validateConfig(load)
-	cfg.Steps = []string{StepHead, StepWrite}
-	cfg.Workers = 1
-	var progress strings.Builder
-	cfg.Progress = &progress
-	client := newCtxS3(f)
-	r, err := Validate(ctx, client, cfg)
-	if err == nil || !r.Interrupted || !slices.Equal(r.Steps, []string{StepHead}) || r.WriteRun == "" || r.Failures != 0 {
-		t.Fatalf("interrupted write: %v, report %+v", err, r)
-	}
-	// No PUT goes out after the interrupt, and each one sent gets a
-	// delete.
-	if puts, deletes := client.puts.Load(), client.deletes.Load(); puts != 7 || deletes != 7 {
-		t.Fatalf("%d PUTs and %d deletes, want 7 of each", puts, deletes)
-	}
-	out := progress.String()
-	for _, want := range []string{"run " + r.WriteRun, "interrupt again to stop at once", "deleting the 7 objects whose PUT was sent"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("progress %q lacks %q", out, want)
-		}
-	}
-	for _, b := range load.Buckets {
-		if !maps.Equal(f.objects(b), before[b]) {
-			t.Fatalf("%s: %d objects left, want %d", b, len(f.objects(b)), len(before[b]))
-		}
+	for _, tc := range []struct {
+		name     string
+		cancelAt int
+		real     uint64
+	}{
+		{"zero-byte", 7, 0},
+		{"real", 11, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeS3()
+			load := loadForValidation(t, f, 2)
+			before := map[string]map[string]int64{}
+			for _, b := range load.Buckets {
+				before[b] = f.objects(b)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			base := f.stored
+			f.after = func(stored int) {
+				if stored == base+tc.cancelAt {
+					cancel()
+				}
+			}
+			cfg := validateConfig(load)
+			cfg.Steps = []string{StepHead, StepWrite}
+			cfg.Workers = 1
+			var progress strings.Builder
+			cfg.Progress = &progress
+			client := newCtxS3(f)
+			r, err := Validate(ctx, client, cfg)
+			if err == nil || !r.Interrupted || !slices.Equal(r.Steps, []string{StepHead}) || r.WriteRun == "" || r.Failures != 0 {
+				t.Fatalf("interrupted write: %v, report %+v", err, r)
+			}
+			// No PUT goes out after the interrupt, and each one sent gets a
+			// delete.
+			want := int64(tc.cancelAt)
+			if puts, deletes := client.puts.Load(), client.deletes.Load(); puts != want || deletes != want {
+				t.Fatalf("%d PUTs and %d deletes, want %d of each", puts, deletes, want)
+			}
+			if got := r.Latency[OpDeleteReal].Count; got != tc.real {
+				t.Fatalf("%d real objects deleted, want %d", got, tc.real)
+			}
+			out := progress.String()
+			for _, want := range []string{"run " + r.WriteRun, "interrupt again to stop at once", fmt.Sprintf("deleting the %d objects whose PUT was sent", tc.cancelAt)} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("progress %q lacks %q", out, want)
+				}
+			}
+			for _, b := range load.Buckets {
+				if !maps.Equal(f.objects(b), before[b]) {
+					t.Fatalf("%s: %d objects left, want %d", b, len(f.objects(b)), len(before[b]))
+				}
+			}
+		})
 	}
 }
 

@@ -145,10 +145,10 @@ func TestFootprintPostgres(t *testing.T) {
 	if err := r.Stop(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// With the runner stopped, one release has been due for the wait, and
-	// one waits out its grace.
-	later := time.Now().Add(time.Hour)
-	for subject, notBefore := range map[string]*time.Time{"due": nil, "waiting": &later} {
+	// With the runner stopped, one release due at once has been due for the
+	// wait, and one waits out its grace.
+	later, dueAgain := time.Now().Add(time.Hour), registry.DueNow()
+	for subject, notBefore := range map[string]*time.Time{"due": &dueAgain, "waiting": &later} {
 		if _, err := r.Submit(ctx, taskrunner.Spec{Queue: spaceshardqueue.Name, Subject: subject, Action: spaceshardqueue.ReleaseAction, NotBefore: notBefore}); err != nil {
 			t.Fatal(err)
 		}
@@ -178,8 +178,8 @@ func TestFootprintPostgres(t *testing.T) {
 	if !ordered(lag) || took == nil || lag.Max < (wait-slack).Seconds() || lag.Max > took.Max+slack.Seconds() || lag.P50 > (grace-slack).Seconds() {
 		t.Errorf("release lag = %+v, want ordered quantiles up to the %v wait, none above %+v", lag, wait, took)
 	}
-	if rel.OldestDueSeconds < (wait - slack).Seconds() {
-		t.Errorf("oldest due = %v seconds, want at least the %v wait", rel.OldestDueSeconds, wait)
+	if rel.OldestDueSeconds < (wait-slack).Seconds() || rel.OldestDueSeconds > (wait+500*time.Millisecond).Seconds() {
+		t.Errorf("oldest due = %v seconds, want about the %v wait", rel.OldestDueSeconds, wait)
 	}
 
 	pg := report.Postgres

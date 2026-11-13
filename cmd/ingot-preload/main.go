@@ -193,7 +193,8 @@ authorization caches warm; a full listing reads enough of the catalog to
 push the first run's reads out, so it comes last. Body bytes come from the
 gateway's local blob cache, which survives a restart, or from the storage
 provider, the same in both runs: the README says how to time either. Use the
---buckets, --bucket-prefix, --seed, --key-prefix and --state the load used.
+--buckets, --bucket-prefix, --seed, --key-prefix, --state, --real-min-mib and
+--real-max-mib the load used.
 
 The report goes to stdout a step at a time and to the --report file as a
 line of JSON. A request that failed or answered wrongly is counted there,

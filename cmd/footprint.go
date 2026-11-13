@@ -68,8 +68,8 @@ releases keep up, as JSON:
     failed                 those that failed for good, kept until resubmitted
 
 ingot-preload's load queues no releases, since it writes each object once.
-Its validate queues one for each real object its write step deletes, due once
-the release grace has passed.
+Its validate queues the releases of the real objects its write step deletes,
+one per blob, due once the release grace has passed.
 
 Shipped catalog segments are counted by "ingot catalog usage". The command
 only reads, and can run beside a live daemon: a file removed while it runs is

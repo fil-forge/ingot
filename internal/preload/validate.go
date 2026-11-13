@@ -195,8 +195,9 @@ type ListResult struct {
 // load built, and checks each answer: a bulk object is there and empty, a
 // range of a real object holds the bytes the load wrote, a listing is in
 // order and holds every object the load recorded, new objects, zero-byte and
-// real, can be written create-only, and once deleted they are gone. It deletes only the objects it
-// wrote itself, and deletes them even when ctx ends.
+// real, can be written create-only, and once deleted they are gone. It
+// deletes only the objects it wrote itself, and deletes them even when ctx
+// ends.
 //
 // A request that fails or answers wrongly is counted in the report, not
 // returned as an error: Validate returns an error only when it cannot start,
