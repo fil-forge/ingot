@@ -606,9 +606,10 @@ releases at once both leave is reclaimed by the cache's time to live.
   resolve it to the signing key. The hilt→agent delegations and hilt's
   provider registration name the agent's DID, so changing it (did:key to
   did:web) re-issues both.
-- **space**: per bucket, a `did:plc` minted by hilt at bucket create and
+- **space**: per bucket, a `did:key` hilt generates at bucket create and
   stored on the bucket row; the subject of every blob and retrieve
-  invocation.
+  invocation. The space delegates authority over itself to the bucket's
+  tenant, and the tenant grants each access key its commands.
 - **tenant**: the `did:plc` hilt names as the caller's tenant in its
   authorize response; stored on the bucket row at create (the bucket's
   owner) and carried per request in `internal/reqscope` (the caller). The
