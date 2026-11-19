@@ -778,6 +778,7 @@ func TestMapAuthError(t *testing.T) {
 		hiltauth.UnknownBucketErrorName:          {"NoSuchBucket", 404},
 		hiltauth.BucketRegionMismatchErrorName:   {"AuthorizationHeaderMalformed", 400},
 		hiltauth.TenantDisabledErrorName:         {"AccessDenied", 403},
+		"TenantWriteLocked":                      {"AccessDenied", 403},
 		hiltauth.IssuerForbiddenErrorName:        {"AccessDenied", 403},
 		hiltauth.RegionNotServedErrorName:        {"AccessDenied", 403},
 		hiltauth.OperationNotPermittedErrorName:  {"AccessDenied", 403},
