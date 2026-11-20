@@ -619,7 +619,11 @@ releases at once both leave is reclaimed by the cache's time to live.
   request is authorized through hilt (`/s3/request/authorize`, with a local
   fast path over the cached derived key, the key's effective S3 action set
   per bucket and its delegations); hilt re-delegates the key's grant to
-  the agent, and the per-key `DelegationCache` carries those proofs into the
+  the agent with the exact stored parent chain captured under its tenant
+  status fence. Write-locked decisions narrow the cached S3 action set to
+  recognized reads and cleanup, even where their UCAN commands overlap uploads.
+  Observed revocations of the captured parents prevent a late active response
+  from being cached beside fresh cleanup roots. The per-key `DelegationCache` carries those proofs into the
   request via `internal/reqscope`, where the uploader and the network read
   tier spend them. The uploader also captures a per-space ship authority
   (1h TTL) for the catalog's `queue-bucket.ship`, from every write that commits, and

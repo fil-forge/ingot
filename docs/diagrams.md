@@ -957,11 +957,11 @@ flowchart TB
         ak["access key<br/>did:key (the S3 access key ID)"]
         agent["ingot agent<br/>identity.key_file key, wrapped as the<br/>identity.service_id did:web; issuer of every outbound invocation"]
         space -->|"root delegation at bucket create"| tenant
-        tenant -->|"grant at access-key creation"| ak
+        tenant -->|"grant at access-key creation,<br/>reissued on policy or tenant-status change"| ak
         ak -->|"re-delegation per authorize<br/>(expires next UTC midnight)"| agent
     end
 
-    hilt["hilt did:web:hilt"] -->|"/s3/request/authorize and<br/>/s3/bucket/info responses"| kp
+    hilt["hilt did:web:hilt"] -->|"authorize: exact parent chains + leaves<br/>bucket/info: legacy chain completion"| kp
     hilt -->|"the same, for a listing the<br/>command signs with an access key"| walk
 
     subgraph stores["proof stores"]
@@ -1081,9 +1081,13 @@ sequenceDiagram
         end
     else hilt authorize
         I->>H: /s3/request/authorize (the signed request)
-        H-->>I: account, derived SigV4 key,<br/>effective action set, fresh delegations
-        I->>K: cacheProofs (re-delegations, bucket info<br/>per bucket) + the action set, keyed by each bucket hilt named<br/>(the addressed bucket and a copy's source)
-        opt chain incomplete
+        H->>H: Shared tenant-status fence:<br/>classify S3 operation and filter write-locked actions,<br/>capture exact stored parent grants with the decision
+        H-->>I: account, derived SigV4 key,<br/>effective action set, fresh leaves + captured parent blocks
+        I->>K: Reject any already-observed revoked parent before caching<br/>the exact chains and effective S3 action set per bucket
+        opt response carries a known revoked parent
+            I->>I: Request-only proof store, nonborrowable#59;<br/>do not cache verification key, tenant, actions or proofs
+        end
+        opt legacy response chain incomplete
             I->>H: /s3/bucket/info
             I->>K: cache the bucket chain
         end
@@ -1100,6 +1104,14 @@ sequenceDiagram
   the store). Everything else undecided (no cached set for a bucket, an
   expired one, an operation that maps to no Forge command) goes to hilt,
   whose response refills the caches.
+- A status-aware Hilt captures parent grants under the same shared tenant
+  fence as its S3 permission decision. Write-locked responses retain explicit
+  read/list and cleanup actions, while configuration/security mutations stay
+  denied. Cleanup commands overlap uploads at the UCAN layer; their presence
+  alone never widens the cached S3 action set. A late pre-change response carries
+  the old parent CIDs, so observed revocations prevent it from repopulating the
+  caches beside new cleanup roots. An already-authorized in-flight request can
+  still use a request-only store; this is not immediate global cutoff.
 - `RoleAdmin` is deliberate: authorization already happened (at hilt or the
   fast path), so versitygw's role and ACL layers must defer entirely.
 - Authorize failures map to S3 errors in `mapAuthError`; unrecognized errors

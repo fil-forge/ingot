@@ -454,6 +454,9 @@ func mapAuthError(err error) (error, bool) {
 			HTTPStatusCode: http.StatusBadRequest,
 		}, true
 	case hiltauth.TenantDisabledErrorName,
+		// Wire name introduced by Hilt's status fence. Keep this compatible
+		// with the pinned Hilt client until its next dependency update.
+		"TenantWriteLocked",
 		hiltauth.IssuerForbiddenErrorName,
 		hiltauth.RegionNotServedErrorName,
 		hiltauth.OperationNotPermittedErrorName,
