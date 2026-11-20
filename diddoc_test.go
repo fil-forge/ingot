@@ -28,8 +28,13 @@ func TestDIDDocumentHandler(t *testing.T) {
 		t.Fatalf("DIDDocument: %v", err)
 	}
 
+	handler, err := didDocumentHandler(doc)
+	if err != nil {
+		t.Fatalf("didDocumentHandler: %v", err)
+	}
+
 	app := fiber.New()
-	app.Get(web.WellKnownDIDPath, didDocumentHandler(doc))
+	app.Get(web.WellKnownDIDPath, handler)
 	app.Get("/:bucket/*", func(c fiber.Ctx) error {
 		return c.Status(http.StatusTeapot).SendString("S3 route table")
 	})
@@ -81,5 +86,31 @@ func TestDIDDocumentHandler(t *testing.T) {
 	}
 	if len(got.CapabilityInvocation) != 1 || got.CapabilityInvocation[0] != vm.ID {
 		t.Fatalf("capabilityInvocation = %v, want [%s]", got.CapabilityInvocation, vm.ID)
+	}
+
+	if cc := res.Header.Get("Cache-Control"); cc != "max-age=300" {
+		t.Fatalf("Cache-Control = %q, want max-age=300", cc)
+	}
+	if lm := res.Header.Get("Last-Modified"); lm == "" {
+		t.Fatal("Last-Modified is not set")
+	}
+	etag := res.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("ETag is not set")
+	}
+
+	// A client that already holds the document gets a 304.
+	req := httptest.NewRequest(http.MethodGet, web.WellKnownDIDPath, nil)
+	req.Header.Set("If-None-Match", etag)
+	res, err = app.Test(req)
+	if err != nil {
+		t.Fatalf("conditional GET %s: %v", web.WellKnownDIDPath, err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusNotModified {
+		t.Fatalf("conditional status = %d, want 304", res.StatusCode)
+	}
+	if body, _ := io.ReadAll(res.Body); len(body) != 0 {
+		t.Fatalf("conditional body = %q, want none", body)
 	}
 }

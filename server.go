@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fil-forge/libforge/diddoc"
 	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/did/web"
@@ -18,6 +19,7 @@ import (
 	"github.com/fil-forge/versitygw/s3event"
 	"github.com/fil-forge/versitygw/s3log"
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/adaptor"
 	"github.com/multiformats/go-multihash"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -632,7 +634,11 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 	if err != nil {
 		return nil, fmt.Errorf("ingot: building the agent DID document: %w", err)
 	}
-	opts = append(opts, s3api.WithRoute(http.MethodGet, web.WellKnownDIDPath, didDocumentHandler(doc)))
+	docHandler, err := didDocumentHandler(doc)
+	if err != nil {
+		return nil, fmt.Errorf("ingot: building the agent DID document handler: %w", err)
+	}
+	opts = append(opts, s3api.WithRoute(http.MethodGet, web.WellKnownDIDPath, docHandler))
 
 	// No s3api.WithRootUser: the gateway has no root account, so every access
 	// key resolves through iam.
@@ -673,11 +679,14 @@ func policyHeaders(c fiber.Ctx) error {
 
 // didDocumentHandler serves a fixed DID document as JSON. The document is
 // built once at construction: the agent identity never changes while the
-// server runs.
-func didDocumentHandler(doc did.Document) fiber.Handler {
-	return func(c fiber.Ctx) error {
-		return c.JSON(doc)
+// server runs. Responses carry Cache-Control, ETag and Last-Modified headers,
+// and conditional requests get a 304 when the document has not changed.
+func didDocumentHandler(doc did.Document) (fiber.Handler, error) {
+	handler, err := diddoc.NewHandler(doc)
+	if err != nil {
+		return nil, err
 	}
+	return adaptor.HTTPHandler(handler), nil
 }
 
 func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
