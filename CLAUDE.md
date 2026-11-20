@@ -368,8 +368,8 @@ neither), `TokenStoreDir` (→ `DataDir`), `MultipartSessionTTL` (empty → 7d,
 negative → never: an open upload's auto-abort and a completed one's reap are
 due this long out), `ReleaseGrace` (empty → 60s, negative → 0: how long a
 blob's release waits after its last claim drops),
-`LocalBlobMaxBytes` (0 → no budget for the cache, writes in progress
-included) with
+`LocalBlobMaxBytes` (required unless `CacheWrites` is false; 0 → no
+budget for the cache, writes in progress included) with
 `CacheTTL` (1h: how long a body stays cached after it was cached or last
 read) and
 `LocalBlobOrphanAge` (24h, ≥ 1h) for the local blob sweeper
