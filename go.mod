@@ -17,7 +17,7 @@ require (
 	github.com/fil-forge/libforge v0.0.0-20261111172920-ff407324a982
 	github.com/fil-forge/smelt v0.0.0-20261021123053-359a84935c40
 	github.com/fil-forge/swarf v0.0.1-0.20261110122649-1097d7d2f5aa
-	github.com/fil-forge/ucantone v0.0.0-20261103134646-342e8488c56a
+	github.com/fil-forge/ucantone v0.0.0-20261120104359-4253712d41e4
 	github.com/fil-forge/versitygw v0.0.0-20261113114807-ac2b4117c1f3
 	github.com/filecoin-project/go-fee v0.3.0
 	github.com/gofiber/fiber/v3 v3.5.0
@@ -125,7 +125,7 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
-	github.com/gobwas/glob v0.2.3 // indirect
+	github.com/gobwas/glob v1.1.0 // indirect
 	github.com/gofiber/schema v1.8.3 // indirect
 	github.com/gofiber/utils/v2 v2.4.1 // indirect
 	github.com/gofrs/flock v0.13.0 // indirect
