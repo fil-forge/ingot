@@ -27,7 +27,7 @@ require (
 	github.com/ipfs/go-cid v0.6.2
 	github.com/ipfs/go-ipld-cbor v0.3.0
 	github.com/ipfs/go-log/v2 v2.9.2
-	github.com/jackc/pgx/v5 v5.12.0
+	github.com/jackc/pgx/v5 v5.13.0
 	github.com/minio/md5-simd v1.1.2
 	github.com/moby/moby/api v1.57.0
 	github.com/multiformats/go-multibase v0.3.0
