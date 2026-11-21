@@ -454,6 +454,14 @@ func mapAuthError(err error) (error, bool) {
 			HTTPStatusCode: http.StatusBadRequest,
 		}, true
 	case hiltauth.TenantDisabledErrorName,
+		// A write-locked tenant's mutation. Hilt refuses it at the shared
+		// authorization point (fil-forge/hilt#52, FIL-1101) and names the
+		// refusal TenantWriteLocked; without this case it falls through to
+		// 500-class, and every SDK retries a 5xx. The name is spelled out
+		// rather than taken from hiltauth.TenantWriteLockedErrorName because
+		// that constant arrives with hilt#52: swap it for the constant with
+		// the next hilt bump.
+		"TenantWriteLocked",
 		hiltauth.IssuerForbiddenErrorName,
 		hiltauth.RegionNotServedErrorName,
 		hiltauth.OperationNotPermittedErrorName,
