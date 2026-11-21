@@ -32,7 +32,9 @@
 // whose commit failed, and caching it would keep the old access in force
 // while the console's retry republishes revocations Swarf
 // deduplicates. The request still gets a store of its own holding the
-// response's delegations, so its onward retrieval has a chain.
+// response's delegations, so its onward retrieval has a chain. A revocation
+// cursor reset that retires the key store while Hilt answers uses the same
+// non-borrowable request-scoped path; it cannot refill the retired store.
 //
 // A local fast path (the RFC's "local cache" authorization) avoids the Hilt
 // round-trip when everything needed is already cached, mirroring Hilt's own
@@ -279,21 +281,19 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 		return auth.Account{}, fmt.Errorf("hilt/iam: no tenant for %s in authorize result", accessKeyID)
 	}
 
-	// A write's revocations reached Swarf without its commit: Hilt still
-	// answers with delegations the consumer saw revoked. Authorize this
-	// request from the response and cache nothing, so the key returns to Hilt
-	// on every request until a committed write issues fresh delegations. The
-	// request keeps a store of its own for its onward retrieval. Otherwise the
-	// delegations land in the key's store in the same step as the check (the
-	// store's Add does both), so a revocation arriving meanwhile still finds
-	// (and drops) them. The same check covers the bucket-info remainder
-	// cacheProofs fetches.
+	// A response cannot be cached when it names a known-revoked delegation
+	// (a Hilt write may have published revocations before its commit failed),
+	// or a cursor reset retired this store while Hilt answered. The response
+	// still authorizes this request through a store of its own, never lent to
+	// background work. Otherwise Add checks and deposits the delegations in
+	// one step, so a concurrent known-CID revocation finds and drops them.
+	// The same check covers the bucket-info remainder cacheProofs fetches.
 	if ctr != nil && !s.cacheProofs(spanCtx, store, ctr, req, accessKeyID) {
 		scoped := NewDelegationCache(nil)
 		ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(scoped))
-		// The scoped store holds a delegation known revoked, so nothing
-		// outside this request may borrow it (an upload registration this
-		// request queues still carries the chain it encodes from it).
+		// This response was not retained by a current key cache, so nothing
+		// outside this request may borrow its store (an upload registration
+		// still carries the chain this request encodes from it).
 		ctx.Locals(reqscope.BorrowableKey(), false)
 		// Refetches bucket info already fetched above; rare (a failed Hilt commit).
 		s.cacheProofs(reqCtx, scoped, ctr, req, accessKeyID)
@@ -304,7 +304,7 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 		}
 		ctx.Locals(reqscope.ActionsKey(), reqscope.ActionSet(scoped))
 		ctx.Locals(reqscope.TenantKey(), ok.Tenant)
-		s.logger.Info("hilt/iam: authorize response carries a revoked delegation, not cached",
+		s.logger.Info("hilt/iam: authorize response not cacheable, using request-scoped proofs",
 			zap.String("access", accessKeyStr), zap.Stringer("tenant", ok.Tenant))
 		return adminAccount(accessKeyStr, key), nil
 	}

@@ -34,10 +34,9 @@ func NewRevoker(proofs *KeyProofs, keys *VerificationKeyCache, tenants *TenantCa
 // ClearAll clears every access key's caches, for when revocations may have
 // been missed and there is no telling which keys they named: each key's next
 // request falls through to Hilt, which re-authorizes it, or refuses a deleted
-// one. The record of revoked CIDs is kept. Stores already captured, such as
-// the uploader's ship authority, are not reached (see
-// [KeyProofs.ClearAll]). It returns how many keys' proof stores it
-// dropped.
+// one. The record of revoked CIDs is kept. Already captured proof-store
+// pointers are invalidated too, including ones no longer in the registry
+// (see [KeyProofs.ClearAll]). It returns the number of live registry entries.
 func (r *Revoker) ClearAll() int {
 	n := r.proofs.ClearAll()
 	r.keys.Clear()
