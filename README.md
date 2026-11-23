@@ -365,6 +365,27 @@ same place. To time body reads
 from Piri, start the first run more than `cache_ttl` after the load wrote its
 last real object, or load with `cache_writes: false`.
 
+On a real node, three settings change what a run measures:
+
+- **Postgres connections.** Ingot sets no pool size, so pgx opens at most
+  max(4, CPU count). Set `pool_max_conns` in the `postgres_dsn` before the
+  load, and record it with the results.
+- **A second read pass with a larger cache.** At 150 buckets the default
+  cache holds a few thousand manifests, so cold reads fetch most catalog
+  blocks from Piri. Repeat the cold and warm runs with `read_cache_bytes`
+  raised to about 12 GB, enough for every tree node at estate scale, so that
+  only manifests come from Piri.
+- **Range sizes.** `--range-kib` sets the length of each ranged GET. Time
+  the two reads the pack server's design depends on, 1.17 MiB and 2 KiB:
+
+```bash
+ingot-preload validate --label 0.6M-cold-1.17MiB --steps get,head --range-kib 1198
+ingot-preload validate --label 0.6M-warm-2KiB --steps get --range-kib 2
+# restart ingot with read_cache_bytes: 12000000000, then
+ingot-preload validate --label 0.6M-cold-bigcache --steps get,head --range-kib 1198
+ingot-preload validate --label 0.6M-warm-bigcache --steps get,head --range-kib 1198
+```
+
 Each step's latencies go to stdout as it ends, and the whole report to a JSON
 lines file (`--report`). A request that failed or answered wrongly is listed
 there and makes the command exit non-zero.
