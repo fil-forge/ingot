@@ -62,5 +62,8 @@ func NewClient(ctx context.Context, c ClientConfig) (*s3.Client, error) {
 			o.BaseEndpoint = aws.String(c.Endpoint)
 		}
 		o.UsePathStyle = true
+		// A ranged GET's answer carries no whole-object checksum, and the
+		// SDK would log a line for each; validate checks the bytes itself.
+		o.DisableLogOutputChecksumValidationSkipped = true
 	}), nil
 }

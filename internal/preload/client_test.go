@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -15,6 +16,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 // isolateAWSConfig points the SDK at no shared config and placeholder
@@ -383,6 +387,41 @@ func TestClientValidatesThroughTheSDK(t *testing.T) {
 	}
 	if len(srv.objects) != 12 {
 		t.Fatalf("%d objects left, want the load's 12", len(srv.objects))
+	}
+}
+
+func TestClientLogsNothingForARangedGetWithoutChecksum(t *testing.T) {
+	isolateAWSConfig(t)
+	// The SDK's default logger writes to the os.Stderr of the moment the
+	// config loads, so swap it before NewClient.
+	stderr, err := os.CreateTemp(t.TempDir(), "stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stderr
+	os.Stderr = stderr
+	t.Cleanup(func() { os.Stderr = orig })
+	srv := &packServerShape{t: t, bucket: "any-bucket", created: true,
+		objects: map[string]bool{"any-key": true}, bodies: map[string][]byte{"any-key": make([]byte, 64)}}
+	hs := httptest.NewServer(srv)
+	defer hs.Close()
+	client, err := NewClient(t.Context(), ClientConfig{Endpoint: hs.URL, Region: "us-east-1", Conns: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A ranged answer carries no whole-object checksum, as ingot's doesn't.
+	out, err := client.GetObject(t.Context(), &s3.GetObjectInput{Bucket: aws.String("any-bucket"), Key: aws.String("any-key"), Range: aws.String("bytes=0-15")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, out.Body)
+	out.Body.Close()
+	logged, err := os.ReadFile(stderr.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logged) != 0 {
+		t.Fatalf("the SDK logged:\n%s", logged)
 	}
 }
 
