@@ -401,8 +401,20 @@ type IdentityConfig struct {
 // TaskWorkerConfig sets how many tasks of a queue one instance runs at once.
 type TaskWorkerConfig struct {
 	// Bucket is the bucket queue's worker count; the queue serializes each
-	// bucket's commits, settings changes and catalog ships.
+	// bucket's commits, settings changes and catalog ships. Zero takes
+	// DefaultBucketWorkers.
 	Bucket int `mapstructure:"bucket" yaml:"bucket"`
+}
+
+// DefaultBucketWorkers is the bucket queue's worker count when none is set.
+const DefaultBucketWorkers = 2
+
+// BucketWorkers returns Bucket, or DefaultBucketWorkers when it is zero.
+func (c TaskWorkerConfig) BucketWorkers() int {
+	if c.Bucket == 0 {
+		return DefaultBucketWorkers
+	}
+	return c.Bucket
 }
 
 // TenantKeyConfig locates the did:plc directory tenant DID documents are
@@ -546,7 +558,7 @@ func Load(configFile string) (*Config, error) {
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("log_level", "info")
 	v.SetDefault("addr", "0.0.0.0:8080")
-	v.SetDefault("task_workers.bucket", 2)
+	v.SetDefault("task_workers.bucket", DefaultBucketWorkers)
 	v.SetDefault("regionkey.openbao.mount", "transit")
 	v.SetDefault("regionkey.inprocess.version", "v1")
 }
@@ -571,8 +583,8 @@ func (c *Config) Validate() error {
 	if c.DataDir == "" {
 		errs = multierr.Append(errs, errors.New("data_dir is required"))
 	}
-	if c.TaskWorkers.Bucket < 1 {
-		errs = multierr.Append(errs, fmt.Errorf("task_workers.bucket %d: must be at least 1", c.TaskWorkers.Bucket))
+	if c.TaskWorkers.Bucket < 0 {
+		errs = multierr.Append(errs, fmt.Errorf("task_workers.bucket %d: must not be negative", c.TaskWorkers.Bucket))
 	}
 	if c.MaxBlobSize > 0 && c.MaxBlobSize < MinMaxBlobSize {
 		errs = multierr.Append(errs, fmt.Errorf("max_blob_size %d: below the %d-byte minimum, a single 5 GiB PUT or copy could split into more blobs than one manifest lists", c.MaxBlobSize, MinMaxBlobSize))

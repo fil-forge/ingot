@@ -53,3 +53,15 @@ func TestTaskQueuesGiveTheBucketQueueItsWorkerCount(t *testing.T) {
 	}
 	t.Fatal("no bucket queue")
 }
+
+func TestTaskQueuesGiveTheBucketQueueTwoWorkersWhenTheConfigLeavesItUnset(t *testing.T) {
+	for _, q := range taskQueues(config.Config{}) {
+		if q.Name == bucketqueue.Name {
+			if q.Workers != 2 {
+				t.Fatalf("bucket queue workers = %d, want 2", q.Workers)
+			}
+			return
+		}
+	}
+	t.Fatal("no bucket queue")
+}

@@ -2,7 +2,6 @@ package config
 
 import (
 	"encoding/base64"
-	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -500,13 +499,19 @@ func TestLoad_BucketQueueWorkersFromEnv(t *testing.T) {
 	}
 }
 
-func TestValidate_RejectsBucketQueueWorkersBelowOne(t *testing.T) {
-	for _, n := range []int{0, -1} {
-		cfg := validConfig(t)
-		cfg.TaskWorkers.Bucket = n
-		want := fmt.Sprintf("task_workers.bucket %d: must be at least 1", n)
-		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), want) {
-			t.Errorf("task_workers.bucket %d: got %v, want an error containing %q", n, err, want)
-		}
+func TestValidate_RejectsNegativeBucketQueueWorkers(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.TaskWorkers.Bucket = -1
+	want := "task_workers.bucket -1: must not be negative"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("got %v, want an error containing %q", err, want)
+	}
+}
+
+func TestValidate_AcceptsZeroBucketQueueWorkersAsTheDefault(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.TaskWorkers.Bucket = 0
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
 	}
 }
