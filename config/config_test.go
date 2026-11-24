@@ -28,7 +28,7 @@ func validConfig(t *testing.T) Config {
 		t.Fatalf("write key file: %v", err)
 	}
 	return Config{
-		TaskWorkers:       TaskWorkerConfig{CatalogShips: 2},
+		TaskWorkers:       TaskWorkerConfig{Bucket: 2},
 		Addr:              "127.0.0.1:9000",
 		DataDir:           "/data",
 		PostgresDSN:       "postgres://ingot@127.0.0.1:5432/ingot",
@@ -471,7 +471,7 @@ func TestServerConfig_CompleteMultipartKeepalive(t *testing.T) {
 	}
 }
 
-func TestLoad_CatalogShipWorkersDefaultToTwo(t *testing.T) {
+func TestLoad_BucketQueueWorkersDefaultToTwo(t *testing.T) {
 	cfgFile := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(cfgFile, []byte("data_dir: /any-dir\n"), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -480,13 +480,13 @@ func TestLoad_CatalogShipWorkersDefaultToTwo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.TaskWorkers.CatalogShips != 2 {
-		t.Fatalf("task_workers.catalog_ships = %d, want 2", cfg.TaskWorkers.CatalogShips)
+	if cfg.TaskWorkers.Bucket != 2 {
+		t.Fatalf("task_workers.bucket = %d, want 2", cfg.TaskWorkers.Bucket)
 	}
 }
 
-func TestLoad_CatalogShipWorkersFromEnv(t *testing.T) {
-	t.Setenv("INGOT_TASK_WORKERS_CATALOG_SHIPS", "16")
+func TestLoad_BucketQueueWorkersFromEnv(t *testing.T) {
+	t.Setenv("INGOT_TASK_WORKERS_BUCKET", "16")
 	cfgFile := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(cfgFile, []byte("data_dir: /any-dir\n"), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -495,18 +495,18 @@ func TestLoad_CatalogShipWorkersFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.TaskWorkers.CatalogShips != 16 {
-		t.Fatalf("task_workers.catalog_ships = %d, want 16", cfg.TaskWorkers.CatalogShips)
+	if cfg.TaskWorkers.Bucket != 16 {
+		t.Fatalf("task_workers.bucket = %d, want 16", cfg.TaskWorkers.Bucket)
 	}
 }
 
-func TestValidate_RejectsCatalogShipWorkersBelowOne(t *testing.T) {
+func TestValidate_RejectsBucketQueueWorkersBelowOne(t *testing.T) {
 	for _, n := range []int{0, -1} {
 		cfg := validConfig(t)
-		cfg.TaskWorkers.CatalogShips = n
-		want := fmt.Sprintf("task_workers.catalog_ships %d: must be at least 1", n)
+		cfg.TaskWorkers.Bucket = n
+		want := fmt.Sprintf("task_workers.bucket %d: must be at least 1", n)
 		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), want) {
-			t.Errorf("task_workers.catalog_ships %d: got %v, want an error containing %q", n, err, want)
+			t.Errorf("task_workers.bucket %d: got %v, want an error containing %q", n, err, want)
 		}
 	}
 }

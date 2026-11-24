@@ -166,7 +166,7 @@ func newTestServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerDe
 	tenantPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	require.NoError(t, err)
 	pool := pgtest.New(t)
-	tasks, err := provideTaskRunner(config.Config{TaskWorkers: config.TaskWorkerConfig{CatalogShips: 2}}, pool, id, zaptest.NewLogger(t))
+	tasks, err := provideTaskRunner(config.Config{TaskWorkers: config.TaskWorkerConfig{Bucket: 2}}, pool, id, zaptest.NewLogger(t))
 	require.NoError(t, err)
 	require.NoError(t, tasks.Migrate(t.Context()))
 	mem := registry.NewPostgres(pool)

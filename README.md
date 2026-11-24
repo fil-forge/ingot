@@ -261,9 +261,9 @@ scan that no write overlapped.
 
 ### Catalog storage on Forge
 
-`task_workers.catalog_ships` (default 2, `INGOT_TASK_WORKERS_CATALOG_SHIPS`) is
-how many buckets ship their catalog segments at once; each bucket ships its
-segments one at a time.
+`task_workers.bucket` (default 2, `INGOT_TASK_WORKERS_BUCKET`) is the bucket
+queue's worker count; the queue serializes each bucket's commits, settings
+changes and catalog ships.
 
 Nothing collects dead catalog blocks yet: each shipped catalog segment stays
 on Forge until its bucket is deleted, retired segments included. With metrics

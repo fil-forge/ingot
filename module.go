@@ -559,7 +559,7 @@ func provideTaskRunner(cfg config.Config, pool *pgxpool.Pool, id identity.Identi
 func taskQueues(cfg config.Config) []taskrunner.QueueOptions {
 	return []taskrunner.QueueOptions{
 		{Name: multipartqueue.Name, Workers: multipartWorkers},
-		{Name: bucketqueue.Name, Workers: cfg.TaskWorkers.CatalogShips},
+		{Name: bucketqueue.Name, Workers: cfg.TaskWorkers.Bucket},
 		{Name: spaceuploadqueue.Name, Workers: uploadRegistrationWorkers},
 		{Name: spaceshardqueue.Name, Workers: releaseWorkers},
 		{Name: shardqueue.Name, Workers: shardWorkers},
