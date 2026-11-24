@@ -537,10 +537,6 @@ const releaseWorkers = 8
 // An accept only queues its parked blobs' accepts, with no round trip.
 const multipartWorkers = 4
 
-// bucketWorkers is how many buckets' catalog ships one instance runs at
-// once. Commits and the other bucket changes run in their requests.
-const bucketWorkers = 2
-
 // provideTaskRunner builds the runner for ingot's durable task queues, over
 // the host's pool. The backend registers its handlers (Server.New); the
 // migration hook creates its tables and the server starts and stops it.
@@ -549,21 +545,25 @@ const bucketWorkers = 2
 // is the agent's DID. That names the S3 endpoint rather than the instance, and
 // each endpoint has one instance today; a second instance behind the same
 // endpoint needs a name of its own.
-func provideTaskRunner(pool *pgxpool.Pool, id identity.Identity, logger *zap.Logger) (*taskrunner.Runner, error) {
+func provideTaskRunner(cfg config.Config, pool *pgxpool.Pool, id identity.Identity, logger *zap.Logger) (*taskrunner.Runner, error) {
 	return taskrunner.New(pool, taskrunner.Options{
 		Schema: taskSchema,
 		Node:   id.DID().String(),
-		// In the RFC's queue order: a task may run sync children only on
-		// the queues after its own.
-		Queues: []taskrunner.QueueOptions{
-			{Name: multipartqueue.Name, Workers: multipartWorkers},
-			{Name: bucketqueue.Name, Workers: bucketWorkers},
-			{Name: spaceuploadqueue.Name, Workers: uploadRegistrationWorkers},
-			{Name: spaceshardqueue.Name, Workers: releaseWorkers},
-			{Name: shardqueue.Name, Workers: shardWorkers},
-		},
+		Queues: taskQueues(cfg),
 		Logger: logger.Named("tasks"),
 	})
+}
+
+// taskQueues lists the queues in the RFC's order: a task may run sync
+// children only on the queues after its own.
+func taskQueues(cfg config.Config) []taskrunner.QueueOptions {
+	return []taskrunner.QueueOptions{
+		{Name: multipartqueue.Name, Workers: multipartWorkers},
+		{Name: bucketqueue.Name, Workers: cfg.TaskWorkers.BucketWorkers()},
+		{Name: spaceuploadqueue.Name, Workers: uploadRegistrationWorkers},
+		{Name: spaceshardqueue.Name, Workers: releaseWorkers},
+		{Name: shardqueue.Name, Workers: shardWorkers},
+	}
 }
 
 // migrationHookOut feeds the migration PreStartHook into the "ingot_prestart"

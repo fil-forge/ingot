@@ -261,6 +261,10 @@ scan that no write overlapped.
 
 ### Catalog storage on Forge
 
+`task_workers.bucket` (default 2, `INGOT_TASK_WORKERS_BUCKET`) is the bucket
+queue's worker count; the queue serializes each bucket's commits, settings
+changes and catalog ships. Zero takes the default.
+
 Nothing collects dead catalog blocks yet: each shipped catalog segment stays
 on Forge until its bucket is deleted, retired segments included. With metrics
 on, these gauges show how much catalog storage each bucket holds there and how
