@@ -1,6 +1,8 @@
 package ingot
 
 import (
+	"github.com/fil-forge/ingot/config"
+	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"path/filepath"
 	"testing"
 
@@ -20,7 +22,7 @@ func TestTaskRunnerHasTheBackendsQueues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("identity: %v", err)
 	}
-	r, err := provideTaskRunner(nil, id, zap.NewNop())
+	r, err := provideTaskRunner(config.Config{BucketWorkers: 2}, nil, id, zap.NewNop())
 	if err != nil {
 		t.Fatalf("provideTaskRunner: %v", err)
 	}
@@ -38,4 +40,16 @@ func TestTaskRunnerHasTheBackendsQueues(t *testing.T) {
 	if got := r.Node(); got != "did:web:ingot.test" {
 		t.Fatalf("runner node = %q, want the agent's DID", got)
 	}
+}
+
+func TestTaskQueuesGiveTheBucketQueueBucketWorkers(t *testing.T) {
+	for _, q := range taskQueues(config.Config{BucketWorkers: 7}) {
+		if q.Name == bucketqueue.Name {
+			if q.Workers != 7 {
+				t.Fatalf("bucket queue workers = %d, want 7", q.Workers)
+			}
+			return
+		}
+	}
+	t.Fatal("no bucket queue")
 }

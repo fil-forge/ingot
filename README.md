@@ -261,6 +261,9 @@ scan that no write overlapped.
 
 ### Catalog storage on Forge
 
+`bucket_workers` (default 2, `INGOT_BUCKET_WORKERS`) is how many buckets ship
+their catalog segments at once; each bucket ships its segments one at a time.
+
 Nothing collects dead catalog blocks yet: each shipped catalog segment stays
 on Forge until its bucket is deleted, retired segments included. With metrics
 on, these gauges show how much catalog storage each bucket holds there and how
