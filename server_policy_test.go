@@ -87,7 +87,7 @@ func TestBuildS3API_BucketPolicy(t *testing.T) {
 	f := &fakeAuthority{}
 	id, err := identity.New("", "did:web:ingot.test")
 	require.NoError(t, err)
-	tasks, err := provideTaskRunner(config.Config{BucketWorkers: 2}, nil, id, zap.NewNop())
+	tasks, err := provideTaskRunner(config.Config{TaskWorkers: config.TaskWorkerConfig{CatalogShips: 2}}, nil, id, zap.NewNop())
 	require.NoError(t, err)
 	cache, err := blockstore.NewBlobCache(filepath.Join(t.TempDir(), "cache"))
 	require.NoError(t, err)

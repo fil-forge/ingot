@@ -179,7 +179,7 @@ func appConfig(t *testing.T, dsn string) *config.Config {
 	return &config.Config{
 		Addr:             "127.0.0.1:0",
 		DataDir:          t.TempDir(),
-		BucketWorkers:    2,
+		TaskWorkers:      config.TaskWorkerConfig{CatalogShips: 2},
 		PostgresDSN:      dsn,
 		Identity:         config.IdentityConfig{KeyFile: keyFile},
 		UploadServiceURL: "http://127.0.0.1:8000",

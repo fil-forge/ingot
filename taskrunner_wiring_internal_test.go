@@ -22,7 +22,7 @@ func TestTaskRunnerHasTheBackendsQueues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("identity: %v", err)
 	}
-	r, err := provideTaskRunner(config.Config{BucketWorkers: 2}, nil, id, zap.NewNop())
+	r, err := provideTaskRunner(config.Config{TaskWorkers: config.TaskWorkerConfig{CatalogShips: 2}}, nil, id, zap.NewNop())
 	if err != nil {
 		t.Fatalf("provideTaskRunner: %v", err)
 	}
@@ -42,8 +42,8 @@ func TestTaskRunnerHasTheBackendsQueues(t *testing.T) {
 	}
 }
 
-func TestTaskQueuesGiveTheBucketQueueBucketWorkers(t *testing.T) {
-	for _, q := range taskQueues(config.Config{BucketWorkers: 7}) {
+func TestTaskQueuesGiveTheBucketQueueTheCatalogShipWorkers(t *testing.T) {
+	for _, q := range taskQueues(config.Config{TaskWorkers: config.TaskWorkerConfig{CatalogShips: 7}}) {
 		if q.Name == bucketqueue.Name {
 			if q.Workers != 7 {
 				t.Fatalf("bucket queue workers = %d, want 7", q.Workers)

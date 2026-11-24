@@ -148,8 +148,6 @@ type Config struct {
 	// orphans younger than LocalBlobOrphanAge). 0 → no budget (the default); negative
 	// is an error.
 	LocalBlobMaxBytes int64 `mapstructure:"local_blob_max_bytes" yaml:"local_blob_max_bytes"`
-	// BucketWorkers is how many buckets' catalog ships run at once.
-	BucketWorkers int `mapstructure:"bucket_workers" yaml:"bucket_workers"`
 	// CacheTTL is how long a blob stays in the cache (Go duration string)
 	// after it was cached or last read, unless the budget evicts it first. A
 	// read extends it only once less than half is left, so most reads cost
@@ -196,6 +194,8 @@ type Config struct {
 	// Encryption sets which bucket encryption modes a tenant may select
 	// through the S3 bucket-encryption API (PutBucketEncryption).
 	Encryption EncryptionConfig `mapstructure:"encryption" yaml:"encryption"`
+
+	TaskWorkers TaskWorkerConfig `mapstructure:"task_workers" yaml:"task_workers"`
 
 	// LogLevel is the zap level (debug|info|warn|error).
 	LogLevel string `mapstructure:"log_level" yaml:"log_level"`
@@ -398,6 +398,12 @@ type IdentityConfig struct {
 	ServiceID string `mapstructure:"service_id" yaml:"service_id"`
 }
 
+// TaskWorkerConfig sets how many tasks of a queue one instance runs at once.
+type TaskWorkerConfig struct {
+	// CatalogShips is how many buckets ship their catalog segments at once.
+	CatalogShips int `mapstructure:"catalog_ships" yaml:"catalog_ships"`
+}
+
 // TenantKeyConfig locates the did:plc directory tenant DID documents are
 // resolved from.
 type TenantKeyConfig struct {
@@ -539,7 +545,7 @@ func Load(configFile string) (*Config, error) {
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("log_level", "info")
 	v.SetDefault("addr", "0.0.0.0:8080")
-	v.SetDefault("bucket_workers", 2)
+	v.SetDefault("task_workers.catalog_ships", 2)
 	v.SetDefault("regionkey.openbao.mount", "transit")
 	v.SetDefault("regionkey.inprocess.version", "v1")
 }
@@ -564,8 +570,8 @@ func (c *Config) Validate() error {
 	if c.DataDir == "" {
 		errs = multierr.Append(errs, errors.New("data_dir is required"))
 	}
-	if c.BucketWorkers < 1 {
-		errs = multierr.Append(errs, fmt.Errorf("bucket_workers %d: must be at least 1, or no catalog ships", c.BucketWorkers))
+	if c.TaskWorkers.CatalogShips < 1 {
+		errs = multierr.Append(errs, fmt.Errorf("task_workers.catalog_ships %d: must be at least 1, or no catalog ships", c.TaskWorkers.CatalogShips))
 	}
 	if c.MaxBlobSize > 0 && c.MaxBlobSize < MinMaxBlobSize {
 		errs = multierr.Append(errs, fmt.Errorf("max_blob_size %d: below the %d-byte minimum, a single 5 GiB PUT or copy could split into more blobs than one manifest lists", c.MaxBlobSize, MinMaxBlobSize))
