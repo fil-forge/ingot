@@ -55,7 +55,7 @@ func TestApp_GraphValidates(t *testing.T) {
 
 // TestApp_StartTimeoutCoversCatalogRecovery pins the start deadline above
 // fx's 15 s default: OnStart recovers every bucket's unshipped segments before
-// the listener binds, and a catalog with ~120k of them takes about 50 s.
+// the listener binds, which took 18.8 s for 118,719 of them on staging.
 func TestApp_StartTimeoutCoversCatalogRecovery(t *testing.T) {
 	_, dsn := pgtest.NewWithDSN(t)
 
@@ -63,7 +63,7 @@ func TestApp_StartTimeoutCoversCatalogRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build app: %v", err)
 	}
-	if got, want := app.StartTimeout(), 10*time.Minute; got != want {
+	if got, want := app.StartTimeout(), time.Minute; got != want {
 		t.Fatalf("start timeout = %v, want %v", got, want)
 	}
 }
