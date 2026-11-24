@@ -8,7 +8,7 @@
 #   build-prod  stripped, static release binary (-s -w)
 #   build-dev   debuggable binary (-N -l: no optimization/inlining) + delve
 #   prod        minimal runtime: ca-certificates + curl (smelt's healthcheck
-#               hits /health with curl) and the release binary
+#               hits /health with curl), the release binary and ingot-preload
 #   dev         prod + a network/debug toolset and the `dlv` debugger, built
 #               from the debuggable binary; publishes as the :main-dev tag
 #
@@ -38,14 +38,18 @@ FROM build AS build-prod
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w" -o /out/ingot ./cmd/ingot
+    go build -ldflags="-s -w" -o /out/ingot ./cmd/ingot && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -ldflags="-s -w" -o /out/ingot-preload ./cmd/ingot-preload
 
 # ---- development binary: debuggable (no optimization/inlining) + delve ----
 FROM build AS build-dev
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -gcflags="all=-N -l" -o /out/ingot ./cmd/ingot
+    go build -gcflags="all=-N -l" -o /out/ingot ./cmd/ingot && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -o /out/ingot-preload ./cmd/ingot-preload
 # Cross-compiled `go install` lands in /go/bin/<os>_<arch>/; native in /go/bin.
 # Normalize to /go/bin/dlv either way (the cp is a no-op on the native path).
 RUN --mount=type=cache,target=/go/pkg/mod \
@@ -60,7 +64,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build-prod /out/ingot /usr/bin/ingot
+COPY --from=build-prod /out/ingot /out/ingot-preload /usr/bin/
 # S3 listener: :8080 by default, the port every Forge service image exposes.
 # smelt overrides addr to :80 in the mounted config so did:web:ingot resolves
 # to http://ingot/.well-known/did.json, and maps that port in compose.
@@ -84,7 +88,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tcpdump \
     jq \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build-dev /out/ingot /usr/bin/ingot
+COPY --from=build-dev /out/ingot /out/ingot-preload /usr/bin/
 COPY --from=build-dev /go/bin/dlv /usr/bin/dlv
 # S3 listener (see the prod target) + delve headless port.
 EXPOSE 8080 2345

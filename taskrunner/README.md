@@ -6,7 +6,7 @@ The package imports nothing else from Ingot. The design is in the [task runner R
 
 ## Setting up
 
-Queues are listed in order. A task may run sync children only in queues later in the list. Each queue gets a tasks table and a leases table in the schema given.
+Queues are listed in order. A task may run sync children only in queues later in the list. Each queue gets a tasks table and a leases table in the schema given; `TasksTable` names a queue's tasks table, for a reader outside the runner.
 
 ```go
 r, err := taskrunner.New(pool, taskrunner.Options{

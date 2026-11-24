@@ -21,11 +21,28 @@ builds:
     env:
       - CGO_ENABLED=0
 
+  # The estate-scale load tool, shipped in the image to run beside ingot.
+  - id: ingot-preload
+    main: ./cmd/ingot-preload
+    binary: ingot-preload
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+    goarch:
+      - 'amd64'
+      - 'arm64'
+    mod_timestamp: '{{.CommitTimestamp}}'
+    env:
+      - CGO_ENABLED=0
+
 universal_binaries:
   - replace: true
 
 archives:
-  - format_overrides:
+  # The release archives stay ingot-only; ingot-preload ships in the image.
+  - ids: [ingot]
+    format_overrides:
       - goos: darwin
         formats: zip
     name_template: >-

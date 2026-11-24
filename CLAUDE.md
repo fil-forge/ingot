@@ -104,8 +104,19 @@ Internal:
   `Blake3` attribute, over `blake3tree`), `catalog usage` (each bucket's
   catalog bytes on Forge, dead on arrival, and live via
   `logstore.WalkCatalog`, which reads segments retired from disk from Forge
-  with an access key from the environment, as JSON, for benchmark runs);
+  with an access key from the environment, as JSON, for benchmark runs),
+  `footprint` (the `ingot` schema's tables, the WAL position, `data_dir`'s
+  entries, and the release queue's timings and backlog, as JSON); those two
+  are left out of the help unless `INGOT_DEV_COMMANDS` is true;
   `deps.go` (agent identity from the PEM key + optional did:web, pgx pool).
+- **`cmd/ingot-preload/`** + **`internal/preload`** — a separate binary, a
+  plain S3 client that loads a gateway's catalog to estate scale for
+  measuring it: zero-byte bulk objects plus a few pack-sized ones with
+  deterministic pseudo-random bodies, keys and PUTs shaped as the pack
+  server's (create-only, `x-amz-checksum-sha256`), progress in a state file it
+  resumes from, reports as JSON lines (`load`); then timed, checked reads,
+  listings, writes and deletes against what the state file says was loaded
+  (`validate`). `internal/preload` imports nothing else from ingot.
 - **`s3frontend/`** — versitygw `backend.Backend`: `object.go`
   (Put/Get/Head/Delete/List), `version.go` (resolveVersion, reading the
   per-key version tree), `bucketqueue.go` (the requests' commits through

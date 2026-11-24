@@ -321,9 +321,9 @@ var defaultReleaseRetry = taskrunner.RetryPolicy{
 // for a running release to finish, and leaves a pending one standing.
 const releaseFlush = "flush"
 
-// releasedResult is a release's result once it has removed the blob; a
+// ReleasedResult is a release's result once it has removed the blob; a
 // release that found it claimed again returns none.
-var releasedResult = []byte("released")
+const ReleasedResult = "released"
 
 // runRelease is queue-space-shard.release: it unwinds one blob for one space,
 // whatever state the blob is in, unless something in the space still uses it.
@@ -451,7 +451,7 @@ func (q *Queue) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrunne
 		}
 	}
 	st := registry.ReleasedIntent(space, digest)
-	return releasedResult, ex.Write(ctx, st.SQL, st.Args...)
+	return []byte(ReleasedResult), ex.Write(ctx, st.SQL, st.Args...)
 }
 
 // releaseWaitLimit bounds how long an S3 verb spends running the releases it
