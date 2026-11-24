@@ -187,6 +187,9 @@ func (u *Forge) catalogShipStore(ctx context.Context, space did.DID) (ucanlib.Pr
 	if store, ok := reqscope.ProofStore(ctx); ok {
 		return store, true
 	}
+	if _, inRequest := reqscope.Request(ctx); inRequest {
+		return nil, false
+	}
 	if v, ok := u.commitProofs.Get(space.String()); ok {
 		if store := v.(ucanlib.ProofStore); u.canShip(ctx, store, space) {
 			return store, true
@@ -196,11 +199,19 @@ func (u *Forge) catalogShipStore(ctx context.Context, space did.DID) (ucanlib.Pr
 }
 
 // shipProofStore resolves the proof store authorizing a ship to space: the
-// request-scoped store if this runs in-request, else the most recent
-// captured store for the space. ok=false means neither exists.
+// request-scoped store for a request, else the most recent captured store for
+// background work. A request missing its own store fails closed rather than
+// borrowing another key's capture. ok=false means no usable store exists.
 func (u *Forge) shipProofStore(ctx context.Context, space did.DID) (ucanlib.ProofStore, bool) {
 	if store, ok := reqscope.ProofStore(ctx); ok {
 		return store, true
+	}
+	// A principal-bearing request must never borrow another key's capture
+	// merely because its own proof store was lost or intentionally masked.
+	// Background tasks can still use explicit tenant cleanup authority, and
+	// catalog shipping retains its currently valid background capture path.
+	if _, inRequest := reqscope.Request(ctx); inRequest {
+		return nil, false
 	}
 	if v, ok := u.shipProofs.Get(space.String()); ok {
 		return v.(ucanlib.ProofStore), true
@@ -217,7 +228,7 @@ func (u *Forge) shipProofStore(ctx context.Context, space did.DID) (ucanlib.Proo
 func (u *Forge) authorityFor(ctx context.Context, space did.DID, cmd ucan.Command) (ucanlib.ProofStore, []ucan.Delegation, error) {
 	store, ok := u.shipProofStore(ctx, space)
 	if !ok {
-		return nil, nil, fmt.Errorf("uploader: no proof store for space %s (no request scope; %s)", space, noCapturedAuthority)
+		return nil, nil, fmt.Errorf("uploader: no proof store for space %s (no usable scoped authority; %s)", space, noCapturedAuthority)
 	}
 	proofs, err := u.chainFor(ctx, store, space, cmd)
 	if err != nil {
