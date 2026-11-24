@@ -101,7 +101,7 @@ func buildApp(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*fx.
 	app := fx.New(
 		// OnStart recovers every bucket's unshipped segments before the
 		// listener binds, which outlasts fx's 15 s default on a large catalog.
-		fx.StartTimeout(10*time.Minute),
+		fx.StartTimeout(time.Minute),
 		fxLogger(logger),
 		fx.Supply(logger),
 		fx.Provide(func(lc fx.Lifecycle) (*pgxpool.Pool, error) {
