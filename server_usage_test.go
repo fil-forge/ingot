@@ -1,7 +1,9 @@
 package ingot
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -86,6 +88,74 @@ func TestServerReportsUsage(t *testing.T) {
 	stopped = true
 	require.NoError(t, s.Stop(context.Background()))
 	require.Empty(t, metricNames(t, reader), "metrics reported after Stop")
+}
+
+// stuckReporter stands in for an auth service that does not answer: each
+// report waits until the test releases it or its context ends.
+type stuckReporter struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *stuckReporter) ReportUsage(ctx context.Context, _ []usagecmds.SpaceEgress, _ ...hiltclient.MethodOption) (*usagecmds.ReportOK, error) {
+	select {
+	case r.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-r.release:
+		return &usagecmds.ReportOK{}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// TestServerFlushesUsageWhileAReportIsStuck: a report the auth service does
+// not answer holds up no flush, so what is counted meanwhile still reaches
+// Postgres within the flush interval.
+func TestServerFlushesUsageWhileAReportIsStuck(t *testing.T) {
+	saved := usageFlushInterval
+	usageFlushInterval = 10 * time.Millisecond
+	t.Cleanup(func() { usageFlushInterval = saved })
+
+	reporter := &stuckReporter{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	var store *registry.Postgres
+	s := newTestServer(t, config.ServerConfig{UsageReportInterval: 20 * time.Millisecond}, func(d *ServerDeps) {
+		store = d.Registry.(*registry.Postgres)
+		d.EgressUsage = store
+		d.UsageReporter = reporter
+	})
+
+	ctx := t.Context()
+	waiting, counted := testutil.RandomDID(t), testutil.RandomDID(t)
+	hour := time.Now().UTC().Truncate(time.Hour)
+	require.NoError(t, store.AddEgress(ctx, registry.EgressFlush{Instance: "test", Seq: 1}, []registry.EgressCount{{Space: waiting, Hour: hour, Bytes: 1}}))
+
+	require.NoError(t, s.Start(ctx))
+	t.Cleanup(func() { _ = s.Stop(context.Background()) })
+	select {
+	case <-reporter.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the usage sweeper never reported the count")
+	}
+
+	// The report is stuck. Bytes a response sends now are still flushed.
+	body := s.usageCounter.Egress(counted, io.NopCloser(bytes.NewReader(make([]byte, 4096))))
+	_, err := io.Copy(io.Discard, body)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		due, err := store.DueEgress(ctx, 10)
+		if err != nil {
+			return false
+		}
+		for _, c := range due {
+			if c.Space == counted && c.Bytes == 4096 {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 10*time.Millisecond, "the count was not flushed while the report was stuck")
+	close(reporter.release)
 }
 
 // TestServerCountsNoUsageWithoutAReporter: usage reporting needs both a store

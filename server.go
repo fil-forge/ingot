@@ -169,6 +169,9 @@ type Server struct {
 	// usage reports the gateway's usage counts; nil when usage reporting is
 	// off (see ServerDeps.EgressUsage).
 	usage *usage.Service
+	// usageCounter is what the GetObject responses count their bytes into;
+	// nil with usage.
+	usageCounter *usage.Counter
 	// sweepCtx is cancelled by Stop. Every background sweep derives its
 	// context from it, and sweeps counts the sweeper goroutines, so Stop
 	// can wait for them to exit before the registry closes.
@@ -305,13 +308,14 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	}
 
 	return &Server{
-		cfg:     cfg,
-		logger:  logger,
-		log:     log,
-		backend: backend,
-		api:     api,
-		tasks:   deps.Tasks,
-		usage:   usageSvc,
+		cfg:          cfg,
+		logger:       logger,
+		log:          log,
+		backend:      backend,
+		api:          api,
+		tasks:        deps.Tasks,
+		usage:        usageSvc,
+		usageCounter: usageCounter,
 	}, nil
 }
 
@@ -421,12 +425,13 @@ func (s *Server) startLocalBlobSweeper() {
 // loses at most this much of it.
 var usageFlushInterval = 5 * time.Second
 
-// startUsageSweeper spawns the usage sweeper: every usageFlushInterval it
-// adds the egress the responses have counted to Postgres, and every
-// UsageReportInterval it reports the counts that have changed to the auth
-// service (see usage.Service). A failed flush keeps its counts in memory for
-// the next one, and a failed report leaves its counts due for the next, so
-// both are logged and carry on.
+// startUsageSweeper spawns the two usage sweepers: one adds the egress the
+// responses have counted to Postgres every usageFlushInterval, and the other
+// reports the counts that have changed to the auth service every
+// UsageReportInterval (see usage.Service). They run apart so a report that
+// takes long, with a backlog to send or a slow service, holds up no flush. A
+// failed flush keeps its counts in memory for the next one, and a failed
+// report leaves its counts due for the next, so both are logged and carry on.
 func (s *Server) startUsageSweeper() {
 	if s.usage == nil {
 		return
@@ -438,8 +443,6 @@ func (s *Server) startUsageSweeper() {
 	s.goSweep(func() {
 		flush := time.NewTicker(usageFlushInterval)
 		defer flush.Stop()
-		report := time.NewTicker(interval)
-		defer report.Stop()
 		for {
 			select {
 			case <-s.sweepCtx.Done():
@@ -451,6 +454,16 @@ func (s *Server) startUsageSweeper() {
 				if err != nil && s.sweepCtx.Err() == nil {
 					s.logger.Warn("usage flush", zap.Error(err))
 				}
+			}
+		}
+	})
+	s.goSweep(func() {
+		report := time.NewTicker(interval)
+		defer report.Stop()
+		for {
+			select {
+			case <-s.sweepCtx.Done():
+				return
 			case <-report.C:
 				ctx, cancel := context.WithTimeout(s.sweepCtx, interval)
 				ctx, span := tracing.Start(ctx, "sweep.usage_report")
