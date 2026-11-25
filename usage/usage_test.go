@@ -518,6 +518,37 @@ func TestFlushRepeatedAfterALostReplyCountsOnce(t *testing.T) {
 	wantCounts(t, due, registry.EgressCount{Space: space, Hour: hour0, Bytes: 110})
 }
 
+// A batch the database has not confirmed after half the retention is given
+// up, since the database may by then have forgotten whether it added it. Its
+// bytes go uncounted and what was sent since is flushed as usual.
+func TestFlushGivesUpOnABatchUnconfirmedForHalfTheRetention(t *testing.T) {
+	f := newFixture(t, Config{Retention: 2 * time.Hour})
+	wall := time.Now()
+	f.svc.now = func() time.Time { return wall }
+	space := testutil.RandomDID(t)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	f.send(t, space, 100)
+	if err := f.svc.Flush(cancelled); err == nil {
+		t.Fatal("Flush succeeded on a cancelled context")
+	}
+	// Short of half the retention the batch is still sent again.
+	wall = wall.Add(59 * time.Minute)
+	if err := f.svc.Flush(cancelled); err == nil {
+		t.Fatal("Flush succeeded on a cancelled context")
+	}
+	wall = wall.Add(2 * time.Minute)
+	f.send(t, space, 5)
+	f.flush(t)
+
+	due, err := f.store.DueEgress(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCounts(t, due, registry.EgressCount{Space: space, Hour: hour0, Bytes: 5})
+}
+
 func TestBacklogGauges(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	f := newFixture(t, Config{MeterProvider: sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))})

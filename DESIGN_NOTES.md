@@ -619,7 +619,9 @@ instances sharing the database add into the same rows). Each instance numbers
 its batches and records the last number it added in `ingot.egress_flush`, in
 the statement that adds the counts. A write that fails may still have been
 committed, so its batch is kept and sent again under the same number, and the
-database adds a batch once. Every `usage_report_interval` it calls
+database adds a batch once. A batch still unconfirmed after half the count
+retention is given up and logged, because the database forgets an idle
+instance's number after the full retention. Every `usage_report_interval` it calls
 `Service.Report`, which reads the rows whose `bytes_sent` differs from
 `bytes_reported`, oldest hour first, and sends them to the auth service with
 `/s3/usage/report`, up to 1,000 counts to a report and as many reports as the
