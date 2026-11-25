@@ -17,6 +17,7 @@ import (
 
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // recordingReporter stands in for the auth service, keeping what it is sent.
@@ -156,6 +157,32 @@ func TestServerFlushesUsageWhileAReportIsStuck(t *testing.T) {
 		return false
 	}, 5*time.Second, 10*time.Millisecond, "the count was not flushed while the report was stuck")
 	close(reporter.release)
+}
+
+// TestServerUnregistersUsageGaugesWhenStartFails: a Start that fails leaves
+// no usage gauge behind, since nothing will call Stop for it.
+func TestServerUnregistersUsageGaugesWhenStartFails(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	prev := otel.GetMeterProvider()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	t.Cleanup(func() { otel.SetMeterProvider(prev) })
+
+	var tasks *taskrunner.Runner
+	s := newTestServer(t, config.ServerConfig{}, func(d *ServerDeps) {
+		d.EgressUsage = d.Registry.(*registry.Postgres)
+		d.UsageReporter = &recordingReporter{}
+		tasks = d.Tasks
+	})
+	require.True(t, metricNames(t, reader)["ingot.usage.egress_unreported_counts"], "usage gauges registered by New")
+
+	// A task runner that is already running refuses to start again, which
+	// fails the server's Start after New has registered the gauges.
+	require.NoError(t, tasks.Start(t.Context()))
+	t.Cleanup(func() { _ = s.Stop(context.Background()) })
+	require.Error(t, s.Start(t.Context()))
+	for name := range metricNames(t, reader) {
+		require.NotContains(t, name, "ingot.usage.")
+	}
 }
 
 // TestServerCountsNoUsageWithoutAReporter: usage reporting needs both a store

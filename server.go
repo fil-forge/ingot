@@ -325,12 +325,12 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 func (s *Server) Start(ctx context.Context) error {
 	if err := s.backend.Recover(ctx); err != nil {
 		// fx does not run OnStop for a hook whose OnStart failed, so the
-		// gauges go now; Stop calling CloseMetrics again is harmless.
-		_ = s.backend.CloseMetrics()
+		// gauges go now; Stop closing them again is harmless.
+		s.closeGauges()
 		return fmt.Errorf("ingot: recover: %w", err)
 	}
 	if err := s.tasks.Start(ctx); err != nil {
-		_ = s.backend.CloseMetrics()
+		s.closeGauges()
 		return fmt.Errorf("ingot: start task runner: %w", err)
 	}
 	s.logger.Info("starting ingot S3 listener",
@@ -345,6 +345,15 @@ func (s *Server) Start(ctx context.Context) error {
 	s.startCatalogUsageSweeper()
 	s.startUsageSweeper()
 	return nil
+}
+
+// closeGauges unregisters the gauges New registered, the backend's and the
+// usage service's, for a Start that fails.
+func (s *Server) closeGauges() {
+	_ = s.backend.CloseMetrics()
+	if s.usage != nil {
+		_ = s.usage.CloseMetrics()
+	}
 }
 
 // serve runs the S3 listener until Stop closes it. Stop's close returns nil,
