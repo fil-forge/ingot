@@ -33,9 +33,10 @@ type EgressBacklog struct {
 // EgressUsageStore holds the egress GetObject sent, by space and hour, and
 // which of it the auth service has acknowledged.
 //
-// The counts are totals the service replaces what it holds with, so a count
-// is due for reporting whenever it differs from the one last acknowledged,
-// and reporting one twice does no harm.
+// The counts are totals that only grow, and the service keeps the largest it
+// is sent for an hour. So a count is due for reporting whenever it differs
+// from the one last acknowledged, and reporting one twice, or two instances
+// reporting it in either order, does no harm.
 type EgressUsageStore interface {
 	// AddEgress adds what was sent to each count's hour. Instances sharing a
 	// database add into the same rows. A count of zero bytes is ignored.
@@ -44,57 +45,14 @@ type EgressUsageStore interface {
 	// last acknowledged, each with its hour's total, oldest hour first.
 	DueEgress(ctx context.Context, limit int) ([]EgressCount, error)
 	// AcknowledgeEgress records that the service holds each count's total.
-	// A count whose total differs from the one acknowledged is due: one that
-	// has grown since it was read stays due, and one acknowledged at less
-	// than an earlier acknowledgement becomes due again.
+	// A count that has grown since it was read stays due. A total below the
+	// one already acknowledged changes nothing: the service holds the larger.
 	AcknowledgeEgress(ctx context.Context, reported []EgressCount) error
 	// PruneEgress deletes the counts that are up to date and were last
 	// acknowledged before the given time, and returns how many it deleted.
 	PruneEgress(ctx context.Context, before time.Time) (int64, error)
 	// EgressBacklog returns how much egress is waiting to be reported.
 	EgressBacklog(ctx context.Context) (EgressBacklog, error)
-	// LockEgressReports takes the lock that lets one instance at a time
-	// report, without waiting for it. held is false when another instance
-	// has it. When held, release gives it up and must be called.
-	//
-	// The service replaces the total it holds with each one it is sent, so
-	// two instances reporting at once could deliver an older total after a
-	// newer one. A holder that dies gives the lock up with its connection.
-	LockEgressReports(ctx context.Context) (release func(), held bool, err error)
-}
-
-// egressReportLockKey is the advisory lock key for LockEgressReports.
-// Arbitrary but fixed (ASCII "igtusage").
-const egressReportLockKey int64 = 0x6967747573616765
-
-func (r *Postgres) LockEgressReports(ctx context.Context) (func(), bool, error) {
-	// The lock is the session's, so it lives on a connection of its own for
-	// as long as it is held; the report's queries run over the pool.
-	conn, err := r.pool.Acquire(ctx)
-	if err != nil {
-		return nil, false, fmt.Errorf("registry: lock egress reports: %w", err)
-	}
-	var held bool
-	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, egressReportLockKey).Scan(&held); err != nil {
-		conn.Release()
-		return nil, false, fmt.Errorf("registry: lock egress reports: %w", err)
-	}
-	if !held {
-		conn.Release()
-		return nil, false, nil
-	}
-	release := func() {
-		// Not the caller's context, which may be done by now. A connection
-		// that could not unlock is closed, which ends the session and the
-		// lock with it, so it never returns to the pool still holding it.
-		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if _, err := conn.Exec(unlockCtx, `SELECT pg_advisory_unlock($1)`, egressReportLockKey); err != nil {
-			_ = conn.Conn().Close(unlockCtx)
-		}
-		conn.Release()
-	}
-	return release, true, nil
 }
 
 var _ EgressUsageStore = (*Postgres)(nil)
@@ -180,16 +138,17 @@ func (r *Postgres) AcknowledgeEgress(ctx context.Context, reported []EgressCount
 		bytes[i] = c.Bytes
 	}
 	// A row that grew after it was read keeps its dirty_since: it has been
-	// due since before this report went out. A row that was up to date and
-	// is acknowledged at a lower total becomes due now: the service was just
-	// sent that lower total, and has to be sent the current one again.
+	// due since before this report went out. Only a larger total is
+	// recorded, as the service keeps only a larger one, so another
+	// instance's older report, acknowledged late, leaves the row alone.
 	_, err := r.pool.Exec(ctx, `
 		UPDATE ingot.egress_usage AS u
 		SET bytes_reported = c.bytes,
 		    reported_at = now(),
-		    dirty_since = CASE WHEN u.bytes_sent = c.bytes THEN NULL ELSE COALESCE(u.dirty_since, now()) END
+		    dirty_since = CASE WHEN u.bytes_sent = c.bytes THEN NULL ELSE u.dirty_since END
 		FROM unnest($1::text[], $2::timestamptz[], $3::bigint[]) AS c(space, hour, bytes)
 		WHERE u.space = c.space AND u.hour = c.hour
+		  AND c.bytes > u.bytes_reported AND c.bytes <= u.bytes_sent
 	`, spaces, hours, bytes)
 	if err != nil {
 		return fmt.Errorf("registry: acknowledge egress: %w", err)

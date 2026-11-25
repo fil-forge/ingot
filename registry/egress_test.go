@@ -162,43 +162,23 @@ func TestAcknowledgeLeavesACountThatGrewDue(t *testing.T) {
 	wantDue(t, dueEgress(t, r, 10))
 }
 
-// An acknowledgement at less than an earlier one means the service was sent
-// the lower total last, so the count is due again and goes out at its current
-// total.
-func TestAcknowledgeAtALowerTotalMakesTheCountDueAgain(t *testing.T) {
+// Two instances may report one count at different totals, and the lower may
+// be acknowledged last. The service keeps the larger, so the row stays as the
+// larger acknowledgement left it.
+func TestAcknowledgeAtALowerTotalChangesNothing(t *testing.T) {
 	r := egressStore(t)
 	space := testutil.RandomDID(t)
 	addEgress(t, r, registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 150})
 	acknowledgeEgress(t, r, registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 150})
+	acknowledgeEgress(t, r, registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 100})
 	wantDue(t, dueEgress(t, r, 10))
 
+	// The same while the row is still due: the larger total stays recorded.
+	addEgress(t, r, registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 50})
 	acknowledgeEgress(t, r, registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 100})
-	wantDue(t, dueEgress(t, r, 10), registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 150})
-	if got := egressBacklog(t, r); got.Counts != 1 || got.Oldest.IsZero() {
-		t.Fatalf("backlog after a lower acknowledgement: %+v, want 1 count with an age", got)
-	}
-}
-
-// One caller holds the report lock at a time, and it is free again once
-// released.
-func TestLockEgressReports(t *testing.T) {
-	r := egressStore(t)
-	ctx := context.Background()
-
-	release, held, err := r.LockEgressReports(ctx)
-	if err != nil || !held {
-		t.Fatalf("first lock: held=%v err=%v", held, err)
-	}
-	if _, held, err := r.LockEgressReports(ctx); err != nil || held {
-		t.Fatalf("lock while held: held=%v err=%v, want not held", held, err)
-	}
-	release()
-
-	release, held, err = r.LockEgressReports(ctx)
-	if err != nil || !held {
-		t.Fatalf("lock after release: held=%v err=%v", held, err)
-	}
-	release()
+	wantDue(t, dueEgress(t, r, 10), registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 200})
+	acknowledgeEgress(t, r, registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 200})
+	wantDue(t, dueEgress(t, r, 10))
 }
 
 func TestEgressBacklogCountsWhatIsDue(t *testing.T) {

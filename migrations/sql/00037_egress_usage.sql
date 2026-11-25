@@ -5,7 +5,7 @@
 -- the service last acknowledged it.
 --
 -- bytes_reported is the count the service acknowledged. A report carries an
--- hour's total so far and the service replaces what it holds, so a row is due
+-- hour's total so far and the service keeps the largest, so a row is due
 -- whenever the two differ, the hour in progress included. dirty_since is when
 -- the row last became due, for the age the reporter's gauge shows; it is NULL
 -- while the row is up to date, and reported_at is when it last got there.

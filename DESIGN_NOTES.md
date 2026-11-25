@@ -622,20 +622,14 @@ interval of one instance's traffic. That is accepted. Every `usage_report_interv
 `Service.Report`, which reads the rows whose `bytes_sent` differs from
 `bytes_reported`, oldest hour first, and sends them to the auth service with
 `/s3/usage/report`, up to 1,000 counts to a report and as many reports as the
-backlog that was waiting needs. A count is the hour's total so far and the
-service replaces what it holds, so the hour in progress is reported like any
-other and again each time it has grown, and a report that fails or is
-repeated changes nothing. On the service's answer the reported totals are
+backlog that was waiting needs. A count is the hour's total so far, which only
+grows, and the service keeps the largest it is sent. So the hour in progress
+is reported like any other and again each time it has grown, a report that
+fails or is repeated changes nothing, and instances sharing a database can
+report the same rows in any order. On the service's answer the reported totals are
 written to `bytes_reported`; a row that grew meanwhile still differs and goes
 with the next pass. Rows are deleted 7 days after they were last
 acknowledged.
-
-One instance reports at a time. Because the service replaces what it holds,
-two instances that read the same row at different moments could deliver the
-older total last. A pass therefore takes a Postgres advisory lock first, and
-an instance that finds it taken skips the pass. A row acknowledged at less
-than an earlier acknowledgement is marked due again, so it is re-sent at its
-current total.
 
 The service answers with a warning for any space whose counts it did not
 store, named for the reason: `UnknownBucket` when it never knew the bucket,

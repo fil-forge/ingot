@@ -282,7 +282,7 @@ The counts go to Postgres (`ingot.egress_usage`) every 5 seconds, so a crash
 loses at most that much, and to the auth service every
 `usage_report_interval` (default `10m`). A report carries each count that
 has changed since the service last acknowledged it, as the hour's total so
-far, and the service replaces what it holds: the hour in progress is sent
+far, and the service keeps the largest it is sent: the hour in progress is sent
 again as it grows, and a report that failed is simply sent again. A count is
 kept for 7 days after the service last acknowledged it.
 

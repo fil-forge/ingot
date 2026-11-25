@@ -439,28 +439,6 @@ func TestReportEndsThoughCountsKeepGrowing(t *testing.T) {
 	}
 }
 
-// While another instance is reporting, a pass sends nothing and leaves the
-// counts due.
-func TestReportLeavesThePassToAnInstanceAlreadyReporting(t *testing.T) {
-	f := newFixture(t, Config{})
-	space := testutil.RandomDID(t)
-	f.send(t, space, 100)
-	f.flush(t)
-
-	release, held, err := f.store.LockEgressReports(context.Background())
-	if err != nil || !held {
-		t.Fatalf("taking the report lock: held=%v err=%v", held, err)
-	}
-	if stats := f.report(t); stats.Reports != 0 {
-		t.Fatalf("sent %d reports while another instance held the lock", stats.Reports)
-	}
-	release()
-
-	if stats := f.report(t); stats.Reports != 1 || stats.Counts != 1 {
-		t.Fatalf("after the lock was released: %+v, want 1 report of 1 count", stats)
-	}
-}
-
 // A flush the database refuses keeps its counts for the next one.
 func TestFlushKeepsCountsItCouldNotStore(t *testing.T) {
 	f := newFixture(t, Config{})
