@@ -458,7 +458,7 @@ func (s *Server) startUsageSweeper() {
 				s.endSweepSpan(span, err,
 					attribute.Int("ingot.sweep.reports", stats.Reports),
 					attribute.Int("ingot.sweep.counts", stats.Counts),
-					attribute.Int("ingot.sweep.skipped", stats.Skipped),
+					attribute.Int("ingot.sweep.warnings", stats.Warnings),
 					attribute.Int64("ingot.sweep.pruned", stats.Pruned))
 				cancel()
 				if err != nil && s.sweepCtx.Err() == nil {

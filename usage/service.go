@@ -9,6 +9,7 @@ import (
 	hiltclient "github.com/fil-forge/hilt/pkg/client"
 	usagecmds "github.com/fil-forge/libforge/commands/s3/usage"
 	"github.com/fil-forge/ucantone/did"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 	"go.uber.org/zap"
@@ -31,8 +32,9 @@ const (
 	backlogTimeout = 5 * time.Second
 )
 
-// Reporter sends usage counts to the auth service and returns the spaces
-// whose counts the service skipped. [hiltclient.Client] implements it.
+// Reporter sends usage counts to the auth service and returns its warnings
+// about them, such as the spaces whose counts it did not store.
+// [hiltclient.Client] implements it.
 type Reporter interface {
 	ReportUsage(ctx context.Context, egress []usagecmds.SpaceEgress, opts ...hiltclient.MethodOption) (*usagecmds.ReportOK, error)
 }
@@ -69,8 +71,8 @@ type Service struct {
 	batch     int
 	retention time.Duration
 
-	skipped metric.Int64Counter
-	gauges  metric.Registration
+	warnings metric.Int64Counter
+	gauges   metric.Registration
 }
 
 // New creates the service and registers its instruments.
@@ -90,7 +92,7 @@ func New(cfg Config) (*Service, error) {
 		logger:    cfg.Logger,
 		batch:     cfg.ReportBatch,
 		retention: cfg.Retention,
-		skipped:   noop.Int64Counter{},
+		warnings:  noop.Int64Counter{},
 	}
 	if s.logger == nil {
 		s.logger = zap.NewNop()
@@ -132,8 +134,8 @@ type ReportStats struct {
 	Reports int
 	// Counts is how many counts they carried.
 	Counts int
-	// Skipped is how many of those the service did not store.
-	Skipped int
+	// Warnings is how many warnings the service answered them with.
+	Warnings int
 	// Pruned is how many acknowledged counts were deleted for age.
 	Pruned int64
 }
@@ -146,8 +148,9 @@ type ReportStats struct {
 // has grown.
 //
 // A report that fails ends the pass, and the next pass starts from the same
-// counts. A count the service skipped is acknowledged like the rest, so it is
-// not sent again, and is logged and counted.
+// counts. An accepted report settles every count in it: one the service
+// warned about, because it did not store it, is acknowledged like the rest and
+// not sent again. Each warning is logged and counted by its name.
 func (s *Service) Report(ctx context.Context) (ReportStats, error) {
 	var stats ReportStats
 	// A count that grows while the pass runs is due again as soon as it is
@@ -174,7 +177,7 @@ func (s *Service) Report(ctx context.Context) (ReportStats, error) {
 		}
 		stats.Reports++
 		stats.Counts += len(due)
-		stats.Skipped += s.noteSkipped(ctx, due, ok.Skipped)
+		stats.Warnings += s.noteWarnings(ctx, due, ok.Warnings)
 	}
 	pruned, err := s.store.PruneEgress(ctx, time.Now().Add(-s.retention))
 	if err != nil {
@@ -184,29 +187,28 @@ func (s *Service) Report(ctx context.Context) (ReportStats, error) {
 	return stats, nil
 }
 
-// noteSkipped logs and counts the reported counts whose space the service
-// skipped, and returns how many there were.
-func (s *Service) noteSkipped(ctx context.Context, reported []registry.EgressCount, skipped []did.DID) int {
-	if len(skipped) == 0 {
-		return 0
-	}
-	spaces := make(map[did.DID]struct{}, len(skipped))
-	for _, space := range skipped {
-		spaces[space] = struct{}{}
-	}
-	n := 0
-	var bytes int64
-	for _, c := range reported {
-		if _, ok := spaces[c.Space]; ok {
-			n++
-			bytes += c.Bytes
+// noteWarnings logs and counts the warnings the service answered a report
+// with, each with how much of the report was about its space, and returns how
+// many there were. A name this version does not know is logged and counted
+// like the rest.
+func (s *Service) noteWarnings(ctx context.Context, reported []registry.EgressCount, warnings []usagecmds.Warning) int {
+	for _, w := range warnings {
+		var (
+			counts int
+			bytes  int64
+		)
+		for _, c := range reported {
+			if c.Space == w.Space {
+				counts++
+				bytes += c.Bytes
+			}
 		}
+		s.warnings.Add(ctx, 1, metric.WithAttributes(attribute.String("name", w.Name)))
+		s.logger.Warn("the auth service warned about usage counts",
+			zap.String("warning", w.Name), zap.String("message", w.Message),
+			zap.Stringer("space", w.Space), zap.Int("counts", counts), zap.Int64("bytes", bytes))
 	}
-	s.skipped.Add(ctx, int64(n))
-	s.logger.Warn("the auth service skipped usage counts",
-		zap.Int("spaces", len(skipped)), zap.Int("counts", n), zap.Int64("bytes", bytes),
-		zap.Stringers("skipped_spaces", skipped))
-	return n
+	return len(warnings)
 }
 
 // CloseMetrics unregisters the service's gauges.
@@ -218,8 +220,8 @@ func (s *Service) CloseMetrics() error {
 }
 
 func (s *Service) registerMetrics(meter metric.Meter) error {
-	skipped, err := meter.Int64Counter("ingot.usage.egress_skipped_counts", metric.WithUnit("{count}"),
-		metric.WithDescription("Egress counts the auth service did not store, because it does not know the bucket or another gateway serves it"))
+	warnings, err := meter.Int64Counter("ingot.usage.report_warnings", metric.WithUnit("{warning}"),
+		metric.WithDescription("Warnings the auth service answered usage reports with, by name: UnknownBucket and BucketRegionMismatch each mean a bucket's counts were not stored"))
 	if err != nil {
 		return err
 	}
@@ -251,7 +253,7 @@ func (s *Service) registerMetrics(meter metric.Meter) error {
 	if err != nil {
 		return err
 	}
-	s.skipped, s.gauges = skipped, reg
+	s.warnings, s.gauges = warnings, reg
 	return nil
 }
 

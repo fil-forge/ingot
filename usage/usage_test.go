@@ -166,8 +166,9 @@ func TestCounterIsSafeForConcurrentResponses(t *testing.T) {
 type fakeReporter struct {
 	mu      sync.Mutex
 	reports [][]usagecmds.SpaceEgress
-	skip    map[did.DID]bool
-	err     error
+	// warn is the warning to answer with for a space, by name.
+	warn map[did.DID]string
+	err  error
 	// onReport, when set, runs inside each report, before it answers.
 	onReport func()
 }
@@ -182,13 +183,13 @@ func (f *fakeReporter) ReportUsage(_ context.Context, egress []usagecmds.SpaceEg
 		return nil, f.err
 	}
 	f.reports = append(f.reports, egress)
-	skipped := []did.DID{}
+	warnings := []usagecmds.Warning{}
 	for _, e := range egress {
-		if f.skip[e.Space] {
-			skipped = append(skipped, e.Space)
+		if name, ok := f.warn[e.Space]; ok {
+			warnings = append(warnings, usagecmds.Warning{Name: name, Message: "left out", Space: e.Space})
 		}
 	}
-	return &usagecmds.ReportOK{Skipped: skipped}, nil
+	return &usagecmds.ReportOK{Warnings: warnings}, nil
 }
 
 // held is what the service would hold after the reports: the last total sent
@@ -223,7 +224,7 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	f := &fixture{
 		clock:    &clock{now: hour0.Add(time.Minute)},
 		store:    registry.NewPostgres(pgtest.New(t)),
-		reporter: &fakeReporter{skip: map[did.DID]bool{}},
+		reporter: &fakeReporter{warn: map[did.DID]string{}},
 	}
 	f.counter = newTestCounter(f.clock)
 	cfg.Counter, cfg.Store, cfg.Reporter = f.counter, f.store, f.reporter
@@ -270,7 +271,7 @@ func TestReportSendsWhatWasCountedGroupedBySpace(t *testing.T) {
 	f.flush(t)
 
 	stats := f.report(t)
-	if stats.Reports != 1 || stats.Counts != 3 || stats.Skipped != 0 {
+	if stats.Reports != 1 || stats.Counts != 3 || stats.Warnings != 0 {
 		t.Fatalf("stats: %+v", stats)
 	}
 	if len(f.reporter.reports) != 1 {
@@ -370,27 +371,42 @@ func TestReportRetriesAfterAFailure(t *testing.T) {
 	}
 }
 
-// A count the service skipped is not sent again, and the counts beside it
-// are stored.
-func TestReportDoesNotResendASkippedCount(t *testing.T) {
+// A count the service warned about is not sent again, and the counts beside
+// it are stored. Each warning is counted under its name, one this version has
+// never heard of included.
+func TestReportDoesNotResendACountItWasWarnedAbout(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	f := newFixture(t, Config{MeterProvider: sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))})
-	known, unknown := testutil.RandomDID(t), testutil.RandomDID(t)
-	f.reporter.skip[unknown] = true
+	known, unknown, elsewhere, odd := testutil.RandomDID(t), testutil.RandomDID(t), testutil.RandomDID(t), testutil.RandomDID(t)
+	f.reporter.warn[unknown] = usagecmds.UnknownBucketWarningName
+	f.reporter.warn[elsewhere] = usagecmds.BucketRegionMismatchWarningName
+	f.reporter.warn[odd] = "SomethingNewer"
 
-	f.send(t, known, 100)
-	f.send(t, unknown, 9)
+	for _, space := range []did.DID{known, unknown, elsewhere, odd} {
+		f.send(t, space, 100)
+	}
 	f.flush(t)
 
 	stats := f.report(t)
-	if stats.Counts != 2 || stats.Skipped != 1 {
-		t.Fatalf("stats: %+v, want 2 counts of which 1 skipped", stats)
+	if stats.Counts != 4 || stats.Warnings != 3 {
+		t.Fatalf("stats: %+v, want 4 counts and 3 warnings", stats)
 	}
 	if stats := f.report(t); stats.Reports != 0 {
-		t.Fatalf("the skipped count was sent again: %+v", stats)
+		t.Fatalf("a count that was warned about was sent again: %+v", stats)
 	}
-	if got := metricValue(t, reader, "ingot.usage.egress_skipped_counts"); got != 1 {
-		t.Fatalf("ingot.usage.egress_skipped_counts = %d, want 1", got)
+	got := warningCounts(t, reader)
+	want := map[string]int64{
+		usagecmds.UnknownBucketWarningName:        1,
+		usagecmds.BucketRegionMismatchWarningName: 1,
+		"SomethingNewer":                          1,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ingot.usage.report_warnings by name: %v, want %v", got, want)
+	}
+	for name, n := range want {
+		if got[name] != n {
+			t.Fatalf("ingot.usage.report_warnings by name: %v, want %v", got, want)
+		}
 	}
 }
 
@@ -516,4 +532,31 @@ func onePoint(t *testing.T, name string, points []metricdata.DataPoint[int64]) i
 		t.Fatalf("%s carries attributes %v, want none", name, points[0].Attributes)
 	}
 	return points[0].Value
+}
+
+// warningCounts collects the reader and returns the warnings counter's values
+// by warning name.
+func warningCounts(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	out := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "ingot.usage.report_warnings" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("ingot.usage.report_warnings is a %T", m.Data)
+			}
+			for _, dp := range sum.DataPoints {
+				name, _ := dp.Attributes.Value("name")
+				out[name.AsString()] = dp.Value
+			}
+		}
+	}
+	return out
 }

@@ -249,7 +249,7 @@ the auth service, which serves them to tenants as their egress (see
 | -- | -- |
 | `ingot.usage.egress_unreported_counts` | Egress counts (one per bucket and hour) that have changed since the auth service last acknowledged them |
 | `ingot.usage.egress_oldest_unreported_age` | Seconds the longest-waiting of them has been due; 0 when none is. Counts are reported every `usage_report_interval`, so an age several times that means reports are failing |
-| `ingot.usage.egress_skipped_counts` | Counts the auth service did not store, because it does not know the bucket or another gateway serves it. Any at all is worth a look |
+| `ingot.usage.report_warnings` | Warnings the auth service answered reports with, by `name`. `UnknownBucket` (it has no record of the bucket) and `BucketRegionMismatch` (another gateway serves it) each mean a bucket's counts were not stored. Any at all is worth a look |
 
 Each commit also journals its catalog blocks in Postgres until their segment
 ships (see `logstore/README.md`), so a copy of the database holds the

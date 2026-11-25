@@ -628,10 +628,13 @@ written to `bytes_reported`; a row that grew meanwhile still differs and goes
 with the next pass. Rows are deleted 7 days after they were last
 acknowledged.
 
-The service names in its answer any space whose counts it did not store,
-because it never knew the bucket or another gateway serves it. Those are
-acknowledged like the rest, so they are not sent again, and logged and
-counted (`ingot.usage.egress_skipped_counts`).
+The service answers with a warning for any space whose counts it did not
+store, named for the reason: `UnknownBucket` when it never knew the bucket,
+`BucketRegionMismatch` when another gateway serves it. An accepted report
+settles every count in it, so those are acknowledged like the rest and not
+sent again. Each warning is logged with its message and counted under its
+name (`ingot.usage.report_warnings`), a name this version does not know
+included.
 
 The agent invokes `/s3/usage/report` on its own authority: it is the
 invocation's subject as well as its issuer, the auth service is only the
