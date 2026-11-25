@@ -64,7 +64,8 @@ ingot depends only on these — it must **never** import `fil-forge/sprue` or
   `commands/{blob,content,http,assert,ucan,index,provider,access}`, `blobindex`
   (sharded-dag-index), `ucan` (ProofStore), `ucan/retrieval`, `didmailto`, `receipt`.
 - **`fil-forge/hilt/pkg/{client,rpc/service,s3perm,sigv4}`** — the auth/tenant
-  service client: `/s3/request/authorize`, `/s3/bucket/*`, SigV4 verification
+  service client: `/s3/request/authorize`, `/s3/bucket/*`, `/s3/usage/report`,
+  SigV4 verification
   helpers, permission→command mapping.
 - **`indexing-service/pkg/{client,types}`** — indexer query client (the
   indexer-backed locator compiles but is not wired; reads use the local tables).
@@ -152,7 +153,8 @@ Internal:
   sums the catalog usage gauges report), `stores*.go` (intents, locations,
   inclusions, blob_refs and pending refs (`CountReferences`),
   multipart sessions/parts, parks, encryption params, the revocation
-  cursor),
+  cursor), `egress.go` (`EgressUsageStore`: the egress counted for each
+  space and hour, and what of it hilt has acknowledged),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
   all of them.
 - **`queue/`** — one package per task queue, each built over the runner
@@ -230,6 +232,14 @@ Internal:
   `commitProofs` from every `queue-bucket.commit` append (`CaptureShipAuthority`), which
   the ship prefers. Both take only stores `reqscope.BorrowableProofStore`
   returns, and their chains skip revoked delegations.
+- **`usage/`** — the usage counts only the gateway knows, reported to hilt:
+  `counter.go` (`Counter`, which wraps each GetObject body and counts what is
+  read from it by bucket space and hour) and `service.go` (`Service`: `Flush`
+  adds the counts to `ingot.egress_usage`, `Report` sends the ones that have
+  changed since hilt acknowledged them with `/s3/usage/report`, the hour in
+  progress included, and prunes old ones). The usage sweeper in `server.go`
+  runs both. Its instruments (`ingot.usage.*`) are created on the global
+  meter provider.
 - **`bucketauthority/`** — hilt bucket ops: forwards CreateBucket /
   DeleteBucket / ListBuckets to `/s3/bucket/*`, recovering the signed S3
   request from ctx.
@@ -337,13 +347,15 @@ Internal:
   seams; `bucketauthority.BucketAuthority`; `registry.Registry` plus the
   intent/location/inclusion/blob-ref/GC/multipart/park/encryption-params
   stores; `logstore.Meta`; `auth.IAMService`; `regionkey.Provider`;
-  `tenantkey.Source`; optionally `registry.CatalogUsageStore`) + a
+  `tenantkey.Source`; optionally `registry.CatalogUsageStore`, and
+  `registry.EgressUsageStore` with `usage.Reporter`, which together turn on
+  usage reporting) + a
   `PreStartHook` group; runs pre-start → `New` → `Start` on the fx
   lifecycle.
 - **`Module(cfg)`** (production wrapper) — supplies Postgres as Registry +
   Meta + every store (one `*registry.Postgres` behind them all), the Forge
   reader (`LocalLocator` inside `Cached`), the task runner
-  (`provideTaskRunner`), the sprue edge client + uploader, the hilt client +
+  (`provideTaskRunner`), the sprue edge client + uploader, the hilt client (also the `usage.Reporter`) +
   `iam.Service` + `KeyProofs`, `bucketauthority`, the region-key provider,
   the tenant key source, the (empty) token store, and the migration
   `PreStartHook` (goose, then the runner's tables); with
@@ -379,6 +391,8 @@ neither), `TokenStoreDir` (→ `DataDir`), `MultipartSessionTTL` (empty → 7d,
 negative → never: an open upload's auto-abort and a completed one's reap are
 due this long out), `ReleaseGrace` (empty → 60s, negative → 0: how long a
 blob's release waits after its last claim drops),
+`UsageReportInterval` (empty → 10m, must be positive: how often the egress
+counts that have changed are reported to hilt),
 `LocalBlobMaxBytes` (0 → no budget for the cache, writes in progress
 included) with
 `CacheTTL` (1h: how long a body stays cached after it was cached or last

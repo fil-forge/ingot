@@ -597,6 +597,48 @@ gives up its allocation. A release leaves the cached file while
 another space still holds an intent for the digest; a file that two spaces'
 releases at once both leave is reclaimed by the cache's time to live.
 
+## Usage reporting
+
+Some of what a tenant is shown as usage only the gateway can count. Today
+that is egress: the bytes of object data GetObject sends to clients. The
+upload service knows what a space stores and never sees a read, and a storage
+node sees only the reads that miss the cache, in stored bytes.
+
+`usage.Counter` wraps each GetObject body (`Counter.Egress`) and adds what is
+read from it, as it is read, to an in-memory count for the bucket's space and
+the current UTC hour. The body is the object's own bytes: decrypted, trimmed
+to the requested range. A read counts toward the hour it happens in, so a
+response that runs across an hour boundary adds to both hours, and a client
+that goes away is counted for what was read, which is at most a buffer more
+than reached it. Copies read their source through another path and are not
+counted.
+
+The usage sweeper (`server.go`) calls `usage.Service.Flush` every 5 seconds,
+which adds the counts to `ingot.egress_usage` (one row per space and hour;
+instances sharing the database add into the same rows) and puts them back in
+memory if the write fails. Every `usage_report_interval` it calls
+`Service.Report`, which reads the rows whose `bytes_sent` differs from
+`bytes_reported`, oldest hour first, and sends them to the auth service with
+`/s3/usage/report`, up to 1,000 counts to a report and as many reports as the
+backlog that was waiting needs. A count is the hour's total so far and the
+service replaces what it holds, so the hour in progress is reported like any
+other and again each time it has grown, and a report that fails or is
+repeated changes nothing. On the service's answer the reported totals are
+written to `bytes_reported`; a row that grew meanwhile still differs and goes
+with the next pass. Rows are deleted 7 days after they were last
+acknowledged.
+
+The service names in its answer any space whose counts it did not store,
+because it never knew the bucket or another gateway serves it. Those are
+acknowledged like the rest, so they are not sent again, and logged and
+counted (`ingot.usage.egress_skipped_counts`).
+
+The agent invokes `/s3/usage/report` on its own authority: it is the
+invocation's subject as well as its issuer, the auth service is only the
+audience, and no proofs are sent. The service accepts it because the agent is
+a provider it has registered. A report names no tenant; the service knows
+each bucket's.
+
 ## Identity & auth
 
 - **agent**: the libforge `identity.Identity` the host provides (daemon: the `identity.key_file` PEM

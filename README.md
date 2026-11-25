@@ -241,6 +241,16 @@ as neither:
 | `ingot.s3.object_egress_bytes` | Bytes GetObject sent to clients: those read from the body before it closed, so an abandoned download counts what went out |
 | `ingot.s3.object_ingress_bytes` | Bytes PutObject and UploadPart received, whether or not the write succeeded |
 
+The same body bytes are counted for each bucket, by the hour, and reported to
+the auth service, which serves them to tenants as their egress (see
+[Usage reporting](#usage-reporting)). The reporter has its own metrics:
+
+| Metric | Meaning |
+| -- | -- |
+| `ingot.usage.egress_unreported_counts` | Egress counts (one per bucket and hour) that have changed since the auth service last acknowledged them |
+| `ingot.usage.egress_oldest_unreported_age` | Seconds the longest-waiting of them has been due; 0 when none is. Counts are reported every `usage_report_interval`, so an age several times that means reports are failing |
+| `ingot.usage.egress_skipped_counts` | Counts the auth service did not store, because it does not know the bucket or another gateway serves it. Any at all is worth a look |
+
 Each commit also journals its catalog blocks in Postgres until their segment
 ships (see `logstore/README.md`), so a copy of the database holds the
 catalog only this host's disk would otherwise hold. The journal reports:
@@ -258,6 +268,27 @@ and takeovers, task duration and busy workers as `taskrunner.*`, listed in
 delete: the provider holds its body. Restart `serve` after deleting files by
 hand: the byte count sees such a change at startup, or only at an hourly
 scan that no write overlapped.
+
+### Usage reporting
+
+Ingot counts the bytes of object data GetObject sends to clients, for each
+bucket and each hour, and reports the counts to the auth service, which
+serves them as the egress series of its tenant and bucket metrics. The count
+is of the object's bytes as the client receives them: after decryption,
+trimmed to the requested range, and only what was read before a client went
+away. A copy sends nothing to a client and counts nothing.
+
+The counts go to Postgres (`ingot.egress_usage`) every 5 seconds, so a crash
+loses at most that much, and to the auth service every
+`usage_report_interval` (default `10m`). A report carries each count that
+has changed since the service last acknowledged it, as the hour's total so
+far, and the service replaces what it holds: the hour in progress is sent
+again as it grows, and a report that failed is simply sent again. A count is
+kept for 7 days after the service last acknowledged it.
+
+Ingot makes the report on its own authority, with no delegation from the auth
+service, which accepts it from a gateway registered as a provider. It runs
+whenever `auth_service_url` is set.
 
 ### Catalog storage on Forge
 

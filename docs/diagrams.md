@@ -54,7 +54,7 @@ flowchart LR
     idx["indexing-service"]
 
     client -->|"S3 REST"| ingot
-    ingot -->|"/s3/request/authorize (every request on a local-cache miss)<br/>/s3/bucket/info (lazy chain completion)<br/>/s3/bucket/create, delete, list<br/>/s3/bucket/policy (?policy, the signed request)"| hilt
+    ingot -->|"/s3/request/authorize (every request on a local-cache miss)<br/>/s3/bucket/info (lazy chain completion)<br/>/s3/bucket/create, delete, list<br/>/s3/bucket/policy (?policy, the signed request)<br/>/s3/usage/report (egress counts, on ingot's own authority)"| hilt
     ingot -->|"/blob/add, /ucan/conclude, GET /receipt/:task<br/>/blob/abort, /blob/remove, /index/add<br/>/upload/add, /upload/remove"| sprue
     ingot -->|"HTTP PUT blob bytes (allocated URL)"| piri
     ingot -->|"content/retrieve (UCAN, on read miss)"| piri
@@ -1257,6 +1257,13 @@ erDiagram
         boolean id PK "single-row latch"
         text token "resume point: the service's cursor for the last record, or its head"
     }
+    egress_usage {
+        text space PK "bucket space DID"
+        timestamptz hour PK "start of the hour"
+        bigint bytes_sent "object bytes GetObject sent in the hour"
+        bigint bytes_reported "the total the auth service last acknowledged"
+        timestamptz dirty_since "when it became due for reporting; NULL when up to date"
+    }
 
     segments ||--o{ segment_op_roots : "ON DELETE CASCADE"
     multipart_sessions ||--o{ multipart_parts : "ON DELETE CASCADE"
@@ -1272,7 +1279,8 @@ erDiagram
 
 - The four solid relationships are the schema's only real foreign keys;
   dashed ones are soft joins the code performs. `revocation_cursor` stands
-  alone. `blob_pending_refs` joins nothing: a release counts its rows with
+  alone, and so does `egress_usage`, which keeps a bucket's last hours after
+  the bucket is deleted so they can still be reported. `blob_pending_refs` joins nothing: a release counts its rows with
   the `blob_refs` claims and the open sessions' parts by (space,
   digest).
 - `catalog_journal` has no foreign key to `segments` on purpose: when a
@@ -1392,6 +1400,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `iam/`, `internal/reqscope/` | principals, authorize, context |
 | `cmd/catalog.go` | packages, principals |
 | `bucket/`, `mst/` | version-tree, put, get |
+| `usage/`, `registry/egress.go` | context, schema |
 | `migrations/sql/` | schema, plus any state diagram naming a changed CHECK |
 | `module.go`, `server.go`, `config/` | packages, context, logstore-pipeline; `server.go` also authorize and multipart |
 | `s3frontend/policy.go` | context, authorize |
