@@ -615,8 +615,11 @@ counted.
 
 The usage sweeper (`server.go`) calls `usage.Service.Flush` every 5 seconds,
 which adds the counts to `ingot.egress_usage` (one row per space and hour;
-instances sharing the database add into the same rows) and puts them back in
-memory if the write fails. Every `usage_report_interval` it calls
+instances sharing the database add into the same rows). Each instance numbers
+its batches and records the last number it added in `ingot.egress_flush`, in
+the statement that adds the counts. A write that fails may still have been
+committed, so its batch is kept and sent again under the same number, and the
+database adds a batch once. Every `usage_report_interval` it calls
 `Service.Report`, which reads the rows whose `bytes_sent` differs from
 `bytes_reported`, oldest hour first, and sends them to the auth service with
 `/s3/usage/report`, up to 1,000 counts to a report and as many reports as the

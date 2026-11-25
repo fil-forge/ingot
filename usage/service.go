@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	hiltclient "github.com/fil-forge/hilt/pkg/client"
 	usagecmds "github.com/fil-forge/libforge/commands/s3/usage"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -71,6 +73,16 @@ type Service struct {
 	batch     int
 	retention time.Duration
 
+	// flushMu serialises flushes and guards the fields below it.
+	flushMu sync.Mutex
+	// instance identifies this process to the store.
+	instance string
+	// seq is the number of the last batch taken from the counter.
+	seq int64
+	// pending is a batch the store did not confirm, kept apart from the
+	// counter so it goes again under the same number.
+	pending []registry.EgressCount
+
 	warnings metric.Int64Counter
 	gauges   metric.Registration
 }
@@ -92,6 +104,7 @@ func New(cfg Config) (*Service, error) {
 		logger:    cfg.Logger,
 		batch:     cfg.ReportBatch,
 		retention: cfg.Retention,
+		instance:  uuid.NewString(),
 		warnings:  noop.Int64Counter{},
 	}
 	if s.logger == nil {
@@ -114,18 +127,33 @@ func New(cfg Config) (*Service, error) {
 }
 
 // Flush adds what the responses have counted since the last flush to the
-// store. If the store cannot take it, the counts stay in memory and go with
-// the next flush.
+// store.
+//
+// A failed add may still have taken effect, so its batch is kept as it was
+// and the next flush sends it again under the same number, which the store
+// adds at most once. What is counted in the meantime follows as a new batch.
 func (s *Service) Flush(ctx context.Context) error {
-	counts := s.counter.take()
-	if len(counts) == 0 {
-		return nil
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	for {
+		retry := s.pending != nil
+		if !retry {
+			counts := s.counter.take()
+			if len(counts) == 0 {
+				return nil
+			}
+			s.seq++
+			s.pending = counts
+		}
+		flush := registry.EgressFlush{Instance: s.instance, Seq: s.seq}
+		if err := s.store.AddEgress(ctx, flush, s.pending); err != nil {
+			return fmt.Errorf("usage: flush: %w", err)
+		}
+		s.pending = nil
+		if !retry {
+			return nil
+		}
 	}
-	if err := s.store.AddEgress(ctx, counts); err != nil {
-		s.counter.restore(counts)
-		return fmt.Errorf("usage: flush: %w", err)
-	}
-	return nil
 }
 
 // ReportStats is what one [Service.Report] did.

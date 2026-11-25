@@ -59,7 +59,7 @@ func TestServerReportsUsage(t *testing.T) {
 	ctx := t.Context()
 	space := testutil.RandomDID(t)
 	hour := time.Now().UTC().Truncate(time.Hour)
-	require.NoError(t, store.AddEgress(ctx, []registry.EgressCount{{Space: space, Hour: hour, Bytes: 4096}}))
+	require.NoError(t, store.AddEgress(ctx, registry.EgressFlush{Instance: "test", Seq: 1}, []registry.EgressCount{{Space: space, Hour: hour, Bytes: 4096}}))
 
 	require.NoError(t, s.Start(ctx))
 	stopped := false

@@ -460,6 +460,64 @@ func TestFlushKeepsCountsItCouldNotStore(t *testing.T) {
 	wantCounts(t, due, registry.EgressCount{Space: space, Hour: hour0, Bytes: 105})
 }
 
+// lostReplyStore adds a batch and then reports failure, as a database does
+// when it commits and the reply never arrives.
+type lostReplyStore struct {
+	registry.EgressUsageStore
+	lose int
+}
+
+func (s *lostReplyStore) AddEgress(ctx context.Context, flush registry.EgressFlush, sent []registry.EgressCount) error {
+	if err := s.EgressUsageStore.AddEgress(ctx, flush, sent); err != nil {
+		return err
+	}
+	if s.lose > 0 {
+		s.lose--
+		return errors.New("reply lost")
+	}
+	return nil
+}
+
+// A flush that took effect and looked like a failure is sent again and counts
+// once. What was sent in the meantime is counted too.
+func TestFlushRepeatedAfterALostReplyCountsOnce(t *testing.T) {
+	c := &clock{now: hour0.Add(time.Minute)}
+	counter := newTestCounter(c)
+	pg := registry.NewPostgres(pgtest.New(t))
+	svc, err := New(Config{
+		Counter:  counter,
+		Store:    &lostReplyStore{EgressUsageStore: pg, lose: 2},
+		Reporter: &fakeReporter{warn: map[did.DID]string{}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	space := testutil.RandomDID(t)
+	send := func(n int) {
+		t.Helper()
+		if _, err := io.Copy(io.Discard, counter.Egress(space, body(n))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	send(100)
+	for range 2 {
+		if err := svc.Flush(context.Background()); err == nil {
+			t.Fatal("Flush succeeded though the reply was lost")
+		}
+		send(5)
+	}
+	if err := svc.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	due, err := pg.DueEgress(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCounts(t, due, registry.EgressCount{Space: space, Hour: hour0, Bytes: 110})
+}
+
 func TestBacklogGauges(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	f := newFixture(t, Config{MeterProvider: sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))})

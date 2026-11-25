@@ -24,5 +24,17 @@ CREATE TABLE ingot.egress_usage (
 CREATE INDEX egress_usage_due_idx ON ingot.egress_usage (hour, space)
     WHERE bytes_sent <> bytes_reported;
 
+-- The last batch of counts each instance added. An instance numbers its
+-- batches and a batch is added only if its number is above the one here, so an
+-- instance that cannot tell whether an add took effect repeats it without
+-- counting twice. An instance is a process: a restart starts a new row, and
+-- rows untouched for the retention are deleted with the settled counts.
+CREATE TABLE ingot.egress_flush (
+    instance   text        PRIMARY KEY,
+    seq        bigint      NOT NULL,
+    flushed_at timestamptz NOT NULL
+);
+
 -- +goose Down
+DROP TABLE ingot.egress_flush;
 DROP TABLE ingot.egress_usage;
