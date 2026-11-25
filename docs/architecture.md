@@ -1045,6 +1045,20 @@ CREATE TABLE ingot.revocation_cursor (
     token       text NOT NULL,                           -- the service's cursor the next reconnect resumes after
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
+
+-- The object bytes GetObject sent to clients, by bucket space and hour, and
+-- the total the auth service last acknowledged. A row is due for reporting
+-- whenever the two differ.
+CREATE TABLE ingot.egress_usage (
+    space          text        NOT NULL,                 -- bucket space DID
+    hour           timestamptz NOT NULL,                 -- start of the hour
+    bytes_sent     bigint      NOT NULL CHECK (bytes_sent > 0),
+    bytes_reported bigint      NOT NULL DEFAULT 0 CHECK (bytes_reported >= 0),
+    dirty_since    timestamptz,                          -- when it became due; NULL when up to date
+    reported_at    timestamptz,                          -- when it was last acknowledged
+    PRIMARY KEY (space, hour),
+    CHECK ((dirty_since IS NULL) = (bytes_sent = bytes_reported))
+);
 ```
 
 Relationships at a glance: `segment_op_roots` cascades from `segments`, `multipart_parts` from
@@ -1053,7 +1067,8 @@ from `buckets` — the schema's only true foreign keys. `catalog_journal`
 references a `segments.seq` by value, deliberately. `blob_refs`, `segments`,
 `multipart_sessions` and `gc_candidates` reference a `buckets.name` by value,
 `shard_inclusions` joins `blob_locations` on `shard_digest`, and `blob_encryption_params` joins
-`blob_locations` on `(space, digest)` with deliberately no FK. `revocation_cursor` stands alone.
+`blob_locations` on `(space, digest)` with deliberately no FK. `revocation_cursor` stands alone,
+as does `egress_usage`, which outlives its bucket so the bucket's last hours can still be reported.
 A space's references to a blob are its `blob_refs` claims, its `blob_pending_refs` rows, and the
 parts of its open multipart sessions, counted in one statement
 (`registry.CountReferences`). The drop of the last claim queues `remove(digest)`

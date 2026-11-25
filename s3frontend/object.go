@@ -942,7 +942,7 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	out := &s3.GetObjectOutput{
 		ServerSideEncryption:      encryptionOf(mf),
 		AcceptRanges:              backend.GetPtrFromString("bytes"),
-		Body:                      b.transferMetrics.countEgress(ctx, body),
+		Body:                      b.usage.Egress(st.Space, b.transferMetrics.countEgress(ctx, body)),
 		ContentLength:             &length,
 		ContentType:               &contentType,
 		ContentEncoding:           strPtrOrNil(mf.ContentEncoding),

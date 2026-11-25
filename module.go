@@ -83,6 +83,7 @@ import (
 	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/tokenstore"
 	"github.com/fil-forge/ingot/uploader"
+	"github.com/fil-forge/ingot/usage"
 	swarfclient "github.com/fil-forge/swarf/pkg/client"
 )
 
@@ -115,6 +116,7 @@ func Module(cfg config.Config) fx.Option {
 			provideTokenStore,
 			provideForgeClient,
 			NewAuthServiceClient,
+			provideUsageReporter,
 			provideUploader,
 			provideMigrationHook,
 			provideKeyProofs,
@@ -178,6 +180,10 @@ type serverParams struct {
 	// CatalogUsage feeds the catalog usage gauges; without it they are not
 	// reported (see ServerDeps.CatalogUsage).
 	CatalogUsage registry.CatalogUsageStore `optional:"true"`
+	// EgressUsage and UsageReporter turn on usage reporting when both are
+	// provided (see ServerDeps.EgressUsage).
+	EgressUsage   registry.EgressUsageStore `optional:"true"`
+	UsageReporter usage.Reporter            `optional:"true"`
 	// Identity is the agent identity (the host-provided libforge identity, the
 	// issuer of every outbound invocation); the listener serves its DID
 	// document at /.well-known/did.json. Required.
@@ -240,6 +246,8 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				TenantKeys:      p.TenantKeys,
 				Meta:            p.Meta,
 				CatalogUsage:    p.CatalogUsage,
+				EgressUsage:     p.EgressUsage,
+				UsageReporter:   p.UsageReporter,
 				Identity:        p.Identity,
 				IAM:             p.IAM,
 			})
@@ -327,6 +335,12 @@ func NewAuthServiceClient(cfg config.Config, id identity.Identity, logger *zap.L
 	proofs := ucanlib.NewContainerProofStore(ct)
 	return hiltclient.New(authServiceDID, *authServiceURL, id, hiltclient.WithBaseProofs(proofs), hiltclient.WithLogger(logger),
 		hiltclient.WithHTTPClient(tracing.NewHTTPClient()))
+}
+
+// provideUsageReporter gives the server the auth service client as the place
+// its usage counts are reported to (see ServerDeps.UsageReporter).
+func provideUsageReporter(c *hiltclient.Client) usage.Reporter {
+	return c
 }
 
 // provideRegionKeyProvider builds the configured region CEK wrap provider
@@ -499,6 +513,7 @@ type registryResult struct {
 	EncParams         registry.EncryptionParamsStore
 	RevocationCursors registry.RevocationCursorStore
 	CatalogUsage      registry.CatalogUsageStore
+	EgressUsage       registry.EgressUsageStore
 	Meta              logstore.Meta
 }
 
@@ -512,7 +527,7 @@ type registryResult struct {
 // hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool, tasks *taskrunner.Runner) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, Multipart: pg, Parks: pg, Claims: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, Multipart: pg, Parks: pg, Claims: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, EgressUsage: pg, Meta: pg}
 }
 
 // taskSchema is the Postgres schema the task queues' tables live in, beside

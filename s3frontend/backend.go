@@ -56,6 +56,7 @@ import (
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/uploader"
+	"github.com/fil-forge/ingot/usage"
 )
 
 // Backend implements versitygw's backend.Backend directly over the
@@ -121,6 +122,9 @@ type Backend struct {
 	multipartGauges  metric.Registration
 	// transferMetrics counts object body bytes sent and received.
 	transferMetrics transferMetrics
+	// usage counts the object body bytes GetObject sends, by space and hour,
+	// for the report to the auth service. Nil counts nothing.
+	usage *usage.Counter
 	// journalGauges is the registration of the catalog journal gauges (nil
 	// when not registered).
 	journalGauges metric.Registration
@@ -246,6 +250,9 @@ type Deps struct {
 	// until a host installs one.
 	MeterProvider metric.MeterProvider
 
+	// Usage, when set, counts the object body bytes GetObject sends to
+	// clients, by space and hour, for the usage report to the auth service.
+	Usage *usage.Counter
 	// CatalogUsage, when set, is what the catalog usage gauges report each
 	// bucket's catalog storage on Forge from, refreshed by
 	// RefreshCatalogUsage. Typically the same instance as Registry.
@@ -337,6 +344,7 @@ func New(d Deps) (*Backend, error) {
 		allowNoneEncryption: d.AllowNoneEncryption,
 		cors:                corsDoc,
 		catalogUsage:        d.CatalogUsage,
+		usage:               d.Usage,
 	}
 	mp := d.MeterProvider
 	if mp == nil {

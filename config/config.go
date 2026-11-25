@@ -137,6 +137,15 @@ type Config struct {
 	// immediately.
 	ReleaseGrace string `mapstructure:"release_grace" yaml:"release_grace"`
 
+	// UsageReportInterval is how often the gateway reports its usage counts
+	// to the auth service (Go duration string): the bytes of object data
+	// GetObject sent to clients from each bucket in each hour. A report
+	// carries every count that has changed since the service last
+	// acknowledged it, the hour in progress included, so this is how far
+	// behind the service's egress figures run. Empty → default 10m; it must
+	// be positive.
+	UsageReportInterval string `mapstructure:"usage_report_interval" yaml:"usage_report_interval"`
+
 	// LocalBlobMaxBytes is the byte budget for local blob storage: the cache
 	// (<data_dir>/cache: copies of bodies the provider holds, and writes in
 	// progress, counted as their bytes land). It does not cover the catalog
@@ -271,6 +280,13 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 			releaseGrace = 0
 		}
 	}
+	usageReportInterval, err := parseDurationKnob("usage_report_interval", c.UsageReportInterval, 10*time.Minute)
+	if err != nil {
+		return ServerConfig{}, err
+	}
+	if usageReportInterval == 0 {
+		return ServerConfig{}, fmt.Errorf("ingot: usage_report_interval %q: must be positive", c.UsageReportInterval)
+	}
 	cacheTTL, err := parseDurationKnob("cache_ttl", c.CacheTTL, time.Hour)
 	if err != nil {
 		return ServerConfig{}, err
@@ -315,6 +331,7 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		MultipartSessionTTL:        mpTTL,
 		CompleteMultipartKeepalive: mpKeepalive,
 		ReleaseGrace:               releaseGrace,
+		UsageReportInterval:        usageReportInterval,
 
 		LocalBlobMaxBytes:  c.LocalBlobMaxBytes,
 		CacheTTL:           cacheTTL,
