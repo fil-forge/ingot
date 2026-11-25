@@ -630,6 +630,13 @@ written to `bytes_reported`; a row that grew meanwhile still differs and goes
 with the next pass. Rows are deleted 7 days after they were last
 acknowledged.
 
+One instance reports at a time. Because the service replaces what it holds,
+two instances that read the same row at different moments could deliver the
+older total last. A pass therefore takes a Postgres advisory lock first, and
+an instance that finds it taken skips the pass. A row acknowledged at less
+than an earlier acknowledgement is marked due again, so it is re-sent at its
+current total.
+
 The service answers with a warning for any space whose counts it did not
 store, named for the reason: `UnknownBucket` when it never knew the bucket,
 `BucketRegionMismatch` when another gateway serves it. An accepted report

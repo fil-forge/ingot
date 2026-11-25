@@ -162,6 +162,45 @@ func TestAcknowledgeLeavesACountThatGrewDue(t *testing.T) {
 	wantDue(t, dueEgress(t, r, 10))
 }
 
+// An acknowledgement at less than an earlier one means the service was sent
+// the lower total last, so the count is due again and goes out at its current
+// total.
+func TestAcknowledgeAtALowerTotalMakesTheCountDueAgain(t *testing.T) {
+	r := egressStore(t)
+	space := testutil.RandomDID(t)
+	addEgress(t, r, registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 150})
+	acknowledgeEgress(t, r, registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 150})
+	wantDue(t, dueEgress(t, r, 10))
+
+	acknowledgeEgress(t, r, registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 100})
+	wantDue(t, dueEgress(t, r, 10), registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 150})
+	if got := egressBacklog(t, r); got.Counts != 1 || got.Oldest.IsZero() {
+		t.Fatalf("backlog after a lower acknowledgement: %+v, want 1 count with an age", got)
+	}
+}
+
+// One caller holds the report lock at a time, and it is free again once
+// released.
+func TestLockEgressReports(t *testing.T) {
+	r := egressStore(t)
+	ctx := context.Background()
+
+	release, held, err := r.LockEgressReports(ctx)
+	if err != nil || !held {
+		t.Fatalf("first lock: held=%v err=%v", held, err)
+	}
+	if _, held, err := r.LockEgressReports(ctx); err != nil || held {
+		t.Fatalf("lock while held: held=%v err=%v, want not held", held, err)
+	}
+	release()
+
+	release, held, err = r.LockEgressReports(ctx)
+	if err != nil || !held {
+		t.Fatalf("lock after release: held=%v err=%v", held, err)
+	}
+	release()
+}
+
 func TestEgressBacklogCountsWhatIsDue(t *testing.T) {
 	r := egressStore(t)
 	a, b := testutil.RandomDID(t), testutil.RandomDID(t)

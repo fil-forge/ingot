@@ -152,12 +152,28 @@ type ReportStats struct {
 // the service replaces what it holds, so the hour is sent again each time it
 // has grown.
 //
+// Instances sharing a database take turns: a pass that finds another
+// instance reporting does nothing, and that instance sends the counts.
+//
 // A report that fails ends the pass, and the next pass starts from the same
 // counts. An accepted report settles every count in it: one the service
 // warned about, because it did not store it, is acknowledged like the rest and
 // not sent again. Each warning is logged and counted by its name.
 func (s *Service) Report(ctx context.Context) (ReportStats, error) {
 	var stats ReportStats
+	// One instance reports at a time. Two reading the same count at
+	// different moments could deliver the older total last, and the service
+	// would keep it. An instance that finds another reporting leaves the
+	// pass to it.
+	release, held, err := s.store.LockEgressReports(ctx)
+	if err != nil {
+		return stats, fmt.Errorf("usage: report: %w", err)
+	}
+	if !held {
+		s.logger.Debug("another instance is reporting usage, skipping this pass")
+		return stats, nil
+	}
+	defer release()
 	// A count that grows while the pass runs is due again as soon as it is
 	// acknowledged. The pass sends what was waiting when it began, and leaves
 	// what has become due since to the next one, so it always ends.
