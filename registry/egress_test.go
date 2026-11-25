@@ -9,7 +9,6 @@ import (
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
-	"github.com/google/uuid"
 )
 
 var (
@@ -24,12 +23,7 @@ func egressStore(t *testing.T) *registry.Postgres {
 
 func addEgress(t *testing.T, r *registry.Postgres, counts ...registry.EgressCount) {
 	t.Helper()
-	addEgressFlush(t, r, registry.EgressFlush{Instance: uuid.NewString(), Seq: 1}, counts...)
-}
-
-func addEgressFlush(t *testing.T, r *registry.Postgres, flush registry.EgressFlush, counts ...registry.EgressCount) {
-	t.Helper()
-	if err := r.AddEgress(context.Background(), flush, counts); err != nil {
+	if err := r.AddEgress(context.Background(), counts); err != nil {
 		t.Fatalf("AddEgress: %v", err)
 	}
 }
@@ -97,37 +91,9 @@ func TestAddEgressIgnoresNothingAndRefusesANegativeCount(t *testing.T) {
 	addEgress(t, r, registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 0})
 	wantDue(t, dueEgress(t, r, 10))
 
-	flush := registry.EgressFlush{Instance: uuid.NewString(), Seq: 1}
-	if err := r.AddEgress(context.Background(), flush, []registry.EgressCount{{Space: space, Hour: egressHour0, Bytes: -1}}); err == nil {
+	if err := r.AddEgress(context.Background(), []registry.EgressCount{{Space: space, Hour: egressHour0, Bytes: -1}}); err == nil {
 		t.Fatal("AddEgress accepted a negative count")
 	}
-	if err := r.AddEgress(context.Background(), registry.EgressFlush{Seq: 1}, []registry.EgressCount{{Space: space, Hour: egressHour0, Bytes: 1}}); err == nil {
-		t.Fatal("AddEgress accepted a flush with no instance")
-	}
-}
-
-// A batch is added once however often it is sent, so an instance that cannot
-// tell whether an add took effect sends it again. Batches numbered above it,
-// and other instances' batches, add as usual.
-func TestAddEgressAddsABatchOnce(t *testing.T) {
-	r := egressStore(t)
-	space := testutil.RandomDID(t)
-	count := func(n int64) registry.EgressCount {
-		return registry.EgressCount{Space: space, Hour: egressHour0, Bytes: n}
-	}
-	a, b := uuid.NewString(), uuid.NewString()
-
-	addEgressFlush(t, r, registry.EgressFlush{Instance: a, Seq: 1}, count(10))
-	addEgressFlush(t, r, registry.EgressFlush{Instance: a, Seq: 1}, count(10))
-	wantDue(t, dueEgress(t, r, 10), count(10))
-
-	addEgressFlush(t, r, registry.EgressFlush{Instance: a, Seq: 2}, count(5))
-	addEgressFlush(t, r, registry.EgressFlush{Instance: a, Seq: 2}, count(5))
-	addEgressFlush(t, r, registry.EgressFlush{Instance: a, Seq: 1}, count(10))
-	wantDue(t, dueEgress(t, r, 10), count(15))
-
-	addEgressFlush(t, r, registry.EgressFlush{Instance: b, Seq: 1}, count(100))
-	wantDue(t, dueEgress(t, r, 10), count(115))
 }
 
 // Due counts come oldest hour first, within the limit, so a backlog is worked
@@ -248,26 +214,5 @@ func TestPruneEgress(t *testing.T) {
 		t.Fatalf("pruned %d counts, want the 1 that is settled", n)
 	}
 	wantDue(t, dueEgress(t, r, 10), registry.EgressCount{Space: due, Hour: egressHour0, Bytes: 20})
-}
 
-// Pruning forgets the instances that have not added a batch since the given
-// time, and keeps the ones that have.
-func TestPruneEgressForgetsIdleInstances(t *testing.T) {
-	r := egressStore(t)
-	space := testutil.RandomDID(t)
-	flush := registry.EgressFlush{Instance: uuid.NewString(), Seq: 1}
-	count := registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 10}
-	addEgressFlush(t, r, flush, count)
-
-	if _, err := r.PruneEgress(context.Background(), time.Now().Add(-time.Hour)); err != nil {
-		t.Fatalf("PruneEgress: %v", err)
-	}
-	addEgressFlush(t, r, flush, count)
-	wantDue(t, dueEgress(t, r, 10), count)
-
-	if _, err := r.PruneEgress(context.Background(), time.Now().Add(time.Hour)); err != nil {
-		t.Fatalf("PruneEgress: %v", err)
-	}
-	addEgressFlush(t, r, flush, count)
-	wantDue(t, dueEgress(t, r, 10), registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 20})
 }

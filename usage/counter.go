@@ -73,6 +73,16 @@ func (c *Counter) take() []registry.EgressCount {
 	return out
 }
 
+// restore puts back counts a take returned and could not be stored, so they
+// go with the next one.
+func (c *Counter) restore(counts []registry.EgressCount) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, n := range counts {
+		c.counts[countKey{space: n.Space, hour: n.Hour.Unix()}] += n.Bytes
+	}
+}
+
 // egressBody counts the bytes read through it as they are read.
 type egressBody struct {
 	io.ReadCloser

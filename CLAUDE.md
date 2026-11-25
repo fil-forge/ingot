@@ -235,8 +235,7 @@ Internal:
 - **`usage/`** — the usage counts only the gateway knows, reported to hilt:
   `counter.go` (`Counter`, which wraps each GetObject body and counts what is
   read from it by bucket space and hour) and `service.go` (`Service`: `Flush`
-  adds the counts to `ingot.egress_usage` in numbered batches a retry cannot
-  add twice, `Report` sends the ones that have
+  adds the counts to `ingot.egress_usage`, `Report` sends the ones that have
   changed since hilt acknowledged them with `/s3/usage/report`, the hour in
   progress included, and prunes old ones). The usage sweeper in `server.go`
   runs both. Its instruments (`ingot.usage.*`) are created on the global

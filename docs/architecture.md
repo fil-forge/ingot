@@ -1059,14 +1059,6 @@ CREATE TABLE ingot.egress_usage (
     PRIMARY KEY (space, hour),
     CHECK ((dirty_since IS NULL) = (bytes_sent = bytes_reported))
 );
-
--- The last batch of egress counts each instance added. A batch is added only
--- if its number is above the one here, so a repeated write counts once.
-CREATE TABLE ingot.egress_flush (
-    instance   text        PRIMARY KEY,                  -- the process adding counts
-    seq        bigint      NOT NULL,                     -- number of the last batch it added
-    flushed_at timestamptz NOT NULL
-);
 ```
 
 Relationships at a glance: `segment_op_roots` cascades from `segments`, `multipart_parts` from
@@ -1076,8 +1068,7 @@ references a `segments.seq` by value, deliberately. `blob_refs`, `segments`,
 `multipart_sessions` and `gc_candidates` reference a `buckets.name` by value,
 `shard_inclusions` joins `blob_locations` on `shard_digest`, and `blob_encryption_params` joins
 `blob_locations` on `(space, digest)` with deliberately no FK. `revocation_cursor` stands alone,
-as does `egress_usage`, which outlives its bucket so the bucket's last hours can still be reported,
-with `egress_flush` beside it.
+as does `egress_usage`, which outlives its bucket so the bucket's last hours can still be reported.
 A space's references to a blob are its `blob_refs` claims, its `blob_pending_refs` rows, and the
 parts of its open multipart sessions, counted in one statement
 (`registry.CountReferences`). The drop of the last claim queues `remove(digest)`

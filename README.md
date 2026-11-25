@@ -279,8 +279,7 @@ trimmed to the requested range, and only what was read before a client went
 away. A copy sends nothing to a client and counts nothing.
 
 The counts go to Postgres (`ingot.egress_usage`) every 5 seconds, so a crash
-loses at most that much. A write that fails is repeated and counts once. They
-go to the auth service every
+loses at most that much, and to the auth service every
 `usage_report_interval` (default `10m`). A report carries each count that
 has changed since the service last acknowledged it, as the hour's total so
 far, and the service replaces what it holds: the hour in progress is sent

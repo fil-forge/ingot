@@ -61,7 +61,7 @@ func TestServerReportsUsage(t *testing.T) {
 	ctx := t.Context()
 	space := testutil.RandomDID(t)
 	hour := time.Now().UTC().Truncate(time.Hour)
-	require.NoError(t, store.AddEgress(ctx, registry.EgressFlush{Instance: "test", Seq: 1}, []registry.EgressCount{{Space: space, Hour: hour, Bytes: 4096}}))
+	require.NoError(t, store.AddEgress(ctx, []registry.EgressCount{{Space: space, Hour: hour, Bytes: 4096}}))
 
 	require.NoError(t, s.Start(ctx))
 	stopped := false
@@ -129,7 +129,7 @@ func TestServerFlushesUsageWhileAReportIsStuck(t *testing.T) {
 	ctx := t.Context()
 	waiting, counted := testutil.RandomDID(t), testutil.RandomDID(t)
 	hour := time.Now().UTC().Truncate(time.Hour)
-	require.NoError(t, store.AddEgress(ctx, registry.EgressFlush{Instance: "test", Seq: 1}, []registry.EgressCount{{Space: waiting, Hour: hour, Bytes: 1}}))
+	require.NoError(t, store.AddEgress(ctx, []registry.EgressCount{{Space: waiting, Hour: hour, Bytes: 1}}))
 
 	require.NoError(t, s.Start(ctx))
 	t.Cleanup(func() { _ = s.Stop(context.Background()) })

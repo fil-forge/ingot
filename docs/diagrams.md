@@ -1264,11 +1264,6 @@ erDiagram
         bigint bytes_reported "the total the auth service last acknowledged"
         timestamptz dirty_since "when it became due for reporting; NULL when up to date"
     }
-    egress_flush {
-        text instance PK "the process adding counts"
-        bigint seq "number of the last batch it added"
-        timestamptz flushed_at "when it added it"
-    }
 
     segments ||--o{ segment_op_roots : "ON DELETE CASCADE"
     multipart_sessions ||--o{ multipart_parts : "ON DELETE CASCADE"
@@ -1285,8 +1280,7 @@ erDiagram
 - The four solid relationships are the schema's only real foreign keys;
   dashed ones are soft joins the code performs. `revocation_cursor` stands
   alone, and so does `egress_usage`, which keeps a bucket's last hours after
-  the bucket is deleted so they can still be reported, with `egress_flush`
-  beside it. `blob_pending_refs` joins nothing: a release counts its rows with
+  the bucket is deleted so they can still be reported. `blob_pending_refs` joins nothing: a release counts its rows with
   the `blob_refs` claims and the open sessions' parts by (space,
   digest).
 - `catalog_journal` has no foreign key to `segments` on purpose: when a

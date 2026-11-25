@@ -20,17 +20,6 @@ type EgressCount struct {
 	Bytes int64
 }
 
-// EgressFlush names one batch of counts an instance adds, so the batch can be
-// added again after a failure without counting twice.
-type EgressFlush struct {
-	// Instance identifies the process adding the batch. It is unique to the
-	// process and the same for every batch it adds.
-	Instance string
-	// Seq numbers the instance's batches, each higher than the last. A batch
-	// sent again keeps its number.
-	Seq int64
-}
-
 // EgressBacklog is the egress waiting to be reported.
 type EgressBacklog struct {
 	// Counts is how many counts have changed since they were last
@@ -50,12 +39,7 @@ type EgressBacklog struct {
 type EgressUsageStore interface {
 	// AddEgress adds what was sent to each count's hour. Instances sharing a
 	// database add into the same rows. A count of zero bytes is ignored.
-	//
-	// A batch is added once: a call whose flush the instance has already
-	// added, or one numbered below it, changes nothing and returns nil. So an
-	// instance that cannot tell whether a call took effect repeats it with
-	// the same flush.
-	AddEgress(ctx context.Context, flush EgressFlush, sent []EgressCount) error
+	AddEgress(ctx context.Context, sent []EgressCount) error
 	// DueEgress returns up to limit counts that have changed since they were
 	// last acknowledged, each with its hour's total, oldest hour first.
 	DueEgress(ctx context.Context, limit int) ([]EgressCount, error)
@@ -64,7 +48,6 @@ type EgressUsageStore interface {
 	AcknowledgeEgress(ctx context.Context, reported []EgressCount) error
 	// PruneEgress deletes the counts that are up to date and were last
 	// acknowledged before the given time, and returns how many it deleted.
-	// It also forgets the instances that last added a batch before then.
 	PruneEgress(ctx context.Context, before time.Time) (int64, error)
 	// EgressBacklog returns how much egress is waiting to be reported.
 	EgressBacklog(ctx context.Context) (EgressBacklog, error)
@@ -72,10 +55,7 @@ type EgressUsageStore interface {
 
 var _ EgressUsageStore = (*Postgres)(nil)
 
-func (r *Postgres) AddEgress(ctx context.Context, flush EgressFlush, sent []EgressCount) error {
-	if flush.Instance == "" {
-		return fmt.Errorf("registry: add egress: flush instance is required")
-	}
+func (r *Postgres) AddEgress(ctx context.Context, sent []EgressCount) error {
 	spaces := make([]string, 0, len(sent))
 	hours := make([]time.Time, 0, len(sent))
 	bytes := make([]int64, 0, len(sent))
@@ -93,31 +73,17 @@ func (r *Postgres) AddEgress(ctx context.Context, flush EgressFlush, sent []Egre
 	if len(spaces) == 0 {
 		return nil
 	}
-	// The instance's row advances to this batch's number, and the counts are
-	// added only if it did. The two happen in one statement, so a repeat of
-	// a batch that was added finds the number already there and adds nothing,
-	// and one that arrives while the first is still running waits on the row.
-	//
-	// The counts are summed first: one statement cannot update a row twice,
-	// and two counts may name the same space and hour.
+	// Summed first: one statement cannot update a row twice, and two counts
+	// may name the same space and hour.
 	_, err := r.pool.Exec(ctx, `
-		WITH advanced AS (
-			INSERT INTO ingot.egress_flush AS f (instance, seq, flushed_at)
-			VALUES ($4, $5, now())
-			ON CONFLICT (instance) DO UPDATE
-			SET seq = EXCLUDED.seq, flushed_at = now()
-			WHERE f.seq < EXCLUDED.seq
-			RETURNING 1
-		)
 		INSERT INTO ingot.egress_usage AS u (space, hour, bytes_sent, dirty_since)
 		SELECT c.space, c.hour, SUM(c.bytes), now()
 		FROM unnest($1::text[], $2::timestamptz[], $3::bigint[]) AS c(space, hour, bytes)
-		WHERE EXISTS (SELECT 1 FROM advanced)
 		GROUP BY c.space, c.hour
 		ON CONFLICT (space, hour) DO UPDATE
 		SET bytes_sent = u.bytes_sent + EXCLUDED.bytes_sent,
 		    dirty_since = COALESCE(u.dirty_since, now())
-	`, spaces, hours, bytes, flush.Instance, flush.Seq)
+	`, spaces, hours, bytes)
 	if err != nil {
 		return fmt.Errorf("registry: add egress: %w", err)
 	}
@@ -192,11 +158,6 @@ func (r *Postgres) PruneEgress(ctx context.Context, before time.Time) (int64, er
 	`, before.UTC())
 	if err != nil {
 		return 0, fmt.Errorf("registry: prune egress: %w", err)
-	}
-	if _, err := r.pool.Exec(ctx, `
-		DELETE FROM ingot.egress_flush WHERE flushed_at < $1
-	`, before.UTC()); err != nil {
-		return 0, fmt.Errorf("registry: prune egress flushes: %w", err)
 	}
 	return tag.RowsAffected(), nil
 }
