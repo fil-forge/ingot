@@ -29,7 +29,7 @@ import (
 // Layered has no Put: body blobs stream to their providers from the write path;
 // catalog blocks flow through bucketop.Tx → OpStaging → Log.AppendBatch.
 type Layered struct {
-	local BlockReader // local blob copies; may be nil (then skipped)
+	local BlobReader // local blob copies; may be nil (then skipped)
 	log   Log
 	base  BlockReader
 	// blobReads counts body-blob reads by the tier that served them; nil
@@ -39,7 +39,7 @@ type Layered struct {
 
 // NewLayered wires the local blob copies and the log in front of a base
 // blockstore. local may be nil.
-func NewLayered(local BlockReader, log Log, base BlockReader) *Layered {
+func NewLayered(local BlobReader, log Log, base BlockReader) *Layered {
 	return &Layered{local: local, log: log, base: base}
 }
 
@@ -82,7 +82,7 @@ func (l *Layered) Get(ctx context.Context, space did.DID, c cid.Cid, out any) er
 // GetBlock fetches a catalog block: log → base. Only the network base
 // consults the space; the log is content-addressed.
 //
-// The local blob copies are not consulted: they hold only body blobs, and a
+// The local blob copies cannot be read here: they hold only body blobs, and a
 // lookup there for any other CID is a failed open, which leaves a negative
 // dentry in the kernel for every CID read.
 func (l *Layered) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (blk block.Block, retErr error) {
@@ -101,12 +101,12 @@ func (l *Layered) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (blk b
 
 // OpenBlob streams an object-body blob by digest: the local copy first (the
 // read-after-write floor), then the network base (after eviction). The log is
-// skipped — it only ever holds catalog blocks, never body blobs. Tiers that
-// don't implement BlobReader are treated as a miss. Returns ErrNotFound if no
+// skipped — it only ever holds catalog blocks, never body blobs. A base that
+// doesn't implement BlobReader is treated as a miss. Returns ErrNotFound if no
 // tier has the blob.
 func (l *Layered) OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash) (io.ReadCloser, error) {
-	if br, ok := l.local.(BlobReader); ok {
-		rc, err := br.OpenBlob(ctx, space, digest)
+	if l.local != nil {
+		rc, err := l.local.OpenBlob(ctx, space, digest)
 		if err == nil {
 			l.countBlobRead(ctx, tracing.BlobLocal, blobReadLocal)
 			return rc, nil
@@ -130,8 +130,8 @@ func (l *Layered) OpenBlob(ctx context.Context, space did.DID, digest mh.Multiha
 // implements only BlobReader is served through OpenBlob with the prefix
 // discarded (OpenBlobRangeOf).
 func (l *Layered) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, error) {
-	if br, ok := l.local.(BlobReader); ok {
-		rc, err := OpenBlobRangeOf(ctx, br, space, digest, start, end)
+	if l.local != nil {
+		rc, err := OpenBlobRangeOf(ctx, l.local, space, digest, start, end)
 		if err == nil {
 			l.countBlobRead(ctx, tracing.BlobLocal, blobReadLocal)
 			return rc, nil

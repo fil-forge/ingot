@@ -236,7 +236,7 @@ flowchart TB
   resolves `shard_inclusions` to a byte range inside the shard.
 - Reads mirror the split: `OpenBlob` (bodies) checks local disk (the
   cache) then network, skipping the log; `GetBlock` (catalog) checks
-  local disk, log, then network
+  the log, then network, and cannot reach the cache
   (the [GetObject diagram](#getobject-version-resolution-local-tiers-network-retrieval)).
 - Removal mirrors it too: bodies are reference-counted
   ([blob lifecycle](#blob-lifecycle-uploading-parked-accepted-released));
@@ -451,7 +451,7 @@ sequenceDiagram
             Note over B: aesstream.CiphertextRange maps the plaintext range to<br/>one contiguous ciphertext span past the envelope header
         end
         B->>LY: read (whole blob, or only the ciphertext span via OpenBlobRange)
-        alt local hit (blockstore.BlobCache)
+        alt local hit (blockstore.BlobCache, OpenBlob only)
             LY-->>B: bytes from the cache
         else catalog log hit (GetBlock only)
             LY->>LG: Get: linear scan of open bucket stores

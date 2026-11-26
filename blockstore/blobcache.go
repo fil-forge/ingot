@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
-	block "github.com/ipfs/go-block-format"
-	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
 )
 
@@ -102,16 +100,6 @@ func (c *BlobCache) OpenBlobRange(ctx context.Context, space did.DID, digest mh.
 		c.read(ctx, digest)
 	}
 	return rc, err
-}
-
-// GetBlock reads the cached blob stored under cid's multihash, or returns
-// ErrNotFound.
-func (c *BlobCache) GetBlock(ctx context.Context, space did.DID, k cid.Cid) (block.Block, error) {
-	b, err := c.blobDir.GetBlock(ctx, space, k)
-	if err == nil {
-		c.read(ctx, k.Hash())
-	}
-	return b, err
 }
 
 // Touch sets the cached blob's modification time to at, which orders the
@@ -232,7 +220,6 @@ func (c *BlobCache) Adopt(t *TempBlob, digest mh.Multihash) (int64, error) {
 }
 
 var (
-	_ BlockReader     = (*BlobCache)(nil)
 	_ BlobReader      = (*BlobCache)(nil)
 	_ BlobRangeReader = (*BlobCache)(nil)
 )

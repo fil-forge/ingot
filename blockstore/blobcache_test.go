@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
-	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
 )
 
@@ -306,15 +305,6 @@ func TestBlobCacheOnRead(t *testing.T) {
 					t.Fatalf("OpenBlobRange: %v", err)
 				}
 				_ = r.Close()
-			},
-			want: true,
-		},
-		{
-			name: "GetBlock hit records the read",
-			read: func(t *testing.T, c *BlobCache, d mh.Multihash) {
-				if _, err := c.GetBlock(ctx, did.Undef, cid.NewCidV1(cid.Raw, d)); err != nil {
-					t.Fatalf("GetBlock: %v", err)
-				}
 			},
 			want: true,
 		},
