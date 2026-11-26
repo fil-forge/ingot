@@ -77,7 +77,7 @@ func newJournalingBackend(t *testing.T, opts ...func(*Deps)) (*Backend, *testSto
 		Cache:      cache,
 		Deferred:   testfakes.NopUploader{},
 		Remover:    &recordingRemover{},
-		Registrar:  &recordingRegistrar{},
+		Capturer:   testfakes.NopUploader{},
 		EncParams:  mem,
 		RegionKeys: testRegionKeys(t),
 		TenantKeys: testTenantKeys(),

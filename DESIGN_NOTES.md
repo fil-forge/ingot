@@ -61,8 +61,7 @@ trace is the
 
 A commit's arguments are declarative: the bucket and an ordered list of key
 changes (Put, Delete, SetAttributes), plus the authority the tasks it spawns
-need (the release proofs and the `/upload/add` and `/upload/remove`
-proofs). A Put covers PutObject, CopyObject, CompleteMultipartUpload and
+need (the release proofs). A Put covers PutObject, CopyObject, CompleteMultipartUpload and
 delete markers; a Delete removes a version, or the current one, which the
 commit turns into a marker or a removal of the key from the bucket's
 versioning state; SetAttributes sets retention, legal hold and tags. A

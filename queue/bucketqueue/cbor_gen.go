@@ -27,7 +27,7 @@ func (t *BucketCommitTask) MarshalCBOR(w io.Writer) error {
 
 	cw := cbg.NewCborWriter(w)
 
-	if _, err := cw.Write([]byte{165}); err != nil {
+	if _, err := cw.Write([]byte{163}); err != nil {
 		return err
 	}
 
@@ -54,7 +54,7 @@ func (t *BucketCommitTask) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	// t.Changes ([]KeyChange) (slice)
+	// t.Changes ([]bucketqueue.KeyChange) (slice)
 	if len("Changes") > 1000000 {
 		return xerrors.Errorf("Value in field \"Changes\" was too long")
 	}
@@ -95,55 +95,6 @@ func (t *BucketCommitTask) MarshalCBOR(w io.Writer) error {
 	if err := t.Release.MarshalCBOR(cw); err != nil {
 		return err
 	}
-
-	// t.RegisterAdd ([]uint8) (slice)
-	if len("RegisterAdd") > 1000000 {
-		return xerrors.Errorf("Value in field \"RegisterAdd\" was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("RegisterAdd"))); err != nil {
-		return err
-	}
-	if _, err := cw.WriteString(string("RegisterAdd")); err != nil {
-		return err
-	}
-
-	if len(t.RegisterAdd) > 2097152 {
-		return xerrors.Errorf("Byte array in field t.RegisterAdd was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.RegisterAdd))); err != nil {
-		return err
-	}
-
-	if _, err := cw.Write(t.RegisterAdd); err != nil {
-		return err
-	}
-
-	// t.RegisterRemove ([]uint8) (slice)
-	if len("RegisterRemove") > 1000000 {
-		return xerrors.Errorf("Value in field \"RegisterRemove\" was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("RegisterRemove"))); err != nil {
-		return err
-	}
-	if _, err := cw.WriteString(string("RegisterRemove")); err != nil {
-		return err
-	}
-
-	if len(t.RegisterRemove) > 2097152 {
-		return xerrors.Errorf("Byte array in field t.RegisterRemove was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.RegisterRemove))); err != nil {
-		return err
-	}
-
-	if _, err := cw.Write(t.RegisterRemove); err != nil {
-		return err
-	}
-
 	return nil
 }
 
@@ -172,7 +123,7 @@ func (t *BucketCommitTask) UnmarshalCBOR(r io.Reader) (err error) {
 
 	n := extra
 
-	nameBuf := make([]byte, 14)
+	nameBuf := make([]byte, 7)
 	for i := uint64(0); i < n; i++ {
 		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
 		if err != nil {
@@ -199,7 +150,7 @@ func (t *BucketCommitTask) UnmarshalCBOR(r io.Reader) (err error) {
 
 				t.Bucket = string(sval)
 			}
-			// t.Changes ([]KeyChange) (slice)
+			// t.Changes ([]bucketqueue.KeyChange) (slice)
 		case "Changes":
 
 			maj, extra, err = cr.ReadHeader()
@@ -248,51 +199,6 @@ func (t *BucketCommitTask) UnmarshalCBOR(r io.Reader) (err error) {
 				}
 
 			}
-			// t.RegisterAdd ([]uint8) (slice)
-		case "RegisterAdd":
-
-			maj, extra, err = cr.ReadHeader()
-			if err != nil {
-				return err
-			}
-
-			if extra > 2097152 {
-				return fmt.Errorf("t.RegisterAdd: byte array too large (%d)", extra)
-			}
-			if maj != cbg.MajByteString {
-				return fmt.Errorf("expected byte array")
-			}
-
-			if extra > 0 {
-				t.RegisterAdd = make([]uint8, extra)
-			}
-
-			if _, err := io.ReadFull(cr, t.RegisterAdd); err != nil {
-				return err
-			}
-
-			// t.RegisterRemove ([]uint8) (slice)
-		case "RegisterRemove":
-
-			maj, extra, err = cr.ReadHeader()
-			if err != nil {
-				return err
-			}
-
-			if extra > 2097152 {
-				return fmt.Errorf("t.RegisterRemove: byte array too large (%d)", extra)
-			}
-			if maj != cbg.MajByteString {
-				return fmt.Errorf("expected byte array")
-			}
-
-			if extra > 0 {
-				t.RegisterRemove = make([]uint8, extra)
-			}
-
-			if _, err := io.ReadFull(cr, t.RegisterRemove); err != nil {
-				return err
-			}
 
 		default:
 			// Field doesn't exist on this type, so ignore it
@@ -339,7 +245,7 @@ func (t *KeyChange) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	// t.Put (PutChange) (struct)
+	// t.Put (bucketqueue.PutChange) (struct)
 	if len("Put") > 1000000 {
 		return xerrors.Errorf("Value in field \"Put\" was too long")
 	}
@@ -355,7 +261,7 @@ func (t *KeyChange) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	// t.Delete (DeleteChange) (struct)
+	// t.Delete (bucketqueue.DeleteChange) (struct)
 	if len("Delete") > 1000000 {
 		return xerrors.Errorf("Value in field \"Delete\" was too long")
 	}
@@ -371,7 +277,7 @@ func (t *KeyChange) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	// t.SetAttributes (SetAttributesChange) (struct)
+	// t.SetAttributes (bucketqueue.SetAttributesChange) (struct)
 	if len("SetAttributes") > 1000000 {
 		return xerrors.Errorf("Value in field \"SetAttributes\" was too long")
 	}
@@ -441,7 +347,7 @@ func (t *KeyChange) UnmarshalCBOR(r io.Reader) (err error) {
 
 				t.Key = string(sval)
 			}
-			// t.Put (PutChange) (struct)
+			// t.Put (bucketqueue.PutChange) (struct)
 		case "Put":
 
 			{
@@ -461,7 +367,7 @@ func (t *KeyChange) UnmarshalCBOR(r io.Reader) (err error) {
 				}
 
 			}
-			// t.Delete (DeleteChange) (struct)
+			// t.Delete (bucketqueue.DeleteChange) (struct)
 		case "Delete":
 
 			{
@@ -481,7 +387,7 @@ func (t *KeyChange) UnmarshalCBOR(r io.Reader) (err error) {
 				}
 
 			}
-			// t.SetAttributes (SetAttributesChange) (struct)
+			// t.SetAttributes (bucketqueue.SetAttributesChange) (struct)
 		case "SetAttributes":
 
 			{
@@ -524,7 +430,7 @@ func (t *PutChange) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	// t.Refs ([]BlobRefTask) (slice)
+	// t.Refs ([]bucketqueue.BlobRefTask) (slice)
 	if len("Refs") > 1000000 {
 		return xerrors.Errorf("Value in field \"Refs\" was too long")
 	}
@@ -631,7 +537,7 @@ func (t *PutChange) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	// t.Reserved (ReservedVersion) (struct)
+	// t.Reserved (bucketqueue.ReservedVersion) (struct)
 	if len("Reserved") > 1000000 {
 		return xerrors.Errorf("Value in field \"Reserved\" was too long")
 	}
@@ -663,7 +569,7 @@ func (t *PutChange) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	// t.DeletePre (DeletePreconditions) (struct)
+	// t.DeletePre (bucketqueue.DeletePreconditions) (struct)
 	if len("DeletePre") > 1000000 {
 		return xerrors.Errorf("Value in field \"DeletePre\" was too long")
 	}
@@ -793,7 +699,7 @@ func (t *PutChange) UnmarshalCBOR(r io.Reader) (err error) {
 		}
 
 		switch string(nameBuf[:nameLen]) {
-		// t.Refs ([]BlobRefTask) (slice)
+		// t.Refs ([]bucketqueue.BlobRefTask) (slice)
 		case "Refs":
 
 			maj, extra, err = cr.ReadHeader()
@@ -920,7 +826,7 @@ func (t *PutChange) UnmarshalCBOR(r io.Reader) (err error) {
 				}
 
 			}
-			// t.Reserved (ReservedVersion) (struct)
+			// t.Reserved (bucketqueue.ReservedVersion) (struct)
 		case "Reserved":
 
 			{
@@ -958,7 +864,7 @@ func (t *PutChange) UnmarshalCBOR(r io.Reader) (err error) {
 			default:
 				return fmt.Errorf("booleans are either major type 7, value 20 or 21 (got %d)", extra)
 			}
-			// t.DeletePre (DeletePreconditions) (struct)
+			// t.DeletePre (bucketqueue.DeletePreconditions) (struct)
 		case "DeletePre":
 
 			{
@@ -1359,7 +1265,7 @@ func (t *DeleteChange) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	// t.Pre (DeletePreconditions) (struct)
+	// t.Pre (bucketqueue.DeletePreconditions) (struct)
 	if len("Pre") > 1000000 {
 		return xerrors.Errorf("Value in field \"Pre\" was too long")
 	}
@@ -1480,7 +1386,7 @@ func (t *DeleteChange) UnmarshalCBOR(r io.Reader) (err error) {
 		}
 
 		switch string(nameBuf[:nameLen]) {
-		// t.Pre (DeletePreconditions) (struct)
+		// t.Pre (bucketqueue.DeletePreconditions) (struct)
 		case "Pre":
 
 			{
@@ -2271,7 +2177,7 @@ func (t *BucketCommitResult) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	// t.Results ([]ChangeResult) (slice)
+	// t.Results ([]bucketqueue.ChangeResult) (slice)
 	if len("Results") > 1000000 {
 		return xerrors.Errorf("Value in field \"Results\" was too long")
 	}
@@ -2363,7 +2269,7 @@ func (t *BucketCommitResult) UnmarshalCBOR(r io.Reader) (err error) {
 		}
 
 		switch string(nameBuf[:nameLen]) {
-		// t.Results ([]ChangeResult) (slice)
+		// t.Results ([]bucketqueue.ChangeResult) (slice)
 		case "Results":
 
 			maj, extra, err = cr.ReadHeader()
@@ -2436,7 +2342,7 @@ func (t *ChangeResult) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	// t.Err (ChangeError) (struct)
+	// t.Err (bucketqueue.ChangeError) (struct)
 	if len("Err") > 1000000 {
 		return xerrors.Errorf("Value in field \"Err\" was too long")
 	}
@@ -2566,7 +2472,7 @@ func (t *ChangeResult) UnmarshalCBOR(r io.Reader) (err error) {
 		}
 
 		switch string(nameBuf[:nameLen]) {
-		// t.Err (ChangeError) (struct)
+		// t.Err (bucketqueue.ChangeError) (struct)
 		case "Err":
 
 			{

@@ -108,7 +108,7 @@ func newRefTestBackendOver(t *testing.T, mem *testStore, log blockstore.Log, mbs
 		Cache:      cache,
 		Deferred:   testfakes.NopUploader{},
 		Remover:    rm,
-		Registrar:  testfakes.NopUploader{},
+		Capturer:   testfakes.NopUploader{},
 		EncParams:  mem,
 		RegionKeys: testRegionKeys(t),
 		TenantKeys: testTenantKeys(),

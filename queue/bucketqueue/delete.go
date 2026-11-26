@@ -135,21 +135,10 @@ func (q *Queue) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t taskr
 		// hilt refuses to delete a space that still holds registrations.
 		// The bucket is provably empty here and its deletion explicit, so
 		// no grace is owed — execute the space's pending releases now. The
-		// workers that run them, and the object-count changes below, read
-		// this request's authority, lent for the space while it waits: what
-		// the tasks captured may have lapsed.
+		// workers that run them read this request's authority, lent for the
+		// space while it waits: what the tasks captured may have lapsed.
 		defer q.proofs.Lend(ctx, st.Space)()
 		if err := q.blobs.DrainSpace(ctx, st.Space); err != nil {
-			return fmt.Errorf("delete bucket: %w", err)
-		}
-
-		// The object-count changes the emptying owed are drained for the same
-		// reason and at the same point: the bucket is provably empty, so the
-		// queue holds its deletes' retractions, and the cascade below would
-		// throw them away. Nothing else would retract those roots — hilt's
-		// delete checks the space's blobs, not its content entries — so every
-		// object of a bucket emptied and deleted in one go would stay counted.
-		if err := q.counts.Drain(ctx, st.Space); err != nil {
 			return fmt.Errorf("delete bucket: %w", err)
 		}
 
@@ -186,9 +175,8 @@ func (q *Queue) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t taskr
 			}
 		}
 
-		// The space's object-count changes went out in the drain above; one
-		// that could not be sent stays in the queue as a failed task, which
-		// outlives the bucket as the record of the count it leaves wrong.
+		// The bucket's object totals go with its row. The hourly counts
+		// under its space stay, for the reporter to send the last of them.
 		if err := q.reg.Delete(ctx, name, st.Space); err != nil {
 			if errors.Is(err, registry.ErrNotFound) {
 				return bucketop.ErrBucketNotFound

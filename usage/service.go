@@ -36,15 +36,16 @@ const (
 // about them, such as the spaces whose counts it did not store.
 // [hiltclient.Client] implements it.
 type Reporter interface {
-	ReportUsage(ctx context.Context, egress []usagecmds.SpaceEgress, opts ...hiltclient.MethodOption) (*usagecmds.ReportOK, error)
+	ReportUsage(ctx context.Context, report *usagecmds.ReportArguments, opts ...hiltclient.MethodOption) (*usagecmds.ReportOK, error)
 }
 
 // Config configures a [Service].
 type Config struct {
 	// Counter is what the responses count into. Required.
 	Counter *Counter
-	// Store holds the counts between reports. Required.
-	Store registry.EgressUsageStore
+	// Store holds the counts between reports: the egress the responses
+	// count, and the object counts the bucket commits write. Required.
+	Store registry.UsageStore
 	// Reporter sends the counts to the auth service. Required.
 	Reporter Reporter
 	// Logger is optional.
@@ -60,12 +61,13 @@ type Config struct {
 	Retention time.Duration
 }
 
-// Service moves counted usage to Postgres and from there to the auth service.
-// A host calls [Service.Flush] every few seconds and [Service.Report] every
-// few minutes.
+// Service moves counted egress to Postgres, and from there to the auth
+// service with the object counts the bucket commits write to Postgres
+// themselves. A host calls [Service.Flush] every few seconds and
+// [Service.Report] every few minutes.
 type Service struct {
 	counter   *Counter
-	store     registry.EgressUsageStore
+	store     registry.UsageStore
 	reporter  Reporter
 	logger    *zap.Logger
 	batch     int
@@ -146,11 +148,11 @@ type ReportStats struct {
 }
 
 // Report sends the auth service every count that has changed since the
-// service last acknowledged it, oldest hour first, in as many reports as it
-// takes, then deletes the counts acknowledged longer ago than the retention.
-// The hour in progress is among them: a count is an hour's total so far and
-// the service keeps the largest it is sent, so the hour is sent again each
-// time it has grown.
+// service last acknowledged it, the egress and then the object counts, each
+// oldest hour first, in as many reports as it takes. It then deletes the
+// counts acknowledged longer ago than the retention. The hour in progress is
+// among them: a count is a total so far and the service keeps the largest it
+// is sent, so the hour is sent again each time it has grown.
 //
 // Instances sharing a database may report the same counts at once. The
 // service ends up holding the largest total whichever arrives last.
@@ -161,60 +163,115 @@ type ReportStats struct {
 // not sent again. Each warning is logged and counted by its name.
 func (s *Service) Report(ctx context.Context) (ReportStats, error) {
 	var stats ReportStats
-	// A count that grows while the pass runs is due again as soon as it is
-	// acknowledged. The pass sends what was waiting when it began, and leaves
-	// what has become due since to the next one, so it always ends.
-	backlog, err := s.store.EgressBacklog(ctx)
-	if err != nil {
+	if err := s.reportEgress(ctx, &stats); err != nil {
 		return stats, fmt.Errorf("usage: report: %w", err)
 	}
-	for remaining := backlog.Counts; remaining > 0; remaining -= int64(s.batch) {
-		due, err := s.store.DueEgress(ctx, s.batch)
-		if err != nil {
-			return stats, fmt.Errorf("usage: report: %w", err)
-		}
-		if len(due) == 0 {
-			break
-		}
-		ok, err := s.reporter.ReportUsage(ctx, groupBySpace(due))
-		if err != nil {
-			return stats, fmt.Errorf("usage: report: %w", err)
-		}
-		if err := s.store.AcknowledgeEgress(ctx, due); err != nil {
-			return stats, fmt.Errorf("usage: report: %w", err)
-		}
-		stats.Reports++
-		stats.Counts += len(due)
-		stats.Warnings += s.noteWarnings(ctx, due, ok.Warnings)
+	if err := s.reportObjects(ctx, &stats); err != nil {
+		return stats, fmt.Errorf("usage: report: %w", err)
 	}
-	pruned, err := s.store.PruneEgress(ctx, time.Now().Add(-s.retention))
+	before := time.Now().Add(-s.retention)
+	pruned, err := s.store.PruneEgress(ctx, before)
 	if err != nil {
 		return stats, fmt.Errorf("usage: report: %w", err)
 	}
 	stats.Pruned = pruned
+	if pruned, err = s.store.PruneObjects(ctx, before); err != nil {
+		return stats, fmt.Errorf("usage: report: %w", err)
+	}
+	stats.Pruned += pruned
 	return stats, nil
 }
 
-// noteWarnings logs and counts the warnings the service answered a report
-// with, each with how much of the report was about its space, and returns how
-// many there were. A name this version does not know is logged and counted
-// like the rest.
-func (s *Service) noteWarnings(ctx context.Context, reported []registry.EgressCount, warnings []usagecmds.Warning) int {
-	for _, w := range warnings {
-		var (
-			counts int
-			bytes  int64
-		)
-		for _, c := range reported {
-			if c.Space == w.Space {
-				counts++
-				bytes += c.Bytes
-			}
+// reportEgress sends the egress that was waiting when it began. A count that
+// grows while the pass runs is due again as soon as it is acknowledged, and
+// is left to the next pass, so this one always ends.
+func (s *Service) reportEgress(ctx context.Context, stats *ReportStats) error {
+	backlog, err := s.store.EgressBacklog(ctx)
+	if err != nil {
+		return err
+	}
+	for remaining := backlog.Counts; remaining > 0; remaining -= int64(s.batch) {
+		due, err := s.store.DueEgress(ctx, s.batch)
+		if err != nil {
+			return err
 		}
+		if len(due) == 0 {
+			break
+		}
+		ok, err := s.reporter.ReportUsage(ctx, &usagecmds.ReportArguments{Egress: groupBySpace(due)})
+		if err != nil {
+			return err
+		}
+		if err := s.store.AcknowledgeEgress(ctx, due); err != nil {
+			return err
+		}
+		stats.Reports++
+		stats.Counts += len(due)
+		stats.Warnings += s.noteWarnings(ctx, ok.Warnings, func(space did.DID) []zap.Field {
+			var (
+				counts int
+				bytes  int64
+			)
+			for _, c := range due {
+				if c.Space == space {
+					counts++
+					bytes += c.Bytes
+				}
+			}
+			return []zap.Field{zap.Int("egress_counts", counts), zap.Int64("bytes", bytes)}
+		})
+	}
+	return nil
+}
+
+// reportObjects sends the object counts that were waiting when it began, as
+// reportEgress sends the egress.
+func (s *Service) reportObjects(ctx context.Context, stats *ReportStats) error {
+	backlog, err := s.store.ObjectBacklog(ctx)
+	if err != nil {
+		return err
+	}
+	for remaining := backlog.Counts; remaining > 0; remaining -= int64(s.batch) {
+		due, err := s.store.DueObjects(ctx, s.batch)
+		if err != nil {
+			return err
+		}
+		if len(due) == 0 {
+			break
+		}
+		ok, err := s.reporter.ReportUsage(ctx, &usagecmds.ReportArguments{Objects: groupObjectsBySpace(due)})
+		if err != nil {
+			return err
+		}
+		if err := s.store.AcknowledgeObjects(ctx, due); err != nil {
+			return err
+		}
+		stats.Reports++
+		stats.Counts += len(due)
+		stats.Warnings += s.noteWarnings(ctx, ok.Warnings, func(space did.DID) []zap.Field {
+			counts := 0
+			for _, c := range due {
+				if c.Space == space {
+					counts++
+				}
+			}
+			return []zap.Field{zap.Int("object_counts", counts)}
+		})
+	}
+	return nil
+}
+
+// noteWarnings logs and counts the warnings the service answered a report
+// with, each with what about tells of how much of the report was about its
+// space, and returns how many there were. A name this version does not know
+// is logged and counted like the rest.
+func (s *Service) noteWarnings(ctx context.Context, warnings []usagecmds.Warning, about func(space did.DID) []zap.Field) int {
+	for _, w := range warnings {
 		s.warnings.Add(ctx, 1, metric.WithAttributes(attribute.String("name", w.Name)))
-		s.logger.Warn("the auth service warned about usage counts",
-			zap.String("warning", w.Name), zap.String("message", w.Message),
-			zap.Stringer("space", w.Space), zap.Int("counts", counts), zap.Int64("bytes", bytes))
+		fields := append([]zap.Field{
+			zap.String("warning", w.Name), zap.String("message", w.Message), zap.Stringer("space", w.Space),
+		}, about(w.Space)...)
+		s.logger.Warn("the auth service warned about usage counts", fields...)
 	}
 	return len(warnings)
 }
@@ -243,6 +300,22 @@ func (s *Service) registerMetrics(meter metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	objectsUnreported, err := meter.Int64ObservableGauge("ingot.usage.object_unreported_counts", metric.WithUnit("{count}"),
+		metric.WithDescription("Object counts that have changed since the auth service last acknowledged them"))
+	if err != nil {
+		return err
+	}
+	objectsAge, err := meter.Int64ObservableGauge("ingot.usage.object_oldest_unreported_age", metric.WithUnit("s"),
+		metric.WithDescription("Seconds the longest-waiting object count has been due for reporting; 0 when none is. Counts are reported every few minutes, so growth means reports are failing"))
+	if err != nil {
+		return err
+	}
+	seconds := func(since time.Time) int64 {
+		if since.IsZero() {
+			return 0
+		}
+		return int64(time.Since(since).Seconds())
+	}
 	reg, err := meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
 		ctx, cancel := context.WithTimeout(ctx, backlogTimeout)
 		defer cancel()
@@ -251,13 +324,15 @@ func (s *Service) registerMetrics(meter metric.Meter) error {
 			return err
 		}
 		o.ObserveInt64(unreported, b.Counts)
-		var oldest int64
-		if !b.Oldest.IsZero() {
-			oldest = int64(time.Since(b.Oldest).Seconds())
+		o.ObserveInt64(age, seconds(b.Oldest))
+		ob, err := s.store.ObjectBacklog(ctx)
+		if err != nil {
+			return err
 		}
-		o.ObserveInt64(age, oldest)
+		o.ObserveInt64(objectsUnreported, ob.Counts)
+		o.ObserveInt64(objectsAge, seconds(ob.Oldest))
 		return nil
-	}, unreported, age)
+	}, unreported, age, objectsUnreported, objectsAge)
 	if err != nil {
 		return err
 	}
@@ -278,6 +353,25 @@ func groupBySpace(counts []registry.EgressCount) []usagecmds.SpaceEgress {
 			out = append(out, usagecmds.SpaceEgress{Space: c.Space})
 		}
 		out[i].Hours = append(out[i].Hours, usagecmds.HourEgress{Hour: c.Hour.Unix(), Bytes: uint64(c.Bytes)})
+	}
+	return out
+}
+
+// groupObjectsBySpace turns object counts ordered by hour into the report's
+// shape: one entry for each space, holding its hours in order.
+func groupObjectsBySpace(counts []registry.ObjectCount) []usagecmds.SpaceObjects {
+	index := map[did.DID]int{}
+	var out []usagecmds.SpaceObjects
+	for _, c := range counts {
+		i, ok := index[c.Space]
+		if !ok {
+			i = len(out)
+			index[c.Space] = i
+			out = append(out, usagecmds.SpaceObjects{Space: c.Space})
+		}
+		out[i].Hours = append(out[i].Hours, usagecmds.HourObjects{
+			Hour: c.Hour.Unix(), Added: uint64(c.Added), Removed: uint64(c.Removed),
+		})
 	}
 	return out
 }

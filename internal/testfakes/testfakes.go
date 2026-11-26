@@ -124,10 +124,8 @@ func (NopUploader) AbortBlob(_ context.Context, _ did.DID, _ cid.Cid) error {
 	return nil
 }
 
-// CaptureAuthority, RegisterUpload and RetractUpload keep no content-entry
-// list: there is no upload service to count against, and nothing in the suite
-// reads one back. The captured authority is an empty container, enough for a
-// queued task to carry.
+// CaptureAuthority captures an empty container, enough for a queued task to
+// carry: there is no upload service to authorize against.
 func (NopUploader) CaptureAuthority(_ context.Context, _ did.DID, _ ucan.Command) ([]byte, error) {
 	return container.Encode(container.RawGzip, container.New())
 }
@@ -138,14 +136,6 @@ func (NopUploader) PrepareAuthority(_ context.Context, _ did.DID, _ ucan.Command
 	return stored, false, nil
 }
 
-func (NopUploader) RegisterUploads(_ context.Context, changes []uploader.QueuedUpload) ([]error, error) {
-	return make([]error, len(changes)), nil
-}
-
-func (NopUploader) RetractUploads(_ context.Context, changes []uploader.QueuedUpload) ([]error, error) {
-	return make([]error, len(changes)), nil
-}
-
 var (
 	_ bucketauthority.BucketAuthority = Authority{}
 	_ blockstore.BlockReader          = NopBaseReader{}
@@ -153,5 +143,5 @@ var (
 	_ uploader.Uploader               = NopUploader{}
 	_ uploader.StreamingBodyUploader  = NopUploader{}
 	_ uploader.BlobRemover            = NopUploader{}
-	_ uploader.UploadRegistrar        = NopUploader{}
+	_ uploader.AuthorityCapturer      = NopUploader{}
 )

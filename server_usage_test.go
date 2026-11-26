@@ -24,12 +24,18 @@ import (
 type recordingReporter struct {
 	mu      sync.Mutex
 	reports [][]usagecmds.SpaceEgress
+	objects [][]usagecmds.SpaceObjects
 }
 
-func (r *recordingReporter) ReportUsage(_ context.Context, egress []usagecmds.SpaceEgress, _ ...hiltclient.MethodOption) (*usagecmds.ReportOK, error) {
+func (r *recordingReporter) ReportUsage(_ context.Context, report *usagecmds.ReportArguments, _ ...hiltclient.MethodOption) (*usagecmds.ReportOK, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.reports = append(r.reports, egress)
+	if len(report.Egress) > 0 {
+		r.reports = append(r.reports, report.Egress)
+	}
+	if len(report.Objects) > 0 {
+		r.objects = append(r.objects, report.Objects)
+	}
 	return &usagecmds.ReportOK{}, nil
 }
 
@@ -52,12 +58,14 @@ func TestServerReportsUsage(t *testing.T) {
 	var store *registry.Postgres
 	s := newTestServer(t, config.ServerConfig{UsageReportInterval: 20 * time.Millisecond}, func(d *ServerDeps) {
 		store = d.Registry.(*registry.Postgres)
-		d.EgressUsage = store
+		d.Usage = store
 		d.UsageReporter = reporter
 	})
 	names := metricNames(t, reader)
 	require.True(t, names["ingot.usage.egress_unreported_counts"], "usage gauges registered by New: %v", names)
 	require.True(t, names["ingot.usage.egress_oldest_unreported_age"], "usage gauges registered by New: %v", names)
+	require.True(t, names["ingot.usage.object_unreported_counts"], "usage gauges registered by New: %v", names)
+	require.True(t, names["ingot.usage.object_oldest_unreported_age"], "usage gauges registered by New: %v", names)
 
 	ctx := t.Context()
 	space := testutil.RandomDID(t)
@@ -101,7 +109,7 @@ type stuckReporter struct {
 	release chan struct{}
 }
 
-func (r *stuckReporter) ReportUsage(ctx context.Context, _ []usagecmds.SpaceEgress, _ ...hiltclient.MethodOption) (*usagecmds.ReportOK, error) {
+func (r *stuckReporter) ReportUsage(ctx context.Context, _ *usagecmds.ReportArguments, _ ...hiltclient.MethodOption) (*usagecmds.ReportOK, error) {
 	select {
 	case r.entered <- struct{}{}:
 	default:
@@ -126,7 +134,7 @@ func TestServerFlushesUsageWhileAReportIsStuck(t *testing.T) {
 	var store *registry.Postgres
 	s := newTestServer(t, config.ServerConfig{UsageReportInterval: 20 * time.Millisecond}, func(d *ServerDeps) {
 		store = d.Registry.(*registry.Postgres)
-		d.EgressUsage = store
+		d.Usage = store
 		d.UsageReporter = reporter
 	})
 
@@ -172,7 +180,7 @@ func TestServerUnregistersUsageGaugesWhenStartFails(t *testing.T) {
 
 	var tasks *taskrunner.Runner
 	s := newTestServer(t, config.ServerConfig{}, func(d *ServerDeps) {
-		d.EgressUsage = d.Registry.(*registry.Postgres)
+		d.Usage = d.Registry.(*registry.Postgres)
 		d.UsageReporter = &recordingReporter{}
 		tasks = d.Tasks
 	})
@@ -198,7 +206,7 @@ func TestServerCountsNoUsageWithoutAReporter(t *testing.T) {
 	t.Cleanup(func() { otel.SetMeterProvider(prev) })
 
 	s := newTestServer(t, config.ServerConfig{}, func(d *ServerDeps) {
-		d.EgressUsage = d.Registry.(*registry.Postgres)
+		d.Usage = d.Registry.(*registry.Postgres)
 	})
 	require.Nil(t, s.usage)
 	for name := range metricNames(t, reader) {

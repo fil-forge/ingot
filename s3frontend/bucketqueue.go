@@ -4,16 +4,14 @@ import (
 	"context"
 
 	"github.com/fil-forge/ucantone/did"
-	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/registry"
-	uploadcmds "github.com/fil-forge/libforge/commands/upload"
 )
 
 // commit runs a queue-bucket.commit of changes to st's bucket and waits for
 // it, with the request's authority for the tasks the commit spawns: the
-// releases of the claims it drops and the upload registrations it queues.
+// releases of the claims it drops.
 func (b *Backend) commit(ctx context.Context, st *registry.State, changes ...bucketqueue.KeyChange) (bucketqueue.Outcome, error) {
 	out, err := b.buckets.Commit(ctx, st, b.commitAuthority(ctx, st.Space), changes...)
 	if err != nil {
@@ -43,15 +41,7 @@ func oneResult(out bucketqueue.Outcome, op string) (bucketqueue.ChangeResult, re
 }
 
 // commitAuthority captures the request's authority for the tasks a commit
-// spawns. A command the request holds no chain for is left empty.
+// spawns.
 func (b *Backend) commitAuthority(ctx context.Context, space did.DID) bucketqueue.Authority {
-	auth := bucketqueue.Authority{Release: b.releaseAuthority(ctx, space)}
-	var err error
-	if auth.RegisterAdd, err = b.proofs.Capture(ctx, space, uploadcmds.Add.Command); err != nil {
-		b.logger.Debug("commit: no /upload/add authority to queue registrations with", zap.Stringer("space", space), zap.Error(err))
-	}
-	if auth.RegisterRemove, err = b.proofs.Capture(ctx, space, uploadcmds.Remove.Command); err != nil {
-		b.logger.Debug("commit: no /upload/remove authority to queue retractions with", zap.Stringer("space", space), zap.Error(err))
-	}
-	return auth
+	return bucketqueue.Authority{Release: b.releaseAuthority(ctx, space)}
 }

@@ -30,7 +30,7 @@ func TestTaskRunnerHasTheBackendsQueues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewBlobCache: %v", err)
 	}
-	b, err := s3frontend.New(s3frontend.Deps{Tasks: r, Registrar: testfakes.NopUploader{}, Cache: cache})
+	b, err := s3frontend.New(s3frontend.Deps{Tasks: r, Capturer: testfakes.NopUploader{}, Cache: cache})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

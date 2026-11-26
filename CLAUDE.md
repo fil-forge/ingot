@@ -154,7 +154,11 @@ Internal:
   inclusions, blob_refs and pending refs (`CountReferences`),
   multipart sessions/parts, parks, encryption params, the revocation
   cursor), `egress.go` (`EgressUsageStore`: the egress counted for each
-  space and hour, and what of it hilt has acknowledged),
+  space and hour, and what of it hilt has acknowledged), `objects.go`
+  (`ObjectCountWrites`, which a bucket commit writes with its root: the
+  objects it adds and takes away go onto the bucket's two totals, gained and
+  lost, and the totals into the hour's row; and `ObjectUsageStore`, the
+  hourly rows and what of them hilt has acknowledged),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
   all of them.
 - **`queue/`** — one package per task queue, each built over the runner
@@ -164,8 +168,7 @@ Internal:
   over the ones after it, which are the only queues a package imports; the
   bucket queue hands the catalog log its ship callback.
   The packages:
-  `shardqueue` (`queue-shard`, the cache's copies), `spaceuploadqueue`
-  (`queue-space-upload`, the object-count changes), `spaceshardqueue`
+  `shardqueue` (`queue-shard`, the cache's copies), `spaceshardqueue`
   (`queue-space-shard`, the tasks on one blob in one space; the releases
   bucket commits and part writes owe come back from `registry` as data,
   and the queue that applies those writes queues them through it),
@@ -202,16 +205,14 @@ Internal:
   runner (`provideTaskRunner` in `module.go`) over the `ingot` schema; its
   tables are migrated in the migration hook, and `Server` starts and stops
   it. Queues in order: `queue-multipart-upload`, `queue-bucket`,
-  `queue-space-upload`, `queue-space-shard`, `queue-shard`.
+  `queue-space-shard`, `queue-shard`.
   `queue-multipart-upload` (`queue/multipartqueue`), subject the
   upload ID: an upload's create, add-part, accept, complete, abort and reap,
   one at a time, the accept queuing a
   `queue-space-shard.accept` for each blob of the upload's parked parts;
   `queue-bucket` (`queue/bucketqueue`), subject the bucket's space
   DID: every change to a bucket, placed on the instance holding its catalog
-  log; `queue-space-upload` (`queue/spaceuploadqueue`), the
-  object-count changes a `queue-bucket.commit` spawns with its own
-  commit; `queue-shard` (`queue/shardqueue`), subject the hex
+  log; `queue-shard` (`queue/shardqueue`), subject the hex
   digest: a cached blob's time to live, `queue-shard.cache` scheduling its
   `queue-shard.evict` at `CacheTTL`, run again by reads with under half
   left, and the budget pass's evictions as sync `queue-shard.evict`s;
@@ -224,9 +225,8 @@ Internal:
   behind `Uploader` (`SubmitShard`), `DeferredBodyUploader` (`ConcludeBlobs`,
   `AbortBlob`), `StreamingBodyUploader` (`StartBlob`, `PutBlob`: allocate by
   digest code, send as the body arrives), `BlobRemover`, and
-  `UploadRegistrar` (`RegisterUploads`/`RetractUploads`, the object-count
-  entries `queue-space-upload` sends, each with authority captured in the
-  request by `CaptureAuthority`); captures the per-space
+  `AuthorityCapturer` (`CaptureAuthority`/`PrepareAuthority`, the authority
+  a task a request queues runs with later); captures the per-space
   ship authority (1h TTL) from in-request writes: `shipProofs` from body
   uploads (also the background releases' and aborts' fallback), and
   `commitProofs` from every `queue-bucket.commit` append (`CaptureShipAuthority`), which
@@ -237,7 +237,10 @@ Internal:
   read from it by bucket space and hour) and `service.go` (`Service`: `Flush`
   adds the counts to `ingot.egress_usage`, `Report` sends the ones that have
   changed since hilt acknowledged them with `/s3/usage/report`, the hour in
-  progress included, and prunes old ones). The usage sweeper in `server.go`
+  progress included, then the object counts the commits wrote to
+  `ingot.object_usage` the same way, and prunes old ones). A bucket's object
+  count is one per version, delete markers included; Ingot registers nothing
+  with the upload service for it. The usage sweeper in `server.go`
   runs both. Its instruments (`ingot.usage.*`) are created on the global
   meter provider.
 - **`bucketauthority/`** — hilt bucket ops: forwards CreateBucket /
@@ -337,7 +340,7 @@ Internal:
 | `blockstore.BlockReader` | `blockstore.Forge` (in `Cached`) | `testfakes.NopBaseReader` |
 | `registry.Registry` + the store seams + `logstore.Meta` | `*registry.Postgres` (all of them) | (same, on a database per test) |
 | `locator.Locator` | `registry.LocalLocator` | (indexer-backed locator exists, unwired) |
-| `uploader.{Uploader,StreamingBodyUploader,DeferredBodyUploader,BlobRemover,UploadRegistrar}` | `uploader.Forge` | `testfakes.NopUploader` |
+| `uploader.{Uploader,StreamingBodyUploader,DeferredBodyUploader,BlobRemover,AuthorityCapturer}` | `uploader.Forge` | `testfakes.NopUploader` |
 
 ## fx module
 

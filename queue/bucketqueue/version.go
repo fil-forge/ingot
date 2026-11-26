@@ -14,7 +14,6 @@ import (
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/mst"
-	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 )
@@ -112,9 +111,6 @@ type discardedVersion struct {
 	versionID string
 	seq       uint64
 	digests   []multihash.Multihash
-	// manifest is the discarded version's root, retracted from the upload
-	// service's content-entry list so the space stops counting it.
-	manifest cid.Cid
 }
 
 // Reserve allocates a version seq and mints its id ahead of the commit,
@@ -320,7 +316,7 @@ func (q *Queue) applyPut(ctx context.Context, sc *commitScope, key string, p *Pu
 				if err != nil {
 					return cid.Undef, err
 				}
-				discards = append(discards, discardedVersion{superseded.VersionID, superseded.Seq, digests, superseded.Manifest})
+				discards = append(discards, discardedVersion{superseded.VersionID, superseded.Seq, digests})
 				discardSeqs = append(discardSeqs, superseded.Seq)
 				tx.AddGCCandidate(superseded.Manifest)
 			}
@@ -343,7 +339,7 @@ func (q *Queue) applyPut(ctx context.Context, sc *commitScope, key string, p *Pu
 						if err != nil {
 							return cid.Undef, err
 						}
-						discards = append(discards, discardedVersion{registry.NullVersionID, newLeaf.NullSeq, digests, nullCid})
+						discards = append(discards, discardedVersion{registry.NullVersionID, newLeaf.NullSeq, digests})
 						discardSeqs = append(discardSeqs, newLeaf.NullSeq)
 						if prevTree, err = prevTree.Delete(ctx, nullKey); err != nil {
 							return cid.Undef, fmt.Errorf("prev delete null: %w", err)
@@ -460,16 +456,14 @@ func (q *Queue) applyPut(ctx context.Context, sc *commitScope, key string, p *Pu
 			q.dropClaims(sc, st, key, claimVersionID(d.versionID, d.seq), d.digests)
 		}
 
-		// Content entries (the space's object count): this version registers,
-		// the ones it discarded retract. Queued in the commit's own
-		// transaction, so the rows exist exactly when the version does, on
-		// queue-space-upload's subject for the space, so a key's changes go out
-		// in commit order. Every write rule runs through here, so a PUT, a
-		// multipart Complete, a CopyObject destination and a delete marker all
-		// count as one object — which is what AWS reports for NumberOfObjects.
-		q.register(sc, st, key, mfCid, spaceuploadqueue.Add)
-		for _, d := range discards {
-			q.register(sc, st, key, d.manifest, spaceuploadqueue.Remove)
+		// The bucket's object count: this version adds one, and each it
+		// discarded takes one away, with the commit. Every write rule runs
+		// through here, so a PUT, a multipart Complete, a CopyObject
+		// destination and a delete marker all count as one object — which is
+		// what AWS reports for NumberOfObjects.
+		tx.CountObjectAdded()
+		for range discards {
+			tx.CountObjectRemoved()
 		}
 		return t2.GetPointer(ctx, tx)
 	}()
@@ -534,8 +528,8 @@ func (q *Queue) applyDeleteVersion(ctx context.Context, sc *commitScope, key, ve
 			}
 			q.dropClaims(sc, st, key, claimVersionID(targetVersionID(kind, mf), mf.Seq), digests)
 			res.Found, res.DeleteMarker = true, mf.DeleteMarker
-			// The version is gone for good, so the space stops counting it.
-			q.register(sc, st, key, valCid, spaceuploadqueue.Remove)
+			// The version is gone for good, so the bucket stops counting it.
+			tx.CountObjectRemoved()
 			// The value block is the manifest — one GC candidate covers it.
 			tx.AddGCCandidate(valCid)
 			t2, err := t.Delete(ctx, key)
@@ -611,8 +605,8 @@ func (q *Queue) applyDeleteVersion(ctx context.Context, sc *commitScope, key, ve
 		}
 		q.dropClaims(sc, st, key, claimVersionID(targetVersionID(kind, targetMf), targetMf.Seq), digests)
 		res.Found, res.DeleteMarker = true, targetMf.DeleteMarker
-		// The version is gone for good, so the space stops counting it.
-		q.register(sc, st, key, targetCid, spaceuploadqueue.Remove)
+		// The version is gone for good, so the bucket stops counting it.
+		tx.CountObjectRemoved()
 		tx.AddGCCandidate(targetCid)
 		tx.AddGCCandidate(valCid)
 

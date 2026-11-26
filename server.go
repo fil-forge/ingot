@@ -71,10 +71,9 @@ type ServerDeps struct {
 	Deferred  uploader.DeferredBodyUploader
 	Remover   uploader.BlobRemover
 
-	// Registrar keeps the upload service's content-entry list in step with the
-	// catalog: one entry per committed object version, which is what the
-	// service counts to report the space's object count.
-	Registrar uploader.UploadRegistrar
+	// Capturer captures the authority the tasks a request queues run with
+	// later, such as a blob's release.
+	Capturer uploader.AuthorityCapturer
 	// Tasks runs ingot's durable task queues: New registers the handlers,
 	// Start starts it and Stop stops it. It must be migrated. Required.
 	Tasks *taskrunner.Runner
@@ -123,13 +122,14 @@ type ServerDeps struct {
 	// same instance as Registry.
 	CatalogUsage registry.CatalogUsageStore
 
-	// EgressUsage and UsageReporter, when both are set, turn on usage
-	// reporting: the bytes of object data GetObject sends to clients are
-	// counted by bucket space and hour, kept in EgressUsage (typically the
-	// same instance as Registry), and reported to the auth service through
-	// UsageReporter (typically its client). With either unset nothing is
-	// counted.
-	EgressUsage   registry.EgressUsageStore
+	// Usage and UsageReporter, when both are set, turn on usage reporting:
+	// the bytes of object data GetObject sends to clients are counted by
+	// bucket space and hour and kept in Usage (typically the same instance
+	// as Registry), and they are reported to the auth service through
+	// UsageReporter (typically its client) with the object counts the
+	// bucket commits keep there. With either unset no egress is counted and
+	// nothing is reported; the commits count objects all the same.
+	Usage         registry.UsageStore
 	UsageReporter usage.Reporter
 
 	// Identity is the agent identity (the issuer of every outbound
@@ -167,7 +167,7 @@ type Server struct {
 	// tasks is ServerDeps.Tasks.
 	tasks *taskrunner.Runner
 	// usage reports the gateway's usage counts; nil when usage reporting is
-	// off (see ServerDeps.EgressUsage).
+	// off (see ServerDeps.Usage).
 	usage *usage.Service
 	// usageCounter is what the GetObject responses count their bytes into;
 	// nil with usage.
@@ -235,11 +235,11 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		usageCounter *usage.Counter
 		usageSvc     *usage.Service
 	)
-	if deps.EgressUsage != nil && deps.UsageReporter != nil {
+	if deps.Usage != nil && deps.UsageReporter != nil {
 		usageCounter = usage.NewCounter()
 		usageSvc, err = usage.New(usage.Config{
 			Counter:       usageCounter,
-			Store:         deps.EgressUsage,
+			Store:         deps.Usage,
 			Reporter:      deps.UsageReporter,
 			Logger:        logger,
 			MeterProvider: otel.GetMeterProvider(),
@@ -264,7 +264,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Deferred:     deps.Deferred,
 		Remover:      deps.Remover,
 		Streaming:    deps.Streaming,
-		Registrar:    deps.Registrar,
+		Capturer:     deps.Capturer,
 		EncParams:    deps.EncParams,
 		RegionKeys:   deps.RegionKeys,
 		TenantKeys:   deps.TenantKeys,
@@ -867,8 +867,8 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	if deps.Remover == nil {
 		return errors.New("ingot: ServerDeps.Remover is required")
 	}
-	if deps.Registrar == nil {
-		return errors.New("ingot: ServerDeps.Registrar is required")
+	if deps.Capturer == nil {
+		return errors.New("ingot: ServerDeps.Capturer is required")
 	}
 	if deps.Meta == nil {
 		return errors.New("ingot: ServerDeps.Meta is required")

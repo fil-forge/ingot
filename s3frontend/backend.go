@@ -50,7 +50,6 @@ import (
 	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
-	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
@@ -191,10 +190,9 @@ type Deps struct {
 	Deferred uploader.DeferredBodyUploader
 	Parks    registry.ParkStore
 	Remover  uploader.BlobRemover
-	// Registrar keeps the upload service's content-entry list in step with the
-	// catalog: one entry per committed object version, which is what the
-	// service counts to report the space's object count.
-	Registrar uploader.UploadRegistrar
+	// Capturer captures the authority the tasks a request queues run with
+	// later, such as a blob's release.
+	Capturer uploader.AuthorityCapturer
 
 	// Streaming uploads each body blob as the body arrives, allocating it by
 	// size and hash function before its digest is known. Required.
@@ -330,7 +328,7 @@ func New(d Deps) (*Backend, error) {
 		cache:      d.Cache,
 		deferred:   d.Deferred,
 		streaming:  d.Streaming,
-		proofs:     authority.New(d.Registrar),
+		proofs:     authority.New(d.Capturer),
 		encParams:  d.EncParams,
 		regionKeys: d.RegionKeys,
 		tenantKeys: d.TenantKeys,
@@ -355,11 +353,8 @@ func New(d Deps) (*Backend, error) {
 	b.journalGauges = newJournalGauges(mp, b, logger)
 	b.catalogGauges = newCatalogUsageGauges(mp, b, logger)
 	b.transferMetrics = newTransferMetrics(mp, logger)
-	var counts *spaceuploadqueue.Queue
 	var err error
-	if b.shards, err = shardqueue.New(d.Tasks, shardqueue.Deps{Cache: d.Cache, TTL: d.CacheTTL, Removed: b.cacheRemoved, Logger: logger}); err == nil {
-		counts, err = spaceuploadqueue.New(d.Tasks, spaceuploadqueue.Deps{Registrar: d.Registrar, Authority: b.proofs, Logger: logger})
-	}
+	b.shards, err = shardqueue.New(d.Tasks, shardqueue.Deps{Cache: d.Cache, TTL: d.CacheTTL, Removed: b.cacheRemoved, Logger: logger})
 	if err == nil {
 		bd := spaceshardqueue.Deps{
 			Intents:   d.Intents,
@@ -392,7 +387,6 @@ func New(d Deps) (*Backend, error) {
 			Buckets:      d.Authority,
 			Authority:    b.proofs,
 			Blobs:        b.blobs,
-			Counts:       counts,
 			ReleaseGrace: d.ReleaseGrace,
 			Logger:       logger,
 		}

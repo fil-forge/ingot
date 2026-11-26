@@ -22,11 +22,6 @@ type BucketCommitTask struct {
 	// Release is the authority the releases of dropped claims remove their
 	// blobs with.
 	Release spaceshardqueue.ReleaseTask
-	// RegisterAdd and RegisterRemove are the /upload/add and /upload/remove
-	// proofs the upload registrations a commit queues run with; empty when
-	// the request held none, and the registration is then skipped.
-	RegisterAdd    []byte
-	RegisterRemove []byte
 }
 
 // KeyChange is one change to one key: exactly one of Put, Delete and
