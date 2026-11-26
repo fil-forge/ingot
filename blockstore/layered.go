@@ -32,9 +32,9 @@ import (
 // Layered has no Put: body blobs stream to their providers from the write path;
 // catalog blocks flow through bucketop.Tx → OpStaging → Log.AppendBatch.
 //
-// A body blob is found locally (until evicted); a catalog block is never
-// cached, so it misses the local tier and resolves from the log. The single
-// local → log → base order therefore serves both without distinguishing codecs.
+// A body blob is found locally (until evicted). A catalog block (dag-cbor) is
+// never a local blob copy, so GetBlock skips the local tier for it and
+// resolves it from the log.
 type Layered struct {
 	local BlockReader // local blob copies; may be nil (then skipped)
 	log   Log
@@ -89,7 +89,9 @@ func (l *Layered) Get(ctx context.Context, space did.DID, c cid.Cid, out any) er
 // GetBlock fetches a raw block: local → log → base. Only the network
 // base consults the space; the local tiers are content-addressed.
 func (l *Layered) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (blk block.Block, retErr error) {
-	if l.local != nil {
+	// Looking a catalog block up among the local blob copies is a failed
+	// open, which leaves a negative dentry in the kernel for every CID read.
+	if l.local != nil && c.Type() != cid.DagCBOR {
 		b, err := l.local.GetBlock(ctx, space, c)
 		if err == nil {
 			tracing.CountRead(ctx, tracing.BlockLocal)
