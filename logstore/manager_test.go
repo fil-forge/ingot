@@ -46,6 +46,12 @@ func (r *recordingFlush) count(bucket string) int {
 
 func openTestManager(t *testing.T, dir string, meta Meta, flush *recordingFlush) *Manager {
 	t.Helper()
+	m, _ := openTestManagerAndShipper(t, dir, meta, flush)
+	return m
+}
+
+func openTestManagerAndShipper(t *testing.T, dir string, meta Meta, flush *recordingFlush) (*Manager, *managerShipper) {
+	t.Helper()
 	sh := &managerShipper{}
 	m, err := OpenManager(context.Background(), ManagerConfig{
 		Dir:  dir,
@@ -59,37 +65,60 @@ func openTestManager(t *testing.T, dir string, meta Meta, flush *recordingFlush)
 		t.Fatalf("OpenManager: %v", err)
 	}
 	sh.start(t, m)
-	return m
+	return m, sh
 }
 
 // managerShipper stands in for the ship queue: each seal starts a
 // ShipBucket, retried until it succeeds or the test ends.
 type managerShipper struct {
-	m   *Manager
-	ctx context.Context
-	wg  sync.WaitGroup
+	m      *Manager
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	mu      sync.Mutex
+	stopped bool
 }
 
 func (sh *managerShipper) sealed(bucket string) {
-	m, ctx := sh.m, sh.ctx
+	sh.mu.Lock()
+	if sh.stopped {
+		sh.mu.Unlock()
+		return
+	}
 	sh.wg.Add(1)
+	sh.mu.Unlock()
+
+	m, ctx := sh.m, sh.ctx
 	go func() {
 		defer sh.wg.Done()
-		for m.ShipBucket(ctx, bucket) != nil && ctx.Err() == nil {
+		for ctx.Err() == nil && m.ShipBucket(ctx, bucket) != nil {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}()
 }
 
 func (sh *managerShipper) start(t *testing.T, m *Manager) {
-	ctx, cancel := context.WithCancel(context.Background())
-	sh.m, sh.ctx = m, ctx
+	sh.m = m
+	sh.ctx, sh.cancel = context.WithCancel(context.Background())
 	t.Cleanup(func() {
-		cancel()
-		sh.wg.Wait()
+		sh.stop()
 		_ = m.Close(context.Background())
 	})
 	m.OnSealed(sh.sealed)
+}
+
+// stop waits for the ships in flight and starts no more, whatever seals
+// afterwards. The ship queue runs no ship for a bucket while it removes the
+// bucket's log, and a test that removes one stops the shipper first for the
+// same reason: ShipBucket opens the log of a bucket the manager does not
+// hold, so a ship beside the removal can open the log again as it goes.
+func (sh *managerShipper) stop() {
+	sh.mu.Lock()
+	sh.stopped = true
+	sh.mu.Unlock()
+	sh.cancel()
+	sh.wg.Wait()
 }
 
 func appendFor(t *testing.T, m *Manager, bucket, payload string) block.Block {
@@ -194,11 +223,12 @@ func TestManager_RemoveBucketLog(t *testing.T) {
 	dir := t.TempDir()
 	meta := newFakeMeta()
 	flush := newRecordingFlush()
-	m := openTestManager(t, dir, meta, flush)
+	m, shipper := openTestManagerAndShipper(t, dir, meta, flush)
 
 	blkA := appendFor(t, m, "alpha", "doomed")
 	blkB := appendFor(t, m, "beta", "kept")
 
+	shipper.stop()
 	if err := m.RemoveBucketLog(context.Background(), "alpha"); err != nil {
 		t.Fatalf("RemoveBucketLog: %v", err)
 	}
