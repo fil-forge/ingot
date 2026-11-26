@@ -72,7 +72,8 @@ func DeletedPartTrees(uploadID string) Statement {
 
 // PartWrites returns the writes that record p, a part of an open upload, and
 // its tree (nil for none), superseding a prior row for the part number and
-// its tree row. They take the part's pending references over, queue the
+// its tree row. They count a part number new to the upload as an object of
+// its bucket, take the part's pending references over, queue the
 // upload's accept, and queue a release, due now and carrying release's
 // authority, of each blob the replaced row named and p does not; those blobs
 // are returned for the caller to run. An upload missing or no longer open is
@@ -93,10 +94,17 @@ func (r *Postgres) PartWrites(ctx context.Context, p MultipartPart, tree *PartTr
 		return w, fmt.Errorf("registry: put part: session space: %w", err)
 	}
 	var replaced []multihash.Multihash
-	if err := r.pool.QueryRow(ctx,
+	err = r.pool.QueryRow(ctx,
 		`SELECT blob_digests FROM ingot.multipart_parts WHERE upload_id = $1 AND part_number = $2`,
-		p.UploadID, p.PartNumber).Scan(&replaced); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		p.UploadID, p.PartNumber).Scan(&replaced)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return w, fmt.Errorf("registry: put part: read replaced: %w", err)
+	}
+	// A part number the upload did not hold is an object the bucket gains,
+	// as the S3 object count has it; one that replaces a part changes
+	// nothing. The upload's Complete or Abort takes its parts away again.
+	if errors.Is(err, pgx.ErrNoRows) {
+		w.Statements = append(w.Statements, SpaceObjectCountWrites(space, 1, 0)...)
 	}
 
 	pstate := p.State

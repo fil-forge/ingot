@@ -34,9 +34,9 @@ type ObjectBacklog struct {
 // ObjectUsageStore holds each space's object counts by the hour, and which of
 // them the auth service has acknowledged.
 //
-// A bucket counts every version of every key, delete markers included, as two
-// totals over its life: the objects it has gained and the objects it has
-// lost. The writes that change them ([ObjectCountWrites]) copy the totals to
+// A bucket counts every version of every key, delete markers included, and
+// every part of a multipart upload still in progress, as two totals over its
+// life: the objects it has gained and the objects it has lost. The writes that change them ([ObjectCountWrites]) copy the totals to
 // the current hour's count. Both only grow, and the service keeps the largest
 // of each it is sent for an hour. So a count is due for reporting whenever it
 // differs from the one last acknowledged, and reporting one twice, or two
@@ -74,6 +74,20 @@ var _ UsageStore = (*Postgres)(nil)
 // change falls in. A bucket already gone is counted nowhere: its space's
 // counts stand as its last change left them.
 func ObjectCountWrites(name string, added, removed int64) []Statement {
+	return objectCountWrites("name", name, added, removed)
+}
+
+// SpaceObjectCountWrites is [ObjectCountWrites] for the bucket whose space is
+// space, for a change that knows its bucket by the space it began in, such as
+// one to a multipart upload: a bucket created later under the same name is
+// another space, and is not counted for it.
+func SpaceObjectCountWrites(space did.DID, added, removed int64) []Statement {
+	return objectCountWrites("space", space.String(), added, removed)
+}
+
+// objectCountWrites counts for the bucket whose column, name or space, holds
+// value.
+func objectCountWrites(column, value string, added, removed int64) []Statement {
 	if added == 0 && removed == 0 {
 		return nil
 	}
@@ -81,8 +95,8 @@ func ObjectCountWrites(name string, added, removed int64) []Statement {
 		{
 			SQL: `UPDATE ingot.buckets
 			         SET objects_added = objects_added + $2, objects_removed = objects_removed + $3
-			       WHERE name = $1`,
-			Args: []any{name, added, removed},
+			       WHERE ` + column + ` = $1`,
+			Args: []any{value, added, removed},
 		},
 		{
 			// The totals only grow and this transaction holds the bucket's
@@ -90,13 +104,13 @@ func ObjectCountWrites(name string, added, removed int64) []Statement {
 			// a count that is not from being marked due.
 			SQL: `INSERT INTO ingot.object_usage AS u (space, hour, added, removed, dirty_since)
 			      SELECT space, date_trunc('hour', now(), 'UTC'), objects_added, objects_removed, now()
-			        FROM ingot.buckets WHERE name = $1
+			        FROM ingot.buckets WHERE ` + column + ` = $1
 			      ON CONFLICT (space, hour) DO UPDATE
 			      SET added = GREATEST(u.added, EXCLUDED.added),
 			          removed = GREATEST(u.removed, EXCLUDED.removed),
 			          dirty_since = COALESCE(u.dirty_since, now())
 			      WHERE u.added < EXCLUDED.added OR u.removed < EXCLUDED.removed`,
-			Args: []any{name},
+			Args: []any{value},
 		},
 	}
 }
