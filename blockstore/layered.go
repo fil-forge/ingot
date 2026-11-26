@@ -15,26 +15,19 @@ import (
 	"github.com/fil-forge/ingot/internal/tracing"
 )
 
-// Layered is the production ReadStore: a read-only seam that consults the local
-// blob copies first (the BlobCache, holding copies of object-body blobs
-// written here, kept until evicted or released; network reads do not fill
-// them), then the local LSM log (catalog blocks: manifests,
-// MST nodes), then a base blockstore (typically *Forge, which resolves
-// locations through its Locator and reads the bytes from piri).
+// Layered is the production ReadStore. It reads the two kinds of block through
+// separate methods, so neither is looked up where it is never stored:
 //
-// It exposes both halves of ReadStore from a single underlying traversal:
-//
-//   - GetBlock returns raw blocks (body blobs).
-//   - Get fetches the same blocks and CBOR-decodes them (manifests, MST nodes),
-//     via an internal Store wrapped around our own GetBlock so the
-//     local → log → base ordering is preserved.
+//   - GetBlock and Get read catalog blocks (manifests, MST nodes): the local
+//     LSM log, then a base blockstore (typically *Forge, which resolves
+//     locations through its Locator and reads the bytes from piri). Get
+//     CBOR-decodes what GetBlock fetches.
+//   - OpenBlob and OpenBlobRange read object-body blobs: the local blob copies
+//     (the BlobCache, holding copies of blobs written here, kept until evicted
+//     or released; network reads do not fill them), then the base.
 //
 // Layered has no Put: body blobs stream to their providers from the write path;
 // catalog blocks flow through bucketop.Tx → OpStaging → Log.AppendBatch.
-//
-// A body blob is found locally (until evicted). A catalog block (dag-cbor) is
-// never a local blob copy, so GetBlock skips the local tier for it and
-// resolves it from the log.
 type Layered struct {
 	local BlockReader // local blob copies; may be nil (then skipped)
 	log   Log
@@ -79,28 +72,20 @@ func (l *Layered) countBlobRead(ctx context.Context, src tracing.ReadSource, tie
 }
 
 // Get fetches a CBOR-encoded value at c and decodes it into out.
-// Same read order as GetBlock (cache → log → base) — the decoder
+// Same read order as GetBlock (log → base) — the decoder
 // fetches via GetBlock under the hood, with the space bound into the
 // adapter (cbor-gen's interface is space-less; see CborStore).
 func (l *Layered) Get(ctx context.Context, space did.DID, c cid.Cid, out any) error {
 	return CborStore(layeredAsBlockstore{l, space}).Get(ctx, c, out)
 }
 
-// GetBlock fetches a raw block: local → log → base. Only the network
-// base consults the space; the local tiers are content-addressed.
+// GetBlock fetches a catalog block: log → base. Only the network base
+// consults the space; the log is content-addressed.
+//
+// The local blob copies are not consulted: they hold only body blobs, and a
+// lookup there for any other CID is a failed open, which leaves a negative
+// dentry in the kernel for every CID read.
 func (l *Layered) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (blk block.Block, retErr error) {
-	// Looking a catalog block up among the local blob copies is a failed
-	// open, which leaves a negative dentry in the kernel for every CID read.
-	if l.local != nil && c.Type() != cid.DagCBOR {
-		b, err := l.local.GetBlock(ctx, space, c)
-		if err == nil {
-			tracing.CountRead(ctx, tracing.BlockLocal)
-			return b, nil
-		}
-		if !errors.Is(err, ErrNotFound) {
-			return nil, err
-		}
-	}
 	if l.log != nil {
 		b, err := l.log.Get(ctx, c)
 		if err == nil {

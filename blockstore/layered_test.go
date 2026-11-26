@@ -33,17 +33,12 @@ func (c *countingTier) AppendBatch(context.Context, []block.Block, OpRoot) (uint
 
 func (c *countingTier) Close(context.Context) error { return nil }
 
-func mustBlock(t *testing.T, codec uint64, data []byte) block.Block {
-	t.Helper()
-	b, err := block.NewBlockWithCid(data, cid.NewCidV1(codec, mustDigest(t, data)))
+func TestLayered_GetBlock_ReadsABlockFromTheLogWithoutALocalLookup(t *testing.T) {
+	data := []byte("any-catalog-block")
+	catalog, err := block.NewBlockWithCid(data, cid.NewCidV1(cid.DagCBOR, mustDigest(t, data)))
 	if err != nil {
 		t.Fatalf("block: %v", err)
 	}
-	return b
-}
-
-func TestLayered_GetBlock_ReadsACatalogBlockFromTheLogWithoutALocalLookup(t *testing.T) {
-	catalog := mustBlock(t, cid.DagCBOR, []byte("any-catalog-block"))
 	local := &countingTier{}
 	l := NewLayered(local, &countingTier{held: catalog}, &countingTier{})
 
@@ -53,19 +48,5 @@ func TestLayered_GetBlock_ReadsACatalogBlockFromTheLogWithoutALocalLookup(t *tes
 	}
 	if string(got.RawData()) != "any-catalog-block" || local.lookups != 0 {
 		t.Fatalf("got %q after %d local lookups, want the log's block after 0", got.RawData(), local.lookups)
-	}
-}
-
-func TestLayered_GetBlock_ReadsABodyBlockFromTheLocalCopies(t *testing.T) {
-	body := mustBlock(t, cid.Raw, []byte("any-body-block"))
-	base := &countingTier{}
-	l := NewLayered(&countingTier{held: body}, &countingTier{}, base)
-
-	got, err := l.GetBlock(context.Background(), did.Undef, body.Cid())
-	if err != nil {
-		t.Fatalf("GetBlock: %v", err)
-	}
-	if string(got.RawData()) != "any-body-block" || base.lookups != 0 {
-		t.Fatalf("got %q after %d base lookups, want the local copy after 0", got.RawData(), base.lookups)
 	}
 }
