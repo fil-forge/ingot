@@ -431,8 +431,8 @@ own row, in its own space, and succeeds.
      if Suspended/Unversioned and a prior null-version existed:
         blob_refs[(space,oldDigest)] -= it; on empty → queue its
         queue-space-shard.release, due after release_grace (default 60 s) → remove (§6)
-     queue the version's queue-space-upload.add (and a queue-space-upload.remove
-        for a version it retires) on the space's subject
+     count the version as an object gained (and each version it discards as
+        one lost): the bucket's totals and the hour's object_usage row
      record superseded MST nodes → gc_candidates
      append the catalog blocks to the bucket's log (one fsync);
      the journal rows, guarded root advance and the rows above commit with the task
@@ -780,7 +780,11 @@ CREATE TABLE ingot.buckets (
     cors_config        bytea,                            -- the bucket's own CORS XML; NULL = the gateway default (docs/s3-cors.md)
     encryption         text CHECK (encryption IN ('AES256','none')),
                                                          -- default encryption; NULL = unconfigured (encrypts)
-    closing            boolean NOT NULL DEFAULT false    -- set by DeleteBucket's queue-bucket.close (§7.3)
+    closing            boolean NOT NULL DEFAULT false,   -- set by DeleteBucket's queue-bucket.close (§7.3)
+    objects_added      bigint NOT NULL DEFAULT 0 CHECK (objects_added >= 0),
+                                                         -- versions and delete markers ever committed
+    objects_removed    bigint NOT NULL DEFAULT 0 CHECK (objects_removed >= 0)
+                                                         -- versions and delete markers ever discarded
 );
 -- A bucket is its own space: the commits that drop a space's claims are one
 -- bucket's, which run one at a time, so a release queued only once no claim
@@ -1059,6 +1063,24 @@ CREATE TABLE ingot.egress_usage (
     PRIMARY KEY (space, hour),
     CHECK ((dirty_since IS NULL) = (bytes_sent = bytes_reported))
 );
+
+-- A bucket's object totals (buckets.objects_added, objects_removed) as of
+-- each hour in which they changed, by its space, and the totals the auth
+-- service last acknowledged. A commit copies the bucket's totals to the
+-- current hour's row in its own transaction. A row is due for reporting
+-- whenever a total differs from the one acknowledged.
+CREATE TABLE ingot.object_usage (
+    space            text        NOT NULL,               -- bucket space DID
+    hour             timestamptz NOT NULL,               -- start of the hour
+    added            bigint      NOT NULL CHECK (added >= 0),
+    removed          bigint      NOT NULL CHECK (removed >= 0),
+    added_reported   bigint      NOT NULL DEFAULT 0 CHECK (added_reported >= 0),
+    removed_reported bigint      NOT NULL DEFAULT 0 CHECK (removed_reported >= 0),
+    dirty_since      timestamptz,                        -- when it became due; NULL when up to date
+    reported_at      timestamptz,                        -- when it was last acknowledged
+    PRIMARY KEY (space, hour),
+    CHECK ((dirty_since IS NULL) = (added = added_reported AND removed = removed_reported))
+);
 ```
 
 Relationships at a glance: `segment_op_roots` cascades from `segments`, `multipart_parts` from
@@ -1068,7 +1090,7 @@ references a `segments.seq` by value, deliberately. `blob_refs`, `segments`,
 `multipart_sessions` and `gc_candidates` reference a `buckets.name` by value,
 `shard_inclusions` joins `blob_locations` on `shard_digest`, and `blob_encryption_params` joins
 `blob_locations` on `(space, digest)` with deliberately no FK. `revocation_cursor` stands alone,
-as does `egress_usage`, which outlives its bucket so the bucket's last hours can still be reported.
+as do `egress_usage` and `object_usage`, which outlive their bucket so its last hours can still be reported.
 A space's references to a blob are its `blob_refs` claims, its `blob_pending_refs` rows, and the
 parts of its open multipart sessions, counted in one statement
 (`registry.CountReferences`). The drop of the last claim queues `remove(digest)`

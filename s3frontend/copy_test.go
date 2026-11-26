@@ -15,7 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
-	uploadcmds "github.com/fil-forge/libforge/commands/upload"
+	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/ucan"
@@ -250,21 +250,28 @@ func TestCopyObject_CrossSpaceReingest(t *testing.T) {
 	}
 }
 
-// hookCommitCapture is an upload registrar that runs hook once, at the next
-// capture of /upload/add authority: the request's last step before it runs
-// its commit, after a copy has resolved its source and taken its references.
+// hookCommitCapture is an authority capturer that runs hook once, at the
+// capture of /blob/remove authority after skip earlier ones. A same-space
+// copy captures it twice: as it starts taking its references to the source's
+// blobs, and as its last step before it runs its commit, which is the one to
+// hook with skip set to one.
 type hookCommitCapture struct {
-	uploader.UploadRegistrar
+	uploader.AuthorityCapturer
 	hook func()
+	skip int
 }
 
 func (h *hookCommitCapture) CaptureAuthority(ctx context.Context, space did.DID, cmd ucan.Command) ([]byte, error) {
-	if cmd == uploadcmds.Add.Command && h.hook != nil {
-		hook := h.hook
-		h.hook = nil
-		hook()
+	if cmd == blobcmds.Remove.Command && h.hook != nil {
+		if h.skip > 0 {
+			h.skip--
+		} else {
+			hook := h.hook
+			h.hook = nil
+			hook()
+		}
 	}
-	return h.UploadRegistrar.CaptureAuthority(ctx, space, cmd)
+	return h.AuthorityCapturer.CaptureAuthority(ctx, space, cmd)
 }
 
 // TestCopyObject_PinnedSourceDeletedBeforeCommitKeepsItsBlobs: a copy within
@@ -278,8 +285,8 @@ func TestCopyObject_PinnedSourceDeletedBeforeCommitKeepsItsBlobs(t *testing.T) {
 	reg := &hookCommitCapture{}
 	var b *Backend
 	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
-		reg.UploadRegistrar = d.Registrar
-		d.Registrar = reg
+		reg.AuthorityCapturer = d.Capturer
+		d.Capturer = reg
 		d.Remover = rm
 	})
 	ctx := context.Background()
@@ -298,6 +305,7 @@ func TestCopyObject_PinnedSourceDeletedBeforeCommitKeepsItsBlobs(t *testing.T) {
 	}
 	digests := storedBlobs(t, b, srcRv).DigestList()
 
+	reg.skip = 1
 	reg.hook = func() {
 		if _, err := b.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &srcBucket, Key: &srcKey}); err != nil {
 			t.Errorf("DeleteObject during the copy: %v", err)

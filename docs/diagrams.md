@@ -55,7 +55,7 @@ flowchart LR
 
     client -->|"S3 REST"| ingot
     ingot -->|"/s3/request/authorize (every request on a local-cache miss)<br/>/s3/bucket/info (lazy chain completion)<br/>/s3/bucket/create, delete, list<br/>/s3/bucket/policy (?policy, the signed request)<br/>/s3/usage/report (egress counts, on ingot's own authority)"| hilt
-    ingot -->|"/blob/add, /ucan/conclude, GET /receipt/:task<br/>/blob/abort, /blob/remove, /index/add<br/>/upload/add, /upload/remove"| sprue
+    ingot -->|"/blob/add, /ucan/conclude, GET /receipt/:task<br/>/blob/abort, /blob/remove, /index/add"| sprue
     ingot -->|"HTTP PUT blob bytes (allocated URL)"| piri
     ingot -->|"content/retrieve (UCAN, on read miss)"| piri
     ingot -->|"pgx + goose migrations"| pg
@@ -319,13 +319,13 @@ sequenceDiagram
         B->>BC: Adopt: the .tmp-* file goes under the digest, before the 200#59;<br/>queue-shard.cache dates it and schedules its queue-shard.evict
     end
     Note over B,U: StartBlob also captures the request proof store, if borrowable,<br/>as the space's ship authority (captureShipProofs, 1h TTL)
-    B->>Q: run sync: Put(key, manifest, blobs, pending references, If-Match/If-None-Match)<br/>+ the captured release and /upload/add, /upload/remove proofs
+    B->>Q: run sync: Put(key, manifest, blobs, pending references, If-Match/If-None-Match)<br/>+ the captured release proofs
     Q->>TX: Begin (snapshot root)
     TX->>R: AllocVersionSeq (a multipart Complete in an Enabled bucket<br/>reserved its seq before the commit: see the multipart diagram)
     TX->>TX: applyPut: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match against the current version,<br/>MST splice (new nodes into staging), advance the working root
     Note over TX: uploader.CaptureShipAuthority: every append captures the request<br/>proof store, if borrowable and it holds a /blob/add chain, as the<br/>space's ship authority, so a write with no body<br/>(a delete, a tag change) leaves one for its segment's ship
     TX->>L: Tx.Append: AppendBatch(catalog blocks, OpRoot) with fsync
-    Q->>R: RootCommitWrites, written with the task's own commit:<br/>the batch's catalog blocks journaled under its segment (catalog_journal,<br/>skipped once the segment has shipped), the root's advance (guarded: it must<br/>find the root it started from), blob_refs gains this version, each claim<br/>taking over the write's pending reference (row deleted, expiry cancelled#59;<br/>an expired one fails the change: SlowDown), superseded version rows removed,<br/>a queue-space-shard.release task, due after the grace, per digest whose<br/>claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (queue-space-upload tasks)
+    Q->>R: RootCommitWrites, written with the task's own commit:<br/>the batch's catalog blocks journaled under its segment (catalog_journal,<br/>skipped once the segment has shipped), the root's advance (guarded: it must<br/>find the root it started from), blob_refs gains this version, each claim<br/>taking over the write's pending reference (row deleted, expiry cancelled#59;<br/>an expired one fails the change: SlowDown), superseded version rows removed,<br/>a queue-space-shard.release task, due after the grace, per digest whose<br/>claims reached 0#59;<br/>the bucket's object totals gain this version and lose each discarded one,<br/>and the hour's object_usage row takes the totals
     Q-->>B: the change's result (version id, seq)
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
     Note over B,U: a task runner worker runs each queue-space-shard.release once its grace passes:<br/>crypto-shred (its blob_encryption_params row deleted), then /blob/remove
@@ -367,41 +367,20 @@ sequenceDiagram
 - Supersession also records each replaced catalog block for future removal:
   the [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram shows every entry path.
-- The `/upload/add` is what the upload service counts to report the space's
-  object count: one content entry per committed version, keyed by the manifest
-  CID. A discarded version retracts, a retained noncurrent one does not, and a
-  delete marker registers like any other version — the same set AWS reports for
-  `NumberOfObjects`. Best-effort, as the index publication is: the object is
-  durable and the response must say so, so a failure logs and the count
-  under-reports rather than failing a write that succeeded.
-- The write does **not** call the upload service. It queues the change as a
-  `queue-space-upload` task in the same transaction as the root's advance, and a
-  worker sends it. The count is reporting data, so a Sprue round trip does not
-  belong in a PUT, and a Sprue outage delays the count instead of failing
-  writes or losing it.
-- The task exists exactly when the version committed. The queue's subject is
-  the space, so a space's changes run in commit order, and a batch takes only
-  consecutive changes of one kind: up to 256 additions in one round trip, then
-  the retractions after them in another. (A batch in ucantone's sense — many
-  invocations, a receipt each.) Splitting by kind is needed because a container
-  sorts its tokens bytewise, so the service may run a batch in any order, and a
-  retraction sharing a batch with the addition it retires could overtake it and
-  leave the root counted for good.
-- A refused change is retried with backoff and holds its space, so a later
-  change can never overtake it. Each change carries the delegation chain that
-  authorizes it, captured from the request that committed the version, because
-  the task has no request to borrow authority from.
-- That chain has room to spare — hilt expires its delegation to the gateway at
-  the next UTC midnight plus an async overhang, so even a change queued at
-  23:59 has hours to be sent in. For a queue that outlasts that, the handler
-  renews from the space's live authority, which a recent body upload with a
-  borrowable store leaves behind, less any delegation a revocation has since
-  named. A space that has gone quiet has none, and after
-  `uploadRegistrationDeadLetterAfter` attempts the change fails for good: it
-  stays in the queue as a failed task, out of the way of the space's later
-  changes. The count is then short (or high) by that one change rather than
-  frozen for the space. A bucket delete resends the space's failed retractions
-  with its own authority before the space goes.
+- The bucket counts its own objects: one per committed version. A discarded
+  version is taken away, a retained noncurrent one is not, and a delete marker
+  counts like any other version — the same set AWS reports for
+  `NumberOfObjects`, less the parts of uploads in progress.
+- The count is two totals on the bucket's row, the objects it has gained and
+  the objects it has lost, which only grow. The commit adds to them and copies
+  them to the current hour's `object_usage` row in the same transaction as the
+  root's advance, so the count moves exactly when the version commits, and the
+  write calls no other service.
+- The usage reporter sends the rows that have changed to the auth service
+  with `/s3/usage/report`, the hour in progress included. The service keeps
+  the largest of each total it is sent for an hour, so a report can be
+  repeated or arrive late, and the bucket holds the difference of the totals
+  in the latest hour reported.
 
 Cross-references: [`architecture.md` §7.1](./architecture.md#71-write-single-shot-putobject).
 
@@ -409,10 +388,10 @@ Sources: `s3frontend/object.go` (PutObject, ingestBody, concludeBody),
 `queue/spaceshardqueue/spaceshardqueue.go` (Add, runAdd, runExpire), `s3frontend/stream.go` (WriteSizedBlob), `queue/shardqueue/shardqueue.go`
 (Cache), `blockstore/blobcache.go`, `bucket/sized.go`, `uploader/stream.go`,
 `s3frontend/copy.go` (CopyObject, copySourceBucket),
-`queue/bucketqueue/version.go` (applyPut), `queue/bucketqueue/bucketqueue.go` (Commit, runCommit, register),
+`queue/bucketqueue/version.go` (applyPut), `queue/bucketqueue/bucketqueue.go` (Commit, runCommit),
 `s3frontend/bucketqueue.go` (commit),
 `registry/bucketcommit.go` (RootCommitWrites),
-`queue/spaceuploadqueue/spaceuploadqueue.go` (the queue-space-upload handlers), `bucketop/bucketop.go`,
+`registry/objects.go` (ObjectCountWrites), `bucketop/bucketop.go`,
 `blockstore/staging.go`, `uploader/blob.go`, `uploader/forge.go`,
 `uploader/upload.go`. Review when these change.
 
@@ -973,7 +952,7 @@ flowchart TB
         tok["tokenstore (tokens.cbor):<br/>empty; dormant login paths only"]
     end
 
-    kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add<br/>/upload/add, /upload/remove"]
+    kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add"]
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
     walk -->|"reqscope.ProofStore<br/>on the walk's ctx"| reads
     kp -->|"captureShipProofs<br/>at StartBlob,<br/>borrowable stores only"| ship
@@ -1142,6 +1121,8 @@ erDiagram
         text encryption "AES256, none; NULL = unconfigured, encrypts"
         bigint next_version_seq
         boolean closing "set by DeleteBucket's queue-bucket.close"
+        bigint objects_added "versions and delete markers ever committed"
+        bigint objects_removed "versions and delete markers ever discarded"
     }
     segments {
         bigint seq PK "from segment_seq"
@@ -1264,6 +1245,15 @@ erDiagram
         bigint bytes_reported "the total the auth service last acknowledged"
         timestamptz dirty_since "when it became due for reporting; NULL when up to date"
     }
+    object_usage {
+        text space PK "bucket space DID"
+        timestamptz hour PK "start of the hour"
+        bigint added "the bucket's objects_added as of the hour"
+        bigint removed "the bucket's objects_removed as of the hour"
+        bigint added_reported "the total the auth service last acknowledged"
+        bigint removed_reported "the total the auth service last acknowledged"
+        timestamptz dirty_since "when it became due for reporting; NULL when up to date"
+    }
 
     segments ||--o{ segment_op_roots : "ON DELETE CASCADE"
     multipart_sessions ||--o{ multipart_parts : "ON DELETE CASCADE"
@@ -1279,8 +1269,8 @@ erDiagram
 
 - The four solid relationships are the schema's only real foreign keys;
   dashed ones are soft joins the code performs. `revocation_cursor` stands
-  alone, and so does `egress_usage`, which keeps a bucket's last hours after
-  the bucket is deleted so they can still be reported. `blob_pending_refs` joins nothing: a release counts its rows with
+  alone, and so do `egress_usage` and `object_usage`, which keep a bucket's
+  last hours after the bucket is deleted so they can still be reported. `blob_pending_refs` joins nothing: a release counts its rows with
   the `blob_refs` claims and the open sessions' parts by (space,
   digest).
 - `catalog_journal` has no foreign key to `segments` on purpose: when a
@@ -1346,7 +1336,6 @@ sequenceDiagram
         Q->>U: /blob/remove (release the space's registration)
     end
     Q->>R: DrainSpace: lend the request's authority for the space, Expedite its pending<br/>queue-space-shard.release tasks (subject space/*) and wait for the workers to run them (/blob/remove each)#59;<br/>a release still waiting fails the delete for the client to retry
-    Q->>U: Drain: send the space's pending queue-space-upload changes,<br/>then resend its failed retractions with the request's authority
     Q->>H: /s3/bucket/delete with the signed S3 request (hilt refuses while registrations remain)#59;<br/>a refusal clears the closing mark, not found finishes the delete,<br/>a failed call leaves the bucket closing for a retry
     Q->>L: RemoveBucketLog, best-effort (directory + segment rows), while the row holds the name:<br/>the log is the name's, and a bucket created under it later runs under its own space
     Q->>R: reg.Delete (the local row, its catalog_journal rows cascading)
@@ -1370,7 +1359,6 @@ Sources: `s3frontend/bucket.go` (DeleteBucket),
 `s3frontend/multipartqueue.go` (abortUpload),
 `queue/multipartqueue/multipartqueue.go` (runAbort, Reap, runReap),
 `queue/spaceshardqueue/spaceshardqueue.go` (DrainSpace),
-`queue/spaceuploadqueue/spaceuploadqueue.go` (Drain),
 `logstore/manager.go`. Review when these change.
 
 ## Package-to-diagram map
@@ -1386,7 +1374,6 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `s3frontend/multipart.go`, `queue/multipartqueue/`, `registry/multipartqueue.go` | multipart, part-states, multipart-states, blob-lifecycle, delete-bucket |
 | `registry/accept.go` | multipart, part-states, blob-lifecycle |
 | `queue/spaceshardqueue/spaceshardqueue.go` | put, multipart, part-states, blob-lifecycle, delete-bucket |
-| `queue/spaceuploadqueue/spaceuploadqueue.go` | put, delete-bucket |
 | `queue/shardqueue/shardqueue.go`, `s3frontend/localblob_sweep.go` | put, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |
@@ -1401,6 +1388,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `cmd/catalog.go` | packages, principals |
 | `bucket/`, `mst/` | version-tree, put, get |
 | `usage/`, `registry/egress.go` | context, schema |
+| `registry/objects.go` | put, schema |
 | `migrations/sql/` | schema, plus any state diagram naming a changed CHECK |
 | `module.go`, `server.go`, `config/` | packages, context, logstore-pipeline; `server.go` also authorize and multipart |
 | `s3frontend/policy.go` | context, authorize |

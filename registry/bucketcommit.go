@@ -27,7 +27,7 @@ type CommitWrites struct {
 	Guards []Statement
 	// Statements are the other writes, in order, after the guards.
 	Statements []Statement
-	// Spawns are the upload registrations the commit queues.
+	// Spawns are the tasks the commit queues.
 	Spawns []taskrunner.Spec
 	// Releases are the blobs the commit leaves unreferenced, whose releases
 	// it owes.
@@ -68,7 +68,7 @@ func (w CommitWrites) Apply(ctx context.Context, ex *taskrunner.Exec) error {
 
 // RootCommitWrites returns the writes that advance bucket name's root from
 // expect to next and record c with it: c's catalog blocks journaled under
-// their segment while it is unshipped, its upload registrations, its claims
+// their segment while it is unshipped, its object counts, its claims
 // (taking over their pending references), its drops (queueing the release of
 // each digest the space no longer claims afterwards, due c.ReleaseGrace from
 // now) and gc, the catalog blocks the commit made garbage. It reads what it
@@ -105,7 +105,7 @@ func (r *Postgres) RootCommitWrites(ctx context.Context, name string, expect, ne
 		SQL:  `UPDATE ingot.buckets SET root_cid = $1 WHERE name = $2 AND root_cid IS NOT DISTINCT FROM $3`,
 		Args: []any{next.Bytes(), name, expectBytes},
 	})
-	w.Spawns = append(w.Spawns, c.Registrations...)
+	w.Statements = append(w.Statements, ObjectCountWrites(name, c.ObjectsAdded, c.ObjectsRemoved)...)
 	if err := r.claimWrites(ctx, &w, c.Claims); err != nil {
 		return CommitWrites{}, err
 	}

@@ -13,7 +13,6 @@ import (
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/mst"
-	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 )
@@ -127,15 +126,13 @@ func (q *Queue) applyDeleteKey(ctx context.Context, sc *commitScope, key string,
 		}
 		oldMf := val.Manifest
 		// A manifest-valued key's block is the manifest itself; a leaf key
-		// names it. Either way this is the root the space counted.
-		oldManifest := valCid
+		// names it.
 		if val.Leaf != nil {
 			var em msbucket.EnvelopedManifest
 			if err := tx.Get(ctx, tx.State().Space, val.Leaf.Current.Manifest, &em); err != nil {
 				return cid.Undef, fmt.Errorf("load manifest: %w", err)
 			}
 			oldMf = em.Manifest
-			oldManifest = val.Leaf.Current.Manifest
 		}
 
 		// Preconditions (If-Match / size / mod-time) against the version
@@ -168,8 +165,8 @@ func (q *Queue) applyDeleteKey(ctx context.Context, sc *commitScope, key string,
 			oldVersionID = registry.NullVersionID
 		}
 		q.dropClaims(sc, tx.State(), key, claimVersionID(oldVersionID, oldMf.Seq), oldDigests)
-		// The key is gone, so the space stops counting it.
-		q.register(sc, tx.State(), key, oldManifest, spaceuploadqueue.Remove)
+		// The key is gone, so the bucket stops counting it.
+		tx.CountObjectRemoved()
 		return t2.GetPointer(ctx, tx)
 	}()
 }

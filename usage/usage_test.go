@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"sort"
 	"sync"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	usagecmds "github.com/fil-forge/libforge/commands/s3/usage"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -166,6 +168,8 @@ func TestCounterIsSafeForConcurrentResponses(t *testing.T) {
 type fakeReporter struct {
 	mu      sync.Mutex
 	reports [][]usagecmds.SpaceEgress
+	// objects is the object counts of each report that carried some.
+	objects [][]usagecmds.SpaceObjects
 	// warn is the warning to answer with for a space, by name.
 	warn map[did.DID]string
 	err  error
@@ -173,7 +177,7 @@ type fakeReporter struct {
 	onReport func()
 }
 
-func (f *fakeReporter) ReportUsage(_ context.Context, egress []usagecmds.SpaceEgress, _ ...hiltclient.MethodOption) (*usagecmds.ReportOK, error) {
+func (f *fakeReporter) ReportUsage(_ context.Context, report *usagecmds.ReportArguments, _ ...hiltclient.MethodOption) (*usagecmds.ReportOK, error) {
 	if f.onReport != nil {
 		f.onReport()
 	}
@@ -182,11 +186,22 @@ func (f *fakeReporter) ReportUsage(_ context.Context, egress []usagecmds.SpaceEg
 	if f.err != nil {
 		return nil, f.err
 	}
-	f.reports = append(f.reports, egress)
 	warnings := []usagecmds.Warning{}
-	for _, e := range egress {
-		if name, ok := f.warn[e.Space]; ok {
-			warnings = append(warnings, usagecmds.Warning{Name: name, Message: "left out", Space: e.Space})
+	warn := func(space did.DID) {
+		if name, ok := f.warn[space]; ok {
+			warnings = append(warnings, usagecmds.Warning{Name: name, Message: "left out", Space: space})
+		}
+	}
+	if len(report.Egress) > 0 {
+		f.reports = append(f.reports, report.Egress)
+		for _, e := range report.Egress {
+			warn(e.Space)
+		}
+	}
+	if len(report.Objects) > 0 {
+		f.objects = append(f.objects, report.Objects)
+		for _, o := range report.Objects {
+			warn(o.Space)
 		}
 	}
 	return &usagecmds.ReportOK{Warnings: warnings}, nil
@@ -216,6 +231,7 @@ type fixture struct {
 	counter  *Counter
 	clock    *clock
 	store    *registry.Postgres
+	pool     *pgxpool.Pool
 	reporter *fakeReporter
 }
 
@@ -223,9 +239,10 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	t.Helper()
 	f := &fixture{
 		clock:    &clock{now: hour0.Add(time.Minute)},
-		store:    registry.NewPostgres(pgtest.New(t)),
+		pool:     pgtest.New(t),
 		reporter: &fakeReporter{warn: map[did.DID]string{}},
 	}
+	f.store = registry.NewPostgres(f.pool)
 	f.counter = newTestCounter(f.clock)
 	cfg.Counter, cfg.Store, cfg.Reporter = f.counter, f.store, f.reporter
 	svc, err := New(cfg)
@@ -241,6 +258,27 @@ func (f *fixture) send(t *testing.T, space did.DID, n int) {
 	t.Helper()
 	if _, err := io.Copy(io.Discard, f.counter.Egress(space, body(n))); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// bucket creates a bucket and returns its space.
+func (f *fixture) bucket(t *testing.T, name string) did.DID {
+	t.Helper()
+	space := testutil.RandomDID(t)
+	if err := f.store.Create(context.Background(), name, space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	return space
+}
+
+// change counts the objects a commit to the bucket adds and takes away, as
+// the commit does.
+func (f *fixture) change(t *testing.T, name string, added, removed int64) {
+	t.Helper()
+	for _, st := range registry.ObjectCountWrites(name, added, removed) {
+		if _, err := f.pool.Exec(context.Background(), st.SQL, st.Args...); err != nil {
+			t.Fatalf("object count write: %v", err)
+		}
 	}
 }
 
@@ -559,4 +597,91 @@ func warningCounts(t *testing.T, reader *sdkmetric.ManualReader) map[string]int6
 		}
 	}
 	return out
+}
+
+// The object counts the commits wrote go out after the egress, grouped by
+// space, each with the bucket's totals, and are sent again only once they
+// have changed.
+func TestReportSendsObjectCounts(t *testing.T) {
+	f := newFixture(t, Config{})
+	a, b := f.bucket(t, "bucket-a"), f.bucket(t, "bucket-b")
+	f.change(t, "bucket-a", 3, 0)
+	f.change(t, "bucket-a", 1, 2)
+	f.change(t, "bucket-b", 1, 0)
+	f.send(t, a, 10)
+	f.flush(t)
+
+	stats := f.report(t)
+	if stats.Reports != 2 || stats.Counts != 3 {
+		t.Fatalf("stats %+v, want 2 reports carrying 3 counts", stats)
+	}
+	if len(f.reporter.reports) != 1 || len(f.reporter.objects) != 1 {
+		t.Fatalf("sent %d egress and %d object reports, want one of each", len(f.reporter.reports), len(f.reporter.objects))
+	}
+	got := map[did.DID][2]uint64{}
+	for _, o := range f.reporter.objects[0] {
+		if len(o.Hours) != 1 {
+			t.Fatalf("space %s reported %d hours, want 1", o.Space, len(o.Hours))
+		}
+		if o.Hours[0].Hour%3600 != 0 {
+			t.Fatalf("reported hour %d is not a whole hour", o.Hours[0].Hour)
+		}
+		got[o.Space] = [2]uint64{o.Hours[0].Added, o.Hours[0].Removed}
+	}
+	want := map[did.DID][2]uint64{a: {4, 2}, b: {1, 0}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("reported %v, want %v", got, want)
+	}
+
+	// Nothing has changed, so nothing is sent.
+	if stats := f.report(t); stats.Reports != 0 {
+		t.Fatalf("a pass with nothing due sent %d reports", stats.Reports)
+	}
+	f.change(t, "bucket-b", 0, 1)
+	f.report(t)
+	if len(f.reporter.objects) != 2 || len(f.reporter.objects[1]) != 1 ||
+		f.reporter.objects[1][0].Space != b || f.reporter.objects[1][0].Hours[0].Removed != 1 {
+		t.Fatalf("after a change, sent %+v", f.reporter.objects)
+	}
+}
+
+// A report that fails leaves its object counts due, and a count the service
+// warned about is settled like the rest.
+func TestReportRetriesObjectCountsAndSettlesWarnedOnes(t *testing.T) {
+	f := newFixture(t, Config{})
+	space := f.bucket(t, "bucket-a")
+	f.change(t, "bucket-a", 2, 0)
+
+	f.reporter.err = errors.New("unreachable")
+	if _, err := f.svc.Report(context.Background()); err == nil {
+		t.Fatal("Report succeeded though the service was unreachable")
+	}
+	f.reporter.err = nil
+	f.reporter.warn[space] = usagecmds.UnknownBucketWarningName
+	if stats := f.report(t); stats.Reports != 1 || stats.Warnings != 1 {
+		t.Fatalf("stats %+v, want one report with one warning", stats)
+	}
+	if stats := f.report(t); stats.Reports != 0 {
+		t.Fatalf("a warned-about count was sent again: %+v", stats)
+	}
+}
+
+func TestObjectBacklogGauges(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	f := newFixture(t, Config{MeterProvider: sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))})
+	f.bucket(t, "bucket-a")
+	if got := metricValue(t, reader, "ingot.usage.object_unreported_counts"); got != 0 {
+		t.Fatalf("unreported object counts %d, want 0", got)
+	}
+	f.change(t, "bucket-a", 1, 0)
+	if got := metricValue(t, reader, "ingot.usage.object_unreported_counts"); got != 1 {
+		t.Fatalf("unreported object counts %d, want 1", got)
+	}
+	f.report(t)
+	if got := metricValue(t, reader, "ingot.usage.object_unreported_counts"); got != 0 {
+		t.Fatalf("unreported object counts %d after a report, want 0", got)
+	}
+	if got := metricValue(t, reader, "ingot.usage.object_oldest_unreported_age"); got != 0 {
+		t.Fatalf("oldest unreported object count age %d, want 0", got)
+	}
 }

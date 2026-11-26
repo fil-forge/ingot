@@ -24,7 +24,6 @@ import (
 	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
-	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
 	"github.com/fil-forge/ingot/taskrunner"
@@ -67,7 +66,6 @@ func policyBackend(t *testing.T, authority bucketauthority.BucketAuthority) *s3f
 		Queues: []taskrunner.QueueOptions{
 			{Name: multipartqueue.Name},
 			{Name: bucketqueue.Name},
-			{Name: spaceuploadqueue.Name},
 			{Name: spaceshardqueue.Name},
 			{Name: shardqueue.Name},
 		},
@@ -75,7 +73,7 @@ func policyBackend(t *testing.T, authority bucketauthority.BucketAuthority) *s3f
 	require.NoError(t, err)
 	cache, err := blockstore.NewBlobCache(filepath.Join(t.TempDir(), "cache"))
 	require.NoError(t, err)
-	b, err := s3frontend.New(s3frontend.Deps{Tasks: tasks, Registrar: testfakes.NopUploader{}, Registry: reg, Cache: cache, Authority: authority})
+	b, err := s3frontend.New(s3frontend.Deps{Tasks: tasks, Capturer: testfakes.NopUploader{}, Registry: reg, Cache: cache, Authority: authority})
 	require.NoError(t, err)
 	return b
 }

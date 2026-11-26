@@ -20,10 +20,8 @@ import (
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
-	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
-	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/jackc/pgx/v5"
@@ -943,10 +941,7 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 	setup := registry.NewPostgres(setupPool)
 
 	space := testutil.RandomDID(t)
-	regs := uploadSpecs(t, spaceuploadqueue.Registration{
-		Bucket: "cas-single-conn", ObjectKey: "k", Space: space,
-		Root: liveCid(t, "root"), Op: spaceuploadqueue.Add, Proofs: []byte("proofs"),
-	})
+	counted := registry.RootCommit{ObjectsAdded: 1}
 
 	// A deadlock hangs rather than fails, so every call below is bounded.
 	bounded := func(name string, fn func(context.Context) error) error {
@@ -962,7 +957,7 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 	// A bucket that does not exist: the conflict path has to say so without
 	// reaching back to the pool.
 	err = bounded("missing bucket", func(c context.Context) error {
-		return reg.CommitRoot(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), registry.RootCommit{Registrations: regs})
+		return reg.CommitRoot(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), counted)
 	})
 	if !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("missing bucket: got %v, want ErrNotFound", err)
@@ -975,7 +970,7 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 
 	// A root that does not match: the same path, reporting a conflict.
 	err = bounded("stale root", func(c context.Context) error {
-		return reg.CommitRoot(c, "cas-single-conn", liveCid(t, "stale"), liveCid(t, "next"), registry.RootCommit{Registrations: regs})
+		return reg.CommitRoot(c, "cas-single-conn", liveCid(t, "stale"), liveCid(t, "next"), counted)
 	})
 	if !errors.Is(err, registry.ErrConflict) {
 		t.Fatalf("stale root: got %v, want ErrConflict", err)
@@ -983,14 +978,12 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 
 	// And the happy path still commits both the root and its rows.
 	if err := bounded("commit", func(c context.Context) error {
-		return reg.CommitRoot(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), registry.RootCommit{Registrations: regs})
+		return reg.CommitRoot(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), counted)
 	}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	// Scoped to this run's space: the suite's database persists, so a global
-	// count would depend on what ran before.
-	if queued := queuedUploads(t, setupPool, space); len(queued) != 1 {
-		t.Fatalf("queued %d registrations for the space, want 1", len(queued))
+	if got := spaceObjects(t, setup, space); len(got) != 1 || got[0].Added != 1 {
+		t.Fatalf("counted %+v for the space, want one object added", got)
 	}
 }
 
@@ -1009,12 +1002,12 @@ func liveRegistry(pool *pgxpool.Pool, tasks *taskrunner.Runner) *registry.Postgr
 	})
 }
 
-// liveUploadTasks returns a migrated runner holding the upload and
-// space-shard queues, for a test registry to queue a commit's tasks on.
+// liveUploadTasks returns a migrated runner holding the space-shard queue,
+// for a test registry to queue a commit's tasks on.
 func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
 	t.Helper()
 	r, err := taskrunner.New(pool, taskrunner.Options{Schema: "ingot", Queues: []taskrunner.QueueOptions{
-		{Name: spaceuploadqueue.Name}, {Name: spaceshardqueue.Name},
+		{Name: spaceshardqueue.Name},
 	}})
 	if err != nil {
 		t.Fatalf("task runner: %v", err)
@@ -1022,11 +1015,6 @@ func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
 	// Submitting a task needs its handler registered, though these tests
 	// never run one.
 	noop := func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil }
-	for _, op := range []spaceuploadqueue.Op{spaceuploadqueue.Add, spaceuploadqueue.Remove} {
-		if err := r.Handle(spaceuploadqueue.Name, string(op), noop); err != nil {
-			t.Fatalf("register %s: %v", op, err)
-		}
-	}
 	if err := r.Handle(spaceshardqueue.Name, spaceshardqueue.ReleaseAction, noop); err != nil {
 		t.Fatalf("register release: %v", err)
 	}
@@ -1036,34 +1024,18 @@ func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
 	return r
 }
 
-// uploadSpecs returns the tasks that carry regs.
-func uploadSpecs(t *testing.T, regs ...spaceuploadqueue.Registration) []taskrunner.Spec {
+// spaceObjects returns the object counts waiting to be reported for space.
+func spaceObjects(t *testing.T, r *registry.Postgres, space did.DID) []registry.ObjectCount {
 	t.Helper()
-	out := make([]taskrunner.Spec, len(regs))
-	for i, reg := range regs {
-		spec, err := reg.Spec()
-		if err != nil {
-			t.Fatalf("registration spec: %v", err)
-		}
-		out[i] = spec
-	}
-	return out
-}
-
-// queuedUploads returns the space's pending registrations, in queue order, as
-// the tasks that carry them.
-func queuedUploads(t *testing.T, pool *pgxpool.Pool, space did.DID) []taskrunner.Spec {
-	t.Helper()
-	tasks, err := taskrunnertest.Tasks(context.Background(), pool, "ingot", spaceuploadqueue.Name)
+	due, err := r.DueObjects(context.Background(), 1000)
 	if err != nil {
-		t.Fatalf("list queued uploads: %v", err)
+		t.Fatalf("DueObjects: %v", err)
 	}
-	var out []taskrunner.Spec
-	for _, q := range tasks {
-		if q.Subject != space.String() || q.State != "pending" {
-			continue
+	var out []registry.ObjectCount
+	for _, c := range due {
+		if c.Space == space {
+			out = append(out, c)
 		}
-		out = append(out, taskrunner.Spec{Queue: spaceuploadqueue.Name, Subject: q.Subject, Action: q.Action, Args: q.Args})
 	}
 	return out
 }
@@ -1075,127 +1047,35 @@ func livePool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// TestCommitRootQueuesUploadRegistrations: a commit's registrations become
-// tasks in its own transaction, in commit order, carrying what the worker
-// needs; a commit that fails queues none.
-func TestCommitRootQueuesUploadRegistrations(t *testing.T) {
+// TestCommitRootCountsObjects: the objects a commit adds and takes away are
+// counted in its own transaction, and a commit that fails counts none.
+func TestCommitRootCountsObjects(t *testing.T) {
 	pool := livePool(t)
 	ctx := context.Background()
 	r := liveRegistry(pool, liveUploadTasks(t, pool))
 	space := testutil.RandomDID(t)
-	if err := r.Create(ctx, "queue-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+	if err := r.Create(ctx, "count-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	t.Cleanup(func() { _ = r.Delete(context.Background(), "queue-bucket", space) })
+	t.Cleanup(func() { _ = r.Delete(context.Background(), "count-bucket", space) })
 
-	regs := uploadSpecs(t,
-		spaceuploadqueue.Registration{Bucket: "queue-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "new"), Op: spaceuploadqueue.Add, Proofs: []byte("add proofs")},
-		spaceuploadqueue.Registration{Bucket: "queue-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "old"), Op: spaceuploadqueue.Remove, Proofs: []byte("remove proofs")},
-	)
-	if err := r.CommitRoot(ctx, "queue-bucket", liveCid(t, "stale"), liveCid(t, "root"), registry.RootCommit{Registrations: regs}); !errors.Is(err, registry.ErrConflict) {
+	change := registry.RootCommit{ObjectsAdded: 2, ObjectsRemoved: 1}
+	if err := r.CommitRoot(ctx, "count-bucket", liveCid(t, "stale"), liveCid(t, "root"), change); !errors.Is(err, registry.ErrConflict) {
 		t.Fatalf("stale commit: %v, want ErrConflict", err)
 	}
-	if queued := queuedUploads(t, pool, space); len(queued) != 0 {
-		t.Fatalf("a failed commit queued %d registrations", len(queued))
+	if got := spaceObjects(t, r, space); len(got) != 0 {
+		t.Fatalf("a failed commit counted %+v", got)
 	}
-	if err := r.CommitRoot(ctx, "queue-bucket", cid.Undef, liveCid(t, "root"), registry.RootCommit{Registrations: regs}); err != nil {
+	if err := r.CommitRoot(ctx, "count-bucket", cid.Undef, liveCid(t, "root"), change); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	if queued := queuedUploads(t, pool, space); !reflect.DeepEqual(queued, regs) {
-		t.Fatalf("queued %+v, want %+v", queued, regs)
+	if err := r.CommitRoot(ctx, "count-bucket", liveCid(t, "root"), liveCid(t, "next"), registry.RootCommit{ObjectsRemoved: 1}); err != nil {
+		t.Fatalf("second commit: %v", err)
 	}
-}
-
-// TestCommitRootWithoutTasksRefusesRegistrations: a registry with no runner
-// cannot queue a commit's registrations, so it refuses the commit rather than
-// dropping them.
-func TestCommitRootWithoutTasksRefusesRegistrations(t *testing.T) {
-	pool := livePool(t)
-	ctx := context.Background()
-	r := registry.NewPostgres(pool)
-	space := testutil.RandomDID(t)
-	if err := r.Create(ctx, "no-tasks-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
-	t.Cleanup(func() { _ = r.Delete(context.Background(), "no-tasks-bucket", space) })
-	err := r.CommitRoot(ctx, "no-tasks-bucket", cid.Undef, liveCid(t, "root"), registry.RootCommit{
-		Registrations: uploadSpecs(t, spaceuploadqueue.Registration{Bucket: "no-tasks-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "mf"), Op: spaceuploadqueue.Add}),
-	})
-	if err == nil {
-		t.Fatal("a commit with registrations succeeded without a task runner")
-	}
-	if st, _ := r.Get(ctx, "no-tasks-bucket"); st != nil && st.Root.Defined() {
-		t.Fatal("the refused commit moved the root")
-	}
-}
-
-// TestABucketIsItsOwnSpace: a second bucket in a space another holds is
-// refused, and not as the name clash ErrExists reports.
-func TestABucketIsItsOwnSpace(t *testing.T) {
-	ctx := context.Background()
-	r := registry.NewPostgres(pgtest.New(t))
-	space, tenant := testutil.RandomDID(t), testutil.RandomDID(t)
-	if err := r.Create(ctx, "first", space, registry.CreateState{Tenant: tenant}); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Create(ctx, "first", testutil.RandomDID(t), registry.CreateState{Tenant: tenant}); !errors.Is(err, registry.ErrExists) {
-		t.Fatalf("a second bucket named first: %v, want ErrExists", err)
-	}
-	err := r.Create(ctx, "second", space, registry.CreateState{Tenant: tenant})
-	if err == nil || errors.Is(err, registry.ErrExists) {
-		t.Fatalf("a second bucket in first's space: %v, want a refusal other than ErrExists", err)
-	}
-}
-
-// TestBucketCORSConfig round-trips a bucket's own CORS document through
-// the SQL store: the column scans back as the bytes stored, NULL reads as
-// nil, a nil write restores NULL, and a missing bucket's write affects no
-// row, which fails a queue-bucket.set-cors's commit.
-func TestBucketCORSConfig(t *testing.T) {
-	ctx := context.Background()
-	pool := pgtest.New(t)
-	r := liveRegistry(pool, liveUploadTasks(t, pool))
-	if err := r.Create(ctx, "b", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	st, err := r.Get(ctx, "b")
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if st.CORSConfig != nil {
-		t.Fatalf("CORSConfig on a new bucket = %q, want nil", st.CORSConfig)
-	}
-
-	// Binary, with a zero byte, to exercise the bytea round trip rather than
-	// a text one.
-	doc := []byte("<CORSConfiguration>\x00</CORSConfiguration>")
-	set := func(name string, cfg []byte) int64 {
-		t.Helper()
-		st := registry.CORSSet(name, cfg)
-		tag, err := pool.Exec(ctx, st.SQL, st.Args...)
-		if err != nil {
-			t.Fatalf("CORSSet: %v", err)
-		}
-		return tag.RowsAffected()
-	}
-	set("b", doc)
-	if st, err = r.Get(ctx, "b"); err != nil {
-		t.Fatalf("Get after set: %v", err)
-	}
-	if !bytes.Equal(st.CORSConfig, doc) {
-		t.Fatalf("CORSConfig = %q, want %q", st.CORSConfig, doc)
-	}
-
-	set("b", nil)
-	if st, err = r.Get(ctx, "b"); err != nil {
-		t.Fatalf("Get after clear: %v", err)
-	}
-	if st.CORSConfig != nil {
-		t.Fatalf("CORSConfig after clear = %q, want nil", st.CORSConfig)
-	}
-
-	if n := set("missing", doc); n != 0 {
-		t.Fatalf("CORSSet on a missing bucket affected %d rows, want none", n)
+	// The latest hour holds the bucket's totals: the commits share an hour
+	// unless one fell either side of its turn.
+	got := spaceObjects(t, r, space)
+	if len(got) == 0 || got[len(got)-1].Added != 2 || got[len(got)-1].Removed != 2 {
+		t.Fatalf("counted %+v, want 2 added and 2 removed", got)
 	}
 }

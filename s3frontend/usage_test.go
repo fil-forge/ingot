@@ -20,7 +20,7 @@ import (
 // the counts from the store.
 type nopUsageReporter struct{}
 
-func (nopUsageReporter) ReportUsage(context.Context, []usagecmds.SpaceEgress, ...hiltclient.MethodOption) (*usagecmds.ReportOK, error) {
+func (nopUsageReporter) ReportUsage(context.Context, *usagecmds.ReportArguments, ...hiltclient.MethodOption) (*usagecmds.ReportOK, error) {
 	return &usagecmds.ReportOK{}, nil
 }
 

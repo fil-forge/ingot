@@ -75,7 +75,6 @@ import (
 	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
-	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/revocation"
@@ -166,7 +165,7 @@ type serverParams struct {
 	Streaming       uploader.StreamingBodyUploader
 	Deferred        uploader.DeferredBodyUploader
 	Remover         uploader.BlobRemover
-	Registrar       uploader.UploadRegistrar
+	Capturer        uploader.AuthorityCapturer
 	Tasks           *taskrunner.Runner
 	BucketAuthority bucketauthority.BucketAuthority
 	Registry        registry.Registry
@@ -180,10 +179,10 @@ type serverParams struct {
 	// CatalogUsage feeds the catalog usage gauges; without it they are not
 	// reported (see ServerDeps.CatalogUsage).
 	CatalogUsage registry.CatalogUsageStore `optional:"true"`
-	// EgressUsage and UsageReporter turn on usage reporting when both are
-	// provided (see ServerDeps.EgressUsage).
-	EgressUsage   registry.EgressUsageStore `optional:"true"`
-	UsageReporter usage.Reporter            `optional:"true"`
+	// Usage and UsageReporter turn on usage reporting when both are
+	// provided (see ServerDeps.Usage).
+	Usage         registry.UsageStore `optional:"true"`
+	UsageReporter usage.Reporter      `optional:"true"`
 	// Identity is the agent identity (the host-provided libforge identity, the
 	// issuer of every outbound invocation); the listener serves its DID
 	// document at /.well-known/did.json. Required.
@@ -231,7 +230,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Deferred:        p.Deferred,
 				Remover:         p.Remover,
 				Streaming:       p.Streaming,
-				Registrar:       p.Registrar,
+				Capturer:        p.Capturer,
 				Tasks:           p.Tasks,
 				Authority:       p.BucketAuthority,
 				Registry:        p.Registry,
@@ -246,7 +245,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				TenantKeys:      p.TenantKeys,
 				Meta:            p.Meta,
 				CatalogUsage:    p.CatalogUsage,
-				EgressUsage:     p.EgressUsage,
+				Usage:           p.Usage,
 				UsageReporter:   p.UsageReporter,
 				Identity:        p.Identity,
 				IAM:             p.IAM,
@@ -513,7 +512,7 @@ type registryResult struct {
 	EncParams         registry.EncryptionParamsStore
 	RevocationCursors registry.RevocationCursorStore
 	CatalogUsage      registry.CatalogUsageStore
-	EgressUsage       registry.EgressUsageStore
+	Usage             registry.UsageStore
 	Meta              logstore.Meta
 }
 
@@ -527,16 +526,12 @@ type registryResult struct {
 // hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool, tasks *taskrunner.Runner) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, Multipart: pg, Parks: pg, Claims: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, EgressUsage: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, Multipart: pg, Parks: pg, Claims: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Usage: pg, Meta: pg}
 }
 
 // taskSchema is the Postgres schema the task queues' tables live in, beside
 // the rest of ingot's.
 const taskSchema = "ingot"
-
-// uploadRegistrationWorkers is how many spaces' object-count changes one
-// instance sends at once.
-const uploadRegistrationWorkers = 4
 
 // shardWorkers is how many cached blobs' moves and evictions one instance
 // runs at once. Each is a rename or an unlink.
@@ -575,7 +570,6 @@ func taskQueues(cfg config.Config) []taskrunner.QueueOptions {
 	return []taskrunner.QueueOptions{
 		{Name: multipartqueue.Name, Workers: multipartWorkers},
 		{Name: bucketqueue.Name, Workers: cfg.TaskWorkers.BucketWorkers()},
-		{Name: spaceuploadqueue.Name, Workers: uploadRegistrationWorkers},
 		{Name: spaceshardqueue.Name, Workers: releaseWorkers},
 		{Name: shardqueue.Name, Workers: shardWorkers},
 	}
@@ -631,7 +625,7 @@ func provideForgeReader(cfg config.Config, id identity.Identity, locations regis
 
 // uploaderResult exposes the one *uploader.Forge under every upload seam:
 // Uploader (catalog CAR segments), Streaming and Deferred (per-blob body
-// uploads), Remover and Registrar.
+// uploads), Remover and Capturer.
 type uploaderResult struct {
 	fx.Out
 
@@ -639,7 +633,7 @@ type uploaderResult struct {
 	Deferred  uploader.DeferredBodyUploader
 	Streaming uploader.StreamingBodyUploader
 	Remover   uploader.BlobRemover
-	Registrar uploader.UploadRegistrar
+	Capturer  uploader.AuthorityCapturer
 }
 
 // provideUploader builds the guppy-style edge client that ships to Forge via
@@ -651,5 +645,5 @@ func provideUploader(c *forgeclient.Client, logger *zap.Logger) (uploaderResult,
 	if err != nil {
 		return uploaderResult{}, err
 	}
-	return uploaderResult{Uploader: f, Deferred: f, Streaming: f, Remover: f, Registrar: f}, nil
+	return uploaderResult{Uploader: f, Deferred: f, Streaming: f, Remover: f, Capturer: f}, nil
 }

@@ -922,8 +922,8 @@ func TestAcceptRacesASupersedesRelease(t *testing.T) {
 	pc := &providerConcluder{}
 	store := &teardownBeforePutPart{}
 	b, mem := newDeferredBackend(t, pc, func(d *Deps) {
-		store.UploadRegistrar = d.Registrar
-		d.Registrar = store
+		store.AuthorityCapturer = d.Capturer
+		d.Capturer = store
 		d.Remover = pc
 	})
 	ctx := context.Background()
