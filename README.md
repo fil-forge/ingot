@@ -260,6 +260,17 @@ catalog only this host's disk would otherwise hold. The journal reports:
 | `ingot.catalog_journal.blocks`, `ingot.catalog_journal.bytes` | Catalog blocks, and their bytes, journaled in Postgres whose segment has not shipped yet |
 | `ingot.catalog_journal.oldest_age` | Seconds since the oldest journaled block was written; 0 when the journal is empty. Segments ship within seconds of sealing, so growth means shipping has stalled and the unshipped catalog is building up in Postgres |
 
+The gateway's totals come from the object counts each bucket keeps for the
+usage report, so reading them costs one row per bucket:
+
+| Metric | Meaning |
+| -- | -- |
+| `ingot.buckets.count` | Buckets in the database |
+| `ingot.objects.count` | Objects in those buckets, counted as the usage report counts them: every version of every key, delete markers included, and every part of a multipart upload still in progress |
+
+Both are totals over the database, so every instance sharing it reports the
+same figures: chart their maximum across instances, never their sum.
+
 The task queues report queue depth, the oldest ready task's age, lease waits
 and takeovers, task duration and busy workers as `taskrunner.*`, listed in
 [`taskrunner/README.md`](./taskrunner/README.md#metrics).

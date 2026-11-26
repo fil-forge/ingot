@@ -216,3 +216,40 @@ func TestPruneObjects(t *testing.T) {
 	f.count(t, 0, 2)
 	wantTotals(t, f.due(t), [2]int64{5, 3})
 }
+
+// TestBucketTotalsSumTheBucketsObjects: the totals count every bucket and
+// what each holds now, gained less lost, and a deleted bucket leaves both.
+func TestBucketTotalsSumTheBucketsObjects(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.New(t)
+	r := registry.NewPostgres(pool)
+	wantBucketTotals := func(want registry.BucketTotals, msg string) {
+		t.Helper()
+		got, err := r.BucketTotals(ctx)
+		if err != nil {
+			t.Fatalf("BucketTotals: %v", err)
+		}
+		if got != want {
+			t.Fatalf("totals = %+v, want %+v: %s", got, want, msg)
+		}
+	}
+	wantBucketTotals(registry.BucketTotals{}, "no buckets")
+
+	first := &objectFixture{pool: pool, r: r, name: "first", space: testutil.RandomDID(t)}
+	second := &objectFixture{pool: pool, r: r, name: "second", space: testutil.RandomDID(t)}
+	for _, f := range []*objectFixture{first, second} {
+		if err := r.Create(ctx, f.name, f.space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+			t.Fatalf("create bucket %s: %v", f.name, err)
+		}
+	}
+	wantBucketTotals(registry.BucketTotals{Buckets: 2}, "two empty buckets")
+
+	first.count(t, 5, 2)
+	second.count(t, 4, 0)
+	wantBucketTotals(registry.BucketTotals{Buckets: 2, Objects: 7}, "3 in one bucket and 4 in the other")
+
+	if err := r.Delete(ctx, second.name, second.space); err != nil {
+		t.Fatalf("delete bucket: %v", err)
+	}
+	wantBucketTotals(registry.BucketTotals{Buckets: 1, Objects: 3}, "the deleted bucket's objects have gone with it")
+}

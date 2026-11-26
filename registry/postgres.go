@@ -131,6 +131,19 @@ func (r *Postgres) CatalogJournalStats(ctx context.Context) (CatalogJournalStats
 	return st, nil
 }
 
+// BucketTotals sums the totals each bucket's row keeps (ObjectCountWrites),
+// so it reads one row per bucket and no object. A deleted bucket's row has
+// gone, and its objects with it.
+func (r *Postgres) BucketTotals(ctx context.Context) (BucketTotals, error) {
+	var t BucketTotals
+	if err := r.pool.QueryRow(ctx,
+		`SELECT count(*), COALESCE(sum(objects_added - objects_removed), 0)::bigint FROM ingot.buckets`,
+	).Scan(&t.Buckets, &t.Objects); err != nil {
+		return BucketTotals{}, fmt.Errorf("registry: bucket totals: %w", err)
+	}
+	return t, nil
+}
+
 // EmptyRoot swaps the bucket root from expect to the empty tree, and in the
 // same transaction clears forge_root_cid and drops the bucket's journaled
 // catalog blocks, which nothing the empty tree reaches needs (Registry).

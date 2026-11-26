@@ -127,6 +127,9 @@ type Backend struct {
 	// journalGauges is the registration of the catalog journal gauges (nil
 	// when not registered).
 	journalGauges metric.Registration
+	// bucketGauges is the registration of the bucket and object total gauges
+	// (nil when not registered).
+	bucketGauges metric.Registration
 	// catalogUsage reports each bucket's catalog storage on Forge (nil: no
 	// catalog usage gauges). catalogSnapshot is its latest report, which the
 	// gauges registered as catalogGauges read.
@@ -351,6 +354,7 @@ func New(d Deps) (*Backend, error) {
 	b.localBlobMetrics, b.localBlobGauges = newLocalBlobMetrics(mp, b, logger)
 	b.multipartMetrics, b.multipartGauges = newMultipartMetrics(mp, b, logger)
 	b.journalGauges = newJournalGauges(mp, b, logger)
+	b.bucketGauges = newBucketGauges(mp, b, logger)
 	b.catalogGauges = newCatalogUsageGauges(mp, b, logger)
 	b.transferMetrics = newTransferMetrics(mp, logger)
 	var err error
