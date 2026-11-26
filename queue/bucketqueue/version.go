@@ -460,7 +460,8 @@ func (q *Queue) applyPut(ctx context.Context, sc *commitScope, key string, p *Pu
 		// discarded takes one away, with the commit. Every write rule runs
 		// through here, so a PUT, a multipart Complete, a CopyObject
 		// destination and a delete marker all count as one object — which is
-		// what AWS reports for NumberOfObjects.
+		// what AWS reports for NumberOfObjects, along with the parts of
+		// multipart uploads in progress, which the multipart queue counts.
 		tx.CountObjectAdded()
 		for range discards {
 			tx.CountObjectRemoved()

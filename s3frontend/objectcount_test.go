@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/ipfs/go-cid"
@@ -20,9 +21,10 @@ import (
 
 // A bucket counts one object per committed object version: it gains one when
 // a version commits and loses one when a version is removed for good, in the
-// commit's own transaction. These tests pin that mapping, which follows what
-// AWS reports for NumberOfObjects — current and noncurrent versions plus
-// delete markers all count.
+// commit's own transaction. It also counts each part of a multipart upload
+// in progress. These tests pin that mapping, which follows what AWS reports
+// for NumberOfObjects — current and noncurrent versions, delete markers and
+// the parts of incomplete multipart uploads all count.
 
 // wantObjects asserts how many objects the bucket has gained and lost.
 func wantObjects(t *testing.T, mem *testStore, added, removed int64, msg string) {
@@ -174,19 +176,30 @@ func TestDeletingAMissingKeyCountsNothing(t *testing.T) {
 	wantObjects(t, mem, 0, 0, "nothing was there")
 }
 
-// TestCompleteMultipartCountsOnce: a multipart object counts as one, not one
-// per part.
-func TestCompleteMultipartCountsOnce(t *testing.T) {
+// TestMultipartPartsCountUntilTheUploadEnds: each part of an upload in
+// progress counts as an object, as AWS reports for NumberOfObjects, and a
+// part number uploaded again replaces its part without counting twice.
+// Complete takes every part away, the ones the object left out included, and
+// the object it commits counts as one.
+func TestMultipartPartsCountUntilTheUploadEnds(t *testing.T) {
 	b, mem := newCountingBackend(t)
 
 	uploadID := mpCreate(t, b, "big", "", "")
+	wantObjects(t, mem, 0, 0, "an upload with no parts counts nothing")
+
+	_, err := mpUploadPart(t, b, "big", uploadID, 1, bytes.Repeat([]byte("x"), 5*1024*1024), nil)
+	require.NoError(t, err)
+	wantObjects(t, mem, 1, 0, "one part in progress")
+
 	p1, err := mpUploadPart(t, b, "big", uploadID, 1, bytes.Repeat([]byte("a"), 5*1024*1024), nil)
 	require.NoError(t, err)
+	wantObjects(t, mem, 1, 0, "a part uploaded again replaces the part")
+
 	p2, err := mpUploadPart(t, b, "big", uploadID, 2, []byte("tail"), nil)
 	require.NoError(t, err)
-
-	// Parts are blobs, not versions: nothing counts until Complete commits.
-	wantObjects(t, mem, 0, 0, "uploading parts counts nothing")
+	_, err = mpUploadPart(t, b, "big", uploadID, 3, []byte("left out"), nil)
+	require.NoError(t, err)
+	wantObjects(t, mem, 3, 0, "three parts in progress")
 
 	one, two := int32(1), int32(2)
 	_, err = mpComplete(t, b, "big", uploadID, []types.CompletedPart{
@@ -194,8 +207,35 @@ func TestCompleteMultipartCountsOnce(t *testing.T) {
 		{PartNumber: &two, ETag: p2.ETag},
 	}, nil)
 	require.NoError(t, err)
+	wantObjects(t, mem, 4, 3, "one object, and no parts")
 
-	wantObjects(t, mem, 1, 0, "one object, however many parts")
+	// A repeated Complete replays its result and counts nothing more.
+	_, err = mpComplete(t, b, "big", uploadID, []types.CompletedPart{
+		{PartNumber: &one, ETag: p1.ETag},
+		{PartNumber: &two, ETag: p2.ETag},
+	}, nil)
+	require.NoError(t, err)
+	wantObjects(t, mem, 4, 3, "a repeated Complete")
+}
+
+// TestAbortedMultipartPartsStopCounting: an abort takes the upload's parts
+// away, and the bucket is back to what it held.
+func TestAbortedMultipartPartsStopCounting(t *testing.T) {
+	b, mem := newCountingBackend(t)
+	putObjV(t, b, "a", []byte("hello"))
+
+	uploadID := mpCreate(t, b, "big", "", "")
+	_, err := mpUploadPart(t, b, "big", uploadID, 1, bytes.Repeat([]byte("a"), 5*1024*1024), nil)
+	require.NoError(t, err)
+	_, err = mpUploadPart(t, b, "big", uploadID, 2, []byte("tail"), nil)
+	require.NoError(t, err)
+	wantObjects(t, mem, 3, 0, "one object and two parts in progress")
+
+	bucket, key := "bk", "big"
+	require.NoError(t, b.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
+		Bucket: &bucket, Key: &key, UploadId: &uploadID,
+	}))
+	wantObjects(t, mem, 3, 2, "the parts went with the upload")
 }
 
 // TestObjectCountIsKeptByTheHourForTheReport: the hour's usage count holds

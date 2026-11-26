@@ -239,8 +239,10 @@ Internal:
   changed since hilt acknowledged them with `/s3/usage/report`, the hour in
   progress included, then the object counts the commits wrote to
   `ingot.object_usage` the same way, and prunes old ones). A bucket's object
-  count is one per version, delete markers included; Ingot registers nothing
-  with the upload service for it. The usage sweeper in `server.go`
+  count is one per version, delete markers included, plus one per part of
+  each multipart upload in progress (counted by `PartWrites`, taken away by
+  the upload's Complete or Abort); Ingot registers nothing with the upload
+  service for it. The usage sweeper in `server.go`
   runs both. Its instruments (`ingot.usage.*`) are created on the global
   meter provider.
 - **`bucketauthority/`** — hilt bucket ops: forwards CreateBucket /

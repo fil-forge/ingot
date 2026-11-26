@@ -369,8 +369,10 @@ sequenceDiagram
   diagram shows every entry path.
 - The bucket counts its own objects: one per committed version. A discarded
   version is taken away, a retained noncurrent one is not, and a delete marker
-  counts like any other version — the same set AWS reports for
-  `NumberOfObjects`, less the parts of uploads in progress.
+  counts like any other version. Each part of a multipart upload in progress
+  counts too, from the `queue-multipart-upload.add-part` that first records
+  its part number until the upload's Complete or Abort. This is the set AWS
+  reports for `NumberOfObjects`.
 - The count is two totals on the bucket's row, the objects it has gained and
   the objects it has lost, which only grow. The commit adds to them and copies
   them to the current hour's `object_usage` row in the same transaction as the

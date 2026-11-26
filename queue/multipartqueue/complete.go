@@ -530,6 +530,14 @@ func (q *Queue) complete(ctx context.Context, ex *taskrunner.Exec, call *complet
 	if err := ex.WriteConditional(ctx, done.SQL, done.Args...); err != nil {
 		return CompleteResult{}, err
 	}
+	// The upload's parts, the ones the object left out included, stop
+	// counting as the bucket's objects: the object the commit above added
+	// stands for them now.
+	for _, st := range registry.SpaceObjectCountWrites(bucketState.Space, 0, int64(len(stored))) {
+		if err := ex.Write(ctx, st.SQL, st.Args...); err != nil {
+			return CompleteResult{}, err
+		}
+	}
 	dropTrees := registry.DeletedPartTrees(uploadID)
 	if err := ex.Write(ctx, dropTrees.SQL, dropTrees.Args...); err != nil {
 		return CompleteResult{}, err
