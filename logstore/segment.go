@@ -122,6 +122,13 @@ func (s *Segment) Size() int64 {
 	return s.size
 }
 
+// blockCount reports how many blocks the segment holds.
+func (s *Segment) blockCount() int {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return len(s.index)
+}
+
 // SHA256 returns the seal-time sha256 of the CAR. Empty for open segments.
 func (s *Segment) SHA256() []byte {
 	s.stateMu.RLock()

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -717,5 +719,37 @@ func TestTakeoverGuardFailsOnAPartialTakeover(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the guard never finished")
+	}
+}
+
+// TestCatalogUsage_SegmentShippedWithoutIndex: a segment whose ship recorded
+// an empty index digest (its CAR shipped without an index) counts toward its
+// bucket's catalog usage.
+func TestCatalogUsage_SegmentShippedWithoutIndex(t *testing.T) {
+	ctx := context.Background()
+	r := registry.NewPostgres(pgtest.New(t))
+	space := testutil.RandomDID(t)
+	if err := r.Create(ctx, "bk", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	seq, err := r.NextSegmentSeq(ctx)
+	if err != nil {
+		t.Fatalf("NextSegmentSeq: %v", err)
+	}
+	if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, "bk"); err != nil {
+		t.Fatalf("InsertSegmentOpen: %v", err)
+	}
+	if err := r.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, seq, 1, 10, nil, nil); err != nil {
+		t.Fatalf("MarkSegmentSealed: %v", err)
+	}
+	if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, 2, multihash.Multihash{}, 3, nil); err != nil {
+		t.Fatalf("MarkSegmentShipped: %v", err)
+	}
+
+	got, err := r.CatalogUsage(ctx)
+
+	want := []registry.CatalogUsage{{Bucket: "bk", Space: space, Bytes: 10, DeadOnArrivalBytes: 3}}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("CatalogUsage = %+v, %v; want %+v", got, err, want)
 	}
 }

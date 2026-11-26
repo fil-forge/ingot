@@ -75,6 +75,7 @@ type SegmentMeta struct {
 	// IndexDigest is the multihash of the shipped sharded-dag-index blob.
 	// Non-nil exactly when the ship registered blobs in the bucket's space
 	// (the CAR + this index) — the registrations DeleteBucket must release.
+	// Empty but not nil when the CAR shipped without an index.
 	IndexDigest multihash.Multihash
 
 	// DeadBytes is how much of this segment was dead on arrival, recorded

@@ -203,10 +203,11 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Dir:  SegmentsDir(cfg.DataDir),
 		Meta: deps.Meta,
 		Catalog: logstore.PlaneConfig{
-			SealBytes: cfg.SealBytesCatalog,
-			SealAge:   cfg.SealAgeCatalog,
-			Ship:      cfg.ShipCatalog,
-			Retain:    cfg.RetainCatalog,
+			SealBytes:  cfg.SealBytesCatalog,
+			SealAge:    cfg.SealAgeCatalog,
+			SealBlocks: uploader.MaxIndexedBlocks,
+			Ship:       cfg.ShipCatalog,
+			Retain:     cfg.RetainCatalog,
 		},
 		FlushFor: func(bucket string) logstore.FlushFunc {
 			return newBucketFlushFunc(deps.Uploader, deps.Registry, deps.Locations, deps.Inclusions, bucket, logger)

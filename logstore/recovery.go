@@ -387,10 +387,10 @@ func frameBound(b block.Block) int64 {
 // sealed. A segment is lost when the journal still files blocks under it
 // but its CAR is not on disk: the data volume was lost or replaced, or the
 // file deleted. The journal is then the only copy of those blocks until they
-// ship. They go into new segments split at SealBytes, page by page, and each
-// stretch of a page's journal rows moves onto its new segment once fsynced
-// there, so a crash partway leaves the rest filed under the lost seq for the
-// next recovery.
+// ship. They go into new segments split at SealBytes and SealBlocks, page by
+// page, and each stretch of a page's journal rows moves onto its new segment
+// once fsynced there, so a crash partway leaves the rest filed under the lost
+// seq for the next recovery.
 // The new segments carry no op-roots: the bucket's forge root then waits for
 // its next shipped write.
 func (pl *PlaneLog) rebuildFromJournal(ctx context.Context, onDisk map[uint64]struct{}) ([]*Segment, error) {
@@ -446,17 +446,21 @@ func (pl *PlaneLog) rebuildFromJournal(ctx context.Context, onDisk map[uint64]st
 					}
 				}
 				// A segment already holding blocks seals rather than take
-				// one that would carry it past SealBytes.
-				if len(cur.index) > 0 && cur.Size()+frameBound(blocks[0]) > pl.pc.SealBytes {
+				// one that would carry it past SealBytes or SealBlocks.
+				room := len(blocks)
+				if pl.pc.SealBlocks > 0 {
+					room = pl.pc.SealBlocks - len(cur.index)
+				}
+				if len(cur.index) > 0 && (room <= 0 || cur.Size()+frameBound(blocks[0]) > pl.pc.SealBytes) {
 					if err := seal(); err != nil {
 						return nil, err
 					}
 					continue
 				}
-				// As many of the page's blocks as fit under SealBytes, at
-				// least one; the rest go to the next segment.
+				// As many of the page's blocks as fit under SealBytes and
+				// SealBlocks, at least one; the rest go to the next segment.
 				n, size := 1, cur.Size()+frameBound(blocks[0])
-				for n < len(blocks) && size+frameBound(blocks[n]) <= pl.pc.SealBytes {
+				for n < len(blocks) && n < room && size+frameBound(blocks[n]) <= pl.pc.SealBytes {
 					size += frameBound(blocks[n])
 					n++
 				}

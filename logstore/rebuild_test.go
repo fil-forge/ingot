@@ -359,6 +359,45 @@ func TestRebuild_SegmentsStayUnderSealBytes(t *testing.T) {
 	}
 }
 
+// TestRebuild_SegmentsStayUnderSealBlocks: a lost segment's blocks are split
+// into rebuilt segments of at most SealBlocks, across the journal's pages.
+func TestRebuild_SegmentsStayUnderSealBlocks(t *testing.T) {
+	ctx := context.Background()
+	mem := newPGMeta(t)
+	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// More blocks than one journal page (256) holds, and a SealBlocks that
+	// fills a rebuilt segment exactly at the end of a page.
+	_, lost := journalSegment(t, mem, "bk", 310)
+
+	m, err := logstore.OpenManager(ctx, logstore.ManagerConfig{
+		Dir:      t.TempDir(),
+		Meta:     mem,
+		Catalog:  logstore.PlaneConfig{SealBlocks: 128, SealAge: time.Hour, Ship: true},
+		FlushFor: (&shipRecorder{}).forBucket,
+		Logger:   zaptest.NewLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close(ctx) })
+
+	requireReadable(t, m, lost)
+	rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
+	if err != nil {
+		t.Fatalf("ListSegments: %v", err)
+	}
+	var got []int
+	for _, r := range rows {
+		// Nothing shipped, so the journal still files each rebuilt segment's blocks.
+		got = append(got, len(mem.JournaledBlocks(t, r.Seq)))
+	}
+	if want := []int{128, 128, 54}; !slices.Equal(got, want) {
+		t.Fatalf("rebuilt segments hold %v blocks, want %v", got, want)
+	}
+}
+
 // TestRebuild_JournalOnlyBucket: a bucket whose lost segment's row is already
 // gone (an older recovery deleted it) is found from the journal alone.
 func TestRebuild_JournalOnlyBucket(t *testing.T) {

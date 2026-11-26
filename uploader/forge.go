@@ -40,7 +40,8 @@ type Uploader interface {
 	// SubmitShard ships one sealed CAR to Forge. Alongside the CAR's
 	// location it returns the digest of the shard's sharded-dag-index blob:
 	// the ship registers TWO blobs in the space (the CAR and its index), and
-	// deleting the bucket later must release both. Nil when nothing shipped.
+	// deleting the bucket later must release both. Nil when nothing shipped,
+	// and empty but not nil when the CAR shipped without an index.
 	SubmitShard(ctx context.Context, plane blockstore.Plane, space did.DID, shard CARShard) (BlobLocation, multihash.Multihash, error)
 	// CaptureShipAuthority records the request's proof store on ctx, if it
 	// carries one that background work may borrow and that holds a /blob/add
@@ -50,6 +51,10 @@ type Uploader interface {
 	// body.
 	CaptureShipAuthority(ctx context.Context, space did.DID)
 }
+
+// MaxIndexedBlocks is the most blocks a shard's index can list: libforge's
+// encoder and every decoder of the index refuse a longer list.
+const MaxIndexedBlocks = 8192
 
 // CARShard describes one plane's sealed CAR file ready to ship. All
 // fields refer to data that already exists on disk or was precomputed
@@ -274,6 +279,14 @@ func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space d
 	if err != nil {
 		return BlobLocation{}, nil, fmt.Errorf("uploader: build %s shard index: %w", plane, err)
 	}
+	if indexBytes == nil {
+		// shortcut: a shard over MaxIndexedBlocks gets no network index, split it into several index blobs once a reader other than ingot needs these shards.
+		u.logger.Warn("uploader: shard has too many blocks to index; segment ships without an index (local inclusions cover reads)",
+			zap.Stringer("plane", plane),
+			zap.Stringer("space", space),
+			zap.Int("blocks", len(shard.Positions)),
+		)
+	}
 
 	// 1. blob/add the shard CAR via sprue, streaming from disk.
 	f, err := os.Open(shard.Path)
@@ -292,6 +305,10 @@ func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space d
 	carLoc, err := locationFromAdded(added)
 	if err != nil {
 		return BlobLocation{}, nil, err
+	}
+
+	if indexBytes == nil {
+		return carLoc, indexDigest, nil
 	}
 
 	// 2-4. Publish the shard's sharded-dag-index to the indexing service.
@@ -313,8 +330,12 @@ func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space d
 
 // shardIndexBlob builds the 1-shard sharded-dag-index blob for shard (inner
 // block digest → byte range, keyed off the CAR multihash) and returns its
-// archived bytes + digest.
+// archived bytes + digest. A shard over MaxIndexedBlocks has no index: the
+// bytes are nil and the digest empty.
 func shardIndexBlob(shard CARShard) ([]byte, multihash.Multihash, error) {
+	if len(shard.Positions) > MaxIndexedBlocks {
+		return nil, multihash.Multihash{}, nil
+	}
 	view := blobindex.NewShardedDagIndex(1)
 	for c, loc := range shard.Positions {
 		view.SetSlice(shard.SHA256, c.Hash(), blobindex.Range{

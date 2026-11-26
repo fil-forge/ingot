@@ -2,6 +2,7 @@ package uploader
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"testing"
@@ -354,4 +355,48 @@ func TestSubmitShardShipsUnderCommitCapture(t *testing.T) {
 	fg.CaptureShipAuthority(borrowable(&chainStore{}), chainless)
 	_, _, err = fg.SubmitShard(ctx, blockstore.PlaneCatalog, chainless, shard)
 	require.ErrorIs(t, err, ErrNoShipAuthority)
+}
+
+// shardOf returns a shard of n blocks whose CAR file does not exist.
+func shardOf(t *testing.T, n int) CARShard {
+	t.Helper()
+	car, err := multihash.Sum([]byte("car"), multihash.SHA2_256, -1)
+	require.NoError(t, err)
+	positions := make(map[cid.Cid]blockstore.BlockLoc, n)
+	for i := range n {
+		mh, err := multihash.Sum(fmt.Appendf(nil, "block %d", i), multihash.SHA2_256, -1)
+		require.NoError(t, err)
+		positions[cid.NewCidV1(cid.Raw, mh)] = blockstore.BlockLoc{Offset: uint64(i), Length: 1}
+	}
+	return CARShard{Path: filepath.Join(t.TempDir(), "missing.car"), Size: int64(n), SHA256: car, Positions: positions}
+}
+
+func TestShardIndexBlob(t *testing.T) {
+	t.Run("builds an index for a shard of exactly MaxIndexedBlocks", func(t *testing.T) {
+		index, digest, err := shardIndexBlob(shardOf(t, MaxIndexedBlocks))
+		require.NoError(t, err)
+		require.NotEmpty(t, index)
+		want, err := multihash.Sum(index, multihash.SHA2_256, -1)
+		require.NoError(t, err)
+		require.Equal(t, want, digest)
+	})
+
+	t.Run("returns no index and an empty, non-nil digest for a shard over MaxIndexedBlocks", func(t *testing.T) {
+		index, digest, err := shardIndexBlob(shardOf(t, MaxIndexedBlocks+1))
+		require.NoError(t, err)
+		require.Nil(t, index)
+		require.Equal(t, multihash.Multihash{}, digest)
+	})
+}
+
+// TestSubmitShardShipsAShardOverMaxIndexedBlocks: the ship gets past the
+// index to the CAR itself, which this shard names but does not have.
+func TestSubmitShardShipsAShardOverMaxIndexedBlocks(t *testing.T) {
+	fg := newTestForge(t)
+	space := mustSpace(t)
+	fg.CaptureShipAuthority(borrowable(shippingStore(t)), space)
+
+	_, _, err := fg.SubmitShard(context.Background(), blockstore.PlaneCatalog, space, shardOf(t, MaxIndexedBlocks+1))
+
+	require.ErrorContains(t, err, "missing.car")
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"sync"
@@ -1094,5 +1095,76 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// blocksPerSegment appends each batch of fresh blocks to a log that seals at
+// sealBlocks, and returns how many blocks each of its segments then holds,
+// oldest first.
+func blocksPerSegment(t *testing.T, sealBlocks int, batches ...int) []int {
+	t.Helper()
+	s, err := Open(context.Background(), Config{
+		Dir:     t.TempDir(),
+		Meta:    newFakeMeta(),
+		Catalog: PlaneConfig{SealBlocks: sealBlocks, SealAge: time.Hour},
+		Logger:  zaptest.NewLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	for b, n := range batches {
+		blocks := make([]block.Block, n)
+		for i := range blocks {
+			blocks[i] = makeBlock(t, fmt.Appendf(nil, "batch %d block %d", b, i))
+		}
+		if _, err := s.AppendBatch(context.Background(), blocks, blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, fmt.Sprint(b))}); err != nil {
+			t.Fatalf("append batch %d: %v", b, err)
+		}
+	}
+
+	s.catalog.catMu.RLock()
+	defer s.catalog.catMu.RUnlock()
+	out := []int{s.catalog.open.blockCount()}
+	for _, seg := range s.catalog.sealed { // newest first
+		out = append([]int{seg.blockCount()}, out...)
+	}
+	return out
+}
+
+func TestSealByBlockCount(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		batches []int
+		want    []int
+	}{
+		{"fills a segment to exactly SealBlocks", []int{2, 2}, []int{4}},
+		{"seals the segment before a batch that would carry it past SealBlocks", []int{3, 2, 2}, []int{3, 4}},
+		{"keeps a batch larger than SealBlocks whole, in a segment of its own", []int{1, 6, 1}, []int{1, 6, 1}},
+		{"seals no empty segment ahead of a first batch larger than SealBlocks", []int{6}, []int{6}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := blocksPerSegment(t, 4, tc.batches...)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("batches %v at SealBlocks 4: segments hold %v blocks, want %v", tc.batches, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRegisteredDigests_SegmentShippedWithoutIndex: only the CAR is listed for
+// release when the segment shipped without an index.
+func TestRegisteredDigests_SegmentShippedWithoutIndex(t *testing.T) {
+	sha := make([]byte, 32)
+	car, err := multihash.Encode(sha, multihash.SHA2_256)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := registeredDigests(SegmentMeta{State: StateSealed, SHA256: sha, ShippedAt: 1, IndexDigest: multihash.Multihash{}})
+
+	if err != nil || !reflect.DeepEqual(got, []multihash.Multihash{car}) {
+		t.Fatalf("registeredDigests = %v, %v; want only the CAR %v", got, err, car)
 	}
 }

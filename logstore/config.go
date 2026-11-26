@@ -44,6 +44,11 @@ type PlaneConfig struct {
 	// before it seals even under SealBytes. 0 → 5s.
 	SealAge time.Duration
 
+	// SealBlocks is the most blocks a segment takes before it seals, so its
+	// ship can index it. A single batch larger than SealBlocks still goes
+	// into one segment, which ships without an index. 0 → no limit.
+	SealBlocks int
+
 	// Ship enables this plane's upload pipeline. When false the plane's
 	// CARs are never shipped and are retained on local disk indefinitely,
 	// the sole source for local reads of that plane. Their blocks also stay
@@ -71,8 +76,8 @@ type PlaneConfig struct {
 // Forge. The segment is single-plane, so no plane argument is needed. On
 // success it returns the digest of the shipped sharded-dag-index blob (the
 // ship registers the CAR and its index in the bucket's space; DeleteBucket
-// releases both), or nil when nothing registered (header-only segment, or a
-// non-publishing uploader).
+// releases both), nil when nothing registered (header-only segment, or a
+// non-publishing uploader), or empty but not nil when only the CAR registered.
 type FlushFunc func(ctx context.Context, seg *Segment) (multihash.Multihash, error)
 
 func (c *Config) validate() error {

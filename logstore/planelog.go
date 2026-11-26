@@ -115,6 +115,14 @@ func (pl *PlaneLog) Append(ctx context.Context, blocks []block.Block, opRoots ..
 	if err != nil {
 		return 0, err
 	}
+	if n := open.blockCount(); pl.pc.SealBlocks > 0 && n > 0 && n+len(blocks) > pl.pc.SealBlocks {
+		if err := pl.sealOpenLockedAppMu(ctx, true); err != nil {
+			return 0, err
+		}
+		if open, err = pl.ensureOpenLockedAppMu(ctx); err != nil {
+			return 0, err
+		}
+	}
 	if err := open.append(blocks, opRoots); err != nil {
 		return 0, err
 	}
@@ -250,7 +258,11 @@ func (pl *PlaneLog) ensureOpenLockedAppMu(ctx context.Context) (*Segment, error)
 func (pl *PlaneLog) sealOpenIfDue(ctx context.Context, force bool) error {
 	pl.appMu.Lock()
 	defer pl.appMu.Unlock()
+	return pl.sealOpenLockedAppMu(ctx, force)
+}
 
+// sealOpenLockedAppMu is sealOpenIfDue for a caller that holds appMu.
+func (pl *PlaneLog) sealOpenLockedAppMu(ctx context.Context, force bool) error {
 	pl.catMu.RLock()
 	open := pl.open
 	openedAt := pl.openedAt
