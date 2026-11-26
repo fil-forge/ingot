@@ -278,11 +278,16 @@ type shipper struct {
 	ctx  context.Context
 	wg   sync.WaitGroup
 	todo bool
+	// stopped is set when the test ends: a seal after it starts no ship.
+	stopped bool
 }
 
 func (sh *shipper) sealed() {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
+	if sh.stopped {
+		return
+	}
 	if sh.s == nil {
 		sh.todo = true
 		return
@@ -304,6 +309,12 @@ func (sh *shipper) start(t *testing.T, s *Store) {
 	todo := sh.todo
 	sh.mu.Unlock()
 	t.Cleanup(func() {
+		// The store seals until it closes, so a seal can land here. Under
+		// the lock it either started its ship already, which Wait sees, or
+		// starts none.
+		sh.mu.Lock()
+		sh.stopped = true
+		sh.mu.Unlock()
 		cancel()
 		sh.wg.Wait()
 		_ = s.Close(context.Background())
