@@ -68,10 +68,10 @@ sequenceDiagram
     C->>M: AppendBatch(catalogBlocks, OpRoot{bucket, root})
     M->>S: route by OpRoot.Bucket (lazy open + recovery on first use)
     S->>FS: append CAR frames + .ops record, fsync both
-    S-->>C: the segment's seq (licenses the commit's root advance)
-    C->>DB: with the task's commit: journal the batch's blocks under the segment<br/>(none once it has shipped), guarded root advance: one tx
+    S-->>C: the segments the batch went into (licenses the commit's root advance)
+    C->>DB: with the task's commit: journal the batch's blocks under their segments<br/>(none once one has shipped), guarded root advance: one tx
 
-    Note over S,FS: seal when size >= SealBytes or age >= SealAge<br/>(also at Close, and recovery force-seals)
+    Note over S,FS: seal when size >= SealBytes or age >= SealAge,<br/>or before a batch that would pass SealBlocks<br/>(also at Close, and recovery force-seals)
     S->>FS: freeze: fsync, hash CAR, open it read-only, close the write fd
     S->>FS: record: write .idx (tmp + fsync, rename, fsync dir)
     S->>DB: record: MarkSegmentSealed(size, sha256, op-roots) in one tx
@@ -93,6 +93,12 @@ sequenceDiagram
 A batch may be empty of blocks: an MST mutation can produce a new root that
 points only at nodes already materialized in a prior segment, so `AppendBatch`
 is called with the op-root alone.
+
+A segment holds at most `SealBlocks` blocks, which is what one shard index
+can list (`uploader.MaxIndexedBlocks`). A batch that does not fit the open
+segment goes into a new one, and a batch larger than `SealBlocks` is split
+across segments, with its op-root in the last. The commit journals each part
+under its own segment.
 
 The log seals on its own trigger and reports each seal to the callback its
 owner sets with `Manager.OnSealed`, holding the seals reported before then,
@@ -236,7 +242,7 @@ Before the fileless rows go, recovery rebuilds any segment the journal still
 files blocks under but whose CAR is gone (`rebuildFromJournal`): a lost or
 replaced data volume, or a deleted file. The blocks are appended to new
 segments, read from the journal a page at a time; a segment takes blocks until
-the next would carry it past `SealBytes`. Each run of blocks' journal rows
+the next would carry it past `SealBytes` or `SealBlocks`. Each run of blocks' journal rows
 move onto its new segment (`Meta.MoveJournal`, keeping their `created_at`)
 once the run is fsynced there, so a crash partway leaves the rest for the
 next start. The new segments are sealed and reported to ship like any other; they
@@ -267,6 +273,7 @@ func (m *Manager) OnSealed(fn func(bucket string))
 type PlaneConfig struct {
     SealBytes int64         // open-segment CAR size threshold (0 -> 64 MiB)
     SealAge   time.Duration // max open age before sealing (0 -> 5s); ticker paces at SealAge/4
+    SealBlocks int          // most blocks a segment holds (0 -> no limit)
     Ship      bool          // false -> never ship, retained forever
     Flush     FlushFunc     // ships one sealed CAR; set by the Manager from FlushFor
     OnSealed  func()        // told after each seal, and at open for any segment left unshipped

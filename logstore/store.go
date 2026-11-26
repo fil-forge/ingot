@@ -38,13 +38,13 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 }
 
 // AppendBatch persists one op's catalog blocks plus the op-root, fsynced before
-// returning, and returns the seq of the segment they went into. The block
+// returning, and returns the segments they went into (PlaneLog.Append). The block
 // slice may be empty: an MST mutation can produce a new root that points only
 // at nodes already materialized in a prior segment (e.g. trimTop after
 // Delete), so AppendBatch is called with the OpRoot alone.
-func (s *Store) AppendBatch(ctx context.Context, catalogBlocks []block.Block, opRoot blockstore.OpRoot) (uint64, error) {
+func (s *Store) AppendBatch(ctx context.Context, catalogBlocks []block.Block, opRoot blockstore.OpRoot) ([]blockstore.Appended, error) {
 	if !opRoot.Root.Defined() {
-		return 0, errors.New("logstore: AppendBatch: opRoot.Root must be defined")
+		return nil, errors.New("logstore: AppendBatch: opRoot.Root must be defined")
 	}
 	return s.catalog.Append(ctx, catalogBlocks, opRoot)
 }

@@ -88,13 +88,16 @@ func openPlaneLog(ctx context.Context, plane blockstore.Plane, bucket, dir strin
 	return pl, nil
 }
 
-// Append persists one batch's blocks to the open segment and returns that
-// segment's seq. opRoots are the bucket-root advances the batch records. A
-// call with no blocks AND no op-roots is a no-op — it does not even create a
-// segment, and returns seq 0. The CAR is fsynced before Append returns.
-func (pl *PlaneLog) Append(ctx context.Context, blocks []block.Block, opRoots ...blockstore.OpRoot) (seq uint64, err error) {
+// Append persists one batch's blocks and returns the segments they went into,
+// in order. A batch goes whole into the open segment, or into a new one when
+// it would carry the open one past SealBlocks; a batch larger than SealBlocks
+// is split across segments. opRoots are the bucket-root advances the batch
+// records, written with its last blocks. A call with no blocks AND no
+// op-roots is a no-op: it does not even create a segment. Every CAR is
+// fsynced before Append returns.
+func (pl *PlaneLog) Append(ctx context.Context, blocks []block.Block, opRoots ...blockstore.OpRoot) (appended []blockstore.Appended, err error) {
 	if len(blocks) == 0 && len(opRoots) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 	// The span covers the wait for the append lock and the segment write and
 	// fsync every acked write waits on.
@@ -111,25 +114,39 @@ func (pl *PlaneLog) Append(ctx context.Context, blocks []block.Block, opRoots ..
 	pl.appMu.Lock()
 	defer pl.appMu.Unlock()
 
-	open, err := pl.ensureOpenLockedAppMu(ctx)
-	if err != nil {
-		return 0, err
-	}
-	if n := open.blockCount(); pl.pc.SealBlocks > 0 && n > 0 && n+len(blocks) > pl.pc.SealBlocks {
-		if err := pl.sealOpenLockedAppMu(ctx, true); err != nil {
-			return 0, err
+	for {
+		open, err := pl.ensureOpenLockedAppMu(ctx)
+		if err != nil {
+			return nil, err
 		}
-		if open, err = pl.ensureOpenLockedAppMu(ctx); err != nil {
-			return 0, err
+		n := len(blocks)
+		if pl.pc.SealBlocks > 0 {
+			held := open.blockCount()
+			if held > 0 && held+n > pl.pc.SealBlocks {
+				if err := pl.sealOpenLockedAppMu(ctx, true); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			n = min(n, pl.pc.SealBlocks)
 		}
+		part, rest := blocks[:n], blocks[n:]
+		var roots []blockstore.OpRoot
+		if len(rest) == 0 {
+			roots = opRoots
+		}
+		if err := open.append(part, roots); err != nil {
+			return nil, err
+		}
+		appended = append(appended, blockstore.Appended{Segment: open.Seq(), Blocks: part})
+		if len(rest) == 0 {
+			if open.Size() >= pl.pc.SealBytes {
+				pl.requestSeal()
+			}
+			return appended, nil
+		}
+		blocks = rest
 	}
-	if err := open.append(blocks, opRoots); err != nil {
-		return 0, err
-	}
-	if open.Size() >= pl.pc.SealBytes {
-		pl.requestSeal()
-	}
-	return open.Seq(), nil
 }
 
 // Get returns the block from this plane's local segments (open first,

@@ -179,11 +179,11 @@ func TestLayeredAndStagingHappyPath(t *testing.T) {
 		t.Fatalf("Commit: %v", err)
 	}
 	// The commit journals what the log took, under the segment it went into.
-	if appended.Segment == 0 {
-		t.Fatal("Commit reported no segment")
+	if len(appended) != 1 || appended[0].Segment == 0 {
+		t.Fatalf("Commit reported %d parts, want one with its segment", len(appended))
 	}
-	if len(appended.Blocks) != 2 || !appended.Blocks[0].Cid().Equals(a.Cid()) || !appended.Blocks[1].Cid().Equals(b.Cid()) {
-		t.Fatalf("Commit reported blocks %v, want [%s %s] in put order", appended.Blocks, a.Cid(), b.Cid())
+	if got := appended[0].Blocks; len(got) != 2 || !got[0].Cid().Equals(a.Cid()) || !got[1].Cid().Equals(b.Cid()) {
+		t.Fatalf("Commit reported blocks %v, want [%s %s] in put order", got, a.Cid(), b.Cid())
 	}
 
 	for _, blk := range []block.Block{a, b} {
