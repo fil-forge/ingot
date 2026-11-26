@@ -15,8 +15,6 @@ import (
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
-	block "github.com/ipfs/go-block-format"
-	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
 )
 
@@ -266,7 +264,7 @@ func (d *blobDir) removeLocked(digest mh.Multihash) (int64, error) {
 }
 
 // OpenBlob returns a streaming reader over the blob with the given digest, or
-// ErrNotFound. Unlike GetBlock it does not read the blob into memory — the
+// ErrNotFound. It does not read the blob into memory: the
 // body read path serves bytes straight off disk. The caller owns the reader
 // and must Close it. The returned *os.File is seekable, which the body reader
 // uses to start a ranged read mid-blob without reading-and-discarding. An open
@@ -295,16 +293,4 @@ func (d *blobDir) OpenBlobRange(_ context.Context, _ did.DID, digest mh.Multihas
 		return nil, fmt.Errorf("blockstore: %s open %s: %w", d.kind, digest.B58String(), err)
 	}
 	return readerCloser{Reader: io.NewSectionReader(f, start, end-start+1), Closer: f}, nil
-}
-
-// GetBlock returns the blob stored under c's multihash, or ErrNotFound.
-func (d *blobDir) GetBlock(_ context.Context, _ did.DID, c cid.Cid) (block.Block, error) {
-	data, err := os.ReadFile(d.Path(c.Hash()))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("blockstore: %s read %s: %w", d.kind, c, err)
-	}
-	return block.NewBlockWithCid(data, c)
 }
