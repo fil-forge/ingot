@@ -83,8 +83,11 @@ func TestServerReportsUsage(t *testing.T) {
 		due, err := store.DueEgress(ctx, 10)
 		return err == nil && len(due) == 0
 	}, 5*time.Second, 10*time.Millisecond, "the reported count was never acknowledged")
+	// A pass that ran out of time before it acknowledged repeats its report,
+	// so the count taken here is of the reports up to the acknowledgement.
+	reported := len(reporter.sent())
 	time.Sleep(100 * time.Millisecond)
-	require.Len(t, reporter.sent(), 1, "a count that had not changed was reported again")
+	require.Len(t, reporter.sent(), reported, "a count that had been acknowledged was reported again")
 
 	stopped = true
 	require.NoError(t, s.Stop(context.Background()))
