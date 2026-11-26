@@ -34,8 +34,8 @@ func wantObjects(t *testing.T, mem *testStore, added, removed int64, msg string)
 }
 
 // newCountingBackend mirrors newRefTestBackend, with a bucket "bk" in a space
-// of its own.
-func newCountingBackend(t *testing.T) (*Backend, *testStore) {
+// of its own. Each of opts may adjust the dependencies first.
+func newCountingBackend(t *testing.T, opts ...func(*Deps)) (*Backend, *testStore) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -74,6 +74,9 @@ func newCountingBackend(t *testing.T) (*Backend, *testStore) {
 		Claims:     mem,
 	}
 	withStreaming(t, &deps, dir)
+	for _, opt := range opts {
+		opt(&deps)
+	}
 	b := mem.newBackend(t, deps)
 	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)

@@ -310,8 +310,10 @@ Internal:
   instruments (`ingot.local_blobs.*`: usage by directory, budget and
   stalled-upload gauges, removals by reason, reads by tier), the multipart
   accept's (`ingot.multipart.*`: parked-part age, blob concludes by outcome,
-  deferred Completes) and the catalog journal's (`ingot.catalog_journal.*`:
-  blocks, bytes, oldest age) are created on the global meter provider,
+  deferred Completes), the catalog journal's (`ingot.catalog_journal.*`:
+  blocks, bytes, oldest age) and the totals' (`ingot.buckets.count`,
+  `ingot.objects.count`: read from the buckets' object counts at each
+  collection) are created on the global meter provider,
   through `s3frontend.Deps.MeterProvider` and `Layered.CountBlobReads`, and
   the runner's `taskrunner.*` on it too; with no provider installed they are
   no-ops. So are the catalog usage gauges (`ingot.catalog.*`: each bucket's
