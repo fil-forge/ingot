@@ -335,8 +335,8 @@ func (c *Client) BlobConclude(ctx context.Context, space did.DID, added AddedBlo
 // This is the other way of doing many things in one request, and not the one
 // ucantone calls a batch: a conclude is a single invocation whose arguments
 // are a list of receipts, where a batch is many invocations answered with a
-// receipt each (see UploadAddBatch). The two size differently, which is why
-// they have their own limits.
+// receipt each. The two size differently, which is why they have their own
+// limits.
 //
 // A UCAN container holds at most 8192 tokens, and each blob costs 2 in the
 // request (its put invocation and receipt) and 4 in the response (the accept
