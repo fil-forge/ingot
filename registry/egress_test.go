@@ -3,6 +3,8 @@ package registry_test
 import (
 	"context"
 	"reflect"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -97,28 +99,48 @@ func TestAddEgressIgnoresNothingAndRefusesANegativeCount(t *testing.T) {
 }
 
 // Due counts come oldest hour first, within the limit, so a backlog is worked
-// through in order across several reports.
+// through in order across several reports. Spaces within one hour come in no
+// promised order: the database sorts them by its own collation.
 func TestDueEgressIsOldestFirstAndLimited(t *testing.T) {
 	r := egressStore(t)
 	a, b := testutil.RandomDID(t), testutil.RandomDID(t)
-	if a.String() > b.String() {
-		a, b = b, a
-	}
 	addEgress(t, r,
 		registry.EgressCount{Space: b, Hour: egressHour1, Bytes: 4},
 		registry.EgressCount{Space: b, Hour: egressHour0, Bytes: 2},
 		registry.EgressCount{Space: a, Hour: egressHour0, Bytes: 1},
 	)
 
-	wantDue(t, dueEgress(t, r, 2),
+	wantDueOldestFirst(t, dueEgress(t, r, 2),
 		registry.EgressCount{Space: a, Hour: egressHour0, Bytes: 1},
 		registry.EgressCount{Space: b, Hour: egressHour0, Bytes: 2},
 	)
-	wantDue(t, dueEgress(t, r, 10),
+	wantDueOldestFirst(t, dueEgress(t, r, 10),
 		registry.EgressCount{Space: a, Hour: egressHour0, Bytes: 1},
 		registry.EgressCount{Space: b, Hour: egressHour0, Bytes: 2},
 		registry.EgressCount{Space: b, Hour: egressHour1, Bytes: 4},
 	)
+}
+
+// wantDueOldestFirst checks got is in hour order and holds the same counts as
+// want, ignoring the order of spaces within an hour.
+func wantDueOldestFirst(t *testing.T, got []registry.EgressCount, want ...registry.EgressCount) {
+	t.Helper()
+	for i := 1; i < len(got); i++ {
+		if got[i].Hour.Before(got[i-1].Hour) {
+			t.Fatalf("due egress out of hour order:\n got %v", got)
+		}
+	}
+	byHourThenSpace := func(c []registry.EgressCount) []registry.EgressCount {
+		c = slices.Clone(c)
+		slices.SortFunc(c, func(x, y registry.EgressCount) int {
+			if n := x.Hour.Compare(y.Hour); n != 0 {
+				return n
+			}
+			return strings.Compare(x.Space.String(), y.Space.String())
+		})
+		return c
+	}
+	wantDue(t, byHourThenSpace(got), byHourThenSpace(want)...)
 }
 
 // An acknowledged count is no longer due, until more is sent in its hour,
