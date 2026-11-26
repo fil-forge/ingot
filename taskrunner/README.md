@@ -225,6 +225,17 @@ if len(releasing[subject]) > 0 {
 }
 ```
 
+A caller that must wait for everything the queue still has to do for one subject, whatever the action, asks with `PendingOn`. It returns the subject's pending tasks, delayed, due or running, oldest first, and changes nothing.
+
+```go
+// Is a change to this tenant still queued or running?
+changes, err := r.PendingOn(ctx, "queue-tenant", tenant)
+if len(changes) > 0 {
+	// Wait for the last of them before answering.
+	_, err = r.Wait(ctx, "queue-tenant", changes[len(changes)-1])
+}
+```
+
 ## Running delayed work now
 
 `Expedite` makes a subject's pending tasks of an action due now, whatever their `NotBefore`, and returns them all by subject, for the caller to wait on, or to wait behind with a sync task on each subject. A subject ending in `*` stands for every subject that starts with what comes before it, which is why a submitted subject may not end in `*`. A bucket delete uses that to run its space's pending releases before the space goes. No task it returns can be replaced any more, due already or not, so nothing pushes it back again. A task waiting to retry is brought forward too, whether or not it holds its subject: the caller asked for now. A placed task brought forward still runs only on its own instance. `ExpediteTasks` does the same for given task IDs, so a caller cleaning up after itself brings forward only its own tasks and leaves others' of the same subject and action at their times.

@@ -151,6 +151,66 @@ func TestPendingReportsSubjectsWithWorkLeft(t *testing.T) {
 	}
 }
 
+// PendingOn returns a subject's pending tasks whatever their action, delayed,
+// due or running, oldest first, and none of another subject's or of a task
+// that has finished.
+func TestPendingOnReportsEveryActionOfTheSubject(t *testing.T) {
+	// One worker to hold the running task, one to finish the others.
+	f := newFixture(t, 2)
+	started, release := make(chan struct{}), make(chan struct{})
+	f.handle(t, qTop, "release", func(_ context.Context, _ *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if task.Subject == "sp/busy" {
+			close(started)
+			<-release
+		}
+		return nil, nil
+	})
+	f.handle(t, qTop, "expire", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil })
+	f.start(t)
+	ctx := waitCtx(t)
+	later := time.Now().Add(time.Hour)
+	submit := func(subject, action string, at *time.Time) taskrunner.TaskID {
+		t.Helper()
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: subject, Action: action, NotBefore: at})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	done := submit("sp/done", "release", nil)
+	if _, err := f.r.Wait(ctx, qTop, done); err != nil {
+		t.Fatal(err)
+	}
+	running := submit("sp/busy", "release", nil)
+	<-started
+	delayed := submit("sp/busy", "expire", &later)
+	submit("sp/other", "release", &later)
+
+	got, err := f.r.PendingOn(ctx, qTop, "sp/busy")
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	if want := []taskrunner.TaskID{running, delayed}; !slices.Equal(got, want) {
+		close(release)
+		t.Fatalf("PendingOn = %v, want %v", got, want)
+	}
+	for _, subject := range []string{"sp/done", "sp/none"} {
+		if got, err := f.r.PendingOn(ctx, qTop, subject); err != nil || len(got) != 0 {
+			close(release)
+			t.Fatalf("PendingOn(%q) = %v, %v, want none", subject, got, err)
+		}
+	}
+	if _, err := f.r.PendingOn(ctx, "no-such-queue", "sp/busy"); err == nil {
+		close(release)
+		t.Fatal("PendingOn accepted an unknown queue")
+	}
+	close(release)
+	if _, err := f.r.Wait(ctx, qTop, running); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // SubmitAllTx adds many tasks in one statement, in order, and keeps the later
 // of two replacements for one subject and action, in the batch or already
 // pending.

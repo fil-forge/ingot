@@ -207,6 +207,28 @@ func (r *Runner) Pending(ctx context.Context, queueName string, subjects []strin
 	return out, nil
 }
 
+// PendingOn returns the subject's pending tasks of every action, running or
+// not, oldest first. It reads and changes nothing else: it is for a caller that
+// must wait for whatever the queue still has to do for the subject, such as a
+// reader that must not answer from before a queued write.
+func (r *Runner) PendingOn(ctx context.Context, queueName, subject string) ([]TaskID, error) {
+	q, ok := r.byName[queueName]
+	if !ok {
+		return nil, fmt.Errorf("task runner: unknown queue %q", queueName)
+	}
+	rows, err := r.db.Query(ctx, `SELECT id FROM `+q.tasks+`
+		WHERE subject = $1 AND state = 'pending'
+		ORDER BY seq`, subject)
+	if err != nil {
+		return nil, fmt.Errorf("pending on %s: %w", queueName, err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[TaskID])
+	if err != nil {
+		return nil, fmt.Errorf("pending on %s: %w", queueName, err)
+	}
+	return ids, nil
+}
+
 // expedite makes the pending tasks of an action on the subjects matching $1
 // no longer replacements, and the unstarted ones due now, whether they waited
 // for a NotBefore, a retry's backoff or nothing, and returns them all, oldest
