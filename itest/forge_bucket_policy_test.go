@@ -23,13 +23,8 @@ import (
 // answering the document's ETag), replaces it with a wildcard document, is
 // refused a document versitygw rejects (a bare principal name) and one Hilt
 // rejects (no Version) with MalformedPolicy, and removes it with
-// DeleteBucketPolicy. The published hilt image lacks /s3/bucket/policy until
-// fil-forge/hilt#89 merges, so the scenario runs only against a hilt override
-// (or when INGOT_ITEST_IAM=1 says the image carries it); drop the guard then.
+// DeleteBucketPolicy.
 func TestForgeBucketPolicy(t *testing.T) {
-	if !iamScenariosEnabled() {
-		t.Skip("the bucket policy scenario needs a hilt override (INGOT_ITEST_HILT_BINARY or INGOT_ITEST_HILT_IMAGE), or INGOT_ITEST_IAM=1, until the :main image serves /s3/bucket/policy")
-	}
 	s, endpoint := forgeStack(t)
 	ctx := t.Context()
 	const tenant, principal, bucket = "bucketpolicy", "member", "policied"

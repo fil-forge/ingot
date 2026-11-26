@@ -76,6 +76,4 @@ registry.
 - `itest`: `TestForgeScenarios/CORS/per_bucket` sets a document on one
   bucket and checks the preflights on it and on a sibling, then deletes it
   and sees the default return; `TestForgeRoutePermissions` checks the
-  writes are refused to a key holding only the read. Both run against a
-  hilt override or with `INGOT_ITEST_CORS_WRITES=1`, until the published
-  hilt image authorizes the writes.
+  writes are refused to a key holding only the read.
