@@ -17,8 +17,9 @@ import (
 
 // DelegationCache is a TTL cache of Hilt-issued delegations, keyed by
 // delegation CID. Each entry lives exactly as long as the delegation itself
-// (Hilt's /s3/request/authorize re-delegations carry a ≤24h expiry; chains
-// from /s3/bucket/info may carry none and are kept until process restart).
+// (Hilt's /s3/request/authorize re-delegations carry a ≤24h expiry; the
+// grants and roots they chain through may carry none and are kept until
+// process restart).
 //
 // It implements [ucanlib.ProofStore], so the network read tier
 // (blockstore.Forge) resolves its per-space /content/retrieve proof chains

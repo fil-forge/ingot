@@ -3,18 +3,17 @@ package ingot
 import (
 	"context"
 	"errors"
-	"github.com/fil-forge/versitygw/s3api"
 	"net"
 	"testing"
 	"time"
 
+	"github.com/fil-forge/versitygw/s3api"
+
 	"github.com/aws/smithy-go"
 	hiltclient "github.com/fil-forge/hilt/pkg/client"
 	s3 "github.com/fil-forge/libforge/commands/s3"
-	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
 	s3req "github.com/fil-forge/libforge/commands/s3/request"
 	"github.com/fil-forge/libforge/identity"
-	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/gofiber/fiber/v3"
@@ -82,10 +81,6 @@ func TestBuildS3API_NoRootShortCircuit(t *testing.T) {
 type neverAuthorizer struct{}
 
 func (neverAuthorizer) AuthorizeRequest(context.Context, s3.Request, ...hiltclient.MethodOption) (*s3req.AuthorizeOK, ucan.Container, error) {
-	return nil, nil, errors.New("hilt must not be consulted for a malformed access key")
-}
-
-func (neverAuthorizer) BucketInfo(context.Context, string, did.DID, ...hiltclient.MethodOption) (*s3bkt.InfoOK, ucan.Container, error) {
 	return nil, nil, errors.New("hilt must not be consulted for a malformed access key")
 }
 

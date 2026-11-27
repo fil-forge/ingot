@@ -17,10 +17,9 @@
 // Proof state is held per access key in [KeyProofs]: each key's store holds
 // only the delegations Hilt issued for that key, so proof chains can never
 // cross keys. The delegations Hilt returns ARE consumed — each authorize
-// response carries access-key→ingot re-delegations (≤24h TTL); their
-// bucket→tenant→access-key remainder comes from /s3/bucket/info, which the
-// service fetches once (into the same per-key store) when a leaf's chain
-// doesn't yet reach the root.
+// response carries access-key→ingot re-delegations (≤24h TTL) and the
+// bucket→tenant→access-key chain they rest on: the access key's grants over
+// every bucket the request acts on, with each bucket's root.
 //
 // Every request stashes its key's store on the request context
 // ([reqscope.ProofStoreKey]) so an onward Forge retrieval — which sees only ctx +
@@ -28,11 +27,13 @@
 //
 // A response carrying a delegation the revocation consumer has seen revoked
 // ([KeyProofs.Revoked]) authorizes the one request it answers and is not
-// cached: it stems from a Hilt write whose revocations were published but
-// whose commit failed, and caching it would keep the old access in force
-// while the console's retry republishes revocations Swarf
-// deduplicates. The request still gets a store of its own holding the
-// response's delegations, so its onward retrieval has a chain.
+// cached. Hilt reads the grants a response carries in the snapshot it
+// decides in, and every change to what a key may do revokes the key's
+// grants, so a response built just before a change, arriving after the
+// change's revocations, names revoked grants. One arriving before them is
+// cached and then dropped when they arrive. The request still gets a store
+// of its own holding the response's delegations, so its onward retrieval
+// has a chain.
 //
 // A local fast path (the RFC's "local cache" authorization) avoids the Hilt
 // round-trip when everything needed is already cached, mirroring Hilt's own
@@ -55,7 +56,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"slices"
 	"strings"
 
 	"time"
@@ -85,12 +85,10 @@ import (
 )
 
 // Authorizer is the slice of [hiltclient.Client] the service uses:
-// /s3/request/authorize per request, and /s3/bucket/info to complete proof
-// chains the authorize response only partially supplies. Each returned
-// container carries the delegation blocks for the respective chains.
+// /s3/request/authorize per request. The returned container carries the
+// delegation blocks of the response's chains.
 type Authorizer interface {
 	AuthorizeRequest(ctx context.Context, req s3.Request, opts ...hiltclient.MethodOption) (*s3req.AuthorizeOK, ucan.Container, error)
-	BucketInfo(ctx context.Context, name string, accessKey did.DID, opts ...hiltclient.MethodOption) (*s3bkt.InfoOK, ucan.Container, error)
 }
 
 // BucketResolver maps a bucket name to its local state (the fast path needs
@@ -279,24 +277,22 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 		return auth.Account{}, fmt.Errorf("hilt/iam: no tenant for %s in authorize result", accessKeyID)
 	}
 
-	// A write's revocations reached Swarf without its commit: Hilt still
-	// answers with delegations the consumer saw revoked. Authorize this
-	// request from the response and cache nothing, so the key returns to Hilt
-	// on every request until a committed write issues fresh delegations. The
-	// request keeps a store of its own for its onward retrieval. Otherwise the
-	// delegations land in the key's store in the same step as the check (the
-	// store's Add does both), so a revocation arriving meanwhile still finds
-	// (and drops) them. The same check covers the bucket-info remainder
-	// cacheProofs fetches.
-	if ctr != nil && !s.cacheProofs(spanCtx, store, ctr, req, accessKeyID) {
+	// The response names a delegation the consumer saw revoked: it was built
+	// before a change to what the key may do and arrived after the change's
+	// revocations. Authorize this request from the response and cache
+	// nothing, so the key returns to Hilt until a response from after the
+	// change. The request keeps a store of its own for its onward retrieval.
+	// Otherwise the delegations land in the key's store in the same step as
+	// the check (the store's Add does both), so a revocation arriving
+	// meanwhile still finds (and drops) them.
+	if !cacheProofs(store, ctr) {
 		scoped := NewDelegationCache(nil)
 		ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(scoped))
 		// The scoped store holds a delegation known revoked, so nothing
 		// outside this request may borrow it (a release this request
 		// queues still carries the chain it encodes from it).
 		ctx.Locals(reqscope.BorrowableKey(), false)
-		// Refetches bucket info already fetched above; rare (a failed Hilt commit).
-		s.cacheProofs(reqCtx, scoped, ctr, req, accessKeyID)
+		cacheProofs(scoped, ctr)
 		// The action set too, held for this request alone.
 		scopedTTL := untilNextUTCMidnight(time.Now())
 		if ok.Bucket != nil {
@@ -309,10 +305,8 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 		return adminAccount(accessKeyStr, key), nil
 	}
 
-	// The returned delegations (access-key→ingot re-delegations, ≤24h TTL) are
-	// now in THIS key's store with their chains completed if needed —
-	// best-effort: the request IS authorized; a gap here only affects onward
-	// Forge invocations, which will surface it as missing retrieval authority.
+	// The returned delegations (access-key→ingot re-delegations, ≤24h TTL,
+	// and the chains they rest on) are now in THIS key's store.
 	//
 	// Cache the verification keys until Hilt's own expiry horizon: SigV4
 	// derived keys die at the next UTC midnight (credential-scope date
@@ -364,15 +358,14 @@ var ErrBucketNotPermitted = errors.New("hilt/iam: the access key may not act on 
 
 // AuthorizeSigned authorizes req, an S3 request signed with the secret of
 // accessKey, by Hilt alone, and returns a proof store holding the
-// delegations Hilt issued for it, their chains completed as for a request
-// the gateway serves. It caches nothing. It is for a process other than the
+// delegations Hilt issued for it with the chains they rest on. It caches
+// nothing. It is for a process other than the
 // serving daemon, such as a command reading a bucket's catalog from Forge
 // with a key its operator holds: the store goes on that work's context under
 // [reqscope.ProofStoreKey]. The store takes no part in the revocations a
 // serving daemon tracks, which such a process doesn't have.
 func (s *Service) AuthorizeSigned(ctx context.Context, req s3.Request, accessKey string) (*DelegationCache, error) {
-	keyDID, err := did.Parse(did.KeyPrefix + accessKey)
-	if err != nil {
+	if _, err := did.Parse(did.KeyPrefix + accessKey); err != nil {
 		return nil, fmt.Errorf("hilt/iam: access key is not a did:key identifier: %w", err)
 	}
 	_, ctr, err := s.authorizer.AuthorizeRequest(ctx, req)
@@ -390,7 +383,7 @@ func (s *Service) AuthorizeSigned(ctx context.Context, req s3.Request, accessKey
 		return nil, fmt.Errorf("hilt/iam: authorize request: %w", err)
 	}
 	store := NewDelegationCache(nil)
-	s.cacheProofs(ctx, store, ctr, req, keyDID)
+	cacheProofs(store, ctr)
 	return store, nil
 }
 
@@ -612,97 +605,14 @@ func untilNextUTCMidnight(now time.Time) time.Duration {
 	return midnight.Sub(nowUTC)
 }
 
-// cacheProofs deposits the authorize response's delegations into this key's
-// proof store and, when it cannot assemble a root-complete chain for one of
-// the fresh leaves, fetches the bucket→tenant→access-key remainder from
-// /s3/bucket/info (once per bucket the request acts on: the addressed bucket,
-// plus a copy's source) and caches that too. It reports false as soon as the
-// store refuses a batch (see [DelegationCache.Add]).
-func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr ucan.Container, req s3.Request, keyDID did.DID) bool {
+// cacheProofs deposits the authorize response's delegations into the proof
+// store. It reports false when the store refuses the batch because it names
+// a revoked delegation (see [DelegationCache.Add]).
+func cacheProofs(store *DelegationCache, ctr ucan.Container) bool {
 	if ctr == nil || len(ctr.Delegations()) == 0 {
 		return true
 	}
-	if !store.Add(ctr.Delegations()...) {
-		return false
-	}
-
-	// A leaf is complete when a chain from its audience (this instance)
-	// back to its subject's root, through the leaf's own issuer, exists in
-	// the cache. Any chain is not enough: the tenant's longer-lived cleanup
-	// delegations arrive complete, and would leave the access key's chain
-	// for the same command, which the fast path needs, unfetched. Powerline
-	// leaves (undefined subject) can't anchor a chain lookup; skip them here —
-	// the retrieval path resolves them against a concrete space, and the
-	// bucket-info fetch below covers the missing intermediates either way.
-	incomplete := false
-	for _, leaf := range ctr.Delegations() {
-		if !leaf.Subject().Defined() {
-			continue
-		}
-		chain, _, err := store.ProofChainVia(ctx, leaf.Audience(), leaf.Command(), leaf.Subject(), leaf.Issuer())
-		if err != nil || len(chain) == 0 {
-			incomplete = true
-			break
-		}
-	}
-	if !incomplete {
-		return true
-	}
-
-	buckets := requestBuckets(req)
-	if len(buckets) == 0 {
-		s.logger.Warn("hilt/iam: incomplete proof chain and no bucket in request URL",
-			zap.String("url", req.URL))
-		return true
-	}
-	for _, bucketName := range buckets {
-		_, infoCtr, err := s.authorizer.BucketInfo(ctx, bucketName, keyDID)
-		if err != nil {
-			s.logger.Warn("hilt/iam: bucket info fetch for proof chain failed",
-				zap.String("bucket", bucketName), zap.Error(err))
-			continue
-		}
-		if infoCtr != nil && !store.Add(infoCtr.Delegations()...) {
-			return false
-		}
-	}
-	return true
-}
-
-// requestBuckets names the buckets a request acts on, in the order Hilt
-// authorizes them: the addressed bucket, then a copy's source when it is a
-// different bucket. A request Hilt cannot classify falls back to the
-// path-style bucket alone; empty for bucket-less requests (ListBuckets).
-func requestBuckets(req s3.Request) []string {
-	_, reqs, err := hiltauth.RequirementsFor(req)
-	if err != nil || len(reqs) == 0 {
-		if b := bucketFromURL(req.URL); b != "" {
-			return []string{b}
-		}
-		return nil
-	}
-	var names []string
-	for _, r := range reqs {
-		if r.Bucket != "" && !slices.Contains(names, r.Bucket) {
-			names = append(names, r.Bucket)
-		}
-	}
-	return names
-}
-
-// bucketFromURL extracts the bucket name from a path-style request URL
-// (ingot serves path-style only). Empty for root-level requests like
-// ListBuckets.
-func bucketFromURL(rawURL string) string {
-	path := rawURL
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
-	path = strings.TrimPrefix(path, "/")
-	if i := strings.IndexByte(path, '/'); i >= 0 {
-		path = path[:i]
-	}
-	return path
+	return store.Add(ctr.Delegations()...)
 }
 
 // sigV4Key picks the sigv4 derived signing key for the access key from an
