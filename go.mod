@@ -14,7 +14,7 @@ require (
 	github.com/exaring/otelpgx v0.13.0
 	github.com/fil-forge/hilt v0.0.1-0.20261127120533-4e5c40e05163
 	github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e
-	github.com/fil-forge/libforge v0.0.0-20261126181628-349853c4bda2
+	github.com/fil-forge/libforge v0.0.0-20261127141527-27569dc193f6
 	github.com/fil-forge/smelt v0.0.0-20261123163211-a0554b227952
 	github.com/fil-forge/swarf v0.0.1-0.20261110122649-1097d7d2f5aa
 	github.com/fil-forge/ucantone v0.0.0-20261123131543-0ef2b25abb66
