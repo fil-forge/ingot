@@ -13,7 +13,7 @@ import (
 
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
+	"github.com/fil-forge/libforge/taskrunner/taskrunnertest"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
 )

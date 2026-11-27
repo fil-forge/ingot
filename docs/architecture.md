@@ -1103,11 +1103,11 @@ goes with the last intent for it.
 
 ### Task queue tables
 
-The task runner ([`taskrunner`](../taskrunner/README.md)) creates its own tables in the `ingot` schema
+The task runner ([libforge's `taskrunner`](https://github.com/fil-forge/libforge/blob/main/taskrunner/README.md)) creates its own tables in the `ingot` schema
 at startup (`Runner.Migrate`, run after the goose migrations), two per queue. `<q>` is the queue's
 name with `-` as `_`: `queue_multipart_upload`, `queue_multipart_upload_shard`, `queue_bucket`,
 `queue_space_upload`, `queue_space_shard` and `queue_shard`. `ingot.taskrunner_versions (queue text
-PRIMARY KEY, version integer NOT NULL)` records how many of `taskrunner/schema.go`'s steps each
+PRIMARY KEY, version integer NOT NULL)` records how many of the runner's schema steps each
 queue's tables have had. Both tables churn, so they are stored with `fillfactor = 80` and an
 autovacuum that runs once 1% of rows are dead.
 

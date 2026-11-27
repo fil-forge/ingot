@@ -22,9 +22,9 @@ import (
 	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/taskrunner"
-	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 	"github.com/fil-forge/ingot/uploader"
+	"github.com/fil-forge/libforge/taskrunner"
+	"github.com/fil-forge/libforge/taskrunner/taskrunnertest"
 )
 
 // cancelQueuedAccepts cancels the accept UploadPart queued for uploadID, so

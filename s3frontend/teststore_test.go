@@ -24,8 +24,8 @@ import (
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/taskrunner"
-	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
+	"github.com/fil-forge/libforge/taskrunner"
+	"github.com/fil-forge/libforge/taskrunner/taskrunnertest"
 )
 
 // testStore is what a test backend runs on: the Postgres registry in a
@@ -374,7 +374,7 @@ func (s *testStore) ReleasingDigests(ctx context.Context, space did.DID, digests
 	for i, d := range digests {
 		subjects[i] = spaceshardqueue.Subject(space, d)
 	}
-	pending, err := s.tasks.Pending(ctx, spaceshardqueue.Name, subjects, spaceshardqueue.ReleaseAction)
+	pending, err := s.tasks.Pending(ctx, spaceshardqueue.Name, subjects, taskrunner.WithActions(spaceshardqueue.ReleaseAction))
 	if err != nil {
 		return nil, err
 	}
