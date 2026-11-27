@@ -454,6 +454,10 @@ func mapAuthError(err error) (error, bool) {
 			HTTPStatusCode: http.StatusBadRequest,
 		}, true
 	case hiltauth.TenantDisabledErrorName,
+		// A write-locked tenant asking for what it has lost: an upload, a
+		// bucket creation or a configuration change. Without this case the
+		// refusal falls through to 500-class, which every SDK retries.
+		hiltauth.TenantWriteLockedErrorName,
 		hiltauth.IssuerForbiddenErrorName,
 		hiltauth.RegionNotServedErrorName,
 		hiltauth.OperationNotPermittedErrorName,
