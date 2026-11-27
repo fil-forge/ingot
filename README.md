@@ -474,17 +474,20 @@ partition (per-group expected-pass and known-fail tables of versitygw cases).
 CI runs it, split into `make itest-group` groups, after unit tests pass. See
 `itest/README.md`.
 
-## Deploying to the dev node
+## Deploying to the staging node
 
 Every merge to `main` publishes `ghcr.io/fil-forge/ingot:main` and dispatches the digest of the
 **prod** image to
 [infra-nodes](https://github.com/fil-forge/infra-nodes/blob/main/.github/workflows/bump-deployed-image.yml).
-That workflow rewrites the pin the FilOne Appliance dev node runs and opens a pull request with
-auto-merge armed. Merging queues the image; the node picks it up on its next reconcile pass, waits
-for a safe proving window, and then restarts.
+That workflow rewrites the pin the FilOne Appliance staging node runs and opens a pull request
+with auto-merge armed. Merging queues the image; the node picks it up on its next reconcile pass,
+waits for a safe proving window, and then restarts.
 
-The `dev` matrix leg dispatches nothing. It carries delve and a debug build, and the node pins the
-prod image.
+Prod nodes are promoted by hand: infra-nodes keeps a pull request open for each prod node that
+copies staging's pins to it, and a person merges it to upgrade that node.
+
+The `dev` matrix leg dispatches nothing. It builds the delve-equipped debug image, and the staging
+node pins the prod image.
 
 The dispatch needs two repository credentials: the Actions variable `FORGE_BOT_APP_ID` and the
 Actions secret `FORGE_BOT_PRIVATE_KEY`, which mint a token scoped to `infra-nodes` alone. Without
