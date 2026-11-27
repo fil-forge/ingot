@@ -65,6 +65,11 @@ type ServerConfig struct {
 	// means releases are due immediately.
 	ReleaseGrace time.Duration
 
+	// UsageReportInterval is how often usage counts are reported to the auth
+	// service. Config.ServerConfig() applies the 10m default; zero here
+	// takes it too.
+	UsageReportInterval time.Duration
+
 	// LocalBlobMaxBytes is the byte budget for the cache, writes in progress
 	// included, enforced by the local blob sweeper; zero means no budget.
 	// CacheTTL is how long a blob stays cached after it was cached or last

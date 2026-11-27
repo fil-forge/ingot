@@ -121,6 +121,18 @@ type QueueOptions struct {
 	FailedRetention time.Duration
 }
 
+// TasksTable returns the quoted name of queueName's tasks table in schema,
+// for a reader outside the runner, such as a measurement of the queue. The
+// columns are the runner's own and change only by a migration step.
+func TasksTable(schema, queueName string) string {
+	return pgx.Identifier{schema, tableStem(queueName) + "_tasks"}.Sanitize()
+}
+
+// tableStem is the stem of queueName's table and index names.
+func tableStem(queueName string) string {
+	return strings.ReplaceAll(queueName, "-", "_")
+}
+
 // Options configures a Runner.
 type Options struct {
 	// Schema is the Postgres schema the queue tables are created in.
@@ -130,7 +142,7 @@ type Options struct {
 	Queues []QueueOptions
 	// LeaseTTL is how long a subject's lease lasts without renewal. A crashed
 	// process's tasks are resumed once it passes. Defaults to 30 seconds, and
-	// must be at least a millisecond.
+	// must be at least a millisecond; a fraction of one is dropped.
 	LeaseTTL time.Duration
 	// PollInterval is how often each queue is checked for due tasks, and the
 	// longest a waiter goes between checks of a task in another process.
@@ -278,10 +290,12 @@ func New(db DB, opts Options) (*Runner, error) {
 	if opts.LeaseTTL == 0 {
 		opts.LeaseTTL = 30 * time.Second
 	}
-	// Leases are stored to the millisecond.
+	// Leases are stored to the millisecond, so the TTL is cut to one: the
+	// runner then times a lease by the period the database gives it.
 	if opts.LeaseTTL < time.Millisecond {
 		return nil, fmt.Errorf("task runner: lease TTL %v is under a millisecond", opts.LeaseTTL)
 	}
+	opts.LeaseTTL = opts.LeaseTTL.Truncate(time.Millisecond)
 	if opts.PollInterval <= 0 {
 		opts.PollInterval = time.Second
 	}
@@ -330,12 +344,12 @@ func New(db DB, opts Options) (*Runner, error) {
 		if qo.Retention < 0 || qo.FailedRetention < 0 {
 			return nil, fmt.Errorf("task runner: queue %q has a negative retention", qo.Name)
 		}
-		table := strings.ReplaceAll(qo.Name, "-", "_")
+		table := tableStem(qo.Name)
 		q := &queue{
 			name:            qo.Name,
 			idx:             i,
 			table:           table,
-			tasks:           pgx.Identifier{opts.Schema, table + "_tasks"}.Sanitize(),
+			tasks:           TasksTable(opts.Schema, qo.Name),
 			leases:          pgx.Identifier{opts.Schema, table + "_leases"}.Sanitize(),
 			workers:         qo.Workers,
 			retention:       cmp.Or(qo.Retention, 24*time.Hour),
@@ -436,6 +450,7 @@ func (r *Runner) Start(ctx context.Context) error {
 }
 
 // Stop cancels the workers and the Run calls in progress, and waits for them.
+// A lease take one has in flight runs on for up to the lease TTL first.
 // A Stop that returns early because ctx ended leaves the shutdown running: a
 // later Stop waits for it, and Start fails until it has finished.
 // A task interrupted by Stop stays pending and is resumed by the next process
@@ -770,9 +785,12 @@ func (r *Runner) submit(ctx context.Context, db execer, s Spec) (TaskID, error) 
 // one.
 //
 // If ctx ends first, Run returns ctx's error and the task stays submitted,
-// for a worker to run later unless its Expires passes first. Give a sync task
-// an Expires, or a ctx with a deadline, whenever a caller that has given up
-// must not see the task take effect later.
+// for a worker to run later unless its Expires passes first. A lease take in
+// flight when ctx ends runs on for up to the lease TTL first, so that a
+// lease it took is handed back rather than left to block the subject until
+// it expires; a take not finished by then can still leave one to expire.
+// Give a sync task an Expires, or a ctx with a deadline, whenever a caller
+// that has given up must not see the task take effect later.
 func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 	ctx, leave, err := r.enterInline(ctx)
 	if err != nil {
@@ -847,6 +865,13 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 		h, task, stop, err := r.takeTurn(ctx, q, s.Subject, age, seq, id)
 		if err != nil {
 			return nil, err
+		}
+		if h != nil && ctx.Err() != nil {
+			// The take landed after the caller gave up: hand the lease back
+			// rather than start the task for no one.
+			h.turn = turn
+			r.endHold(ctx, h, nil)
+			return nil, ctx.Err()
 		}
 		if h != nil || stop != nil {
 			d := drained{stop: stop}

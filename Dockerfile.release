@@ -1,16 +1,17 @@
 # Runtime image for goreleaser release builds (see .goreleaser.yaml `dockers`).
 #
 # Unlike the main Dockerfile, this does NOT compile: goreleaser cross-compiles
-# the per-arch `ingot` binary and drops it into the build context, so this just
-# packages it. Mirrors the main Dockerfile's `prod` target — debian slim +
-# ca-certificates + curl (smelt's healthcheck hits /health with curl) — and
-# keeps the bare ENTRYPOINT so the compose `command:` supplies `serve …`.
+# the per-arch `ingot` and `ingot-preload` binaries and drops them into the
+# build context, so this just packages them. Mirrors the main Dockerfile's
+# `prod` target — debian slim + ca-certificates + curl (smelt's healthcheck
+# hits /health with curl) — and keeps the bare ENTRYPOINT so the compose
+# `command:` supplies `serve …`.
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     && rm -rf /var/lib/apt/lists/*
-COPY ingot /usr/bin/ingot
+COPY ingot ingot-preload /usr/bin/
 # S3 listener: :8080 by default, the port every Forge service image exposes.
 # smelt overrides addr to :80 in the mounted config so did:web:ingot resolves
 # to http://ingot/.well-known/did.json, and maps that port in compose.

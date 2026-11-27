@@ -5,63 +5,32 @@ import (
 	"fmt"
 	"time"
 
-	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/container"
-	"github.com/ipfs/go-cid"
-
-	"github.com/fil-forge/ingot/forgeclient"
 )
 
-// UploadRegistrar keeps the upload service's content-entry list for a space in
-// step with the bucket catalog, one entry per committed object version. The
-// entry is what sprue counts to report the space's object count; the bytes are
-// accounted separately, per blob, by BodyUploader and BlobRemover.
-//
-// A version's root is its manifest CID, so the count follows S3: a new version
-// registers, a retired one retracts, and a bucket that retains noncurrent
-// versions keeps counting them. Delete markers are versions too and count the
-// same way, which is what AWS reports.
-//
-// The calls are made by the queue-space-upload tasks, off the request path,
-// from changes the write path queued. Each change carries its own authority —
-// captured with CaptureAuthority while the request that committed the version
-// was still in hand — because the task has no request to borrow from and may
-// be sending for a space that will never be written again.
-type UploadRegistrar interface {
+// AuthorityCapturer captures the authority a task queued by a request runs
+// with later, such as a blob's release. The task has no request to borrow
+// from and may act on a space that will never be written again, so it
+// carries its own, captured while the request was still in hand.
+type AuthorityCapturer interface {
 	// CaptureAuthority encodes the delegation chain authorizing cmd on space
-	// into the container a queued registration carries.
+	// into the container a queued task carries.
 	CaptureAuthority(ctx context.Context, space did.DID, cmd ucan.Command) ([]byte, error)
-	// PrepareAuthority returns the authority to send a queued change with,
+	// PrepareAuthority returns the authority to run a queued task with,
 	// renewing the stored chain when it has run out or is about to. It reports
 	// whether the chain it returns is a new one, so the caller can persist it.
 	//
 	// The stored chain has room to spare: hilt expires its delegation to the
 	// gateway at the next UTC midnight plus an async overhang, so even a
-	// change queued at 23:59 has hours to be drained in. Renewal is for the
+	// task queued at 23:59 has hours to run in. Renewal is for the
 	// queue that outlasts that, which is the upload service being away for
 	// longer than a night. It comes from the space's live authority, which a
 	// body upload to that space leaves behind for an hour if its store is
 	// borrowable, so it rescues a space still in use. A space that has gone
 	// quiet has none, and the error says so.
 	PrepareAuthority(ctx context.Context, space did.DID, cmd ucan.Command, stored []byte) ([]byte, bool, error)
-	// RegisterUploads records each change as a content entry in one round
-	// trip, reporting the outcomes in the order given: a nil entry means the
-	// upload service took the change. The returned error is a transport
-	// failure, where nothing was answered.
-	RegisterUploads(ctx context.Context, changes []QueuedUpload) ([]error, error)
-	// RetractUploads drops each change's content entry, with the same
-	// reporting as RegisterUploads.
-	RetractUploads(ctx context.Context, changes []QueuedUpload) ([]error, error)
-}
-
-// QueuedUpload is one queued content-entry change: the root to register or
-// retract in a space, and the encoded authority the queued row carries.
-type QueuedUpload struct {
-	Space  did.DID
-	Root   cid.Cid
-	Proofs []byte
 }
 
 // CaptureAuthority resolves the proof chain for cmd on space and encodes it.
@@ -71,16 +40,16 @@ type QueuedUpload struct {
 func (u *Forge) CaptureAuthority(ctx context.Context, space did.DID, cmd ucan.Command) ([]byte, error) {
 	// An empty chain is not an error to ProofChain, but it is one here
 	// (authorityFor refuses it): the invocation would go out proofless and be
-	// refused, and a queued change carrying it can never be sent by anybody.
+	// refused, and a queued task carrying it can never run for anybody.
 	// Failing now puts the problem where it can be read — the request holds no
-	// chain for this command on this space — instead of queueing a row that
+	// chain for this command on this space — instead of queueing a task that
 	// fails forever and takes a bucket delete with it.
 	_, proofs, err := u.authorityFor(ctx, space, cmd)
 	if err != nil {
 		return nil, err
 	}
-	// Gzipped raw: the chain is stored once per object version and outlives
-	// the request that produced it.
+	// Gzipped raw: the chain is stored with each task that carries it and
+	// outlives the request that produced it.
 	encoded, err := container.Encode(container.RawGzip, container.New(container.WithDelegations(proofs...)))
 	if err != nil {
 		return nil, fmt.Errorf("uploader: encoding proof chain: %w", err)
@@ -132,64 +101,4 @@ func authorityUsable(proofs []byte, at time.Time) bool {
 	return true
 }
 
-// proofStore rebuilds a proof store from a queued row's container.
-func proofStoreFrom(proofs []byte) (ucanlib.ProofStore, error) {
-	ct, err := container.Decode(proofs)
-	if err != nil {
-		return nil, fmt.Errorf("uploader: decoding queued proof chain: %w", err)
-	}
-	return ucanlib.NewContainerProofStore(ct), nil
-}
-
-// RegisterUploads records the changes as content entries via /upload/add on
-// the upload service, in one round trip per MaxUploadBatch. Idempotent: sprue
-// upserts by root and counts only the first add, so a retried row cannot
-// double count.
-func (u *Forge) RegisterUploads(ctx context.Context, changes []QueuedUpload) ([]error, error) {
-	return u.uploadChanges(ctx, changes, u.client.UploadAddBatch)
-}
-
-// RetractUploads drops the changes' content entries via /upload/remove. It
-// does not touch the blobs those roots covered — the reference index releases
-// those per digest, since a blob can be claimed by more than one version.
-// Idempotent.
-func (u *Forge) RetractUploads(ctx context.Context, changes []QueuedUpload) ([]error, error) {
-	return u.uploadChanges(ctx, changes, u.client.UploadRemoveBatch)
-}
-
-func (u *Forge) uploadChanges(
-	ctx context.Context,
-	changes []QueuedUpload,
-	send func(context.Context, []forgeclient.UploadChange) ([]error, error),
-) ([]error, error) {
-	if len(changes) == 0 {
-		return nil, nil
-	}
-	out := make([]error, len(changes))
-	batch := make([]forgeclient.UploadChange, 0, len(changes))
-	// idx maps a batch position back to the caller's, since a change whose
-	// stored authority will not decode never reaches the wire.
-	idx := make([]int, 0, len(changes))
-	for i, ch := range changes {
-		store, err := proofStoreFrom(ch.Proofs)
-		if err != nil {
-			out[i] = err
-			continue
-		}
-		batch = append(batch, forgeclient.UploadChange{Space: ch.Space, Root: ch.Root, Proofs: store})
-		idx = append(idx, i)
-	}
-	if len(batch) == 0 {
-		return out, nil
-	}
-	results, err := send(ctx, batch)
-	if err != nil {
-		return out, err
-	}
-	for j, res := range results {
-		out[idx[j]] = res
-	}
-	return out, nil
-}
-
-var _ UploadRegistrar = (*Forge)(nil)
+var _ AuthorityCapturer = (*Forge)(nil)

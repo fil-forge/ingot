@@ -42,6 +42,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
+	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/authority"
@@ -49,12 +50,12 @@ import (
 	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
-	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/uploader"
+	"github.com/fil-forge/ingot/usage"
 )
 
 // Backend implements versitygw's backend.Backend directly over the
@@ -118,9 +119,17 @@ type Backend struct {
 	// not registered).
 	multipartMetrics multipartMetrics
 	multipartGauges  metric.Registration
+	// transferMetrics counts object body bytes sent and received.
+	transferMetrics transferMetrics
+	// usage counts the object body bytes GetObject sends, by space and hour,
+	// for the report to the auth service. Nil counts nothing.
+	usage *usage.Counter
 	// journalGauges is the registration of the catalog journal gauges (nil
 	// when not registered).
 	journalGauges metric.Registration
+	// bucketGauges is the registration of the bucket and object total gauges
+	// (nil when not registered).
+	bucketGauges metric.Registration
 	// catalogUsage reports each bucket's catalog storage on Forge (nil: no
 	// catalog usage gauges). catalogSnapshot is its latest report, which the
 	// gauges registered as catalogGauges read.
@@ -184,10 +193,9 @@ type Deps struct {
 	Deferred uploader.DeferredBodyUploader
 	Parks    registry.ParkStore
 	Remover  uploader.BlobRemover
-	// Registrar keeps the upload service's content-entry list in step with the
-	// catalog: one entry per committed object version, which is what the
-	// service counts to report the space's object count.
-	Registrar uploader.UploadRegistrar
+	// Capturer captures the authority the tasks a request queues run with
+	// later, such as a blob's release.
+	Capturer uploader.AuthorityCapturer
 
 	// Streaming uploads each body blob as the body arrives, allocating it by
 	// size and hash function before its digest is known. Required.
@@ -243,6 +251,9 @@ type Deps struct {
 	// until a host installs one.
 	MeterProvider metric.MeterProvider
 
+	// Usage, when set, counts the object body bytes GetObject sends to
+	// clients, by space and hour, for the usage report to the auth service.
+	Usage *usage.Counter
 	// CatalogUsage, when set, is what the catalog usage gauges report each
 	// bucket's catalog storage on Forge from, refreshed by
 	// RefreshCatalogUsage. Typically the same instance as Registry.
@@ -320,7 +331,7 @@ func New(d Deps) (*Backend, error) {
 		cache:      d.Cache,
 		deferred:   d.Deferred,
 		streaming:  d.Streaming,
-		proofs:     authority.New(d.Registrar),
+		proofs:     authority.New(d.Capturer),
 		encParams:  d.EncParams,
 		regionKeys: d.RegionKeys,
 		tenantKeys: d.TenantKeys,
@@ -334,6 +345,7 @@ func New(d Deps) (*Backend, error) {
 		allowNoneEncryption: d.AllowNoneEncryption,
 		cors:                corsDoc,
 		catalogUsage:        d.CatalogUsage,
+		usage:               d.Usage,
 	}
 	mp := d.MeterProvider
 	if mp == nil {
@@ -342,12 +354,11 @@ func New(d Deps) (*Backend, error) {
 	b.localBlobMetrics, b.localBlobGauges = newLocalBlobMetrics(mp, b, logger)
 	b.multipartMetrics, b.multipartGauges = newMultipartMetrics(mp, b, logger)
 	b.journalGauges = newJournalGauges(mp, b, logger)
+	b.bucketGauges = newBucketGauges(mp, b, logger)
 	b.catalogGauges = newCatalogUsageGauges(mp, b, logger)
-	var counts *spaceuploadqueue.Queue
+	b.transferMetrics = newTransferMetrics(mp, logger)
 	var err error
-	if b.shards, err = shardqueue.New(d.Tasks, shardqueue.Deps{Cache: d.Cache, TTL: d.CacheTTL, Removed: b.cacheRemoved, Logger: logger}); err == nil {
-		counts, err = spaceuploadqueue.New(d.Tasks, spaceuploadqueue.Deps{Registrar: d.Registrar, Authority: b.proofs, Logger: logger})
-	}
+	b.shards, err = shardqueue.New(d.Tasks, shardqueue.Deps{Cache: d.Cache, TTL: d.CacheTTL, Removed: b.cacheRemoved, Logger: logger})
 	if err == nil {
 		bd := spaceshardqueue.Deps{
 			Intents:   d.Intents,
@@ -368,6 +379,7 @@ func New(d Deps) (*Backend, error) {
 		}
 		b.blobs, err = spaceshardqueue.New(d.Tasks, bd)
 	}
+	var blobList msbucket.BlobListSizes
 	if err == nil {
 		bd := bucketqueue.Deps{
 			Registry:     d.Registry,
@@ -379,13 +391,13 @@ func New(d Deps) (*Backend, error) {
 			Buckets:      d.Authority,
 			Authority:    b.proofs,
 			Blobs:        b.blobs,
-			Counts:       counts,
 			ReleaseGrace: d.ReleaseGrace,
 			Logger:       logger,
 		}
 		if d.tuneBuckets != nil {
 			d.tuneBuckets(&bd)
 		}
+		blobList = bd.BlobList
 		b.buckets, err = bucketqueue.New(d.Tasks, bd)
 	}
 	if err == nil {
@@ -401,7 +413,7 @@ func New(d Deps) (*Backend, error) {
 			Capture:          b.commitAuthority,
 			ReleaseGrace:     d.ReleaseGrace,
 			SessionTTL:       d.MultipartSessionTTL,
-			Limits:           &multipartqueue.Limits{RehashBudget: d.RehashBudget},
+			Limits:           &multipartqueue.Limits{RehashBudget: d.RehashBudget, MaxBodyBlobs: blobList.MaxBlobs()},
 			CompleteDeferred: b.multipartMetrics.completeDeferred,
 			Logger:           logger,
 		}

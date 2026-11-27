@@ -6,7 +6,7 @@ The package imports nothing else from Ingot. The design is in the [task runner R
 
 ## Setting up
 
-Queues are listed in order. A task may run sync children only in queues later in the list. Each queue gets a tasks table and a leases table in the schema given.
+Queues are listed in order. A task may run sync children only in queues later in the list. Each queue gets a tasks table and a leases table in the schema given; `TasksTable` names a queue's tasks table, for a reader outside the runner.
 
 ```go
 r, err := taskrunner.New(pool, taskrunner.Options{
@@ -114,7 +114,7 @@ if errors.Is(err, taskrunner.ErrExpired) {
 }
 ```
 
-A sync task cannot have a `NotBefore`, and a batching action cannot run sync. `Expires` defaults to `ctx`'s deadline. If `ctx` ends first, `Run` returns the context's error and the task stays recorded for a worker to finish, unless its `Expires` passes first. Give a sync task an `Expires`, or a `ctx` with a deadline, whenever a caller that has given up must not see the task take effect later.
+A sync task cannot have a `NotBefore`, and a batching action cannot run sync. `Expires` defaults to `ctx`'s deadline. If `ctx` ends first, `Run` returns the context's error and the task stays recorded for a worker to finish, unless its `Expires` passes first. A lease take in flight when `ctx` ends runs on for up to the lease TTL first, so that a lease it took is handed back rather than left to block the subject until it expires; a take not finished by then can still leave one to expire. Give a sync task an `Expires`, or a `ctx` with a deadline, whenever a caller that has given up must not see the task take effect later.
 
 ### Waiting
 
@@ -326,6 +326,10 @@ A handler can do the same through `ex.ListFailed` and `ex.Resubmit`, so the repl
 ## Leases
 
 A worker or sync caller holds its subject's lease while it runs tasks there. The runner renews every lease it holds three times per `Options.LeaseTTL`, 30 seconds by default. A lease left unrenewed past its TTL, because its process crashed, stalled or lost its database connection, is taken over by the next consumer to ask, which runs the interrupted task again. The old holder's commit then fails, so it writes nothing, and it starts no further sync child once renewal has found the lease gone.
+
+The old holder's handlers stop as well. A handler's context ends when renewal finds a lease of its tree taken over, and when a lease comes within a sixth of the TTL (5 seconds by default) of expiring without having been extended, as when renewal cannot reach the database. The runner times each lease on its own clock from when it sent the statement that last extended it, so the handler stops before the lease can expire in the database whatever the two clocks read. A run stopped this way is discarded whatever its handler returned, and records nothing: no success, no failure and no retry.
+
+A handler's effects outside the database are not undone when its commit fails, so pass the handler's context to every network call. A request already sent when the lease is lost still arrives. The margin gives it time to do so before another consumer can take the lease.
 
 A worker makes at most `Options.DrainLimit` handler runs on one subject, 100 by default and a batch counting as one, before it releases the lease. Each queue is checked for due subjects every `Options.PollInterval`, 1 second by default, and at once when this process submits a task to it or a worker frees up with more due.
 

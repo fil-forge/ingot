@@ -5,37 +5,23 @@ package itest
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/fil-forge/smelt/pkg/stack"
 
 	ingottest "github.com/fil-forge/ingot/testing"
 )
 
-// TestForgeObjectCount proves the object count FilOne bills on: every
-// committed object version registers a content entry with the upload service,
-// and a retired one retracts, so the count sprue derives — /upload/add-total
-// minus /upload/remove-total on the bucket's space — tracks the bucket.
-//
-// Needs two services ahead of their published images: an upload service that
-// records the upload metrics and carries the upload_diff table, and a hilt
-// that grants /upload/remove for s3:PutObject. The test skips itself against
-// an upload service without the table (see requireUploadMetrics), so it stays
-// green on the published images and starts running on its own once they carry
-// the support — no gate to remember to remove. To run it now, point the stack
-// at local builds:
-//
-//	INGOT_ITEST_UPLOAD_IMAGE=ghcr.io/fil-forge/upload-service:local \
-//	INGOT_ITEST_HILT_IMAGE=ghcr.io/fil-forge/hilt:local \
-//	  go test -tags itest ./itest -run TestForgeObjectCount -v -timeout 900s
+// TestForgeObjectCount proves the object count the gateway reports for
+// billing: a bucket gains an object with every object version it commits and
+// loses one with every version it discards, in the commit itself, and the
+// hour's usage count under the bucket's space holds the totals for the report
+// to the auth service. Nothing is registered with the upload service for it.
 func TestForgeObjectCount(t *testing.T) {
 	ctx := t.Context()
 
 	s, ingotEndpoint := forgeStack(t)
-	requireUploadMetrics(t, ctx, s)
 	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, "objcount")
 	cfg := forgeConfig(ingotEndpoint, accessKey, secretKey)
 
@@ -45,102 +31,74 @@ func TestForgeObjectCount(t *testing.T) {
 	}
 	space := bucketSpace(t, ctx, s, bucket)
 
-	// One PUT, one object. The write queues the change and a queue worker
-	// sends it, so every count below is awaited rather than read once.
+	// One PUT, one object. The count moves with the commit, so it is read
+	// as soon as the write returns.
 	if err := ingottest.PutBytes(ctx, cfg, bucket, "a", patternBytes(4<<10)); err != nil {
 		t.Fatalf("put a: %v", err)
 	}
-	awaitObjectCount(t, ctx, s, space, 1, "after one PUT")
+	wantBucketObjects(t, ctx, s, bucket, "1 0", "after one PUT")
 
 	// A second key adds one more.
 	if err := ingottest.PutBytes(ctx, cfg, bucket, "b", patternBytes(4<<10)); err != nil {
 		t.Fatalf("put b: %v", err)
 	}
-	awaitObjectCount(t, ctx, s, space, 2, "after two PUTs")
+	wantBucketObjects(t, ctx, s, bucket, "2 0", "after two PUTs")
 
 	// Overwriting a key in an unversioned bucket discards the prior version,
-	// so the count holds: the new root registers and the old one retracts.
+	// so the bucket gains one and loses one, and holds two.
 	if err := ingottest.PutBytes(ctx, cfg, bucket, "a", patternBytes(8<<10)); err != nil {
 		t.Fatalf("overwrite a: %v", err)
 	}
-	// A count that climbs to 3 and stays there is the authorization half
-	// rather than ingot: a put that supersedes retracts the replaced version
-	// with /upload/remove, which hilt grants through s3:PutObject. Without the
-	// grant the retraction is refused and requeued forever.
-	awaitObjectCount(t, ctx, s, space, 2, "after overwriting a key "+
-		"(a count stuck at 3 means hilt is not granting /upload/remove for s3:PutObject)")
+	wantBucketObjects(t, ctx, s, bucket, "3 1", "after overwriting a key")
 
-	// Deleting returns the count.
+	// Deleting takes one away.
 	if err := ingottest.DeleteObject(ctx, cfg, bucket, "a"); err != nil {
 		t.Fatalf("delete a: %v", err)
 	}
-	awaitObjectCount(t, ctx, s, space, 1, "after a delete")
+	wantBucketObjects(t, ctx, s, bucket, "3 2", "after a delete")
 
-	// The diff log carries the same history with timestamps, which is what a
-	// windowed object-count series is reconstructed from. Three adds (a, b, a
-	// again) and two removes (the superseded a, the deleted a) net to 1.
-	if got := spaceUploadDiffSum(t, ctx, s, space); got != 1 {
-		t.Fatalf("upload_diff deltas sum to %d, want 1", got)
+	// The usage count the reporter sends holds the same totals under the
+	// bucket's space, in the latest hour it changed.
+	if got := spaceObjectTotals(t, ctx, s, space); got != "3 2" {
+		t.Fatalf("the space's latest usage count is %q, want \"3 2\"", got)
 	}
 
-	// Nothing is left owing: the queue drained rather than stalling.
-	owing := fmt.Sprintf(`SELECT count(*) FROM ingot.queue_space_upload_tasks
-		WHERE subject = '%s' AND state IN ('pending', 'failed') AND action <> 'flush'`, space)
-	if left := ingotSQL(t, ctx, s, owing); left != "0" {
-		t.Fatalf("the space still owes %s object-count changes; the queue is not draining", left)
+	// The upload service was told of no object.
+	if n := sprueSQL(t, ctx, s, fmt.Sprintf("SELECT count(*) FROM upload WHERE space = '%s'", space)); n != "0" {
+		t.Fatalf("the bucket's space holds %s content entries in the upload service, want none", n)
 	}
 
-	// Emptied and deleted back to back — what a script does. The retraction
-	// "b" owes may still be queued, and nothing would send it once the space
-	// is gone, so the delete sends it first or the upload service keeps that
-	// root and its count for good.
+	// Emptied and deleted back to back — what a script does. The bucket's
+	// row goes, and its space's usage count stays for the reporter, saying
+	// the bucket ended empty.
 	if err := ingottest.DeleteObject(ctx, cfg, bucket, "b"); err != nil {
 		t.Fatalf("delete b: %v", err)
 	}
 	if err := ingottest.DeleteBucket(ctx, cfg, bucket); err != nil {
 		t.Fatalf("delete bucket: %v", err)
 	}
-	// The space holds no content entries: every root it registered was
-	// retracted before it went.
-	if n := sprueSQL(t, ctx, s, fmt.Sprintf("SELECT count(*) FROM upload WHERE space = '%s'", space)); n != "0" {
-		t.Fatalf("the deleted bucket's space still holds %s content entries in the upload service", n)
-	}
-	if got := spaceObjectCount(t, ctx, s, space); got != 0 {
-		t.Fatalf("the deleted bucket's space reports %d objects, want 0", got)
-	}
-	if left := ingotSQL(t, ctx, s, owing); left != "0" {
-		t.Fatalf("the deleted bucket's space still owes %s object-count changes", left)
+	if got := spaceObjectTotals(t, ctx, s, space); got != "3 3" {
+		t.Fatalf("the deleted bucket's latest usage count is %q, want \"3 3\"", got)
 	}
 }
 
-// awaitObjectCount waits for the space's object count to reach want. Queue
-// workers send the changes off the request path, so the count trails the
-// write by a moment.
-func awaitObjectCount(t *testing.T, ctx context.Context, s *stack.Stack, space string, want int, stage string) {
+// wantBucketObjects asserts the objects the bucket has gained and lost, as
+// "gained lost".
+func wantBucketObjects(t *testing.T, ctx context.Context, s *stack.Stack, bucket, want, stage string) {
 	t.Helper()
-	deadline := time.Now().Add(90 * time.Second)
-	var got int
-	for time.Now().Before(deadline) {
-		got = spaceObjectCount(t, ctx, s, space)
-		if got == want {
-			return
-		}
-		time.Sleep(time.Second)
+	got := ingotSQL(t, ctx, s, fmt.Sprintf(
+		"SELECT objects_added || ' ' || objects_removed FROM ingot.buckets WHERE name = '%s'", bucket))
+	if got != want {
+		t.Fatalf("%s: the bucket has gained and lost %q objects, want %q", stage, got, want)
 	}
-	t.Fatalf("%s: object count settled at %d, want %d", stage, got, want)
 }
 
-// requireUploadMetrics skips the test unless the upload service records object
-// counts — probed by the presence of the upload_diff table, which arrives with
-// the metric counters in the same change. Probing the capability rather than
-// gating on the image override env vars means the test runs by itself once the
-// published image carries the support.
-func requireUploadMetrics(t *testing.T, ctx context.Context, s *stack.Stack) {
+// spaceObjectTotals returns the totals of the space's latest usage count, as
+// "gained lost".
+func spaceObjectTotals(t *testing.T, ctx context.Context, s *stack.Stack, space string) string {
 	t.Helper()
-	if sprueSQL(t, ctx, s, "SELECT to_regclass('public.upload_diff') IS NOT NULL") != "t" {
-		t.Skip("upload service does not record object counts (no upload_diff table); " +
-			"set INGOT_ITEST_UPLOAD_IMAGE to a build that does")
-	}
+	return ingotSQL(t, ctx, s, fmt.Sprintf(
+		"SELECT added || ' ' || removed FROM ingot.object_usage WHERE space = '%s' ORDER BY hour DESC LIMIT 1", space))
 }
 
 // sprueSQL runs one SQL statement against the upload service's Postgres and
@@ -155,7 +113,7 @@ func sprueSQL(t *testing.T, ctx context.Context, s *stack.Stack, q string) strin
 }
 
 // bucketSpace reads the DID of the space backing a bucket from ingot's own
-// registry — the subject every /upload/add for the bucket is issued against.
+// registry.
 func bucketSpace(t *testing.T, ctx context.Context, s *stack.Stack, bucket string) string {
 	t.Helper()
 	space := ingotSQL(t, ctx, s, fmt.Sprintf("SELECT space FROM ingot.buckets WHERE name = '%s'", bucket))
@@ -163,31 +121,4 @@ func bucketSpace(t *testing.T, ctx context.Context, s *stack.Stack, bucket strin
 		t.Fatalf("no space recorded for bucket %q", bucket)
 	}
 	return space
-}
-
-// spaceObjectCount is the count sprue reports for a space: the adds it has
-// counted less the removes, from the cumulative per-space metric counters.
-func spaceObjectCount(t *testing.T, ctx context.Context, s *stack.Stack, space string) int {
-	t.Helper()
-	q := fmt.Sprintf(`SELECT COALESCE(SUM(CASE WHEN name = '/upload/add-total' THEN value
-	                                           WHEN name = '/upload/remove-total' THEN -value
-	                                           ELSE 0 END), 0)
-	                  FROM space_metrics WHERE space = '%s'`, space)
-	n, err := strconv.Atoi(sprueSQL(t, ctx, s, q))
-	if err != nil {
-		t.Fatalf("parse object count: %v", err)
-	}
-	return n
-}
-
-// spaceUploadDiffSum is the same count derived the other way, by summing the
-// signed deltas of the append-only log a windowed series is built from.
-func spaceUploadDiffSum(t *testing.T, ctx context.Context, s *stack.Stack, space string) int {
-	t.Helper()
-	q := fmt.Sprintf("SELECT COALESCE(SUM(delta), 0) FROM upload_diff WHERE space = '%s'", space)
-	n, err := strconv.Atoi(sprueSQL(t, ctx, s, q))
-	if err != nil {
-		t.Fatalf("parse upload_diff sum: %v", err)
-	}
-	return n
 }

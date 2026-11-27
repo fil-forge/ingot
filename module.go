@@ -13,7 +13,10 @@
 //
 //   - *zap.Logger
 //   - *pgxpool.Pool          — ingot owns its schema and runs its own goose
-//     migrations against this pool at startup
+//     migrations against this pool at startup. ingot's stop hooks also write
+//     through the pool, so a host that closes the pool on stop should append
+//     that hook from the pool's own constructor: fx runs it after the stop
+//     hooks of everything built from the pool.
 //   - identity.Identity       — the agent (libforge identity); issuer of every
 //     outbound invocation (a did:key, or a did:web wrapping the key)
 //
@@ -72,7 +75,6 @@ import (
 	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
-	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/revocation"
@@ -80,6 +82,7 @@ import (
 	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/tokenstore"
 	"github.com/fil-forge/ingot/uploader"
+	"github.com/fil-forge/ingot/usage"
 	swarfclient "github.com/fil-forge/swarf/pkg/client"
 )
 
@@ -112,6 +115,7 @@ func Module(cfg config.Config) fx.Option {
 			provideTokenStore,
 			provideForgeClient,
 			NewAuthServiceClient,
+			provideUsageReporter,
 			provideUploader,
 			provideMigrationHook,
 			provideKeyProofs,
@@ -161,7 +165,7 @@ type serverParams struct {
 	Streaming       uploader.StreamingBodyUploader
 	Deferred        uploader.DeferredBodyUploader
 	Remover         uploader.BlobRemover
-	Registrar       uploader.UploadRegistrar
+	Capturer        uploader.AuthorityCapturer
 	Tasks           *taskrunner.Runner
 	BucketAuthority bucketauthority.BucketAuthority
 	Registry        registry.Registry
@@ -175,6 +179,10 @@ type serverParams struct {
 	// CatalogUsage feeds the catalog usage gauges; without it they are not
 	// reported (see ServerDeps.CatalogUsage).
 	CatalogUsage registry.CatalogUsageStore `optional:"true"`
+	// Usage and UsageReporter turn on usage reporting when both are
+	// provided (see ServerDeps.Usage).
+	Usage         registry.UsageStore `optional:"true"`
+	UsageReporter usage.Reporter      `optional:"true"`
 	// Identity is the agent identity (the host-provided libforge identity, the
 	// issuer of every outbound invocation); the listener serves its DID
 	// document at /.well-known/did.json. Required.
@@ -222,7 +230,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Deferred:        p.Deferred,
 				Remover:         p.Remover,
 				Streaming:       p.Streaming,
-				Registrar:       p.Registrar,
+				Capturer:        p.Capturer,
 				Tasks:           p.Tasks,
 				Authority:       p.BucketAuthority,
 				Registry:        p.Registry,
@@ -237,6 +245,8 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				TenantKeys:      p.TenantKeys,
 				Meta:            p.Meta,
 				CatalogUsage:    p.CatalogUsage,
+				Usage:           p.Usage,
+				UsageReporter:   p.UsageReporter,
 				Identity:        p.Identity,
 				IAM:             p.IAM,
 			})
@@ -324,6 +334,12 @@ func NewAuthServiceClient(cfg config.Config, id identity.Identity, logger *zap.L
 	proofs := ucanlib.NewContainerProofStore(ct)
 	return hiltclient.New(authServiceDID, *authServiceURL, id, hiltclient.WithBaseProofs(proofs), hiltclient.WithLogger(logger),
 		hiltclient.WithHTTPClient(tracing.NewHTTPClient()))
+}
+
+// provideUsageReporter gives the server the auth service client as the place
+// its usage counts are reported to (see ServerDeps.UsageReporter).
+func provideUsageReporter(c *hiltclient.Client) usage.Reporter {
+	return c
 }
 
 // provideRegionKeyProvider builds the configured region CEK wrap provider
@@ -496,6 +512,7 @@ type registryResult struct {
 	EncParams         registry.EncryptionParamsStore
 	RevocationCursors registry.RevocationCursorStore
 	CatalogUsage      registry.CatalogUsageStore
+	Usage             registry.UsageStore
 	Meta              logstore.Meta
 }
 
@@ -509,16 +526,12 @@ type registryResult struct {
 // hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool, tasks *taskrunner.Runner) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, Multipart: pg, Parks: pg, Claims: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, Multipart: pg, Parks: pg, Claims: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Usage: pg, Meta: pg}
 }
 
 // taskSchema is the Postgres schema the task queues' tables live in, beside
 // the rest of ingot's.
 const taskSchema = "ingot"
-
-// uploadRegistrationWorkers is how many spaces' object-count changes one
-// instance sends at once.
-const uploadRegistrationWorkers = 4
 
 // shardWorkers is how many cached blobs' moves and evictions one instance
 // runs at once. Each is a rename or an unlink.
@@ -534,10 +547,6 @@ const releaseWorkers = 8
 // An accept only queues its parked blobs' accepts, with no round trip.
 const multipartWorkers = 4
 
-// bucketWorkers is how many buckets' catalog ships one instance runs at
-// once. Commits and the other bucket changes run in their requests.
-const bucketWorkers = 2
-
 // provideTaskRunner builds the runner for ingot's durable task queues, over
 // the host's pool. The backend registers its handlers (Server.New); the
 // migration hook creates its tables and the server starts and stops it.
@@ -546,21 +555,24 @@ const bucketWorkers = 2
 // is the agent's DID. That names the S3 endpoint rather than the instance, and
 // each endpoint has one instance today; a second instance behind the same
 // endpoint needs a name of its own.
-func provideTaskRunner(pool *pgxpool.Pool, id identity.Identity, logger *zap.Logger) (*taskrunner.Runner, error) {
+func provideTaskRunner(cfg config.Config, pool *pgxpool.Pool, id identity.Identity, logger *zap.Logger) (*taskrunner.Runner, error) {
 	return taskrunner.New(pool, taskrunner.Options{
 		Schema: taskSchema,
 		Node:   id.DID().String(),
-		// In the RFC's queue order: a task may run sync children only on
-		// the queues after its own.
-		Queues: []taskrunner.QueueOptions{
-			{Name: multipartqueue.Name, Workers: multipartWorkers},
-			{Name: bucketqueue.Name, Workers: bucketWorkers},
-			{Name: spaceuploadqueue.Name, Workers: uploadRegistrationWorkers},
-			{Name: spaceshardqueue.Name, Workers: releaseWorkers},
-			{Name: shardqueue.Name, Workers: shardWorkers},
-		},
+		Queues: taskQueues(cfg),
 		Logger: logger.Named("tasks"),
 	})
+}
+
+// taskQueues lists the queues in the RFC's order: a task may run sync
+// children only on the queues after its own.
+func taskQueues(cfg config.Config) []taskrunner.QueueOptions {
+	return []taskrunner.QueueOptions{
+		{Name: multipartqueue.Name, Workers: multipartWorkers},
+		{Name: bucketqueue.Name, Workers: cfg.TaskWorkers.BucketWorkers()},
+		{Name: spaceshardqueue.Name, Workers: releaseWorkers},
+		{Name: shardqueue.Name, Workers: shardWorkers},
+	}
 }
 
 // migrationHookOut feeds the migration PreStartHook into the "ingot_prestart"
@@ -613,7 +625,7 @@ func provideForgeReader(cfg config.Config, id identity.Identity, locations regis
 
 // uploaderResult exposes the one *uploader.Forge under every upload seam:
 // Uploader (catalog CAR segments), Streaming and Deferred (per-blob body
-// uploads), Remover and Registrar.
+// uploads), Remover and Capturer.
 type uploaderResult struct {
 	fx.Out
 
@@ -621,7 +633,7 @@ type uploaderResult struct {
 	Deferred  uploader.DeferredBodyUploader
 	Streaming uploader.StreamingBodyUploader
 	Remover   uploader.BlobRemover
-	Registrar uploader.UploadRegistrar
+	Capturer  uploader.AuthorityCapturer
 }
 
 // provideUploader builds the guppy-style edge client that ships to Forge via
@@ -633,5 +645,5 @@ func provideUploader(c *forgeclient.Client, logger *zap.Logger) (uploaderResult,
 	if err != nil {
 		return uploaderResult{}, err
 	}
-	return uploaderResult{Uploader: f, Deferred: f, Streaming: f, Remover: f, Registrar: f}, nil
+	return uploaderResult{Uploader: f, Deferred: f, Streaming: f, Remover: f, Capturer: f}, nil
 }

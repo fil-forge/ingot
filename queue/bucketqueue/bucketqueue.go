@@ -32,7 +32,6 @@ import (
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
-	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/uploader"
@@ -61,11 +60,12 @@ type Deps struct {
 	Authority *authority.Resolver
 	// Blobs drains a deleted bucket's space of its blobs' releases.
 	Blobs *spaceshardqueue.Queue
-	// Counts drains a deleted bucket's space of its object-count changes.
-	Counts *spaceuploadqueue.Queue
 	// ReleaseGrace is how long after a commit a blob it drops the last
 	// claim on is released.
 	ReleaseGrace time.Duration
+	// BlobList is the sizes of the blob lists commits write; the zero value
+	// for the default.
+	BlobList msbucket.BlobListSizes
 	// ShipRetryFirst is the first wait before a ship that could not be
 	// queued is queued again; zero for a second.
 	ShipRetryFirst time.Duration
@@ -93,8 +93,8 @@ type Queue struct {
 	buckets      bucketauthority.BucketAuthority
 	proofs       *authority.Resolver
 	blobs        *spaceshardqueue.Queue
-	counts       *spaceuploadqueue.Queue
 	releaseGrace time.Duration
+	blobList     msbucket.BlobListSizes
 	logger       *zap.Logger
 	ships        ships
 }
@@ -116,8 +116,8 @@ func New(r *taskrunner.Runner, d Deps) (*Queue, error) {
 		buckets:      d.Buckets,
 		proofs:       d.Authority,
 		blobs:        d.Blobs,
-		counts:       d.Counts,
 		releaseGrace: d.ReleaseGrace,
+		blobList:     d.BlobList,
 		logger:       d.Logger,
 		ships:        ships{retryFirst: d.ShipRetryFirst, retryMax: d.ShipRetryMax},
 	}
@@ -148,13 +148,6 @@ type Authority struct {
 	// Release is the authority the releases of dropped claims remove their
 	// blobs with.
 	Release spaceshardqueue.ReleaseTask
-	// RegisterAdd is the /upload/add chain the upload registrations a commit
-	// queues run with; empty when the request held none, and the
-	// registration is then skipped.
-	RegisterAdd []byte
-	// RegisterRemove is RegisterAdd's /upload/remove twin, for the
-	// retractions.
-	RegisterRemove []byte
 }
 
 // Outcome is what a commit reports to the request that ran it.
@@ -191,7 +184,7 @@ type syncRunner interface {
 
 // commitWith runs the commit through run and decodes its result.
 func (q *Queue) commitWith(ctx context.Context, run syncRunner, st *registry.State, auth Authority, changes ...KeyChange) (Outcome, error) {
-	args := BucketCommitTask{Bucket: st.Name, Changes: changes, Release: auth.Release, RegisterAdd: auth.RegisterAdd, RegisterRemove: auth.RegisterRemove}
+	args := BucketCommitTask{Bucket: st.Name, Changes: changes, Release: auth.Release}
 	var buf bytes.Buffer
 	if err := args.MarshalCBOR(&buf); err != nil {
 		return Outcome{}, fmt.Errorf("bucketqueue: encode commit: %w", err)
@@ -323,45 +316,6 @@ func (q *Queue) applyDelete(ctx context.Context, sc *commitScope, key string, d 
 	r, root, err := q.applyPut(ctx, sc, key, marker)
 	r.DeleteMarker = true
 	return r, root, err
-}
-
-// register queues one change to the space's content-entry list with the
-// commit, under the request's captured authority. A request with none
-// cannot produce authority for the registration to run with later, and
-// failing the write over the object count would fail a write that otherwise
-// succeeded: the registration is skipped and logged, and the count
-// under-reports until something registers that root again.
-func (q *Queue) register(sc *commitScope, st *registry.State, key string, root cid.Cid, op spaceuploadqueue.Op) {
-	if !root.Defined() {
-		return
-	}
-	proofs := sc.args.RegisterAdd
-	if op == spaceuploadqueue.Remove {
-		proofs = sc.args.RegisterRemove
-	}
-	if len(proofs) == 0 {
-		q.logger.Warn("commit: no authority to queue an upload registration; object count will drift",
-			zap.String("bucket", st.Name),
-			zap.String("op", string(op)),
-			zap.Stringer("space", st.Space),
-			zap.Stringer("root", root),
-		)
-		return
-	}
-	spec, err := spaceuploadqueue.Registration{
-		Bucket:    st.Name,
-		ObjectKey: key,
-		Space:     st.Space,
-		Root:      root,
-		Op:        op,
-		Proofs:    proofs,
-	}.Spec()
-	if err != nil {
-		q.logger.Warn("commit: could not encode an upload registration; object count will drift",
-			zap.String("bucket", st.Name), zap.Stringer("root", root), zap.Error(err))
-		return
-	}
-	sc.tx.EnqueueUploadRegistration(spec)
 }
 
 // putPreCheck returns the check a put runs against the version it would

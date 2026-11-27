@@ -877,15 +877,10 @@ func TestForgeScenarios(t *testing.T) {
 
 		// Per-bucket CORS (docs/s3-cors.md): a bucket's own document
 		// replaces the gateway-wide one for that bucket alone, and deleting
-		// it restores the default. The writes need a hilt that authorizes
-		// PutBucketCors, so this runs only against a hilt override or when
-		// INGOT_ITEST_CORS_WRITES=1 says the image has it.
+		// it restores the default.
 		t.Run("per bucket", func(t *testing.T) {
-			if !corsWritesEnabled() {
-				t.Skip("the per-bucket CORS scenario needs a hilt override (INGOT_ITEST_HILT_BINARY or INGOT_ITEST_HILT_IMAGE), or INGOT_ITEST_CORS_WRITES=1, until the :main image authorizes PutBucketCors")
-			}
 			const (
-				own     = "https://app.example" // matches no gateway entry
+				own     = "https://bucket-own.example" // matches no gateway entry
 				sibling = "cors-sibling"
 			)
 			if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(sibling)}); err != nil {

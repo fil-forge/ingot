@@ -233,6 +233,24 @@ blob by a `queue-space-shard.accept` task the upload's
 | `ingot.multipart.accept_passes` | Part blobs concluded, by `outcome`: `accepted` or `failed` (the blob's accept retries; a timed-out conclude included) |
 | `ingot.multipart.complete_deferred` | CompleteMultipartUpload requests answered OperationAborted because the parts' accepts did not finish in time. Botocore clients (the AWS CLI) treat that as a failed upload |
 
+Object traffic is counted in body bytes. Copies stay inside Ingot and count
+as neither:
+
+| Metric | Meaning |
+| -- | -- |
+| `ingot.s3.object_egress_bytes` | Bytes GetObject sent to clients: those read from the body before it closed, so an abandoned download counts what went out |
+| `ingot.s3.object_ingress_bytes` | Bytes PutObject and UploadPart received, whether or not the write succeeded |
+
+The same body bytes are counted for each bucket, by the hour, and reported to
+the auth service, which serves them to tenants as their egress (see
+[Usage reporting](#usage-reporting)). The reporter has its own metrics:
+
+| Metric | Meaning |
+| -- | -- |
+| `ingot.usage.egress_unreported_counts` | Egress counts (one per bucket and hour) that have changed since the auth service last acknowledged them |
+| `ingot.usage.egress_oldest_unreported_age` | Seconds the longest-waiting of them has been due; 0 when none is. Counts are reported every `usage_report_interval`, so an age several times that means reports are failing |
+| `ingot.usage.report_warnings` | Warnings the auth service answered reports with, by `name`. `UnknownBucket` (it has no record of the bucket) and `BucketRegionMismatch` (another gateway serves it) each mean a bucket's counts were not stored. Any at all is worth a look |
+
 Each commit also journals its catalog blocks in Postgres until their segment
 ships (see `logstore/README.md`), so a copy of the database holds the
 catalog only this host's disk would otherwise hold. The journal reports:
@@ -241,6 +259,17 @@ catalog only this host's disk would otherwise hold. The journal reports:
 | -- | -- |
 | `ingot.catalog_journal.blocks`, `ingot.catalog_journal.bytes` | Catalog blocks, and their bytes, journaled in Postgres whose segment has not shipped yet |
 | `ingot.catalog_journal.oldest_age` | Seconds since the oldest journaled block was written; 0 when the journal is empty. Segments ship within seconds of sealing, so growth means shipping has stalled and the unshipped catalog is building up in Postgres |
+
+The gateway's totals come from the object counts each bucket keeps for the
+usage report, so reading them costs one row per bucket:
+
+| Metric | Meaning |
+| -- | -- |
+| `ingot.buckets.count` | Buckets in the database |
+| `ingot.objects.count` | Objects in those buckets, counted as the usage report counts them: every version of every key, delete markers included, and every part of a multipart upload still in progress |
+
+Both are totals over the database, so every instance sharing it reports the
+same figures: chart their maximum across instances, never their sum.
 
 The task queues report queue depth, the oldest ready task's age, lease waits
 and takeovers, task duration and busy workers as `taskrunner.*`, listed in
@@ -251,7 +280,32 @@ delete: the provider holds its body. Restart `serve` after deleting files by
 hand: the byte count sees such a change at startup, or only at an hourly
 scan that no write overlapped.
 
+### Usage reporting
+
+Ingot counts the bytes of object data GetObject sends to clients, for each
+bucket and each hour, and reports the counts to the auth service, which
+serves them as the egress series of its tenant and bucket metrics. The count
+is of the object's bytes as the client receives them: after decryption,
+trimmed to the requested range, and only what was read before a client went
+away. A copy sends nothing to a client and counts nothing.
+
+The counts go to Postgres (`ingot.egress_usage`) every 5 seconds, so a crash
+loses at most that much, and to the auth service every
+`usage_report_interval` (default `10m`). A report carries each count that
+has changed since the service last acknowledged it, as the hour's total so
+far, and the service keeps the largest it is sent: the hour in progress is sent
+again as it grows, and a report that failed is simply sent again. A count is
+kept for 7 days after the service last acknowledged it.
+
+Ingot makes the report on its own authority, with no delegation from the auth
+service, which accepts it from a gateway registered as a provider. It runs
+whenever `auth_service_url` is set.
+
 ### Catalog storage on Forge
+
+`task_workers.bucket` (default 2, `INGOT_TASK_WORKERS_BUCKET`) is the bucket
+queue's worker count; the queue serializes each bucket's commits, settings
+changes and catalog ships. Zero takes the default.
 
 Nothing collects dead catalog blocks yet: each shipped catalog segment stays
 on Forge until its bucket is deleted, retired segments included. With metrics
@@ -289,6 +343,118 @@ tenant's signed requests.
 were kept (migration `00033`): those rows were deleted, so their CARs, still on
 Forge, count nowhere, not even as unmeasured. Read such a bucket's figures as a
 floor, or reset its data.
+
+### Loading a catalog to estate scale
+
+`ingot-preload` (`cmd/ingot-preload`) fills a gateway's buckets through its S3
+API, to measure the catalog at sizes no test reaches by accident. It is a plain
+S3 client, with its access key and region taken from the AWS SDK's usual
+sources (smelt's `make s3-key` writes a profile it can use):
+
+```bash
+GOWORK=off go run ./cmd/ingot-preload load --profile smelt --encryption "" \
+  --buckets 3 --until 2000 --real-every 500 --real-min-mib 16 --real-max-mib 32
+```
+
+Most objects are zero-byte, which runs the whole commit, seal and ship without
+uploading a blob. One object per `--real-every` has a pseudo-random body of a
+pack's size, for timing reads and deletes. Keys and PUTs are shaped as the pack
+server writes them: 64 hex digits after an optional prefix, create-only, with
+the body's SHA-256. New buckets get the `none` default encryption, which needs
+`encryption.allow_none`. smelt's ingot doesn't allow it, so the example passes
+`--encryption ""` and keeps ingot's default; to try `none` on smelt, add
+`encryption: {allow_none: true}` to its `systems/ingot/config/config.yaml`,
+recreate ingot, and load other buckets with another state file
+(`--bucket-prefix`, `--state`): a state file remembers each bucket's encryption
+and refuses another. Progress is saved in a state file, so a second `load` with
+a higher `--until` carries on from the first, and reports go to stdout and, as
+JSON lines, to a metrics file.
+
+Real objects at their default size add up. At estate scale, `--buckets 150
+--until 600000 --real-every 30000` writes 20 per bucket, about 540 GiB of
+bodies in all.
+
+`ingot-preload validate` then times requests against the loaded buckets and
+checks every answer, reading which objects exist from the load's state file:
+pass it the load's `--buckets`, `--bucket-prefix`, `--seed`, `--key-prefix`,
+`--state`, `--real-min-mib` and `--real-max-mib`. It reads a range of every
+real object and checks its bytes, reads the metadata of a sample of bulk
+objects, lists a few buckets in full and checks every recorded object is there,
+and writes, deletes and re-checks new objects shaped like the load's: zero-byte
+ones in every bucket, and `--write-real` real ones (20 by default, about 3.6
+GiB uploaded at the default sizes) over the buckets in turn. Its access key
+must also be allowed to read, list and delete. It deletes only what it wrote,
+and deletes it even after an interrupt; a second interrupt stops it at once,
+and a later listing of a bucket counts what it left there as extra keys. A test
+point is a load to that size, a gateway restart, two reading runs with the same
+`--sample`, then the listing and writes:
+
+```bash
+ingot-preload load --until 600000 --real-every 30000      # loaded to the test point
+# restart ingot
+ingot-preload validate --label 0.6M-cold --steps get,head
+ingot-preload validate --label 0.6M-warm --steps get,head
+ingot-preload validate --label 0.6M-list-write --steps list,write
+```
+
+The restart empties the catalog's block cache and the authorization caches,
+so the first run reads them cold and the second warm. A full listing reads
+every listed key's manifest through that block cache (`read_cache_bytes`,
+256 MiB by default): three buckets at the 0.6M point come to an estimated
+0.6 GB, more than it holds, so the listing runs after the warm run.
+
+Body bytes are a different matter: a range is served from the local blob
+cache, which survives a restart and holds a blob for `cache_ttl` (1h by
+default) after it was written or last read, and otherwise from Piri, which
+reads don't copy back into the cache. Both reading runs read bodies from the
+same place. To time body reads
+from Piri, start the first run more than `cache_ttl` after the load wrote its
+last real object, or load with `cache_writes: false`.
+
+On a real node, three settings change what a run measures:
+
+- **Postgres connections.** Ingot sets no pool size, so pgx opens at most
+  max(4, CPU count). Set `pool_max_conns` in the `postgres_dsn` before the
+  load, and record it with the results.
+- **A second read pass with a larger cache.** At 150 buckets the default
+  cache holds a few thousand manifests, so cold reads fetch most catalog
+  blocks from Piri. Repeat the cold and warm runs with `read_cache_bytes`
+  raised to about 12 GB, enough for every tree node at estate scale, so that
+  only manifests come from Piri.
+- **Range sizes.** `--range-kib` sets the length of each ranged GET. Time
+  the two reads the pack server's design depends on, 1.17 MiB and 2 KiB:
+
+```bash
+ingot-preload validate --label 0.6M-cold-1.17MiB --steps get,head --range-kib 1198
+ingot-preload validate --label 0.6M-warm-2KiB --steps get --range-kib 2
+# restart ingot with read_cache_bytes: 12000000000, then
+ingot-preload validate --label 0.6M-cold-bigcache --steps get,head --range-kib 1198
+ingot-preload validate --label 0.6M-warm-bigcache --steps get,head --range-kib 1198
+```
+
+Each step's latencies go to stdout as it ends, and the whole report to a JSON
+lines file (`--report`). A request that failed or answered wrongly is listed
+there and makes the command exit non-zero.
+
+`ingot footprint`, run where the daemon runs and with its config, prints what
+the node keeps, as JSON: each table of the `ingot` schema with its bytes and
+estimated rows, the database's size and the server's write-ahead log position,
+and each entry under `data_dir` with its files and bytes. Run it and
+`ingot catalog usage` before a load and at each test point. The difference in
+`wal_bytes` between two reports is the WAL written in between, and each table's
+and directory's growth per object loaded is what a projection scales.
+
+It also reports how blob releases keep up: how long the finished ones took from
+the change that queued them, any grace included, how far past their due time
+they ran, and how many are still pending, past due or failed. Finished releases
+are kept for a day, the task runner's retention for finished tasks, so those
+figures are a rolling window, not totals to subtract. The load queues no
+releases, since it writes each object once. `validate`'s write step queues the
+releases of the real objects it deletes, one per blob, due once the release
+grace has passed, so run `ingot footprint` after that to see them finished.
+
+Neither command is listed in `ingot --help` unless `INGOT_DEV_COMMANDS` is set
+to `1` or `true`; both run either way.
 
 ## Build & test
 

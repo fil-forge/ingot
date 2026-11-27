@@ -27,6 +27,7 @@ func validConfig(t *testing.T) Config {
 		t.Fatalf("write key file: %v", err)
 	}
 	return Config{
+		TaskWorkers:       TaskWorkerConfig{Bucket: 2},
 		Addr:              "127.0.0.1:9000",
 		DataDir:           "/data",
 		PostgresDSN:       "postgres://ingot@127.0.0.1:5432/ingot",
@@ -99,6 +100,9 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"bad release_grace", func(c *Config) { c.ReleaseGrace = "soon" }, "parse release_grace"},
 		{"bad complete_multipart_keepalive", func(c *Config) { c.CompleteMultipartKeepalive = "soon" }, "parse complete_multipart_keepalive"},
 		{"negative local_blob_max_bytes", func(c *Config) { c.LocalBlobMaxBytes = -1 }, "local_blob_max_bytes -1: must not be negative"},
+		{"bad usage_report_interval", func(c *Config) { c.UsageReportInterval = "often" }, "parse usage_report_interval"},
+		{"negative usage_report_interval", func(c *Config) { c.UsageReportInterval = "-1m" }, `usage_report_interval "-1m": must not be negative`},
+		{"zero usage_report_interval", func(c *Config) { c.UsageReportInterval = "0s" }, `usage_report_interval "0s": must be positive`},
 		{"bad cache_ttl", func(c *Config) { c.CacheTTL = "soon" }, "parse cache_ttl"},
 		{"negative cache_ttl", func(c *Config) { c.CacheTTL = "-1m" }, `cache_ttl "-1m": must not be negative`},
 		{"zero cache_ttl", func(c *Config) { c.CacheTTL = "0s" }, `cache_ttl "0s": must be positive`},
@@ -466,5 +470,51 @@ func TestServerConfig_CompleteMultipartKeepalive(t *testing.T) {
 				t.Fatalf("CompleteMultipartKeepalive = %v, want %v", sc.CompleteMultipartKeepalive, tc.want)
 			}
 		})
+	}
+}
+
+func TestLoad_BucketQueueWorkersDefaultToTwo(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("data_dir: /any-dir\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TaskWorkers.Bucket != 2 {
+		t.Fatalf("task_workers.bucket = %d, want 2", cfg.TaskWorkers.Bucket)
+	}
+}
+
+func TestLoad_BucketQueueWorkersFromEnv(t *testing.T) {
+	t.Setenv("INGOT_TASK_WORKERS_BUCKET", "16")
+	cfgFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("data_dir: /any-dir\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TaskWorkers.Bucket != 16 {
+		t.Fatalf("task_workers.bucket = %d, want 16", cfg.TaskWorkers.Bucket)
+	}
+}
+
+func TestValidate_RejectsNegativeBucketQueueWorkers(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.TaskWorkers.Bucket = -1
+	want := "task_workers.bucket -1: must not be negative"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("got %v, want an error containing %q", err, want)
+	}
+}
+
+func TestValidate_AcceptsZeroBucketQueueWorkersAsTheDefault(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.TaskWorkers.Bucket = 0
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
 	}
 }

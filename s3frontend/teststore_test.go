@@ -23,7 +23,6 @@ import (
 	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
-	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
@@ -43,6 +42,9 @@ type testStore struct {
 	// limits are the backend's multipart limits, which a test may change
 	// while it runs.
 	limits *multipartqueue.Limits
+	// blobList is the sizes of the blob lists the backend's commits write,
+	// which a test sets before it builds the backend.
+	blobList msbucket.BlobListSizes
 }
 
 // stores maps each test backend to the store it runs on, for helpers that
@@ -84,7 +86,6 @@ func newTestStoreWithLease(t testing.TB, ttl time.Duration) *testStore {
 			{Name: multipartqueue.Name, Workers: 2},
 			// Commits run sync, in the request; the workers run ships.
 			{Name: bucketqueue.Name, Workers: 2},
-			{Name: spaceuploadqueue.Name, Workers: 2},
 			{Name: spaceshardqueue.Name, Workers: 2},
 			{Name: shardqueue.Name, Workers: 2},
 		},
@@ -116,10 +117,18 @@ func (s *testStore) newBackend(t testing.TB, deps Deps) *Backend {
 			tune(d)
 		}
 	}
+	tuneBuckets := deps.tuneBuckets
+	deps.tuneBuckets = func(d *bucketqueue.Deps) {
+		d.BlobList = s.blobList
+		if tuneBuckets != nil {
+			tuneBuckets(d)
+		}
+	}
 	s.limits = &multipartqueue.Limits{AcceptDelay: time.Hour}
 	tuneUploads := deps.tuneUploads
 	deps.tuneUploads = func(d *multipartqueue.Deps) {
 		s.limits.RehashBudget = d.Limits.RehashBudget
+		s.limits.MaxBodyBlobs = d.Limits.MaxBodyBlobs
 		d.Limits = s.limits
 		if tuneUploads != nil {
 			tuneUploads(d)
@@ -189,30 +198,16 @@ func randomDID() did.DID {
 	return id.KeyDID()
 }
 
-// drainUploads waits until the upload queue has sent every object-count
-// change queued so far.
-func (s *testStore) drainUploads(t testing.TB) {
+// objectTotals returns the objects the bucket has gained and lost over its
+// life, as its commits counted them.
+func (s *testStore) objectTotals(t testing.TB, bucket string) (added, removed int64) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		tasks, err := s.queued(context.Background(), spaceuploadqueue.Name)
-		if err != nil {
-			t.Fatalf("list queued uploads: %v", err)
-		}
-		n := 0
-		for _, q := range tasks {
-			if q.State == "pending" {
-				n++
-			}
-		}
-		if n == 0 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%d object-count changes still queued after 10s", n)
-		}
-		time.Sleep(10 * time.Millisecond)
+	if err := s.pool.QueryRow(context.Background(),
+		`SELECT objects_added, objects_removed FROM ingot.buckets WHERE name = $1`, bucket,
+	).Scan(&added, &removed); err != nil {
+		t.Fatalf("read object totals: %v", err)
 	}
+	return added, removed
 }
 
 // spaceOf returns the one space whose row in table names digest.

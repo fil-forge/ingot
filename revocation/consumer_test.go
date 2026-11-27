@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	jsg "github.com/alanshaw/dag-json-gen"
@@ -59,8 +60,9 @@ const testHead = swarfclient.Cursor("cursor-head")
 
 // fakeSource plays one streamScript per StreamAfter call, recording the
 // cursor each was opened after. When the scripts run out, a stream blocks
-// until ctx cancel (a healthy idle connection). Head fails with each of
-// headErrs in turn, then reports testHead.
+// until ctx cancel (a healthy idle connection), then yields ctx's error, as
+// the swarf client does. Head fails with each of headErrs in turn, then
+// reports testHead.
 type fakeSource struct {
 	mu       sync.Mutex
 	scripts  []streamScript
@@ -99,6 +101,7 @@ func (f *fakeSource) StreamAfter(ctx context.Context, after swarfclient.Cursor) 
 	return func(yield func(swarfclient.Event, error) bool) {
 		if script == nil {
 			<-ctx.Done()
+			yield(swarfclient.Event{}, ctx.Err())
 			return
 		}
 		for _, rec := range script.records {
@@ -493,19 +496,179 @@ func TestConsumerSavesOnlyTheLastPositionWhenStoppedBeforeTheInterval(t *testing
 	require.Equal(t, []registry.RevocationCursor{{Token: string(last.Cursor)}}, store.calls())
 }
 
-func TestConsumerSavesNothingMoreWhileTheFeedIsIdle(t *testing.T) {
-	recs := records(t, 1)
-	store := &recordingCursorStore{stored: &registry.RevocationCursor{Token: "cursor-stored"}}
-	src := &fakeSource{scripts: []streamScript{{records: recs}}}
-	c := revocation.NewConsumer(src, store, &fakeInvalidator{},
-		revocation.WithSaveInterval(time.Millisecond))
-	stop := run(c)
-	defer stop()
+// A synctest.Test bubble's clock advances only once every goroutine in it is
+// blocked, so after synctest.Wait a consumer run in one has done everything
+// the elapsed intervals call for.
 
-	waitFor(t, func() bool { return len(store.calls()) == 1 })
-	// Twenty intervals with no new record.
-	time.Sleep(20 * time.Millisecond)
-	require.Len(t, store.calls(), 1)
+// storedCursorStore returns a recordingCursorStore holding a cursor, so a
+// consumer on it streams without saving the head first, and the only saves
+// it records are the saver's.
+func storedCursorStore() *recordingCursorStore {
+	return &recordingCursorStore{stored: &registry.RevocationCursor{Token: "cursor-stored"}}
+}
+
+// errUnavailable is a save failure the tests inject.
+var errUnavailable = errors.New("database unavailable")
+
+// failing returns n injected save failures.
+func failing(n int) []error {
+	errs := make([]error, n)
+	for i := range errs {
+		errs[i] = errUnavailable
+	}
+	return errs
+}
+
+func TestConsumerSavesNothingMoreWhileTheFeedIsIdle(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		recs := records(t, 1)
+		store := storedCursorStore()
+		src := &fakeSource{scripts: []streamScript{{records: recs}}}
+		c := revocation.NewConsumer(src, store, &fakeInvalidator{},
+			revocation.WithSaveInterval(time.Second))
+		stop := run(c)
+		defer stop()
+
+		// Twenty intervals with no new record.
+		time.Sleep(20 * time.Second)
+		synctest.Wait()
+		require.Len(t, store.calls(), 1)
+	})
+}
+
+func TestConsumerRetriesAFailedSaveUntilItLands(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		recs := records(t, 1)
+		store := storedCursorStore()
+		store.putErrs = failing(3)
+		core, logs := observer.New(zap.InfoLevel)
+		src := &fakeSource{scripts: []streamScript{{records: recs}}}
+		c := revocation.NewConsumer(src, store, &fakeInvalidator{},
+			revocation.WithSaveInterval(time.Second),
+			revocation.WithLogger(zap.New(core)))
+		stop := run(c)
+		defer stop()
+
+		// The feed is idle after the record, so only a later interval's
+		// save can land it.
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		require.Equal(t, []registry.RevocationCursor{{Token: string(recs[0].Cursor)}}, store.calls())
+		require.Equal(t, 1, logs.FilterMessage("revocation: persist cursor failed; retrying each interval").Len(),
+			"the failures are logged once, when they start")
+		require.Equal(t, 1, logs.FilterMessage("revocation: persist cursor recovered").Len())
+	})
+}
+
+func TestConsumerLogsARecoveryAtStop(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		recs := records(t, 1)
+		store := storedCursorStore()
+		store.putErrs = failing(1)
+		core, logs := observer.New(zap.InfoLevel)
+		src := &fakeSource{scripts: []streamScript{{records: recs}}}
+		c := revocation.NewConsumer(src, store, &fakeInvalidator{},
+			revocation.WithSaveInterval(time.Second),
+			revocation.WithLogger(zap.New(core)))
+		stop := run(c)
+
+		// The first interval's save fails; the final save is the next one.
+		time.Sleep(time.Second)
+		synctest.Wait()
+		stop()
+
+		require.Len(t, store.calls(), 1, "the final save lands")
+		require.Equal(t, 1, logs.FilterMessage("revocation: persist cursor recovered").Len())
+	})
+}
+
+func TestConsumerLogsNoFailureForASaveCutShortByStop(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		recs := records(t, 1)
+		store := storedCursorStore()
+		store.release = make(chan struct{})
+		core, logs := observer.New(zap.InfoLevel)
+		src := &fakeSource{scripts: []streamScript{{records: recs}}}
+		c := revocation.NewConsumer(src, store, &fakeInvalidator{},
+			revocation.WithSaveInterval(time.Second),
+			revocation.WithLogger(zap.New(core)))
+		stop := run(c)
+
+		// The first interval's save waits on release, so the stop cuts it
+		// short; the final save then waits on release too.
+		time.Sleep(time.Second)
+		synctest.Wait()
+		stopped := make(chan struct{})
+		go func() { defer close(stopped); stop() }()
+		synctest.Wait()
+		close(store.release)
+		<-stopped
+
+		require.Len(t, store.calls(), 1, "the final save lands")
+		require.Zero(t, logs.FilterLevelExact(zap.WarnLevel).Len(), "a save cut short by the stop is no failure")
+	})
+}
+
+func TestConsumerIgnoresANonPositiveSaveInterval(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		t.Run(d.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				recs := records(t, 1)
+				store := storedCursorStore()
+				src := &fakeSource{scripts: []streamScript{{records: recs}}}
+				c := revocation.NewConsumer(src, store, &fakeInvalidator{},
+					revocation.WithSaveInterval(d))
+				stop := run(c)
+
+				synctest.Wait()
+				stop()
+				require.Len(t, store.calls(), 1, "the save at stop lands")
+			})
+		})
+	}
+}
+
+func TestConsumerLogsAFailedHeadSaveAsTheStartOfAFailingRun(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &recordingCursorStore{putErrs: failing(1)}
+		core, logs := observer.New(zap.InfoLevel)
+		c := revocation.NewConsumer(&fakeSource{}, store, &fakeInvalidator{},
+			revocation.WithSaveInterval(time.Second),
+			revocation.WithLogger(zap.New(core)))
+		stop := run(c)
+		defer stop()
+
+		// The head's save fails; the first interval's save lands it.
+		time.Sleep(time.Second)
+		synctest.Wait()
+		require.Equal(t, []registry.RevocationCursor{{Token: string(testHead)}}, store.calls())
+		require.Equal(t, 1, logs.FilterMessage("revocation: persist cursor failed; retrying each interval").Len())
+		require.Equal(t, 1, logs.FilterMessage("revocation: persist cursor recovered").Len())
+	})
+}
+
+func TestConsumerLogsNoFailureForAHeadSaveCutShortByStop(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &recordingCursorStore{release: make(chan struct{})}
+		core, logs := observer.New(zap.InfoLevel)
+		c := revocation.NewConsumer(&fakeSource{}, store, &fakeInvalidator{},
+			revocation.WithSaveInterval(time.Second),
+			revocation.WithLogger(zap.New(core)))
+		stop := run(c)
+
+		// The head's save waits on release, so the stop cuts it short; the
+		// final save then waits on release too.
+		synctest.Wait()
+		stopped := make(chan struct{})
+		go func() { defer close(stopped); stop() }()
+		synctest.Wait()
+		close(store.release)
+		<-stopped
+
+		require.Equal(t, []registry.RevocationCursor{{Token: string(testHead)}}, store.calls(), "the final save lands the head")
+		require.Zero(t, logs.FilterLevelExact(zap.WarnLevel).Len(), "a save cut short by the stop is no failure")
+		require.Zero(t, logs.FilterMessage("revocation: persist cursor recovered").Len(), "nothing failed to recover from")
+	})
 }
 
 // cancelingInvalidator cancels the consumer's context from inside the
@@ -556,7 +719,9 @@ func TestConsumerReconnectsFromLastRecord(t *testing.T) {
 
 func TestConsumerStopsOnCancel(t *testing.T) {
 	src := &fakeSource{} // no scripts: the stream blocks until ctx cancel
-	c := revocation.NewConsumer(src, registry.NewPostgres(pgtest.New(t)), &fakeInvalidator{})
+	core, logs := observer.New(zap.WarnLevel)
+	c := revocation.NewConsumer(src, registry.NewPostgres(pgtest.New(t)), &fakeInvalidator{},
+		revocation.WithLogger(zap.New(core)))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -569,4 +734,5 @@ func TestConsumerStopsOnCancel(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after ctx cancel")
 	}
+	require.Empty(t, logs.All(), "a stop is not a stream fault")
 }

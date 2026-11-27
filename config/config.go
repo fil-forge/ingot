@@ -137,6 +137,15 @@ type Config struct {
 	// immediately.
 	ReleaseGrace string `mapstructure:"release_grace" yaml:"release_grace"`
 
+	// UsageReportInterval is how often the gateway reports its usage counts
+	// to the auth service (Go duration string): the bytes of object data
+	// GetObject sent to clients from each bucket in each hour. A report
+	// carries every count that has changed since the service last
+	// acknowledged it, the hour in progress included, so this is how far
+	// behind the service's egress figures run. Empty → default 10m; it must
+	// be positive.
+	UsageReportInterval string `mapstructure:"usage_report_interval" yaml:"usage_report_interval"`
+
 	// LocalBlobMaxBytes is the byte budget for local blob storage: the cache
 	// (<data_dir>/cache: copies of bodies the provider holds, and writes in
 	// progress, counted as their bytes land). It does not cover the catalog
@@ -194,6 +203,8 @@ type Config struct {
 	// Encryption sets which bucket encryption modes a tenant may select
 	// through the S3 bucket-encryption API (PutBucketEncryption).
 	Encryption EncryptionConfig `mapstructure:"encryption" yaml:"encryption"`
+
+	TaskWorkers TaskWorkerConfig `mapstructure:"task_workers" yaml:"task_workers"`
 
 	// LogLevel is the zap level (debug|info|warn|error).
 	LogLevel string `mapstructure:"log_level" yaml:"log_level"`
@@ -269,6 +280,13 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 			releaseGrace = 0
 		}
 	}
+	usageReportInterval, err := parseDurationKnob("usage_report_interval", c.UsageReportInterval, 10*time.Minute)
+	if err != nil {
+		return ServerConfig{}, err
+	}
+	if usageReportInterval == 0 {
+		return ServerConfig{}, fmt.Errorf("ingot: usage_report_interval %q: must be positive", c.UsageReportInterval)
+	}
 	cacheTTL, err := parseDurationKnob("cache_ttl", c.CacheTTL, time.Hour)
 	if err != nil {
 		return ServerConfig{}, err
@@ -313,6 +331,7 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		MultipartSessionTTL:        mpTTL,
 		CompleteMultipartKeepalive: mpKeepalive,
 		ReleaseGrace:               releaseGrace,
+		UsageReportInterval:        usageReportInterval,
 
 		LocalBlobMaxBytes:  c.LocalBlobMaxBytes,
 		CacheTTL:           cacheTTL,
@@ -394,6 +413,25 @@ type IdentityConfig struct {
 	// DID; peers resolve it through the DID document the S3 listener serves at
 	// /.well-known/did.json. When empty, the key's did:key is used.
 	ServiceID string `mapstructure:"service_id" yaml:"service_id"`
+}
+
+// TaskWorkerConfig sets how many tasks of a queue one instance runs at once.
+type TaskWorkerConfig struct {
+	// Bucket is the bucket queue's worker count; the queue serializes each
+	// bucket's commits, settings changes and catalog ships. Zero takes
+	// DefaultBucketWorkers.
+	Bucket int `mapstructure:"bucket" yaml:"bucket"`
+}
+
+// DefaultBucketWorkers is the bucket queue's worker count when none is set.
+const DefaultBucketWorkers = 2
+
+// BucketWorkers returns Bucket, or DefaultBucketWorkers when it is zero.
+func (c TaskWorkerConfig) BucketWorkers() int {
+	if c.Bucket == 0 {
+		return DefaultBucketWorkers
+	}
+	return c.Bucket
 }
 
 // TenantKeyConfig locates the did:plc directory tenant DID documents are
@@ -537,6 +575,7 @@ func Load(configFile string) (*Config, error) {
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("log_level", "info")
 	v.SetDefault("addr", "0.0.0.0:8080")
+	v.SetDefault("task_workers.bucket", DefaultBucketWorkers)
 	v.SetDefault("regionkey.openbao.mount", "transit")
 	v.SetDefault("regionkey.inprocess.version", "v1")
 }
@@ -560,6 +599,9 @@ func (c *Config) Validate() error {
 	}
 	if c.DataDir == "" {
 		errs = multierr.Append(errs, errors.New("data_dir is required"))
+	}
+	if c.TaskWorkers.Bucket < 0 {
+		errs = multierr.Append(errs, fmt.Errorf("task_workers.bucket %d: must not be negative", c.TaskWorkers.Bucket))
 	}
 	if c.MaxBlobSize > 0 && c.MaxBlobSize < MinMaxBlobSize {
 		errs = multierr.Append(errs, fmt.Errorf("max_blob_size %d: below the %d-byte minimum, a single 5 GiB PUT or copy could split into more blobs than one manifest lists", c.MaxBlobSize, MinMaxBlobSize))

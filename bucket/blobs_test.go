@@ -75,22 +75,14 @@ func uniformRefs(t testing.TB, n int, size int64) BlobRefs {
 	return refsOf(t, lengths...)
 }
 
-// withShape shrinks the writer constants for one test.
-func withShape(t *testing.T, head, extent int) {
-	t.Helper()
-	oldHead, oldExtent := headEntries, extentEntries
-	headEntries, extentEntries = head, extent
-	t.Cleanup(func() { headEntries, extentEntries = oldHead, oldExtent })
-}
-
-// roundTrip builds refs into a /1 manifest, encodes it as a value block,
-// decodes it, and returns the decoded body and the block store holding its
-// extents.
-func roundTrip(t *testing.T, refs BlobRefs) (Body, *memBlocks, int) {
+// roundTrip builds refs into a /1 manifest with lists of the given sizes, encodes
+// it as a value block, decodes it, and returns the decoded body and the block
+// store holding its extents.
+func roundTrip(t *testing.T, refs BlobRefs, sizes BlobListSizes) (Body, *memBlocks, int) {
 	t.Helper()
 	ctx := context.Background()
 	store := newMemBlocks()
-	list, err := BuildBlobList(ctx, store, refs)
+	list, err := BuildBlobList(ctx, store, refs, sizes)
 	if err != nil {
 		t.Fatalf("BuildBlobList: %v", err)
 	}
@@ -146,7 +138,7 @@ func TestBlobList_RoundTrip(t *testing.T) {
 	for _, n := range []int{0, 1, 1024, 1025, 2048, 2049} {
 		t.Run(fmt.Sprintf("%d blobs", n), func(t *testing.T) {
 			refs := uniformRefs(t, n, 1000)
-			body, store, _ := roundTrip(t, refs)
+			body, store, _ := roundTrip(t, refs, BlobListSizes{})
 			wantExtents := 0
 			if n > 1024 {
 				wantExtents = (n - 1024 + 1023) / 1024
@@ -181,7 +173,7 @@ func TestBlobList_LargestUpload(t *testing.T) {
 	}
 	ctx := context.Background()
 	store := newMemBlocks()
-	list, err := BuildBlobList(ctx, store, refs)
+	list, err := BuildBlobList(ctx, store, refs, BlobListSizes{})
 	if err != nil {
 		t.Fatalf("BuildBlobList: %v", err)
 	}
@@ -219,7 +211,6 @@ func TestBlobList_LargestUpload(t *testing.T) {
 // a fresh index each time; Locate must agree with the flat list and fetch at
 // most one block.
 func TestBlobIndex_LocateLoadsAtMostOneExtent(t *testing.T) {
-	withShape(t, 3, 4)
 	rng := rand.New(rand.NewSource(1))
 	ctx := context.Background()
 	for trial := range 50 {
@@ -228,7 +219,7 @@ func TestBlobIndex_LocateLoadsAtMostOneExtent(t *testing.T) {
 			lengths[i] = 1 + rng.Int63n(50)
 		}
 		refs := refsOf(t, lengths...)
-		body, store, _ := roundTrip(t, refs)
+		body, store, _ := roundTrip(t, refs, BlobListSizes{Head: 3, Extent: 4})
 		for range 20 {
 			off := rng.Int63n(refs.Size())
 			want, _ := refs.Locate(ctx, off)
@@ -251,9 +242,8 @@ func TestBlobIndex_LocateLoadsAtMostOneExtent(t *testing.T) {
 // TestBlobIndex_SequentialReadLoadsEachExtentOnce: walking the body in order
 // fetches each extent block once.
 func TestBlobIndex_SequentialReadLoadsEachExtentOnce(t *testing.T) {
-	withShape(t, 2, 3)
 	refs := uniformRefs(t, 11, 10) // head 2, extents of 3, 3, 3
-	body, store, _ := roundTrip(t, refs)
+	body, store, _ := roundTrip(t, refs, BlobListSizes{Head: 2, Extent: 3})
 	idx := body.Index(store, did.Undef)
 	ctx := context.Background()
 	for off := int64(0); off < refs.Size(); off += 5 {
@@ -268,9 +258,8 @@ func TestBlobIndex_SequentialReadLoadsEachExtentOnce(t *testing.T) {
 
 // TestBlobIndex_Extent returns the blobs stored with the one at an offset.
 func TestBlobIndex_Extent(t *testing.T) {
-	withShape(t, 2, 3)
 	refs := uniformRefs(t, 7, 10) // head [0,2), extents [2,5), [5,7)
-	body, store, _ := roundTrip(t, refs)
+	body, store, _ := roundTrip(t, refs, BlobListSizes{Head: 2, Extent: 3})
 	idx := body.Index(store, did.Undef)
 	for off, want := range map[int64][2]int{0: {0, 2}, 19: {0, 2}, 20: {2, 5}, 49: {2, 5}, 50: {5, 7}, 69: {5, 7}} {
 		got, err := idx.Extent(context.Background(), off)
@@ -288,14 +277,14 @@ func TestBlobIndex_Extent(t *testing.T) {
 
 // TestBuildBlobList_Deterministic: the same refs give the same list and CIDs.
 func TestBuildBlobList_Deterministic(t *testing.T) {
-	withShape(t, 2, 2)
 	refs := uniformRefs(t, 9, 7)
+	sizes := BlobListSizes{Head: 2, Extent: 2}
 	ctx := context.Background()
-	a, err := BuildBlobList(ctx, newMemBlocks(), refs)
+	a, err := BuildBlobList(ctx, newMemBlocks(), refs, sizes)
 	if err != nil {
 		t.Fatalf("BuildBlobList: %v", err)
 	}
-	b, err := BuildBlobList(ctx, newMemBlocks(), refs)
+	b, err := BuildBlobList(ctx, newMemBlocks(), refs, sizes)
 	if err != nil {
 		t.Fatalf("BuildBlobList: %v", err)
 	}
@@ -309,18 +298,36 @@ func TestBuildBlobList_Deterministic(t *testing.T) {
 	}
 }
 
-// TestBuildBlobList_Rejects a list over capacity, a gap, an empty span and a
-// missing digest.
+// TestBuildBlobList_Rejects a list over capacity, sizes a list cannot
+// encode, a gap, an empty span and a missing digest.
 func TestBuildBlobList_Rejects(t *testing.T) {
 	ctx := context.Background()
 	t.Run("over capacity", func(t *testing.T) {
-		withShape(t, 1, 1)
-		_, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, blobCapacity()+1, 1))
+		sizes := BlobListSizes{Head: 1, Extent: 1}
+		_, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, sizes.MaxBlobs()+1, 1), sizes)
 		if err == nil || !strings.Contains(err.Error(), "at most") {
 			t.Fatalf("err = %v, want the capacity refusal", err)
 		}
-		if _, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, blobCapacity(), 1)); err != nil {
+		if _, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, sizes.MaxBlobs(), 1), sizes); err != nil {
 			t.Fatalf("at capacity: %v", err)
+		}
+	})
+	for name, sizes := range map[string]BlobListSizes{
+		"negative head":   {Head: -1},
+		"negative extent": {Extent: -1},
+		"head too long":   {Head: 8193},
+		"extent too long": {Extent: 8193},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, 1, 1), sizes); err == nil {
+				t.Fatal("want an error")
+			}
+		})
+	}
+	t.Run("longest lists", func(t *testing.T) {
+		sizes := BlobListSizes{Head: 8192, Extent: 8192}
+		if _, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, 8192+8192, 1), sizes); err != nil {
+			t.Fatalf("lists of 8,192: %v", err)
 		}
 	})
 	for name, refs := range map[string]BlobRefs{
@@ -330,17 +337,17 @@ func TestBuildBlobList_Rejects(t *testing.T) {
 		"no digest":     {{Start: 0, End: 9}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := BuildBlobList(ctx, newMemBlocks(), refs); err == nil {
+			if _, err := BuildBlobList(ctx, newMemBlocks(), refs, BlobListSizes{}); err == nil {
 				t.Fatal("want an error")
 			}
 		})
 	}
 }
 
-// TestMaxBodyBlobs is the capacity at the default writer constants.
+// TestMaxBodyBlobs is the capacity at the default sizes.
 func TestMaxBodyBlobs(t *testing.T) {
-	if MaxBodyBlobs != blobCapacity() {
-		t.Fatalf("MaxBodyBlobs = %d, capacity at the default shape %d", MaxBodyBlobs, blobCapacity())
+	if got := (BlobListSizes{}).MaxBlobs(); MaxBodyBlobs != got {
+		t.Fatalf("MaxBodyBlobs = %d, capacity at the default sizes %d", MaxBodyBlobs, got)
 	}
 }
 

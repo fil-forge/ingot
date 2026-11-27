@@ -49,7 +49,7 @@ GROUP_auth        := TestForgeAccessKeyExpiry             # 2m24, waits for the 
 GROUP_auth        += TestForgeCopyAuthorization           # 0m46
 GROUP_auth        += TestForgeRoutePermissions            # 0m46
 GROUP_auth        += TestForgeBucketEncryptionPermissions # 0m46
-GROUP_auth        += TestForgeBucketPolicy                # skips unless INGOT_ITEST_IAM=1 or a hilt override
+GROUP_auth        += TestForgeBucketPolicy                # 0m46
 GROUP_localdisk   := TestForgeCatalogUsage                # 1m23
 GROUP_localdisk   += TestForgeLocalBlobBudget             # 1m16
 GROUP_localdisk   += TestForgeRebuildAfterLostVolume      # 0m52

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fil-forge/libforge/diddoc"
 	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/did/web"
@@ -18,6 +19,7 @@ import (
 	"github.com/fil-forge/versitygw/s3event"
 	"github.com/fil-forge/versitygw/s3log"
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/adaptor"
 	"github.com/multiformats/go-multihash"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -39,6 +41,7 @@ import (
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/uploader"
+	"github.com/fil-forge/ingot/usage"
 )
 
 // ServerDeps bundles the runtime collaborators of an ingot Server
@@ -68,10 +71,9 @@ type ServerDeps struct {
 	Deferred  uploader.DeferredBodyUploader
 	Remover   uploader.BlobRemover
 
-	// Registrar keeps the upload service's content-entry list in step with the
-	// catalog: one entry per committed object version, which is what the
-	// service counts to report the space's object count.
-	Registrar uploader.UploadRegistrar
+	// Capturer captures the authority the tasks a request queues run with
+	// later, such as a blob's release.
+	Capturer uploader.AuthorityCapturer
 	// Tasks runs ingot's durable task queues: New registers the handlers,
 	// Start starts it and Stop stops it. It must be migrated. Required.
 	Tasks *taskrunner.Runner
@@ -120,6 +122,16 @@ type ServerDeps struct {
 	// same instance as Registry.
 	CatalogUsage registry.CatalogUsageStore
 
+	// Usage and UsageReporter, when both are set, turn on usage reporting:
+	// the bytes of object data GetObject sends to clients are counted by
+	// bucket space and hour and kept in Usage (typically the same instance
+	// as Registry), and they are reported to the auth service through
+	// UsageReporter (typically its client) with the object counts the
+	// bucket commits keep there. With either unset no egress is counted and
+	// nothing is reported; the commits count objects all the same.
+	Usage         registry.UsageStore
+	UsageReporter usage.Reporter
+
 	// Identity is the agent identity (the issuer of every outbound
 	// invocation). The listener serves its DID document at
 	// /.well-known/did.json so peers can resolve a did:web agent to its
@@ -154,6 +166,12 @@ type Server struct {
 	api     *s3api.S3ApiServer
 	// tasks is ServerDeps.Tasks.
 	tasks *taskrunner.Runner
+	// usage reports the gateway's usage counts; nil when usage reporting is
+	// off (see ServerDeps.Usage).
+	usage *usage.Service
+	// usageCounter is what the GetObject responses count their bytes into;
+	// nil with usage.
+	usageCounter *usage.Counter
 	// sweepCtx is cancelled by Stop. Every background sweep derives its
 	// context from it, and sweeps counts the sweeper goroutines, so Stop
 	// can wait for them to exit before the registry closes.
@@ -211,6 +229,26 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	if err := bs.CountBlobReads(otel.Meter("github.com/fil-forge/ingot/blockstore")); err != nil {
 		logger.Warn("local blob read metric not created", zap.Error(err))
 	}
+	// Usage is counted only when there is somewhere to keep the counts and
+	// someone to report them to.
+	var (
+		usageCounter *usage.Counter
+		usageSvc     *usage.Service
+	)
+	if deps.Usage != nil && deps.UsageReporter != nil {
+		usageCounter = usage.NewCounter()
+		usageSvc, err = usage.New(usage.Config{
+			Counter:       usageCounter,
+			Store:         deps.Usage,
+			Reporter:      deps.UsageReporter,
+			Logger:        logger,
+			MeterProvider: otel.GetMeterProvider(),
+		})
+		if err != nil {
+			_ = log.Close(ctx)
+			return nil, fmt.Errorf("ingot: %w", err)
+		}
+	}
 	backend, err := s3frontend.New(s3frontend.Deps{
 		Tasks:        deps.Tasks,
 		Authority:    deps.Authority,
@@ -226,7 +264,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Deferred:     deps.Deferred,
 		Remover:      deps.Remover,
 		Streaming:    deps.Streaming,
-		Registrar:    deps.Registrar,
+		Capturer:     deps.Capturer,
 		EncParams:    deps.EncParams,
 		RegionKeys:   deps.RegionKeys,
 		TenantKeys:   deps.TenantKeys,
@@ -245,10 +283,14 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		CORS:                cfg.CORSConfig,
 		AllowNoneEncryption: cfg.AllowNoneEncryption,
 		CatalogUsage:        deps.CatalogUsage,
+		Usage:               usageCounter,
 		Logger:              logger,
 	})
 
 	if err != nil {
+		if usageSvc != nil {
+			_ = usageSvc.CloseMetrics()
+		}
 		_ = log.Close(ctx)
 		return nil, fmt.Errorf("ingot: %w", err)
 	}
@@ -257,18 +299,23 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	if err != nil {
 		// Best-effort cleanup if we got past the log open: the caller
 		// has no Server handle to call Stop on.
+		if usageSvc != nil {
+			_ = usageSvc.CloseMetrics()
+		}
 		_ = backend.CloseMetrics()
 		_ = log.Close(ctx)
 		return nil, err
 	}
 
 	return &Server{
-		cfg:     cfg,
-		logger:  logger,
-		log:     log,
-		backend: backend,
-		api:     api,
-		tasks:   deps.Tasks,
+		cfg:          cfg,
+		logger:       logger,
+		log:          log,
+		backend:      backend,
+		api:          api,
+		tasks:        deps.Tasks,
+		usage:        usageSvc,
+		usageCounter: usageCounter,
 	}, nil
 }
 
@@ -278,12 +325,12 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 func (s *Server) Start(ctx context.Context) error {
 	if err := s.backend.Recover(ctx); err != nil {
 		// fx does not run OnStop for a hook whose OnStart failed, so the
-		// gauges go now; Stop calling CloseMetrics again is harmless.
-		_ = s.backend.CloseMetrics()
+		// gauges go now; Stop closing them again is harmless.
+		s.closeGauges()
 		return fmt.Errorf("ingot: recover: %w", err)
 	}
 	if err := s.tasks.Start(ctx); err != nil {
-		_ = s.backend.CloseMetrics()
+		s.closeGauges()
 		return fmt.Errorf("ingot: start task runner: %w", err)
 	}
 	s.logger.Info("starting ingot S3 listener",
@@ -292,15 +339,29 @@ func (s *Server) Start(ctx context.Context) error {
 		zap.String("data_dir", s.cfg.DataDir),
 		zap.Int64("max_blob_size", s.cfg.MaxBlobSize),
 	)
-	go func() {
-		if err := s.api.ServeMultiPort([]string{s.cfg.Addr}); err != nil {
-			s.logger.Error("ingot listener error", zap.Error(err))
-		}
-	}()
+	go s.serve()
 	s.sweepCtx, s.sweepCancel = context.WithCancel(context.Background())
 	s.startLocalBlobSweeper()
 	s.startCatalogUsageSweeper()
+	s.startUsageSweeper()
 	return nil
+}
+
+// closeGauges unregisters the gauges New registered, the backend's and the
+// usage service's, for a Start that fails.
+func (s *Server) closeGauges() {
+	_ = s.backend.CloseMetrics()
+	if s.usage != nil {
+		_ = s.usage.CloseMetrics()
+	}
+}
+
+// serve runs the S3 listener until Stop closes it. Stop's close returns nil,
+// so any error is a listener failure.
+func (s *Server) serve() {
+	if err := s.api.ServeMultiPort([]string{s.cfg.Addr}); err != nil {
+		s.logger.Error("ingot listener error", zap.Error(err))
+	}
 }
 
 // goSweep runs fn in a sweeper goroutine that Stop waits for. fn must return
@@ -369,6 +430,67 @@ func (s *Server) startLocalBlobSweeper() {
 	})
 }
 
+// usageFlushInterval is how often counted usage is added to Postgres. A crash
+// loses at most this much of it.
+var usageFlushInterval = 5 * time.Second
+
+// startUsageSweeper spawns the two usage sweepers: one adds the egress the
+// responses have counted to Postgres every usageFlushInterval, and the other
+// reports the counts that have changed to the auth service every
+// UsageReportInterval (see usage.Service). They run apart so a report that
+// takes long, with a backlog to send or a slow service, holds up no flush. A
+// failed flush keeps its counts in memory for the next one, and a failed
+// report leaves its counts due for the next, so both are logged and carry on.
+func (s *Server) startUsageSweeper() {
+	if s.usage == nil {
+		return
+	}
+	interval := s.cfg.UsageReportInterval
+	if interval <= 0 {
+		interval = 10 * time.Minute
+	}
+	s.goSweep(func() {
+		flush := time.NewTicker(usageFlushInterval)
+		defer flush.Stop()
+		for {
+			select {
+			case <-s.sweepCtx.Done():
+				return
+			case <-flush.C:
+				ctx, cancel := context.WithTimeout(s.sweepCtx, usageFlushInterval)
+				err := s.usage.Flush(ctx)
+				cancel()
+				if err != nil && s.sweepCtx.Err() == nil {
+					s.logger.Warn("usage flush", zap.Error(err))
+				}
+			}
+		}
+	})
+	s.goSweep(func() {
+		report := time.NewTicker(interval)
+		defer report.Stop()
+		for {
+			select {
+			case <-s.sweepCtx.Done():
+				return
+			case <-report.C:
+				ctx, cancel := context.WithTimeout(s.sweepCtx, interval)
+				ctx, span := tracing.Start(ctx, "sweep.usage_report")
+				stats, err := s.usage.Report(ctx)
+				s.endSweepSpan(span, err,
+					attribute.Int("ingot.sweep.reports", stats.Reports),
+					attribute.Int("ingot.sweep.counts", stats.Counts),
+					attribute.Int("ingot.sweep.warnings", stats.Warnings),
+					attribute.Int64("ingot.sweep.pruned", stats.Pruned))
+				cancel()
+				if err != nil && s.sweepCtx.Err() == nil {
+					s.logger.Warn("usage report", zap.Error(err))
+				}
+			}
+		}
+	})
+}
+
 // catalogUsageInterval is how often the catalog usage gauges' figures are
 // refreshed from the segment rows. Each refresh scans every segment row,
 // retired ones included, which accumulate until DeleteBucket (see
@@ -423,6 +545,16 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))
+	}
+	// After the listener, so what its last responses sent is counted, and
+	// stored before the process goes: the next start reports it.
+	if s.usage != nil {
+		if err := s.usage.Flush(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("usage flush: %w", err))
+		}
+		if err := s.usage.CloseMetrics(); err != nil {
+			errs = append(errs, fmt.Errorf("unregister usage gauges: %w", err))
+		}
 	}
 	// After the listener, whose requests run sync tasks, and before the
 	// backend drains: a task interrupted here stays queued and resumes on the
@@ -592,6 +724,7 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 	}
 
 	opts := []s3api.Option{
+		s3api.WithServerHeader(serverHeader),
 		s3api.WithQuiet(),
 		s3api.WithHealth("/health"),
 		s3api.WithConcurrencyLimiter(cfg.MaxConnections, cfg.MaxRequests),
@@ -627,7 +760,11 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 	if err != nil {
 		return nil, fmt.Errorf("ingot: building the agent DID document: %w", err)
 	}
-	opts = append(opts, s3api.WithRoute(http.MethodGet, web.WellKnownDIDPath, didDocumentHandler(doc)))
+	docHandler, err := didDocumentHandler(doc)
+	if err != nil {
+		return nil, fmt.Errorf("ingot: building the agent DID document handler: %w", err)
+	}
+	opts = append(opts, s3api.WithRoute(http.MethodGet, web.WellKnownDIDPath, docHandler))
 
 	// No s3api.WithRootUser: the gateway has no root account, so every access
 	// key resolves through iam.
@@ -640,6 +777,9 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 	}
 	return api, nil
 }
+
+// serverHeader is the Server response header on every response.
+const serverHeader = "Ingot"
 
 // policyHeaders adds what versitygw's bucket policy controllers leave out of
 // a ?policy response, since the backend seam returns only the document: the
@@ -665,11 +805,14 @@ func policyHeaders(c fiber.Ctx) error {
 
 // didDocumentHandler serves a fixed DID document as JSON. The document is
 // built once at construction: the agent identity never changes while the
-// server runs.
-func didDocumentHandler(doc did.Document) fiber.Handler {
-	return func(c fiber.Ctx) error {
-		return c.JSON(doc)
+// server runs. Responses carry Cache-Control, ETag and Last-Modified headers,
+// and conditional requests get a 304 when the document has not changed.
+func didDocumentHandler(doc did.Document) (fiber.Handler, error) {
+	handler, err := diddoc.NewHandler(doc)
+	if err != nil {
+		return nil, err
 	}
+	return adaptor.HTTPHandler(handler), nil
 }
 
 func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
@@ -724,8 +867,8 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	if deps.Remover == nil {
 		return errors.New("ingot: ServerDeps.Remover is required")
 	}
-	if deps.Registrar == nil {
-		return errors.New("ingot: ServerDeps.Registrar is required")
+	if deps.Capturer == nil {
+		return errors.New("ingot: ServerDeps.Capturer is required")
 	}
 	if deps.Meta == nil {
 		return errors.New("ingot: ServerDeps.Meta is required")

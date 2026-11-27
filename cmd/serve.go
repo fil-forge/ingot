@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/spf13/cobra"
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
@@ -93,26 +94,23 @@ func buildApp(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*fx.
 	// The issuer's String() prints the service DID and, for a did:web agent,
 	// the underlying key: "did:web:… (key: z6Mk…)".
 	logger.Info("loaded agent identity", zap.Stringer("agent", id))
-	pool, err := openPool(ctx, cfg.PostgresDSN)
-	if err != nil {
-		return nil, err
-	}
 
 	mcfg := *cfg
 	mcfg.Enabled = true
 
 	app := fx.New(
+		// OnStart recovers every bucket's unshipped segments before the
+		// listener binds, which outlasts fx's 15 s default on a large catalog.
+		fx.StartTimeout(time.Minute),
 		fxLogger(logger),
 		fx.Supply(logger),
-		fx.Supply(pool),
+		fx.Provide(func(lc fx.Lifecycle) (*pgxpool.Pool, error) {
+			return providePool(ctx, lc, cfg.PostgresDSN)
+		}),
 		fx.Supply(id),
 		ingot.Module(mcfg),
-		fx.Invoke(func(lc fx.Lifecycle) {
-			lc.Append(fx.Hook{OnStop: func(context.Context) error { pool.Close(); return nil }})
-		}),
 	)
 	if err := app.Err(); err != nil {
-		pool.Close()
 		return nil, err
 	}
 	return app, nil

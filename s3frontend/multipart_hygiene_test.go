@@ -518,7 +518,7 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 		Cache:      cache,
 		Deferred:   up,
 		Remover:    &recordingRemover{},
-		Registrar:  testfakes.NopUploader{},
+		Capturer:   testfakes.NopUploader{},
 		EncParams:  mem,
 		RegionKeys: testRegionKeys(t),
 		TenantKeys: testTenantKeys(),
@@ -1392,14 +1392,14 @@ func TestRecreatedBucketDisownsItsPredecessorsUploads(t *testing.T) {
 	}
 }
 
-// teardownBeforePutPart is an upload registrar that runs hook once, at the
+// teardownBeforePutPart is an authority capturer that runs hook once, at the
 // second capture of /blob/remove authority after it is armed: UploadPart
 // captures it to park the part's blobs and again for the part's add-part,
 // right before it runs, so the hook lands in the window after UploadPart
 // streamed its blobs and before its part row, where a teardown can take the
 // session.
 type teardownBeforePutPart struct {
-	uploader.UploadRegistrar
+	uploader.AuthorityCapturer
 	hook     func()
 	captures int
 }
@@ -1412,7 +1412,7 @@ func (s *teardownBeforePutPart) CaptureAuthority(ctx context.Context, space did.
 			hook()
 		}
 	}
-	return s.UploadRegistrar.CaptureAuthority(ctx, space, cmd)
+	return s.AuthorityCapturer.CaptureAuthority(ctx, space, cmd)
 }
 
 // TestUploadPartRefusedAfterTeardownReleasesItsBlobs: a sweep takes the
@@ -1423,8 +1423,8 @@ func (s *teardownBeforePutPart) CaptureAuthority(ctx context.Context, space did.
 func TestUploadPartRefusedAfterTeardownReleasesItsBlobs(t *testing.T) {
 	mp := &teardownBeforePutPart{}
 	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
-		mp.UploadRegistrar = d.Registrar
-		d.Registrar = mp
+		mp.AuthorityCapturer = d.Capturer
+		d.Capturer = mp
 	})
 	ctx := context.Background()
 	key := "refused-part"

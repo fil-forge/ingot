@@ -87,11 +87,11 @@ func TestBuildS3API_BucketPolicy(t *testing.T) {
 	f := &fakeAuthority{}
 	id, err := identity.New("", "did:web:ingot.test")
 	require.NoError(t, err)
-	tasks, err := provideTaskRunner(nil, id, zap.NewNop())
+	tasks, err := provideTaskRunner(config.Config{TaskWorkers: config.TaskWorkerConfig{Bucket: 2}}, nil, id, zap.NewNop())
 	require.NoError(t, err)
 	cache, err := blockstore.NewBlobCache(filepath.Join(t.TempDir(), "cache"))
 	require.NoError(t, err)
-	backend, err := s3frontend.New(s3frontend.Deps{Tasks: tasks, Registrar: testfakes.NopUploader{}, Registry: mem, Cache: cache, CORS: corsCfg, Authority: f})
+	backend, err := s3frontend.New(s3frontend.Deps{Tasks: tasks, Capturer: testfakes.NopUploader{}, Registry: mem, Cache: cache, CORS: corsCfg, Authority: f})
 	require.NoError(t, err)
 	// New registers its gauges on the global meter provider; leaving them
 	// registered would leak this backend's into a later test's provider.

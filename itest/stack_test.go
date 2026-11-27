@@ -18,7 +18,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -103,11 +102,6 @@ func localIngotBinary(t *testing.T) string {
 	return builtBinary
 }
 
-// pinnedBlockchainImage is a filecoin-localdev image (its multi-arch index,
-// tagged 96e9d9e) whose Anvil loads the chain state of the smelt version
-// go.mod pins; forgeStack explains why it is pinned.
-const pinnedBlockchainImage = "ghcr.io/fil-forge/filecoin-localdev@sha256:96e72624eb71efb1c15de1d0729b780955e5ece700e840dd56291f5c522b4bee"
-
 // forgeStack boots the smelt stack with the working tree's ingot injected
 // (plus any extra stack options), waits for ingot's S3 listener, and returns
 // the stack and ingot's host endpoint. Callers must provision a hilt tenant
@@ -123,17 +117,6 @@ func forgeStack(t *testing.T, extra ...stack.Option) (*stack.Stack, string) {
 		stack.WithPiriNodes(stack.PiriNodeConfig{Postgres: true}),
 		stack.WithServiceBinary("ingot", localIngotBinary(t)),
 	}
-	// The blockchain image is pinned, not smelt's default moving :main tag:
-	// Anvil loads the chain state smelt commits beside its compose file only
-	// in a localdev image whose Anvil can parse it, and a republished :main
-	// need not. Remove the pin (and this override with it) once ingot depends
-	// on a smelt version that pins the localdev image beside its state.
-	blockchainImage := pinnedBlockchainImage
-	if img := os.Getenv("INGOT_ITEST_BLOCKCHAIN_IMAGE"); img != "" {
-		t.Logf("using blockchain image override: %s", img)
-		blockchainImage = img
-	}
-	opts = append(opts, stack.WithBlockchainImage(blockchainImage))
 	// Local-dev escape hatches: run against upload-service (sprue) / piri
 	// images the registry doesn't have yet — e.g. built from an unmerged
 	// branch. Unset (CI) uses the published defaults. These exist because the
@@ -369,6 +352,10 @@ var hiltAllPermissions = []string{
 	"s3:GetBucketLocation",
 	"s3:GetBucketAcl",
 	"s3:GetBucketCORS",
+	"s3:PutBucketCORS",
+	"s3:GetBucketPolicy",
+	"s3:PutBucketPolicy",
+	"s3:DeleteBucketPolicy",
 	"s3:GetBucketPolicyStatus",
 	"s3:GetBucketTagging",
 	"s3:PutBucketTagging",
@@ -384,46 +371,6 @@ var hiltAllPermissions = []string{
 	// is priced on its own permission; the conformance suite clears
 	// governance-locked versions when it tears a bucket down.
 	"s3:BypassGovernanceRetention",
-}
-
-// hiltPolicyPermissions are the bucket policy operations, held by service
-// keys only. The published hilt image does not know them until
-// fil-forge/hilt#58 merges, so the test key carries them only when the IAM
-// scenarios run (see [iamScenariosEnabled]); fold them into
-// hiltAllPermissions then.
-var hiltPolicyPermissions = []string{
-	"s3:GetBucketPolicy",
-	"s3:PutBucketPolicy",
-	"s3:DeleteBucketPolicy",
-}
-
-// hiltCORSPermissions are the bucket CORS writes, held by service keys
-// only. The published hilt image does not know the permission until the
-// CORS write operations merge, so the test key carries it only when the
-// CORS write scenarios run (see [corsWritesEnabled]); fold it into
-// hiltAllPermissions then.
-var hiltCORSPermissions = []string{
-	"s3:PutBucketCORS",
-}
-
-// corsWritesEnabled reports whether the stack's hilt authorizes
-// PutBucketCors and DeleteBucketCors: a hilt override is in use, or
-// INGOT_ITEST_CORS_WRITES=1 says the image has them.
-func corsWritesEnabled() bool {
-	return os.Getenv("INGOT_ITEST_CORS_WRITES") == "1" || hiltOverridden()
-}
-
-// hiltOverridden reports whether the stack's hilt comes from a local override
-// rather than the published image.
-func hiltOverridden() bool {
-	return os.Getenv("INGOT_ITEST_HILT_BINARY") != "" || os.Getenv("INGOT_ITEST_HILT_IMAGE") != ""
-}
-
-// iamScenariosEnabled reports whether the stack's hilt carries the IAM
-// changes: a hilt override is in use, or INGOT_ITEST_IAM=1 says the image
-// has them.
-func iamScenariosEnabled() bool {
-	return os.Getenv("INGOT_ITEST_IAM") == "1" || hiltOverridden()
 }
 
 // hiltProvisionTenant provisions tenantID in hilt with an all-permission
@@ -465,16 +412,9 @@ func hiltProvisionTenantErr(ctx context.Context, s *stack.Stack, tenantID string
 		return "", "", fmt.Errorf("hilt provision tenant %q: %w (stdout=%s stderr=%s)", tenantID, err, out, errOut)
 	}
 
-	permissions := slices.Clone(hiltAllPermissions)
-	if iamScenariosEnabled() {
-		permissions = append(permissions, hiltPolicyPermissions...)
-	}
-	if corsWritesEnabled() {
-		permissions = append(permissions, hiltCORSPermissions...)
-	}
 	keyReq, err := json.Marshal(map[string]any{
 		"name":        "itest",
-		"permissions": permissions,
+		"permissions": hiltAllPermissions,
 	})
 	if err != nil {
 		return "", "", fmt.Errorf("marshal access-key request: %w", err)

@@ -135,7 +135,7 @@ func WithLogger(logger *zap.Logger) Option {
 }
 
 // WithBackoff overrides the reconnect backoff's initial interval and cap
-// (defaults 1s..1m).
+// (defaults: defaultMinBackoff, defaultMaxBackoff).
 func WithBackoff(min, max time.Duration) Option {
 	return func(c *Consumer) {
 		c.minBackoff = min
@@ -143,10 +143,13 @@ func WithBackoff(min, max time.Duration) Option {
 	}
 }
 
-// WithSaveInterval overrides how often the resume cursor is saved (default 1s).
+// WithSaveInterval overrides how often the resume cursor is saved (default:
+// defaultSaveInterval). A non-positive d is ignored.
 func WithSaveInterval(d time.Duration) Option {
 	return func(c *Consumer) {
-		c.saveInterval = d
+		if d > 0 {
+			c.saveInterval = d
+		}
 	}
 }
 
@@ -181,12 +184,12 @@ func (c *Consumer) Run(ctx context.Context) {
 	bo.MaxInterval = c.maxBackoff
 
 	var latest atomic.Pointer[registry.RevocationCursor]
-	position, ok := c.startPosition(ctx, bo, &latest)
+	position, headUnsaved, ok := c.startPosition(ctx, bo, &latest)
 	if !ok {
 		return
 	}
 	saved := make(chan struct{})
-	go c.saveCursor(ctx, &latest, saved)
+	go c.saveCursor(ctx, &latest, headUnsaved, saved)
 	defer func() { <-saved }()
 
 	bo.Reset()
@@ -202,7 +205,10 @@ func (c *Consumer) Run(ctx context.Context) {
 				break
 			}
 			if err != nil {
-				c.logger.Warn("revocation: stream error", zap.Error(err))
+				// A stop ends the stream with ctx's own error, not a fault.
+				if ctx.Err() == nil {
+					c.logger.Warn("revocation: stream error", zap.Error(err))
+				}
 				break
 			}
 			// The stream can hold records it read before ctx was canceled.
@@ -254,37 +260,44 @@ func (c *Consumer) Run(ctx context.Context) {
 // or, with none stored, at the firehose's head, which it saves first (see the
 // package doc). It reads the cursor, and then the head, with backoff until
 // each answers; a cursor it can't read is never replaced by the head. A head
-// it fails to save goes to latest, for the saver to retry. It reports false
-// only when ctx is canceled first.
-func (c *Consumer) startPosition(ctx context.Context, bo *backoff.ExponentialBackOff, latest *atomic.Pointer[registry.RevocationCursor]) (registry.RevocationCursor, bool) {
+// it fails to save goes to latest, for the saver to retry, and unsaved
+// reports the failure, logged as the start of a run of failed saves unless a
+// stop cut the save short. It reports ok false only when ctx is canceled
+// first.
+func (c *Consumer) startPosition(ctx context.Context, bo *backoff.ExponentialBackOff, latest *atomic.Pointer[registry.RevocationCursor]) (position registry.RevocationCursor, unsaved, ok bool) {
 	for {
 		stored, err := c.cursor.GetRevocationCursor(ctx)
 		if err == nil {
-			return *stored, true
+			return *stored, false, true
 		}
 		if errors.Is(err, registry.ErrNotFound) {
 			break
 		}
 		if ctx.Err() != nil {
-			return registry.RevocationCursor{}, false
+			return registry.RevocationCursor{}, false, false
 		}
 		// No revocation is applied until it can be read, so this is an error.
 		c.logger.Error("revocation: load cursor", zap.Error(err))
 		if !sleepCtx(ctx, bo.NextBackOff()) {
-			return registry.RevocationCursor{}, false
+			return registry.RevocationCursor{}, false, false
 		}
 	}
 	head, ok := c.readHead(ctx, bo)
 	if !ok {
-		return registry.RevocationCursor{}, false
+		return registry.RevocationCursor{}, false, false
 	}
-	position := registry.RevocationCursor{Token: string(head)}
+	position = registry.RevocationCursor{Token: string(head)}
 	if err := c.cursor.PutRevocationCursor(ctx, position); err != nil {
-		c.logger.Warn("revocation: persist cursor", zap.Error(err))
 		saveLater := position
 		latest.Store(&saveLater)
+		// A save cut short by a stop is no failure: the final save settles it.
+		if ctx.Err() != nil {
+			return position, false, true
+		}
+		c.logger.Warn("revocation: persist cursor failed; retrying each interval", zap.Error(err))
+		return position, true, true
 	}
-	return position, true
+	return position, false, true
 }
 
 // readHead reads the firehose's head with backoff until the service answers,
@@ -309,22 +322,24 @@ func (c *Consumer) readHead(ctx context.Context, bo *backoff.ExponentialBackOff)
 // skipping intervals in which it has not moved, and once more when ctx is
 // canceled, then closes done. Saving off the record loop matters on a busy
 // firehose: each save is a durable commit, and on a node whose database sits
-// on slow disks one commit per record capped the loop at about 55 records a
-// second. A failed save is retried at the next interval; until one succeeds,
-// a restart re-delivers from the previous saved cursor.
-func (c *Consumer) saveCursor(ctx context.Context, latest *atomic.Pointer[registry.RevocationCursor], done chan<- struct{}) {
+// on slow disks, one commit per record bounded how fast the loop could apply
+// records. A failed save is retried at the next interval; until one succeeds,
+// a restart re-delivers from the previous saved cursor. A run of failed
+// interval saves is logged once when it starts and once when it ends;
+// failing says the run started before the saver did, with the head's save.
+func (c *Consumer) saveCursor(ctx context.Context, latest *atomic.Pointer[registry.RevocationCursor], failing bool, done chan<- struct{}) {
 	defer close(done)
 	var last *registry.RevocationCursor
-	save := func(ctx context.Context) {
+	save := func(ctx context.Context) error {
 		cur := latest.Load()
 		if cur == nil || cur == last {
-			return
+			return nil
 		}
 		if err := c.cursor.PutRevocationCursor(ctx, *cur); err != nil {
-			c.logger.Warn("revocation: persist cursor", zap.Error(err))
-			return
+			return err
 		}
 		last = cur
+		return nil
 	}
 
 	ticker := time.NewTicker(c.saveInterval)
@@ -332,10 +347,26 @@ func (c *Consumer) saveCursor(ctx context.Context, latest *atomic.Pointer[regist
 	for {
 		select {
 		case <-ticker.C:
-			save(ctx)
+			err := save(ctx)
+			if ctx.Err() != nil {
+				// Stopped mid-save: the final save settles it.
+				continue
+			}
+			switch {
+			case err != nil && !failing:
+				c.logger.Warn("revocation: persist cursor failed; retrying each interval", zap.Error(err))
+			case err == nil && failing:
+				c.logger.Info("revocation: persist cursor recovered")
+			}
+			failing = err != nil
 		case <-ctx.Done():
 			final, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalSaveTimeout)
-			save(final)
+			switch err := save(final); {
+			case err != nil:
+				c.logger.Warn("revocation: persist cursor at stop", zap.Error(err))
+			case failing:
+				c.logger.Info("revocation: persist cursor recovered")
+			}
 			cancel()
 			return
 		}

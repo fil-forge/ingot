@@ -75,7 +75,7 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 		Deferred:   up,
 		Remover:    &recordingRemover{},
 		Claims:     mem,
-		Registrar:  testfakes.NopUploader{},
+		Capturer:   testfakes.NopUploader{},
 		EncParams:  mem,
 		RegionKeys: testRegionKeys(t),
 		TenantKeys: testTenantKeys(),

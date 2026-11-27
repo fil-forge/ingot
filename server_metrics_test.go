@@ -27,7 +27,7 @@ import (
 )
 
 // TestServerReportsLocalBlobGauges: New registers the local blob, catalog
-// journal and multipart gauges on the global meter provider, and Stop
+// journal, bucket total and multipart gauges on the global meter provider, and Stop
 // unregisters them.
 func TestServerReportsLocalBlobGauges(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
@@ -43,6 +43,8 @@ func TestServerReportsLocalBlobGauges(t *testing.T) {
 		"ingot.catalog_journal.blocks":     true,
 		"ingot.catalog_journal.bytes":      true,
 		"ingot.catalog_journal.oldest_age": true,
+		"ingot.buckets.count":              true,
+		"ingot.objects.count":              true,
 		"ingot.multipart.parked_age":       true,
 	}, metricNames(t, reader), "metrics reported after New")
 
@@ -166,7 +168,7 @@ func newTestServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerDe
 	tenantPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	require.NoError(t, err)
 	pool := pgtest.New(t)
-	tasks, err := provideTaskRunner(pool, id, zaptest.NewLogger(t))
+	tasks, err := provideTaskRunner(config.Config{TaskWorkers: config.TaskWorkerConfig{Bucket: 2}}, pool, id, zaptest.NewLogger(t))
 	require.NoError(t, err)
 	require.NoError(t, tasks.Migrate(t.Context()))
 	mem := registry.NewPostgres(pool)
@@ -181,7 +183,7 @@ func newTestServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerDe
 		Streaming:       testfakes.NopUploader{},
 		Deferred:        testfakes.NopUploader{},
 		Remover:         testfakes.NopUploader{},
-		Registrar:       testfakes.NopUploader{},
+		Capturer:        testfakes.NopUploader{},
 		Registry:        mem,
 		Intents:         mem,
 		Locations:       mem,

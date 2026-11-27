@@ -164,6 +164,10 @@ type Registry interface {
 	// blocks commits journaled whose segments have not shipped yet.
 	CatalogJournalStats(ctx context.Context) (CatalogJournalStats, error)
 
+	// BucketTotals reports how many buckets there are and how many objects
+	// they hold between them.
+	BucketTotals(ctx context.Context) (BucketTotals, error)
+
 	// SetForgeRoot records that the DAG reachable from root has been
 	// successfully shipped to Forge. Used as the high-water mark by
 	// the recovery loop: anything reachable from Root but not from
@@ -197,10 +201,14 @@ var (
 // (Registry.RootCommitWrites):
 // the rows that must exist exactly when the version does.
 type RootCommit struct {
-	// Registrations are the queue-space-upload tasks the commit queues in
-	// its transaction: the versions it publishes and retracts from the
-	// space's content-entry list.
-	Registrations []taskrunner.Spec
+	// ObjectsAdded is how many objects the commit adds to the bucket: the
+	// versions it publishes. It is added to the bucket's total, and the
+	// totals copied to the current hour's usage count, in the commit's
+	// transaction (ObjectCountWrites).
+	ObjectsAdded int64
+	// ObjectsRemoved is how many objects the commit takes from the bucket:
+	// the versions it discards. It is counted as ObjectsAdded is.
+	ObjectsRemoved int64
 	// Claims are the new generation's claims, one per body digest. A claim
 	// with a Ref takes over the write's pending reference to the blob, and
 	// cancels the reference's expiry, in the same transaction; a reference
@@ -231,7 +239,7 @@ type RootCommit struct {
 
 // Empty reports whether the commit carries nothing besides the root.
 func (c RootCommit) Empty() bool {
-	return len(c.Registrations) == 0 && len(c.Claims) == 0 && len(c.Drops) == 0 &&
+	return c.ObjectsAdded == 0 && c.ObjectsRemoved == 0 && len(c.Claims) == 0 && len(c.Drops) == 0 &&
 		len(c.Journal.Blocks) == 0
 }
 
@@ -244,6 +252,17 @@ type CatalogJournalStats struct {
 	// Oldest is when the oldest of them was journaled; zero when the
 	// journal is empty.
 	Oldest time.Time
+}
+
+// BucketTotals is the buckets the registry holds and the objects in them.
+type BucketTotals struct {
+	// Buckets is the number of buckets, ones being deleted included until
+	// their row goes.
+	Buckets int64
+	// Objects is the objects they hold, counted as the usage report counts
+	// them ([ObjectUsageStore]): every version of every key, delete markers
+	// included, and every part of a multipart upload still in progress.
+	Objects int64
 }
 
 // ClaimDrop is one claim a commit removes: a discarded version's row on a

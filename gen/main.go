@@ -12,7 +12,6 @@ import (
 	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
-	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	cbg "github.com/whyrusleeping/cbor-gen"
 )
 
@@ -37,11 +36,6 @@ func main() {
 	if err := cfg.WriteMapEncodersToFile("../queue/shardqueue/cbor_gen.go", "shardqueue",
 		shardqueue.CacheTask{},
 		shardqueue.EvictTask{},
-	); err != nil {
-		panic(err)
-	}
-	if err := cfg.WriteMapEncodersToFile("../queue/spaceuploadqueue/cbor_gen.go", "spaceuploadqueue",
-		spaceuploadqueue.Task{},
 	); err != nil {
 		panic(err)
 	}

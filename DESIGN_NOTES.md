@@ -61,8 +61,7 @@ trace is the
 
 A commit's arguments are declarative: the bucket and an ordered list of key
 changes (Put, Delete, SetAttributes), plus the authority the tasks it spawns
-need (the release proofs and the `/upload/add` and `/upload/remove`
-proofs). A Put covers PutObject, CopyObject, CompleteMultipartUpload and
+need (the release proofs). A Put covers PutObject, CopyObject, CompleteMultipartUpload and
 delete markers; a Delete removes a version, or the current one, which the
 commit turns into a marker or a removal of the key from the bucket's
 versioning state; SetAttributes sets retention, legal hold and tags. A
@@ -573,6 +572,17 @@ through an add on the subject, so a release that may have acted never finds
 one afterwards. A release runs only as a task: Complete queues its orphans'
 releases with its own commit.
 
+A release acts only while it holds the subject's lease. The task runner ends
+a handler's context when its lease is taken over, or is 5 s from expiring
+without having been renewed (a stalled process, or one with no route to
+Postgres), and the release passes that context to its crypto-shred and its
+network step. Without that, a release that stalled after its checks could
+wake after another node had released the blob and a write had added it
+again, and remove the copy the new object needs. A `/blob/remove` already sent when the lease is lost still arrives;
+the 5 s are the time it has to do so before another node can take the lease.
+The upload service cannot tell the two copies apart, since a remove names
+only the space and the digest.
+
 In a plaintext bucket, a write of a deleted object's bytes while that
 object's release is still within its reader grace keeps the blob: the
 write's add takes a reference, and the release is stale when it runs. If the
@@ -586,6 +596,54 @@ gives up its allocation. A release leaves the cached file while
 another space still holds an intent for the digest; a file that two spaces'
 releases at once both leave is reclaimed by the cache's time to live.
 
+## Usage reporting
+
+Some of what a tenant is shown as usage only the gateway can count. Today
+that is egress: the bytes of object data GetObject sends to clients. The
+upload service knows what a space stores and never sees a read, and a storage
+node sees only the reads that miss the cache, in stored bytes.
+
+`usage.Counter` wraps each GetObject body (`Counter.Egress`) and adds what is
+read from it, as it is read, to an in-memory count for the bucket's space and
+the current UTC hour. The body is the object's own bytes: decrypted, trimmed
+to the requested range. A read counts toward the hour it happens in, so a
+response that runs across an hour boundary adds to both hours, and a client
+that goes away is counted for what was read, which is at most a buffer more
+than reached it. Copies read their source through another path and are not
+counted.
+
+The usage sweeper (`server.go`) calls `usage.Service.Flush` every 5 seconds,
+which adds the counts to `ingot.egress_usage` (one row per space and hour;
+instances sharing the database add into the same rows) and puts them back in
+memory if the write fails. A write that was committed but whose reply was lost
+is therefore added twice, which overstates egress by at most one flush
+interval of one instance's traffic. That is accepted. Every `usage_report_interval` it calls
+`Service.Report`, which reads the rows whose `bytes_sent` differs from
+`bytes_reported`, oldest hour first, and sends them to the auth service with
+`/s3/usage/report`, up to 1,000 counts to a report and as many reports as the
+backlog that was waiting needs. A count is the hour's total so far, which only
+grows, and the service keeps the largest it is sent. So the hour in progress
+is reported like any other and again each time it has grown, a report that
+fails or is repeated changes nothing, and instances sharing a database can
+report the same rows in any order. On the service's answer the reported totals are
+written to `bytes_reported`; a row that grew meanwhile still differs and goes
+with the next pass. Rows are deleted 7 days after they were last
+acknowledged.
+
+The service answers with a warning for any space whose counts it did not
+store, named for the reason: `UnknownBucket` when it never knew the bucket,
+`BucketRegionMismatch` when another gateway serves it. An accepted report
+settles every count in it, so those are acknowledged like the rest and not
+sent again. Each warning is logged with its message and counted under its
+name (`ingot.usage.report_warnings`), a name this version does not know
+included.
+
+The agent invokes `/s3/usage/report` on its own authority: it is the
+invocation's subject as well as its issuer, the auth service is only the
+audience, and no proofs are sent. The service accepts it because the agent is
+a provider it has registered. A report names no tenant; the service knows
+each bucket's.
+
 ## Identity & auth
 
 - **agent**: the libforge `identity.Identity` the host provides (daemon: the `identity.key_file` PEM
@@ -595,9 +653,10 @@ releases at once both leave is reclaimed by the cache's time to live.
   resolve it to the signing key. The hilt→agent delegations and hilt's
   provider registration name the agent's DID, so changing it (did:key to
   did:web) re-issues both.
-- **space**: per bucket, a `did:plc` minted by hilt at bucket create and
+- **space**: per bucket, a `did:key` hilt generates at bucket create and
   stored on the bucket row; the subject of every blob and retrieve
-  invocation.
+  invocation. The space delegates authority over itself to the bucket's
+  tenant, and the tenant grants each access key its commands.
 - **tenant**: the `did:plc` hilt names as the caller's tenant in its
   authorize response; stored on the bucket row at create (the bucket's
   owner) and carried per request in `internal/reqscope` (the caller). The

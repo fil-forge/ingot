@@ -394,7 +394,8 @@ func (q *Queue) Abort(ctx context.Context, sess registry.MultipartSession) ([]mh
 }
 
 // runAbort is queue-multipart-upload.abort: it deletes an open upload and
-// its parts and queues the release of each of their blobs still there to
+// its parts, takes the parts off the bucket's object count, and queues the
+// release of each of their blobs still there to
 // release (sessionReleases): due at once, or after the reader grace for a
 // blob an object published. An upload already completed or gone is
 // ErrNoSuchUpload for a request's abort, and nothing for the auto-abort.
@@ -413,9 +414,15 @@ func (q *Queue) runAbort(ctx context.Context, ex *taskrunner.Exec, t taskrunner.
 		}
 		return nil, ErrNoSuchUpload
 	}
-	digests, published, err := q.sessionReleases(ctx, sess.Space, t.Subject)
+	digests, published, parts, err := q.sessionReleases(ctx, sess.Space, t.Subject)
 	if err != nil {
 		return nil, err
+	}
+	// The upload's parts stop counting as the bucket's objects.
+	for _, st := range registry.SpaceObjectCountWrites(sess.Space, 0, int64(parts)) {
+		if err := ex.Write(ctx, st.SQL, st.Args...); err != nil {
+			return nil, err
+		}
 	}
 	if err := spawnReleases(ctx, ex, sess.Space, digests, args.Release, registry.DueNow()); err != nil {
 		return nil, err
@@ -437,8 +444,8 @@ func (q *Queue) runAbort(ctx context.Context, ex *taskrunner.Exec, t taskrunner.
 	return nil, nil
 }
 
-// sessionReleases returns the blobs of uploadID's parts that are still there
-// to release, each once, for an open upload's abort to queue their releases,
+// sessionReleases returns how many parts uploadID holds, and the blobs of
+// those parts that are still there to release, each once, for an open upload's abort to queue their releases,
 // as every reference that goes does. The blob's upload intent says which
 // those are. A published intent is a committed blob — the state its first
 // reference claim wrote — so it may have been readable through an object:
@@ -452,13 +459,14 @@ func (q *Queue) runAbort(ctx context.Context, ex *taskrunner.Exec, t taskrunner.
 // can complete. Whether a blob is in fact free to go is the release's
 // question, answered when it runs: it does nothing for a digest anything in
 // the space still references.
-func (q *Queue) sessionReleases(ctx context.Context, space did.DID, uploadID string) (digests, published []mh.Multihash, err error) {
-	parts, err := q.multipart.ListParts(ctx, uploadID)
+func (q *Queue) sessionReleases(ctx context.Context, space did.DID, uploadID string) (digests, published []mh.Multihash, parts int, err error) {
+	stored, err := q.multipart.ListParts(ctx, uploadID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list parts: %w", err)
+		return nil, nil, 0, fmt.Errorf("list parts: %w", err)
 	}
+	parts = len(stored)
 	seen := map[string]bool{}
-	for _, p := range parts {
+	for _, p := range stored {
 		for _, d := range p.BlobDigests {
 			if seen[string(d)] {
 				continue
@@ -470,7 +478,7 @@ func (q *Queue) sessionReleases(ctx context.Context, space did.DID, uploadID str
 				// Already released in full, intent and all.
 				continue
 			case err != nil:
-				return nil, nil, fmt.Errorf("lookup intent: %w", err)
+				return nil, nil, 0, fmt.Errorf("lookup intent: %w", err)
 			case in.State == registry.IntentPublished:
 				// Committed, so possibly read: released after the grace.
 				published = append(published, d)
@@ -479,7 +487,7 @@ func (q *Queue) sessionReleases(ctx context.Context, space did.DID, uploadID str
 			digests = append(digests, d)
 		}
 	}
-	return digests, published, nil
+	return digests, published, parts, nil
 }
 
 // Reap runs uploadID's queue-multipart-upload.reap at once, for a

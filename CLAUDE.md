@@ -64,7 +64,8 @@ ingot depends only on these — it must **never** import `fil-forge/sprue` or
   `commands/{blob,content,http,assert,ucan,index,provider,access}`, `blobindex`
   (sharded-dag-index), `ucan` (ProofStore), `ucan/retrieval`, `didmailto`, `receipt`.
 - **`fil-forge/hilt/pkg/{client,rpc/service,s3perm,sigv4}`** — the auth/tenant
-  service client: `/s3/request/authorize`, `/s3/bucket/*`, SigV4 verification
+  service client: `/s3/request/authorize`, `/s3/bucket/*`, `/s3/usage/report`,
+  SigV4 verification
   helpers, permission→command mapping.
 - **`indexing-service/pkg/{client,types}`** — indexer query client (the
   indexer-backed locator compiles but is not wired; reads use the local tables).
@@ -104,8 +105,19 @@ Internal:
   `Blake3` attribute, over `blake3tree`), `catalog usage` (each bucket's
   catalog bytes on Forge, dead on arrival, and live via
   `logstore.WalkCatalog`, which reads segments retired from disk from Forge
-  with an access key from the environment, as JSON, for benchmark runs);
+  with an access key from the environment, as JSON, for benchmark runs),
+  `footprint` (the `ingot` schema's tables, the WAL position, `data_dir`'s
+  entries, and the release queue's timings and backlog, as JSON); those two
+  are left out of the help unless `INGOT_DEV_COMMANDS` is true;
   `deps.go` (agent identity from the PEM key + optional did:web, pgx pool).
+- **`cmd/ingot-preload/`** + **`internal/preload`** — a separate binary, a
+  plain S3 client that loads a gateway's catalog to estate scale for
+  measuring it: zero-byte bulk objects plus a few pack-sized ones with
+  deterministic pseudo-random bodies, keys and PUTs shaped as the pack
+  server's (create-only, `x-amz-checksum-sha256`), progress in a state file it
+  resumes from, reports as JSON lines (`load`); then timed, checked reads,
+  listings, writes and deletes against what the state file says was loaded
+  (`validate`). `internal/preload` imports nothing else from ingot.
 - **`s3frontend/`** — versitygw `backend.Backend`: `object.go`
   (Put/Get/Head/Delete/List), `version.go` (resolveVersion, reading the
   per-key version tree), `bucketqueue.go` (the requests' commits through
@@ -141,7 +153,12 @@ Internal:
   sums the catalog usage gauges report), `stores*.go` (intents, locations,
   inclusions, blob_refs and pending refs (`CountReferences`),
   multipart sessions/parts, parks, encryption params, the revocation
-  cursor),
+  cursor), `egress.go` (`EgressUsageStore`: the egress counted for each
+  space and hour, and what of it hilt has acknowledged), `objects.go`
+  (`ObjectCountWrites`, which a bucket commit writes with its root: the
+  objects it adds and takes away go onto the bucket's two totals, gained and
+  lost, and the totals into the hour's row; and `ObjectUsageStore`, the
+  hourly rows and what of them hilt has acknowledged),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
   all of them.
 - **`queue/`** — one package per task queue, each built over the runner
@@ -151,8 +168,7 @@ Internal:
   over the ones after it, which are the only queues a package imports; the
   bucket queue hands the catalog log its ship callback.
   The packages:
-  `shardqueue` (`queue-shard`, the cache's copies), `spaceuploadqueue`
-  (`queue-space-upload`, the object-count changes), `spaceshardqueue`
+  `shardqueue` (`queue-shard`, the cache's copies), `spaceshardqueue`
   (`queue-space-shard`, the tasks on one blob in one space; the releases
   bucket commits and part writes owe come back from `registry` as data,
   and the queue that applies those writes queues them through it),
@@ -189,16 +205,14 @@ Internal:
   runner (`provideTaskRunner` in `module.go`) over the `ingot` schema; its
   tables are migrated in the migration hook, and `Server` starts and stops
   it. Queues in order: `queue-multipart-upload`, `queue-bucket`,
-  `queue-space-upload`, `queue-space-shard`, `queue-shard`.
+  `queue-space-shard`, `queue-shard`.
   `queue-multipart-upload` (`queue/multipartqueue`), subject the
   upload ID: an upload's create, add-part, accept, complete, abort and reap,
   one at a time, the accept queuing a
   `queue-space-shard.accept` for each blob of the upload's parked parts;
   `queue-bucket` (`queue/bucketqueue`), subject the bucket's space
   DID: every change to a bucket, placed on the instance holding its catalog
-  log; `queue-space-upload` (`queue/spaceuploadqueue`), the
-  object-count changes a `queue-bucket.commit` spawns with its own
-  commit; `queue-shard` (`queue/shardqueue`), subject the hex
+  log; `queue-shard` (`queue/shardqueue`), subject the hex
   digest: a cached blob's time to live, `queue-shard.cache` scheduling its
   `queue-shard.evict` at `CacheTTL`, run again by reads with under half
   left, and the budget pass's evictions as sync `queue-shard.evict`s;
@@ -211,14 +225,26 @@ Internal:
   behind `Uploader` (`SubmitShard`), `DeferredBodyUploader` (`ConcludeBlobs`,
   `AbortBlob`), `StreamingBodyUploader` (`StartBlob`, `PutBlob`: allocate by
   digest code, send as the body arrives), `BlobRemover`, and
-  `UploadRegistrar` (`RegisterUploads`/`RetractUploads`, the object-count
-  entries `queue-space-upload` sends, each with authority captured in the
-  request by `CaptureAuthority`); captures the per-space
+  `AuthorityCapturer` (`CaptureAuthority`/`PrepareAuthority`, the authority
+  a task a request queues runs with later); captures the per-space
   ship authority (1h TTL) from in-request writes: `shipProofs` from body
   uploads (also the background releases' and aborts' fallback), and
   `commitProofs` from every `queue-bucket.commit` append (`CaptureShipAuthority`), which
   the ship prefers. Both take only stores `reqscope.BorrowableProofStore`
   returns, and their chains skip revoked delegations.
+- **`usage/`** — the usage counts only the gateway knows, reported to hilt:
+  `counter.go` (`Counter`, which wraps each GetObject body and counts what is
+  read from it by bucket space and hour) and `service.go` (`Service`: `Flush`
+  adds the counts to `ingot.egress_usage`, `Report` sends the ones that have
+  changed since hilt acknowledged them with `/s3/usage/report`, the hour in
+  progress included, then the object counts the commits wrote to
+  `ingot.object_usage` the same way, and prunes old ones). A bucket's object
+  count is one per version, delete markers included, plus one per part of
+  each multipart upload in progress (counted by `PartWrites`, taken away by
+  the upload's Complete or Abort); Ingot registers nothing with the upload
+  service for it. The usage sweeper in `server.go`
+  runs both. Its instruments (`ingot.usage.*`) are created on the global
+  meter provider.
 - **`bucketauthority/`** — hilt bucket ops: forwards CreateBucket /
   DeleteBucket / ListBuckets to `/s3/bucket/*`, recovering the signed S3
   request from ctx.
@@ -284,8 +310,10 @@ Internal:
   instruments (`ingot.local_blobs.*`: usage by directory, budget and
   stalled-upload gauges, removals by reason, reads by tier), the multipart
   accept's (`ingot.multipart.*`: parked-part age, blob concludes by outcome,
-  deferred Completes) and the catalog journal's (`ingot.catalog_journal.*`:
-  blocks, bytes, oldest age) are created on the global meter provider,
+  deferred Completes), the catalog journal's (`ingot.catalog_journal.*`:
+  blocks, bytes, oldest age) and the totals' (`ingot.buckets.count`,
+  `ingot.objects.count`: read from the buckets' object counts at each
+  collection) are created on the global meter provider,
   through `s3frontend.Deps.MeterProvider` and `Layered.CountBlobReads`, and
   the runner's `taskrunner.*` on it too; with no provider installed they are
   no-ops. So are the catalog usage gauges (`ingot.catalog.*`: each bucket's
@@ -316,7 +344,7 @@ Internal:
 | `blockstore.BlockReader` | `blockstore.Forge` (in `Cached`) | `testfakes.NopBaseReader` |
 | `registry.Registry` + the store seams + `logstore.Meta` | `*registry.Postgres` (all of them) | (same, on a database per test) |
 | `locator.Locator` | `registry.LocalLocator` | (indexer-backed locator exists, unwired) |
-| `uploader.{Uploader,StreamingBodyUploader,DeferredBodyUploader,BlobRemover,UploadRegistrar}` | `uploader.Forge` | `testfakes.NopUploader` |
+| `uploader.{Uploader,StreamingBodyUploader,DeferredBodyUploader,BlobRemover,AuthorityCapturer}` | `uploader.Forge` | `testfakes.NopUploader` |
 
 ## fx module
 
@@ -326,13 +354,15 @@ Internal:
   seams; `bucketauthority.BucketAuthority`; `registry.Registry` plus the
   intent/location/inclusion/blob-ref/GC/multipart/park/encryption-params
   stores; `logstore.Meta`; `auth.IAMService`; `regionkey.Provider`;
-  `tenantkey.Source`; optionally `registry.CatalogUsageStore`) + a
+  `tenantkey.Source`; optionally `registry.CatalogUsageStore`, and
+  `registry.EgressUsageStore` with `usage.Reporter`, which together turn on
+  usage reporting) + a
   `PreStartHook` group; runs pre-start → `New` → `Start` on the fx
   lifecycle.
 - **`Module(cfg)`** (production wrapper) — supplies Postgres as Registry +
   Meta + every store (one `*registry.Postgres` behind them all), the Forge
   reader (`LocalLocator` inside `Cached`), the task runner
-  (`provideTaskRunner`), the sprue edge client + uploader, the hilt client +
+  (`provideTaskRunner`), the sprue edge client + uploader, the hilt client (also the `usage.Reporter`) +
   `iam.Service` + `KeyProofs`, `bucketauthority`, the region-key provider,
   the tenant key source, the (empty) token store, and the migration
   `PreStartHook` (goose, then the runner's tables); with
@@ -368,6 +398,8 @@ neither), `TokenStoreDir` (→ `DataDir`), `MultipartSessionTTL` (empty → 7d,
 negative → never: an open upload's auto-abort and a completed one's reap are
 due this long out), `ReleaseGrace` (empty → 60s, negative → 0: how long a
 blob's release waits after its last claim drops),
+`UsageReportInterval` (empty → 10m, must be positive: how often the egress
+counts that have changed are reported to hilt),
 `LocalBlobMaxBytes` (0 → no budget for the cache, writes in progress
 included) with
 `CacheTTL` (1h: how long a body stays cached after it was cached or last

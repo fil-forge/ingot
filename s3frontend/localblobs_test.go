@@ -20,7 +20,6 @@ import (
 	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
-	"github.com/fil-forge/ingot/queue/spaceuploadqueue"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 )
@@ -41,7 +40,6 @@ func newShardFixture(t *testing.T, ttl time.Duration) *shardFixture {
 		Queues: []taskrunner.QueueOptions{
 			{Name: multipartqueue.Name},
 			{Name: bucketqueue.Name},
-			{Name: spaceuploadqueue.Name},
 			{Name: spaceshardqueue.Name},
 			{Name: shardqueue.Name, Workers: 2},
 		},
@@ -54,7 +52,7 @@ func newShardFixture(t *testing.T, ttl time.Duration) *shardFixture {
 	dir := t.TempDir()
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
 	require.NoError(t, err)
-	b, err := New(Deps{Tasks: r, Registrar: testfakes.NopUploader{}, Cache: cache, Intents: newTestStore(t), CacheTTL: ttl, Logger: zaptest.NewLogger(t)})
+	b, err := New(Deps{Tasks: r, Capturer: testfakes.NopUploader{}, Cache: cache, Intents: newTestStore(t), CacheTTL: ttl, Logger: zaptest.NewLogger(t)})
 	require.NoError(t, err)
 	require.NoError(t, r.Migrate(context.Background()))
 	require.NoError(t, r.Start(context.Background()))

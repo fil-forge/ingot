@@ -28,7 +28,6 @@ import (
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // ErrBucketNotFound is returned by Begin when the bucket doesn't
@@ -132,8 +131,8 @@ type Tx struct {
 	staging *blockstore.OpStaging
 	cst     cbor.IpldStore
 
-	// commit is what the root's advance carries besides the root: the upload
-	// registrations this commit queues and the reference index rows of the
+	// commit is what the root's advance carries besides the root: the objects
+	// this commit adds and takes away and the reference index rows of the
 	// versions it publishes and discards. They are written with the root,
 	// so none can describe a version that did not commit, nor miss one that
 	// did.
@@ -145,13 +144,14 @@ type Tx struct {
 // Mark is a point in a Tx to return to: the working root and what the
 // commit carries at that point.
 type Mark struct {
-	root                    cid.Cid
-	regs, claims, drops, gc int
+	root              cid.Cid
+	added, removed    int64
+	claims, drops, gc int
 }
 
 // Mark returns the transaction's current point, for Restore.
 func (tx *Tx) Mark() Mark {
-	return Mark{tx.state.Root, len(tx.commit.Registrations), len(tx.commit.Claims), len(tx.commit.Drops), len(tx.gc)}
+	return Mark{tx.state.Root, tx.commit.ObjectsAdded, tx.commit.ObjectsRemoved, len(tx.commit.Claims), len(tx.commit.Drops), len(tx.gc)}
 }
 
 // Restore returns the transaction to m, dropping what the commit gained
@@ -159,7 +159,7 @@ func (tx *Tx) Mark() Mark {
 // blocks it staged, which nothing references.
 func (tx *Tx) Restore(m Mark) {
 	tx.state.Root = m.root
-	tx.commit.Registrations = tx.commit.Registrations[:m.regs]
+	tx.commit.ObjectsAdded, tx.commit.ObjectsRemoved = m.added, m.removed
 	tx.commit.Claims = tx.commit.Claims[:m.claims]
 	tx.commit.Drops = tx.commit.Drops[:m.drops]
 	tx.gc = tx.gc[:m.gc]
@@ -173,13 +173,14 @@ func (tx *Tx) Advance(root cid.Cid) { tx.state.Root = root }
 // commit to record as a GC candidate.
 func (tx *Tx) AddGCCandidate(c cid.Cid) { tx.gc = append(tx.gc, c) }
 
-// EnqueueUploadRegistration records a change to the space's content-entry
-// list for this commit to carry. Commits run one at a time on the bucket's
-// subject, so a bucket's registrations are queued in commit order, the order
-// a key's changes have to replay in.
-func (tx *Tx) EnqueueUploadRegistration(reg taskrunner.Spec) {
-	tx.commit.Registrations = append(tx.commit.Registrations, reg)
-}
+// CountObjectAdded records that this commit adds an object to the bucket:
+// a version of a key, or a delete marker. The bucket's count gains it with
+// the commit.
+func (tx *Tx) CountObjectAdded() { tx.commit.ObjectsAdded++ }
+
+// CountObjectRemoved records that this commit takes an object from the
+// bucket: a version it discards. The bucket's count loses it with the commit.
+func (tx *Tx) CountObjectRemoved() { tx.commit.ObjectsRemoved++ }
 
 // ClaimBlobs records the new generation's claims on its body digests for
 // this commit to carry. A claim whose write's pending reference has expired
