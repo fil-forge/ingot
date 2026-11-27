@@ -28,7 +28,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/libforge/taskrunner"
 )
 
 // Name is the task queue the cache's copies are kept on. Its subject is the

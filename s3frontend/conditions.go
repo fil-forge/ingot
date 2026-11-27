@@ -14,7 +14,7 @@ import (
 
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/queue/bucketqueue"
-	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/libforge/taskrunner"
 )
 
 // copySourceConditionPrefix is what S3 prepends to the failed header's name

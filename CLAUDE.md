@@ -184,7 +184,7 @@ Internal:
   `queue-space-shard.accept` per parked blob, which concludes it while the
   client uploads, and Complete validates the part list, assembles the
   object and commits it as a `queue-bucket.commit` child).
-- **`taskrunner/`** — durable task queues in Postgres (one tasks table and
+- **`taskrunner`** (libforge's `github.com/fil-forge/libforge/taskrunner`, not a package of this repo) — durable task queues in Postgres (one tasks table and
   one leases table per queue), serialized per (queue, subject) by a lease
   row. A task's tree (its handler plus sync children in later queues) adds
   writes to an ordered list that commits in one transaction at the end, with

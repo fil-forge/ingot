@@ -20,8 +20,8 @@ import (
 	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
-	"github.com/fil-forge/ingot/taskrunner"
-	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
+	"github.com/fil-forge/libforge/taskrunner"
+	"github.com/fil-forge/libforge/taskrunner/taskrunnertest"
 )
 
 // shardFixture runs a backend holding only a cache, whose queue-shard

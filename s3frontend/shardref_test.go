@@ -14,8 +14,8 @@ import (
 
 	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
-	"github.com/fil-forge/ingot/taskrunner"
-	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
+	"github.com/fil-forge/libforge/taskrunner"
+	"github.com/fil-forge/libforge/taskrunner/taskrunnertest"
 )
 
 // lostAnswerRemover removes a blob and then, for its next `lose` calls,

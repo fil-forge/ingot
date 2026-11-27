@@ -17,8 +17,8 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/taskrunner"
-	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
+	"github.com/fil-forge/libforge/taskrunner"
+	"github.com/fil-forge/libforge/taskrunner/taskrunnertest"
 )
 
 // fixture runs the queue over a fresh schema and a cache of its own.

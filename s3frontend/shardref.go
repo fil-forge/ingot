@@ -9,8 +9,8 @@ import (
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
-	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/uploader"
+	"github.com/fil-forge/libforge/taskrunner"
 )
 
 // addBlob takes a write's pending reference to a blob through

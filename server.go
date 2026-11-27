@@ -38,10 +38,10 @@ import (
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
-	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/uploader"
 	"github.com/fil-forge/ingot/usage"
+	"github.com/fil-forge/libforge/taskrunner"
 )
 
 // ServerDeps bundles the runtime collaborators of an ingot Server
