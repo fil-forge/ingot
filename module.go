@@ -78,11 +78,11 @@ import (
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/revocation"
-	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/tokenstore"
 	"github.com/fil-forge/ingot/uploader"
 	"github.com/fil-forge/ingot/usage"
+	"github.com/fil-forge/libforge/taskrunner"
 	swarfclient "github.com/fil-forge/swarf/pkg/client"
 )
 

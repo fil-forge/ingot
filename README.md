@@ -273,7 +273,7 @@ same figures: chart their maximum across instances, never their sum.
 
 The task queues report queue depth, the oldest ready task's age, lease waits
 and takeovers, task duration and busy workers as `taskrunner.*`, listed in
-[`taskrunner/README.md`](./taskrunner/README.md#metrics).
+[the task runner's README](https://github.com/fil-forge/libforge/blob/main/taskrunner/README.md#metrics).
 
 **Manual cleanup.** Every blob file in `<data_dir>/cache` is safe to
 delete: the provider holds its body. Restart `serve` after deleting files by

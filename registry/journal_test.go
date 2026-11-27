@@ -23,7 +23,7 @@ import (
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/libforge/taskrunner"
 	"github.com/fil-forge/libforge/testutil"
 )
 

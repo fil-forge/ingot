@@ -44,6 +44,8 @@ if [[ -z "${INGOT_TEST_DSN:-}" ]]; then
 	await "$pg" docker exec "$pg" pg_isready -U postgres -h 127.0.0.1
 	export INGOT_TEST_DSN="postgres://postgres:pw@127.0.0.1:$(port "$pg" 5432)/postgres?sslmode=disable"
 fi
+# The task runner's test helper reads its own variable and skips without it.
+export TASKRUNNER_TEST_DSN="$INGOT_TEST_DSN"
 
 if [[ -z "${INGOT_TEST_BAO_ADDR:-}" ]]; then
 	bao="ingot-test-bao-$$"

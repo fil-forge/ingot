@@ -17,7 +17,7 @@ import (
 
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/libforge/taskrunner"
 )
 
 // recordingReporter stands in for the auth service, keeping what it is sent.

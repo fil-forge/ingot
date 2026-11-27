@@ -34,8 +34,8 @@ import (
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/queue/shardqueue"
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/uploader"
+	"github.com/fil-forge/libforge/taskrunner"
 )
 
 // abandonTimeLimit bounds giving up a surplus stream's allocation, which may
@@ -161,7 +161,7 @@ func (q *Queue) AcceptSpecs(ctx context.Context, space did.DID, digests []multih
 	for i, d := range digests {
 		subjects[i] = Subject(space, d)
 	}
-	pending, err := q.tasks.Pending(ctx, Name, subjects, AcceptAction)
+	pending, err := q.tasks.Pending(ctx, Name, subjects, taskrunner.WithActions(AcceptAction))
 	if err != nil {
 		return nil, err
 	}
@@ -512,7 +512,7 @@ func (q *Queue) DrainSpace(ctx context.Context, space did.DID) error {
 			return fmt.Errorf("release the space's blobs: %w", err)
 		}
 	}
-	left, err := q.tasks.Pending(ctx, Name, subjects, ReleaseAction)
+	left, err := q.tasks.Pending(ctx, Name, subjects, taskrunner.WithActions(ReleaseAction))
 	if err != nil {
 		return fmt.Errorf("check the space's releases: %w", err)
 	}

@@ -16,7 +16,7 @@ import (
 
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
-	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/libforge/taskrunner"
 )
 
 // ingotSchema is the Postgres schema ingot's migrations and task queues

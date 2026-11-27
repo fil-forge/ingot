@@ -11,8 +11,8 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/uploader"
+	"github.com/fil-forge/libforge/taskrunner"
 )
 
 // A bucket's catalog ships from its log as a queue-bucket.ship on the

@@ -5,7 +5,7 @@ something operational should add so that a failure shows. The OTLP environment v
 described under [Running it](../README.md#running-it) in the README, the metrics Ingot reports
 (local blob storage, multipart acceptance, the catalog journal) are listed in its
 [Local disk](../README.md#local-disk) tables, and the task queues' `taskrunner.*` metrics in
-[`taskrunner/README.md`](../taskrunner/README.md#metrics); this page does not repeat them.
+[the task runner's README](https://github.com/fil-forge/libforge/blob/main/taskrunner/README.md#metrics); this page does not repeat them.
 
 ---
 

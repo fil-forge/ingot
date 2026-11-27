@@ -11,7 +11,7 @@ import (
 
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/libforge/taskrunner"
 )
 
 // A bucket's settings and lifecycle change on its subject too, so a commit

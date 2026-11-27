@@ -26,7 +26,7 @@ import (
 	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/libforge/taskrunner"
 )
 
 // defaultMaxListing is the S3 default and cap for max-parts / max-uploads.

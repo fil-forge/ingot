@@ -8,7 +8,7 @@ import (
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
-	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/libforge/taskrunner"
 )
 
 // BucketCommitTask is a queue-bucket.commit task's arguments: the changes to

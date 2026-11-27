@@ -162,7 +162,7 @@ flowchart TB
 - `registry.Postgres` is one struct satisfying the registry seams
   (`Registry` plus the intent, location, inclusion, blob-ref, GC, multipart,
   park, and catalog usage stores) and `logstore.Meta`.
-- `taskrunner` imports nothing else from ingot. `New` registers
+- `taskrunner` is libforge's package and imports nothing from ingot. `New` registers
   `s3frontend`'s handlers for every queue on the one runner
   `provideTaskRunner` builds, and `registry` returns the statements and task
   specs a handler commits with.
@@ -1381,7 +1381,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `s3frontend/bucket.go` | context, delete-bucket |
 | `s3frontend/bucketqueue.go`, `bucketadmin.go` | put, multipart, gc-candidates, delete-bucket |
 | `bucketop/` | put, get, delete-bucket, packages, principals |
-| `taskrunner/` | packages, put, multipart, multipart-states, delete-bucket |
+| libforge's `taskrunner` (a version bump) | packages, put, multipart, multipart-states, delete-bucket |
 | `blockstore/` | get, packages, block-routes; `forge.go` also context, principals |
 | `registry/` | schema, get, blob-lifecycle, logstore-pipeline |
 | `logstore/` | logstore-pipeline, segment-states, get, block-routes, delete-bucket |

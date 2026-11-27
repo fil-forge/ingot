@@ -33,8 +33,8 @@ import (
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/uploader"
+	"github.com/fil-forge/libforge/taskrunner"
 )
 
 // Deps are what a Queue's tasks need.

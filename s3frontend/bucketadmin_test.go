@@ -17,7 +17,7 @@ import (
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/ingot/registry"
-	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/libforge/taskrunner"
 )
 
 // A bucket task queued for a bucket's old space, run once the name belongs to
