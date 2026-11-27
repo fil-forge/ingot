@@ -12,7 +12,6 @@ import (
 
 	awsv4 "github.com/aws/aws-sdk-go-v2/aws"
 	s3 "github.com/fil-forge/libforge/commands/s3"
-	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
 	s3req "github.com/fil-forge/libforge/commands/s3/request"
 	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
@@ -40,10 +39,6 @@ type fakeAuthorizer struct {
 	proofs []ucan.Delegation // the proof chain in the authorize response container
 	res    *s3req.AuthorizeOK
 	err    error
-
-	infoBuckets []string          // BucketInfo calls received, by name
-	infoDlgs    []ucan.Delegation // delegations in the bucket-info container
-	infoErr     error
 }
 
 func (f *fakeAuthorizer) AuthorizeRequest(_ context.Context, req s3.Request, _ ...hiltclient.MethodOption) (*s3req.AuthorizeOK, ucan.Container, error) {
@@ -53,14 +48,6 @@ func (f *fakeAuthorizer) AuthorizeRequest(_ context.Context, req s3.Request, _ .
 		return nil, nil, f.err
 	}
 	return f.res, container.New(container.WithDelegations(f.proofs...)), nil
-}
-
-func (f *fakeAuthorizer) BucketInfo(_ context.Context, name string, _ did.DID, _ ...hiltclient.MethodOption) (*s3bkt.InfoOK, ucan.Container, error) {
-	f.infoBuckets = append(f.infoBuckets, name)
-	if f.infoErr != nil {
-		return nil, nil, f.infoErr
-	}
-	return &s3bkt.InfoOK{}, container.New(container.WithDelegations(f.infoDlgs...)), nil
 }
 
 // newAccessKey generates an access key and returns its accessKeyId (the
@@ -356,20 +343,18 @@ func TestRevokedResponseIsNotCached(t *testing.T) {
 	require.Len(t, chain, 3)
 }
 
-// TestRevokedBucketInfoDelegationIsNotCached: a leaf-only authorize response
-// is completed from /s3/bucket/info, and a revoked hop there refuses the
-// caching just as one in the authorize response does.
-func TestRevokedBucketInfoDelegationIsNotCached(t *testing.T) {
+// TestOutOfDateResponseIsNotCached: a response built just before a change to
+// what the key may do carries the key's grants as they were, and the change
+// revokes them. One arriving after the revocation authorizes its request
+// and is not cached.
+func TestOutOfDateResponseIsNotCached(t *testing.T) {
 	access, keyDID := newAccessKey(t)
 	sigv4 := s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: []byte("dk")}
 	root, mid, leaf, agent := mintRetrieveChain(t)
 	cache := iam.NewKeyProofs()
 	keys, tenants := iam.NewVerificationKeyCache(), iam.NewTenantCache()
-	fake := &fakeAuthorizer{
-		res:      authorizeOK(t, keyDID, sigv4),
-		proofs:   []ucan.Delegation{leaf},
-		infoDlgs: []ucan.Delegation{root, mid},
-	}
+	// mid is the tenant's grant to the key, which the change revoked.
+	fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, sigv4), proofs: []ucan.Delegation{root, mid, leaf}}
 	svc := iam.New(fake, cache, keys, tenants)
 	require.Empty(t, iam.NewRevoker(cache, keys, tenants, nil).Revoke(mid.Link()))
 
@@ -386,7 +371,7 @@ func TestRevokedBucketInfoDelegationIsNotCached(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, resp.Body.Close())
 	}
-	require.Equal(t, 2, fake.calls, "every request reaches Hilt while bucket info carries a revoked delegation")
+	require.Equal(t, 2, fake.calls, "every request reaches Hilt while its responses carry a revoked grant")
 
 	_, found := keys.Get(access, s3.KeyKindSigV4)
 	require.False(t, found)
@@ -405,14 +390,13 @@ func TestRevokedBucketInfoDelegationIsNotCached(t *testing.T) {
 }
 
 // TestProofChainCapture covers the delegation plumbing: authorize-response
-// delegations land in the cache, incomplete chains trigger exactly one
-// /s3/bucket/info fetch, and info failures never fail authentication.
+// delegations land in the cache with the action sets Hilt reported.
 func TestProofChainCapture(t *testing.T) {
 	access, keyDID := newAccessKey(t)
 	sigv4 := s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: []byte("dk")}
 	ctx := context.Background()
 
-	t.Run("complete chain in authorize response: no bucket info call", func(t *testing.T) {
+	t.Run("the response's chain is cached", func(t *testing.T) {
 		root, mid, leaf, agent := mintRetrieveChain(t)
 		cache := iam.NewKeyProofs()
 		fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, sigv4), proofs: []ucan.Delegation{root, mid, leaf}}
@@ -421,48 +405,6 @@ func TestProofChainCapture(t *testing.T) {
 		_, err := resolveForRequest(t, svc, access,
 			httptest.NewRequest(http.MethodGet, "http://example.com/bkt/key", nil))
 		require.NoError(t, err)
-		require.Empty(t, fake.infoBuckets, "complete chain must not trigger bucket info")
-
-		chain, _, err := cache.For(keyDID).ProofChain(ctx, agent.DID(), leaf.Command(), leaf.Subject())
-		require.NoError(t, err)
-		require.Len(t, chain, 3)
-	})
-
-	t.Run("leaf-only response: bucket info completes the chain", func(t *testing.T) {
-		root, mid, leaf, agent := mintRetrieveChain(t)
-		cache := iam.NewKeyProofs()
-		fake := &fakeAuthorizer{
-			res:      authorizeOK(t, keyDID, sigv4),
-			proofs:   []ucan.Delegation{leaf},      // authorize: re-delegation only
-			infoDlgs: []ucan.Delegation{root, mid}, // bucket info: the rest
-		}
-		svc := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache())
-
-		_, err := resolveForRequest(t, svc, access,
-			httptest.NewRequest(http.MethodGet, "http://example.com/bkt/key", nil))
-		require.NoError(t, err)
-		require.Equal(t, []string{"bkt"}, fake.infoBuckets, "exactly one info fetch, path-style bucket name")
-
-		chain, _, err := cache.For(keyDID).ProofChain(ctx, agent.DID(), leaf.Command(), leaf.Subject())
-		require.NoError(t, err)
-		require.Len(t, chain, 3, "chain must resolve after the info fetch")
-	})
-
-	t.Run("cross-bucket copy: bucket info for the destination and the source", func(t *testing.T) {
-		root, mid, leaf, agent := mintRetrieveChain(t)
-		cache := iam.NewKeyProofs()
-		fake := &fakeAuthorizer{
-			res:      authorizeOK(t, keyDID, sigv4),
-			proofs:   []ucan.Delegation{leaf},
-			infoDlgs: []ucan.Delegation{root, mid},
-		}
-		svc := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache())
-
-		req := signedCopyRequest(t, "dst", "src")
-		_, err := resolveForRequest(t, svc, access, req)
-		require.NoError(t, err)
-		require.Equal(t, []string{"dst", "src"}, fake.infoBuckets,
-			"a copy's chains span two buckets; both need their bucket→tenant→key remainder")
 
 		chain, _, err := cache.For(keyDID).ProofChain(ctx, agent.DID(), leaf.Command(), leaf.Subject())
 		require.NoError(t, err)
@@ -507,22 +449,6 @@ func TestProofChainCapture(t *testing.T) {
 			require.True(t, known, "hilt named %s; its set must be cached", b)
 			require.True(t, allowed)
 		}
-	})
-
-	t.Run("bucket info failure degrades, auth still succeeds", func(t *testing.T) {
-		_, _, leaf, _ := mintRetrieveChain(t)
-		fake := &fakeAuthorizer{
-			res:     authorizeOK(t, keyDID, sigv4),
-			proofs:  []ucan.Delegation{leaf},
-			infoErr: errors.New("hilt down"),
-		}
-		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
-
-		acct, err := resolveForRequest(t, svc, access,
-			httptest.NewRequest(http.MethodGet, "http://example.com/bkt/key", nil))
-		require.NoError(t, err, "proof-chain trouble must not fail authentication")
-		require.Equal(t, access, acct.Access)
-		require.Equal(t, []string{"bkt"}, fake.infoBuckets)
 	})
 }
 
@@ -584,7 +510,7 @@ func TestGetUserAccountForRequest_PlainAccessKey(t *testing.T) {
 }
 
 // TestAuthorizeSigned: a signed request's delegations land in a fresh store
-// with their chains completed, leaving the key's own caches untouched; Hilt
+// with the chains they rest on, leaving the key's own caches untouched; Hilt
 // refusing the key the bucket is ErrBucketNotPermitted, and any other
 // failure is not.
 func TestAuthorizeSigned(t *testing.T) {
@@ -594,16 +520,11 @@ func TestAuthorizeSigned(t *testing.T) {
 
 	root, mid, leaf, agent := mintRetrieveChain(t)
 	cache := iam.NewKeyProofs()
-	fake := &fakeAuthorizer{
-		res:      authorizeOK(t, keyDID),
-		proofs:   []ucan.Delegation{leaf},
-		infoDlgs: []ucan.Delegation{root, mid},
-	}
+	fake := &fakeAuthorizer{res: authorizeOK(t, keyDID), proofs: []ucan.Delegation{root, mid, leaf}}
 	svc := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache())
 	store, err := svc.AuthorizeSigned(ctx, req, access)
 	require.NoError(t, err)
 	require.Equal(t, req, fake.got, "the request goes to Hilt as given")
-	require.Equal(t, []string{"bkt"}, fake.infoBuckets)
 	chain, _, err := store.ProofChain(ctx, agent.DID(), leaf.Command(), leaf.Subject())
 	require.NoError(t, err)
 	require.Len(t, chain, 3)
