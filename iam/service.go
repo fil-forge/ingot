@@ -617,8 +617,9 @@ func untilNextUTCMidnight(now time.Time) time.Duration {
 }
 
 // cacheProofs deposits the authorize response's delegations into this key's
-// proof store and, when it cannot assemble a root-complete chain for one of
-// the fresh leaves, fetches the bucket→tenant→access-key remainder from
+// proof store and, when it cannot assemble a root-complete chain that lasts
+// as long as the leaf for one of the fresh leaves, fetches the
+// bucket→tenant→access-key remainder from
 // /s3/bucket/info (once per bucket the request acts on: the addressed bucket,
 // plus a copy's source) and caches that too. It reports false as soon as the
 // store refuses a batch (see [DelegationCache.Add]).
@@ -638,13 +639,19 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 	// leaves (undefined subject) can't anchor a chain lookup; skip them here —
 	// the retrieval path resolves them against a concrete space, and the
 	// bucket-info fetch below covers the missing intermediates either way.
+	//
+	// A chain with a link that expires before its leaf counts as incomplete
+	// too. Hilt's grants to an access key expire, and it issues the next ones
+	// days ahead, so the fetch brings the grant that outlasts the leaf; work
+	// the request queues for later then holds authority for the leaf's whole
+	// life, the overhang Hilt gives it for that included.
 	incomplete := false
 	for _, leaf := range ctr.Delegations() {
 		if !leaf.Subject().Defined() {
 			continue
 		}
 		chain, _, err := store.ProofChainVia(ctx, leaf.Audience(), leaf.Command(), leaf.Subject(), leaf.Issuer())
-		if err != nil || len(chain) == 0 {
+		if err != nil || len(chain) == 0 || !outlivesLeaf(chain) {
 			incomplete = true
 			break
 		}
@@ -667,6 +674,18 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 			continue
 		}
 		if infoCtr != nil && !store.Add(infoCtr.Delegations()...) {
+			return false
+		}
+	}
+	return true
+}
+
+// outlivesLeaf reports whether every delegation of the root-first chain lasts
+// at least as long as its last, the leaf.
+func outlivesLeaf(chain []ucan.Delegation) bool {
+	leaf := chain[len(chain)-1]
+	for _, link := range chain[:len(chain)-1] {
+		if compareRemainingLife(link, leaf) < 0 {
 			return false
 		}
 	}

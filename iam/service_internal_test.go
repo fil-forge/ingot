@@ -1035,3 +1035,48 @@ func TestCacheProofsFetchesTheKeysChainBesideACompleteTenantOne(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, chain, 3, "the key's own chain is complete once bucket info is cached")
 }
+
+// A cached grant that expires before the response's leaf must be fetched
+// again: Hilt has issued the key its next grant by then, and the leaf's chain
+// should last as long as the leaf does.
+func TestCacheProofsFetchesAGrantThatOutlastsTheLeaf(t *testing.T) {
+	accessKey, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	spaceIssuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	agent, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	tenant, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	space := spaceIssuer.DID()
+
+	root, err := contentcmds.Retrieve.Delegate(spaceIssuer, tenant.DID(), space, delegation.WithNoExpiration())
+	require.NoError(t, err)
+	expiring, err := contentcmds.Retrieve.Delegate(tenant, accessKey.DID(), space, delegation.WithExpiration(ucan.Now()+3600))
+	require.NoError(t, err)
+	renewed, err := contentcmds.Retrieve.Delegate(tenant, accessKey.DID(), space, delegation.WithExpiration(ucan.Now()+7*86400))
+	require.NoError(t, err)
+	keyLeaf, err := contentcmds.Retrieve.Delegate(accessKey, agent.DID(), space, delegation.WithExpiration(ucan.Now()+86400))
+	require.NoError(t, err)
+
+	authz := &recordingAuthorizer{info: container.New(container.WithDelegations(root, renewed))}
+	s := New(authz, NewKeyProofs(), NewVerificationKeyCache(), NewTenantCache())
+	store := s.proofs.For(accessKey.DID())
+	// The key's store holds the grant an earlier request fetched.
+	require.True(t, store.Add(root, expiring))
+	resp := container.New(container.WithDelegations(keyLeaf))
+	req := s3.Request{Method: "GET", URL: "/bkt/obj"}
+
+	require.True(t, s.cacheProofs(context.Background(), store, resp, req, accessKey.DID()))
+	require.Equal(t, 1, authz.asked, "the cached grant expires before the leaf, so bucket info must be fetched")
+	chain, _, err := store.ProofChainVia(context.Background(), agent.DID(), contentcmds.Retrieve.Command, space, accessKey.DID())
+	require.NoError(t, err)
+	require.Len(t, chain, 3)
+	require.Equal(t, renewed.Link(), chain[1].Link(), "the chain goes through the grant that outlasts the leaf")
+
+	// With that grant cached, the next response's leaf needs no fetch.
+	next, err := contentcmds.Retrieve.Delegate(accessKey, agent.DID(), space, delegation.WithExpiration(ucan.Now()+86400))
+	require.NoError(t, err)
+	require.True(t, s.cacheProofs(context.Background(), store, container.New(container.WithDelegations(next)), req, accessKey.DID()))
+	require.Equal(t, 1, authz.asked)
+}
