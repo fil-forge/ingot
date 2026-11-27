@@ -645,18 +645,7 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 	// days ahead, so the fetch brings the grant that outlasts the leaf; work
 	// the request queues for later then holds authority for the leaf's whole
 	// life, the overhang Hilt gives it for that included.
-	incomplete := false
-	for _, leaf := range ctr.Delegations() {
-		if !leaf.Subject().Defined() {
-			continue
-		}
-		chain, _, err := store.ProofChainVia(ctx, leaf.Audience(), leaf.Command(), leaf.Subject(), leaf.Issuer())
-		if err != nil || len(chain) == 0 || !outlivesLeaf(chain) {
-			incomplete = true
-			break
-		}
-	}
-	if !incomplete {
+	if _, _, incomplete := s.incompleteLeaf(ctx, store, ctr); !incomplete {
 		return true
 	}
 
@@ -677,7 +666,53 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 			return false
 		}
 	}
+	// Hilt issues a key's next grant days before the last one expires, so a
+	// chain that still ends before its leaf means Hilt's renewal has fallen
+	// behind. The request goes ahead, and work it queues holds authority only
+	// until the grant expires.
+	if leaf, chain, short := s.incompleteLeaf(ctx, store, ctr); short && len(chain) > 0 {
+		s.logger.Warn("hilt/iam: the key's grant expires before the delegation issued under it; Hilt's renewal is late",
+			zap.Stringer("access_key", keyDID),
+			zap.Stringer("subject", leaf.Subject()),
+			zap.Stringer("command", leaf.Command()),
+			zap.Time("chain_expires", chainExpiry(chain)),
+			zap.Time("leaf_expires", chainExpiry(chain[len(chain)-1:])))
+	}
 	return true
+}
+
+// incompleteLeaf returns the first of the response's leaves with a subject
+// whose chain through the leaf's issuer is missing from store, or ends
+// before the leaf does (see [outlivesLeaf]), with the chain store holds for
+// it, which is empty when it is missing.
+func (s *Service) incompleteLeaf(ctx context.Context, store *DelegationCache, ctr ucan.Container) (ucan.Delegation, []ucan.Delegation, bool) {
+	for _, leaf := range ctr.Delegations() {
+		if !leaf.Subject().Defined() {
+			continue
+		}
+		chain, _, err := store.ProofChainVia(ctx, leaf.Audience(), leaf.Command(), leaf.Subject(), leaf.Issuer())
+		if err != nil {
+			return leaf, nil, true
+		}
+		if len(chain) == 0 || !outlivesLeaf(chain) {
+			return leaf, chain, true
+		}
+	}
+	return nil, nil, false
+}
+
+// chainExpiry returns when the first delegation of chain to expire does, or
+// the zero time when none of them expires.
+func chainExpiry(chain []ucan.Delegation) time.Time {
+	var first time.Time
+	for _, d := range chain {
+		if exp := d.Expiration(); exp != nil {
+			if t := time.Unix(int64(*exp), 0).UTC(); first.IsZero() || t.Before(first) {
+				first = t
+			}
+		}
+	}
+	return first
 }
 
 // outlivesLeaf reports whether every delegation of the root-first chain lasts
