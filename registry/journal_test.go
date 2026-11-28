@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -60,7 +61,7 @@ func TestCatalogJournal(t *testing.T) {
 		}
 		next := liveCid(t, time.Now().String()+blocks[0].Cid().String())
 		return next, r.CommitRoot(ctx, "jb", st.Root, next, registry.RootCommit{
-			Journal: blockstore.Appended{Segment: seg, Blocks: blocks},
+			Journal: []blockstore.Appended{{Segment: seg, Blocks: blocks}},
 		})
 	}
 	journaled := func(t *testing.T, seg uint64) map[string]string {
@@ -108,7 +109,7 @@ func TestCatalogJournal(t *testing.T) {
 
 		// A commit that loses the CAS journals nothing.
 		if err := r.CommitRoot(ctx, "jb", liveCid(t, "not-the-root"), liveCid(t, "next"), registry.RootCommit{
-			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("lost"))}},
+			Journal: []blockstore.Appended{{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("lost"))}}},
 		}); !errors.Is(err, registry.ErrConflict) {
 			t.Fatalf("conflicting commit = %v, want ErrConflict", err)
 		}
@@ -229,7 +230,7 @@ func TestCatalogJournal(t *testing.T) {
 			t.Fatalf("Delete: %v", err)
 		}
 		err := r.CommitRoot(ctx, "jb-gone", cid.Undef, liveCid(t, "gone-root"), registry.RootCommit{
-			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("gone"))}},
+			Journal: []blockstore.Appended{{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("gone"))}}},
 		})
 		if !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("commit to a deleted bucket = %v, want ErrNotFound", err)
@@ -245,7 +246,7 @@ func TestCatalogJournal(t *testing.T) {
 		seg := newBucket(t, "jb-del")
 		root := liveCid(t, "del-root")
 		if err := r.CommitRoot(ctx, "jb-del", cid.Undef, root, registry.RootCommit{
-			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("del"))}},
+			Journal: []blockstore.Appended{{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("del"))}}},
 		}); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
@@ -296,7 +297,7 @@ func TestCatalogJournal(t *testing.T) {
 		seg := newBucket(t, "jb-stale")
 		old, next := liveCid(t, "stale-old"), liveCid(t, "stale-next")
 		if err := r.CommitRoot(ctx, "jb-stale", cid.Undef, old, registry.RootCommit{
-			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("stale"))}},
+			Journal: []blockstore.Appended{{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("stale"))}}},
 		}); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
@@ -346,13 +347,13 @@ func TestCatalogJournal(t *testing.T) {
 		seg := newBucket(t, "jb-emptying")
 		old := liveCid(t, "emptying-old")
 		if err := r.CommitRoot(ctx, "jb-emptying", cid.Undef, old, registry.RootCommit{
-			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("emptying-a"))}},
+			Journal: []blockstore.Appended{{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("emptying-a"))}}},
 		}); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
 		cur := liveCid(t, "emptying-cur")
 		if err := r.CommitRoot(ctx, "jb-emptying", old, cur, registry.RootCommit{
-			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("emptying-b"))}},
+			Journal: []blockstore.Appended{{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("emptying-b"))}}},
 		}); err != nil {
 			t.Fatalf("second commit: %v", err)
 		}
@@ -409,12 +410,12 @@ func TestCatalogJournal(t *testing.T) {
 		otherSeg := newBucket(t, "jb-other")
 		root := liveCid(t, "empty-root")
 		if err := r.CommitRoot(ctx, "jb-empty", cid.Undef, root, registry.RootCommit{
-			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("emptied"))}},
+			Journal: []blockstore.Appended{{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("emptied"))}}},
 		}); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
 		if err := r.CommitRoot(ctx, "jb-other", cid.Undef, liveCid(t, "other-root"), registry.RootCommit{
-			Journal: blockstore.Appended{Segment: otherSeg, Blocks: []block.Block{block.NewBlock([]byte("other"))}},
+			Journal: []blockstore.Appended{{Segment: otherSeg, Blocks: []block.Block{block.NewBlock([]byte("other"))}}},
 		}); err != nil {
 			t.Fatalf("commit other: %v", err)
 		}
@@ -475,7 +476,7 @@ func TestCatalogJournal(t *testing.T) {
 			blocks = append(blocks, block.NewBlock([]byte(fmt.Sprintf("rebuild-%d", i))))
 		}
 		if err := r.CommitRoot(ctx, "jb-rebuild", cid.Undef, liveCid(t, "rebuild-root"), registry.RootCommit{
-			Journal: blockstore.Appended{Segment: seg, Blocks: blocks},
+			Journal: []blockstore.Appended{{Segment: seg, Blocks: blocks}},
 		}); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
@@ -513,7 +514,7 @@ func TestCatalogJournal(t *testing.T) {
 			blocks = append(blocks, block.NewBlock([]byte(fmt.Sprintf("move-%d", i))))
 		}
 		if err := r.CommitRoot(ctx, "jb-move", cid.Undef, liveCid(t, "move-root"), registry.RootCommit{
-			Journal: blockstore.Appended{Segment: from, Blocks: blocks},
+			Journal: []blockstore.Appended{{Segment: from, Blocks: blocks}},
 		}); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
@@ -570,7 +571,7 @@ func TestCatalogJournal(t *testing.T) {
 			blocks = append(blocks, block.NewBlock([]byte(fmt.Sprintf("wiped-%03d-%s", i, strings.Repeat("w", 64)))))
 		}
 		if err := r.CommitRoot(ctx, "jb-wiped", cid.Undef, liveCid(t, "wiped-root"), registry.RootCommit{
-			Journal: blockstore.Appended{Segment: seg, Blocks: blocks},
+			Journal: []blockstore.Appended{{Segment: seg, Blocks: blocks}},
 		}); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
@@ -620,6 +621,28 @@ func TestCatalogJournal(t *testing.T) {
 		}
 		if next, err := r.NextSegmentSeq(ctx); err != nil || next != start+12 {
 			t.Fatalf("NextSegmentSeq after a lower EnsureSegmentSeqAbove = %d (err %v), want %d", next, err, start+12)
+		}
+	})
+
+	t.Run("a commit split across two segments journals each part under its own", func(t *testing.T) {
+		first, second := openSegment(t), openSegment(t)
+		a, b := block.NewBlock([]byte("part one")), block.NewBlock([]byte("part two"))
+		st, err := r.Get(ctx, "jb")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if err := r.CommitRoot(ctx, "jb", st.Root, liveCid(t, "split"), registry.RootCommit{
+			Journal: []blockstore.Appended{{Segment: first, Blocks: []block.Block{a}}, {Segment: second, Blocks: []block.Block{b}}},
+		}); err != nil {
+			t.Fatalf("CommitRoot: %v", err)
+		}
+		got := []map[string]string{journaled(t, first), journaled(t, second)}
+		want := []map[string]string{
+			{string(a.Cid().Bytes()): "part one"},
+			{string(b.Cid().Bytes()): "part two"},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("journal under the two segments = %v, want %v", got, want)
 		}
 	})
 }

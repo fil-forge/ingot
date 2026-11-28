@@ -92,26 +92,26 @@ func (b *OpStaging) Put(_ context.Context, blk block.Block) error {
 // segment (e.g., trimTop after Delete unwraps to an existing
 // subtree). The bucket Root still needs to advance, so AppendBatch
 // is called with an empty payload and the OpRoot record alone.
-func (b *OpStaging) Commit(ctx context.Context, root cid.Cid) (Appended, error) {
+func (b *OpStaging) Commit(ctx context.Context, root cid.Cid) ([]Appended, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if !root.Defined() {
-		return Appended{}, errors.New("opstaging: commit with undefined root")
+		return nil, errors.New("opstaging: commit with undefined root")
 	}
 
 	cat := make([]block.Block, len(b.order))
 	for i, c := range b.order {
 		cat[i] = b.blocks[string(c.Bytes())]
 	}
-	seg, err := b.log.AppendBatch(ctx, cat, OpRoot{Bucket: b.bucket, Root: root})
+	appended, err := b.log.AppendBatch(ctx, cat, OpRoot{Bucket: b.bucket, Root: root})
 	if err != nil {
-		return Appended{}, fmt.Errorf("opstaging: append: %w", err)
+		return nil, fmt.Errorf("opstaging: append: %w", err)
 	}
 
 	b.blocks = map[string]block.Block{}
 	b.order = nil
-	return Appended{Segment: seg, Blocks: cat}, nil
+	return appended, nil
 }
 
 // Discard drops any staged blocks without writing them. Use when the

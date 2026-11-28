@@ -51,6 +51,10 @@ type Uploader interface {
 	CaptureShipAuthority(ctx context.Context, space did.DID)
 }
 
+// MaxIndexedBlocks is the most blocks a shard's index can list: libforge's
+// encoder and every decoder of the index refuse a longer list.
+const MaxIndexedBlocks = 8192
+
 // CARShard describes one plane's sealed CAR file ready to ship. All
 // fields refer to data that already exists on disk or was precomputed
 // at seal time.

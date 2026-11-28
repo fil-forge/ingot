@@ -132,7 +132,7 @@ full lifecycle):
   licenses the commit's guarded root advance.
 - **The unshipped catalog is journaled in Postgres**: the root advance's
   transaction writes the batch's blocks to `ingot.catalog_journal` under the
-  segment `AppendBatch` reported, and shipping that segment deletes them, as
+  segments `AppendBatch` reported, and shipping a segment deletes its rows, as
   do `DeleteBucket` emptying the bucket's root and the bucket row's deletion.
   A copy of Postgres (a standby, a restore) therefore holds every block its
   roots need that this host's disk alone would otherwise hold. Recovery

@@ -44,6 +44,12 @@ type PlaneConfig struct {
 	// before it seals even under SealBytes. 0 → 5s.
 	SealAge time.Duration
 
+	// SealBlocks is the most blocks a segment holds, so its ship can index
+	// it. A batch that does not fit the open segment goes into a new one,
+	// and a batch larger than SealBlocks is split across segments.
+	// 0 → no limit.
+	SealBlocks int
+
 	// Ship enables this plane's upload pipeline. When false the plane's
 	// CARs are never shipped and are retained on local disk indefinitely,
 	// the sole source for local reads of that plane. Their blocks also stay

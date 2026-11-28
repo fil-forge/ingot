@@ -2,6 +2,7 @@ package uploader
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"testing"
@@ -354,4 +355,29 @@ func TestSubmitShardShipsUnderCommitCapture(t *testing.T) {
 	fg.CaptureShipAuthority(borrowable(&chainStore{}), chainless)
 	_, _, err = fg.SubmitShard(ctx, blockstore.PlaneCatalog, chainless, shard)
 	require.ErrorIs(t, err, ErrNoShipAuthority)
+}
+
+// TestShardIndexBlob_MaxIndexedBlocks: a shard of exactly MaxIndexedBlocks
+// still gets an index, and one block more does not.
+func TestShardIndexBlob_MaxIndexedBlocks(t *testing.T) {
+	shardOf := func(n int) CARShard {
+		car, err := multihash.Sum([]byte("car"), multihash.SHA2_256, -1)
+		require.NoError(t, err)
+		positions := make(map[cid.Cid]blockstore.BlockLoc, n)
+		for i := range n {
+			mh, err := multihash.Sum(fmt.Appendf(nil, "block %d", i), multihash.SHA2_256, -1)
+			require.NoError(t, err)
+			positions[cid.NewCidV1(cid.Raw, mh)] = blockstore.BlockLoc{Offset: uint64(i), Length: 1}
+		}
+		return CARShard{SHA256: car, Positions: positions}
+	}
+
+	index, digest, err := shardIndexBlob(shardOf(MaxIndexedBlocks))
+	require.NoError(t, err)
+	want, err := multihash.Sum(index, multihash.SHA2_256, -1)
+	require.NoError(t, err)
+	require.Equal(t, want, digest)
+
+	_, _, err = shardIndexBlob(shardOf(MaxIndexedBlocks + 1))
+	require.ErrorContains(t, err, "too long")
 }

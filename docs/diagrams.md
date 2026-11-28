@@ -204,7 +204,7 @@ flowchart TB
 
     subgraph catr["the catalog route (dag-cbor blocks, asynchronous ship)"]
         commit["queue-bucket.commit: manifest + MST splice into OpStaging,<br/>one fsynced AppendBatch into the bucket's log,<br/>guarded root advance journaling the new blocks<br/>in Postgres (catalog_journal), 200 to the client"]
-        seal["open segment seals at SealBytes / SealAge<br/>(CAR + .idx + .ops)"]
+        seal["open segment seals at SealBytes / SealAge / SealBlocks<br/>(CAR + .idx + .ops)"]
         ship["queue-bucket.ship: /blob/add the sealed CAR,<br/>PUT, conclude, accept"]
         incl["blob_locations (the CAR) + shard_inclusions<br/>(inner byte ranges), then the guarded<br/>forge_root_cid advance, the segment's journal<br/>rows deleted, and retention"]
         commit --> seal --> ship --> incl

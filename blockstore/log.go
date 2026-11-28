@@ -83,24 +83,25 @@ func (p Plane) String() string {
 // returning, so a successful append is locally durable before the bucket Root
 // is allowed to advance. Object-body blobs do not flow through the log — they
 // are streamed to their providers per-blob before the manifest commits.
-// It returns the seq of the segment the batch went into, which the commit
-// journals the blocks under until that segment ships.
+// It returns the segments the batch went into, which the commit journals the
+// blocks under until each ships.
 //
 // Implemented by *logstore.Store.
 type Log interface {
-	AppendBatch(ctx context.Context, catalogBlocks []block.Block, opRoot OpRoot) (segment uint64, err error)
+	AppendBatch(ctx context.Context, catalogBlocks []block.Block, opRoot OpRoot) ([]Appended, error)
 	Get(ctx context.Context, c cid.Cid) (block.Block, error)
 	Close(ctx context.Context) error
 }
 
-// Appended is one committed batch as the log took it: the catalog blocks and
-// the segment they went into. The commit journals the blocks in Postgres
-// under that segment until it ships (registry.RootCommit.Journal), so a copy
-// of Postgres holds every block the host's disk alone would otherwise hold.
+// Appended is the part of a committed batch the log put into one segment: a
+// batch is one part unless it was too large for a segment. The commit
+// journals the blocks in Postgres under that segment until it ships
+// (registry.RootCommit.Journal), so a copy of Postgres holds every block the
+// host's disk alone would otherwise hold.
 type Appended struct {
-	// Segment is the seq of the log segment the batch was appended to.
+	// Segment is the seq of the log segment the blocks were appended to.
 	Segment uint64
-	// Blocks are the batch's catalog blocks, in append order. Empty when the
+	// Blocks are the part's catalog blocks, in append order. Empty when the
 	// new root reuses only blocks an earlier batch wrote.
 	Blocks []block.Block
 }

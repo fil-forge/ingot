@@ -61,8 +61,8 @@ GROUP_CLAIMED := $(GROUP_encryption) $(GROUP_conformance) $(GROUP_uploads) $(GRO
 
 # `rest` is the complement, so a test added to itest/ runs there rather than
 # matching no group and silently never running: BucketEncryption (2m01), and
-# CompleteKeepalive, UncachedWrites, DeferredMultipart and NativeProvision at
-# ~0m45 each (~5m00 in total); MultipartManyParts skips unless
+# CompleteKeepalive, UncachedWrites, DeferredMultipart, NativeProvision and
+# SegmentBlockLimit at ~0m45 each (~6m00 in total); MultipartManyParts skips unless
 # INGOT_ITEST_MP_BENCH=1.
 GROUP_ALL  = $(filter Test%,$(shell GOWORK=off $(GO) test -tags itest -list '.*' ./itest))
 GROUP_rest = $(filter-out $(GROUP_CLAIMED),$(GROUP_ALL))

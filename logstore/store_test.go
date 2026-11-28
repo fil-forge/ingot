@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"sync"
@@ -738,11 +739,12 @@ func TestFailedShipStampRetriedWithoutReshipping(t *testing.T) {
 	meta.mu.Unlock()
 
 	blk := makeBlock(t, append([]byte("stamp-"), make([]byte, 80)...))
-	seq, err := s.AppendBatch(context.Background(), []block.Block{blk},
+	appended, err := s.AppendBatch(context.Background(), []block.Block{blk},
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "stamp")})
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
+	seq := appended[0].Segment
 
 	// Between the failed stamp and its retry, a backoff away, the segment
 	// must not count as shipped.
@@ -801,11 +803,12 @@ func TestFailedSealStampRecordedBeforeShip(t *testing.T) {
 	meta.mu.Unlock()
 
 	blk := makeBlock(t, append([]byte("seal-"), make([]byte, 80)...))
-	seq, err := s.AppendBatch(ctx, []block.Block{blk},
+	appended, err := s.AppendBatch(ctx, []block.Block{blk},
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "seal")})
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
+	seq := appended[0].Segment
 	select {
 	case failed := <-sealFailed:
 		if failed != seq {
@@ -819,11 +822,12 @@ func TestFailedSealStampRecordedBeforeShip(t *testing.T) {
 		t.Fatalf("Get after a failed seal stamp: %v", err)
 	}
 	next := makeBlock(t, append([]byte("next-"), make([]byte, 80)...))
-	seq2, err := s.AppendBatch(ctx, []block.Block{next},
+	appended2, err := s.AppendBatch(ctx, []block.Block{next},
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "next")})
 	if err != nil {
 		t.Fatalf("append after a failed seal stamp: %v", err)
 	}
+	seq2 := appended2[0].Segment
 	if seq2 == seq {
 		t.Fatalf("append after a failed seal stamp went to the frozen segment %d", seq)
 	}
@@ -874,11 +878,12 @@ func TestReadsGoOnWhileTheSealStampWaits(t *testing.T) {
 	t.Cleanup(func() { close(gate) }) // before the store's Close, registered earlier
 
 	blk := makeBlock(t, append([]byte("hang-"), make([]byte, 80)...))
-	seq, err := s.AppendBatch(ctx, []block.Block{blk},
+	appended, err := s.AppendBatch(ctx, []block.Block{blk},
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "hang")})
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
+	seq := appended[0].Segment
 	select {
 	case waited := <-waiting:
 		if waited != seq {
@@ -1094,5 +1099,106 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// blocksPerSegment appends each batch of fresh blocks to a log that seals at
+// sealBlocks, and returns how many blocks each of its segments then holds,
+// oldest first.
+func blocksPerSegment(t *testing.T, sealBlocks int, batches ...int) []int {
+	t.Helper()
+	s, err := Open(context.Background(), Config{
+		Dir:     t.TempDir(),
+		Meta:    newFakeMeta(),
+		Catalog: PlaneConfig{SealBlocks: sealBlocks, SealAge: time.Hour},
+		Logger:  zaptest.NewLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	for b, n := range batches {
+		blocks := make([]block.Block, n)
+		for i := range blocks {
+			blocks[i] = makeBlock(t, fmt.Appendf(nil, "batch %d block %d", b, i))
+		}
+		if _, err := s.AppendBatch(context.Background(), blocks, blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, fmt.Sprint(b))}); err != nil {
+			t.Fatalf("append batch %d: %v", b, err)
+		}
+	}
+
+	s.catalog.catMu.RLock()
+	defer s.catalog.catMu.RUnlock()
+	out := []int{s.catalog.open.blockCount()}
+	for _, seg := range s.catalog.sealed { // newest first
+		out = append([]int{seg.blockCount()}, out...)
+	}
+	return out
+}
+
+func TestSealByBlockCount(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		batches []int
+		want    []int
+	}{
+		{"fills a segment to exactly SealBlocks", []int{2, 2}, []int{4}},
+		{"seals the segment before a batch that would carry it past SealBlocks", []int{3, 2, 2}, []int{3, 4}},
+		{"splits a batch larger than SealBlocks across segments of its own", []int{1, 6, 1}, []int{1, 4, 3}},
+		{"seals no empty segment ahead of a first batch larger than SealBlocks", []int{6}, []int{4, 2}},
+		{"fills each segment of a batch several times SealBlocks", []int{9}, []int{4, 4, 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := blocksPerSegment(t, 4, tc.batches...)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("batches %v at SealBlocks 4: segments hold %v blocks, want %v", tc.batches, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAppendReportsEachPartOfASplitBatch: a batch larger than SealBlocks
+// comes back as one part per segment, in order, and its op-root is recorded
+// in the last segment only.
+func TestAppendReportsEachPartOfASplitBatch(t *testing.T) {
+	s, err := Open(context.Background(), Config{
+		Dir:     t.TempDir(),
+		Meta:    newFakeMeta(),
+		Catalog: PlaneConfig{SealBlocks: 4, SealAge: time.Hour},
+		Logger:  zaptest.NewLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+	blocks := make([]block.Block, 9)
+	for i := range blocks {
+		blocks[i] = makeBlock(t, fmt.Appendf(nil, "block %d", i))
+	}
+	root := blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "split")}
+
+	got, err := s.AppendBatch(context.Background(), blocks, root)
+	if err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+
+	s.catalog.catMu.RLock()
+	defer s.catalog.catMu.RUnlock()
+	segs := []*Segment{s.catalog.sealed[1], s.catalog.sealed[0], s.catalog.open} // sealed is newest first
+	want := []blockstore.Appended{
+		{Segment: segs[0].Seq(), Blocks: blocks[:4]},
+		{Segment: segs[1].Seq(), Blocks: blocks[4:8]},
+		{Segment: segs[2].Seq(), Blocks: blocks[8:]},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("AppendBatch = %v, want %v", got, want)
+	}
+	var roots []int
+	for _, seg := range segs {
+		roots = append(roots, len(seg.OpRoots()))
+	}
+	if wantRoots := []int{0, 0, 1}; !slices.Equal(roots, wantRoots) || !reflect.DeepEqual(segs[2].OpRoots(), []blockstore.OpRoot{root}) {
+		t.Fatalf("op-roots per segment = %v, the last %v; want %v, the last %v", roots, segs[2].OpRoots(), wantRoots, root)
 	}
 }

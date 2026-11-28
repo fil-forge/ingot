@@ -6,6 +6,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
@@ -228,19 +229,19 @@ type RootCommit struct {
 	// discarded version just before the swap has the whole grace to open
 	// its blobs.
 	ReleaseGrace time.Duration
-	// Journal is the commit's catalog blocks and the log segment they went
-	// into. They are kept in the catalog journal until that segment ships,
+	// Journal is the commit's catalog blocks and the log segments they went
+	// into. They are kept in the catalog journal until their segment ships,
 	// so a copy of the database (a standby, a restore) holds every block
-	// its roots need that exists nowhere but this host's disk. A commit
-	// whose segment has already shipped journals nothing: its blocks are on
+	// its roots need that exists nowhere but this host's disk. A part whose
+	// segment has already shipped journals nothing: its blocks are on
 	// Forge.
-	Journal blockstore.Appended
+	Journal []blockstore.Appended
 }
 
 // Empty reports whether the commit carries nothing besides the root.
 func (c RootCommit) Empty() bool {
 	return c.ObjectsAdded == 0 && c.ObjectsRemoved == 0 && len(c.Claims) == 0 && len(c.Drops) == 0 &&
-		len(c.Journal.Blocks) == 0
+		!slices.ContainsFunc(c.Journal, func(j blockstore.Appended) bool { return len(j.Blocks) > 0 })
 }
 
 // CatalogJournalStats is the size of the catalog journal (RootCommit.Journal).

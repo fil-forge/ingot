@@ -78,7 +78,10 @@ func (w CommitWrites) Apply(ctx context.Context, ex *taskrunner.Exec) error {
 // before the writes commit fails their conditional take-over.
 func (r *Postgres) RootCommitWrites(ctx context.Context, name string, expect, next cid.Cid, c RootCommit, gc []cid.Cid) (CommitWrites, error) {
 	var w CommitWrites
-	if j := c.Journal; len(j.Blocks) > 0 {
+	for _, j := range c.Journal {
+		if len(j.Blocks) == 0 {
+			continue
+		}
 		cids := make([][]byte, len(j.Blocks))
 		data := make([][]byte, len(j.Blocks))
 		for i, b := range j.Blocks {
