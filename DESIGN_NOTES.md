@@ -374,10 +374,10 @@ network remove, which the upload service treats as success for a blob it
 never registered. The crypto-shred goes first and the network step next.
 After the network step nothing can fail but the commit: the location, park
 and upload intent rows are deleted by writes committed with the task's
-outcome, so a retry sees the same state. The release queues a `queue-shard.evict` task
-for the cached copy, which runs on the blob's subject after the release
-commits and leaves the copy while another space still holds an intent for
-the digest.
+outcome, so a retry sees the same state. The release queues a
+`queue-shard.evict` task for the cached copy, which runs on the blob's
+subject after the release commits and leaves the copy while another space
+still holds an intent for the digest.
 A release whose digest a part of an in-flight session still references is
 stale: that session's Complete turns the part's reference into a claim, and
 its teardown queues a release of its own.
