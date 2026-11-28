@@ -82,7 +82,8 @@ type EvictTask struct {
 	// removals.
 	Budget bool
 	// Released marks an eviction a blob's release queues, the blob being gone
-	// from its space. Without either, the copy's time to live ran out.
+	// from its space. It leaves the copy while another space still holds an
+	// intent for the blob. Without either, the copy's time to live ran out.
 	Released bool
 }
 
@@ -96,10 +97,19 @@ const (
 	Released
 )
 
+// Intents tells a release's eviction whether any space still holds an
+// intent for a blob (registry.IntentStore satisfies it).
+type Intents interface {
+	HasIntent(ctx context.Context, digest multihash.Multihash) (bool, error)
+}
+
 // Deps is what the queue's handlers need.
 type Deps struct {
 	// Cache holds the copies. Required.
 	Cache *blockstore.BlobCache
+	// Intents is asked, by an eviction a release queues, whether another
+	// space still holds the blob. Required.
+	Intents Intents
 	// TTL is how long a copy stays cached after it was cached or last renewed
 	// (0 → DefaultTTL).
 	TTL time.Duration
@@ -114,6 +124,7 @@ type Deps struct {
 type Queue struct {
 	tasks   *taskrunner.Runner
 	cache   *blockstore.BlobCache
+	intents Intents
 	ttl     time.Duration
 	removed func(ctx context.Context, why Removal, freed int64)
 	logger  *zap.Logger
@@ -128,9 +139,13 @@ func New(r *taskrunner.Runner, d Deps) (*Queue, error) {
 	if d.Cache == nil {
 		return nil, errors.New("shardqueue: no cache")
 	}
+	if d.Intents == nil {
+		return nil, errors.New("shardqueue: no intents")
+	}
 	q := &Queue{
 		tasks:    r,
 		cache:    d.Cache,
+		intents:  d.Intents,
 		ttl:      cmp.Or(d.TTL, DefaultTTL),
 		removed:  d.Removed,
 		logger:   cmp.Or(d.Logger, zap.NewNop()),
@@ -299,7 +314,11 @@ func (q *Queue) Evict(ctx context.Context, digest multihash.Multihash) (int64, e
 }
 
 // ReleasedSpec is the queue-shard.evict a blob's release spawns for its
-// cached copy, the blob being gone from its space.
+// cached copy, the blob being gone from its space. The eviction runs on the
+// blob's subject after the release commits and removes the copy only once no
+// space holds an intent for the blob, so of two spaces releasing the same
+// bytes, at once or not, the eviction that runs after the last release
+// removes it.
 func (q *Queue) ReleasedSpec(digest multihash.Multihash) (taskrunner.Spec, error) {
 	return q.evictSpec(digest, EvictTask{Released: true})
 }
@@ -321,7 +340,8 @@ func (q *Queue) evictSpec(digest multihash.Multihash, args EvictTask) (taskrunne
 
 // runEvict is queue-shard.evict: it removes the cached copy, if there is one,
 // and returns the bytes freed as a varint. A reader that already opened the
-// file keeps reading it.
+// file keeps reading it. A release's eviction leaves the copy, freeing
+// nothing, while any space still holds an intent for the blob.
 func (q *Queue) runEvict(ctx context.Context, _ *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
 	digest, err := hex.DecodeString(t.Subject)
 	if err != nil {
@@ -331,6 +351,15 @@ func (q *Queue) runEvict(ctx context.Context, _ *taskrunner.Exec, t taskrunner.T
 	if len(t.Args) > 0 {
 		if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
 			return nil, taskrunner.Permanent(fmt.Errorf("decode evict task: %w", err))
+		}
+	}
+	if args.Released {
+		held, err := q.intents.HasIntent(ctx, digest)
+		if err != nil {
+			return nil, fmt.Errorf("look up the blob's intents: %w", err)
+		}
+		if held {
+			return binary.AppendVarint(nil, 0), nil
 		}
 	}
 	freed, err := q.cache.Remove(digest)

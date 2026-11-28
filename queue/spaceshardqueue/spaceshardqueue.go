@@ -376,10 +376,6 @@ func (q *Queue) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrunne
 	if err != nil && !errors.Is(err, registry.ErrNotFound) {
 		return nil, fmt.Errorf("lookup park: %w", err)
 	}
-	others, err := q.intents.CountOtherIntents(ctx, space, digest)
-	if err != nil {
-		return nil, fmt.Errorf("count other intents: %w", err)
-	}
 	netCtx, err := q.proofs.WithProofs(ctx, space, args.RemoveProofs, args.AbortProofs)
 	if err != nil {
 		return nil, taskrunner.Permanent(err)
@@ -437,18 +433,15 @@ func (q *Queue) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrunne
 		}
 	}
 	// The cached copy is shared with every other space whose intent names
-	// the digest (the same bytes stored as received in two buckets), so
-	// while another space holds an intent it stays, for that space's reads.
-	// A copy both spaces' releases leave at once is reclaimed by the cache's
-	// time to live.
-	if others == 0 {
-		evict, err := q.shards.ReleasedSpec(digest)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := ex.Submit(ctx, evict); err != nil {
-			return nil, err
-		}
+	// the digest (the same bytes stored as received in two buckets). The
+	// eviction decides once this commits, on the blob's own subject, and
+	// leaves the copy while another space still holds an intent.
+	evict, err := q.shards.ReleasedSpec(digest)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := ex.Submit(ctx, evict); err != nil {
+		return nil, err
 	}
 	st := registry.ReleasedIntent(space, digest)
 	return []byte(ReleasedResult), ex.Write(ctx, st.SQL, st.Args...)

@@ -23,9 +23,28 @@ import (
 
 // fixture runs the queue over a fresh schema and a cache of its own.
 type fixture struct {
-	q     *Queue
-	cache *blockstore.BlobCache
-	env   taskrunnertest.Env
+	q       *Queue
+	cache   *blockstore.BlobCache
+	env     taskrunnertest.Env
+	intents *heldIntents
+}
+
+// heldIntents is the digests some space holds an intent for.
+type heldIntents struct {
+	mu   sync.Mutex
+	held map[string]bool
+}
+
+func (h *heldIntents) HasIntent(_ context.Context, digest multihash.Multihash) (bool, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.held[string(digest)], nil
+}
+
+func (h *heldIntents) set(digest multihash.Multihash, held bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.held[string(digest)] = held
 }
 
 func newFixture(t *testing.T, ttl time.Duration) *fixture {
@@ -42,12 +61,13 @@ func newFixture(t *testing.T, ttl time.Duration) *fixture {
 	require.NoError(t, err)
 	cache, err := blockstore.NewBlobCache(filepath.Join(t.TempDir(), "cache"))
 	require.NoError(t, err)
-	q, err := New(r, Deps{Cache: cache, TTL: ttl, Logger: zaptest.NewLogger(t)})
+	intents := &heldIntents{held: map[string]bool{}}
+	q, err := New(r, Deps{Cache: cache, Intents: intents, TTL: ttl, Logger: zaptest.NewLogger(t)})
 	require.NoError(t, err)
 	require.NoError(t, r.Migrate(context.Background()))
 	require.NoError(t, r.Start(context.Background()))
 	t.Cleanup(func() { _ = r.Stop(context.Background()) })
-	return &fixture{q: q, cache: cache, env: env}
+	return &fixture{q: q, cache: cache, env: env, intents: intents}
 }
 
 // hold writes a blob's local copy and caches it, as a PUT does once the
@@ -259,4 +279,33 @@ func TestEvictionsReportTheirRemovals(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	require.Equal(t, []Removal{Released}, got)
+}
+
+// A release's eviction leaves the copy while another space holds the blob,
+// and removes it once none does.
+func TestReleasedEvictionWaitsForTheLastSpace(t *testing.T) {
+	f := newFixture(t, time.Hour)
+	d := f.hold(t, "shared")
+	spec, err := f.q.ReleasedSpec(d)
+	require.NoError(t, err)
+
+	f.intents.set(d, true)
+	_, err = f.q.tasks.Run(t.Context(), spec)
+	require.NoError(t, err)
+	require.True(t, f.cached(d), "another space still holds the blob")
+
+	f.intents.set(d, false)
+	_, err = f.q.tasks.Run(t.Context(), spec)
+	require.NoError(t, err)
+	require.False(t, f.cached(d), "the last space's eviction removes the copy")
+}
+
+func TestNewRefusesNoIntents(t *testing.T) {
+	env := taskrunnertest.NewEnv(t)
+	r, err := taskrunner.New(env.DB, taskrunner.Options{Schema: env.Schema, Queues: []taskrunner.QueueOptions{{Name: Name, Workers: 1}}})
+	require.NoError(t, err)
+	cache, err := blockstore.NewBlobCache(filepath.Join(t.TempDir(), "cache"))
+	require.NoError(t, err)
+	_, err = New(r, Deps{Cache: cache})
+	require.Error(t, err)
 }

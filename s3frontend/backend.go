@@ -358,7 +358,7 @@ func New(d Deps) (*Backend, error) {
 	b.catalogGauges = newCatalogUsageGauges(mp, b, logger)
 	b.transferMetrics = newTransferMetrics(mp, logger)
 	var err error
-	b.shards, err = shardqueue.New(d.Tasks, shardqueue.Deps{Cache: d.Cache, TTL: d.CacheTTL, Removed: b.cacheRemoved, Logger: logger})
+	b.shards, err = shardqueue.New(d.Tasks, shardqueue.Deps{Cache: d.Cache, Intents: d.Intents, TTL: d.CacheTTL, Removed: b.cacheRemoved, Logger: logger})
 	if err == nil {
 		bd := spaceshardqueue.Deps{
 			Intents:   d.Intents,

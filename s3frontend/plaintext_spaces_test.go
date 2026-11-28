@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/multiformats/go-multihash"
@@ -601,8 +602,8 @@ func TestPlaintextRelease_StaleReleaseRemovesNothing(t *testing.T) {
 }
 
 // TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile: two spaces release
-// the same digest; the first sees the other's intent and leaves the file, and
-// the last out removes it.
+// the same digest; the eviction after the first sees the other's intent and
+// leaves the file, and the one after the last removes it.
 func TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile(t *testing.T) {
 	b, mem, _ := newRefTestBackend(t)
 	space2 := secondPlaintextBucket(t, b, mem)
@@ -622,6 +623,55 @@ func TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile(t *testing.T) {
 		}
 	}
 	settleCache(t, b, d) // the release queues the eviction as its own task
+	if localCopyExists(b, d) {
+		t.Fatalf("the shared file survived both releases")
+	}
+}
+
+// TestPlaintextSpaces_OverlappingReleasesRemoveTheSharedFile: two spaces'
+// releases of the same digest run at once, each past its checks before the
+// other commits. The file still goes: each release's eviction runs after it
+// commits, and the one that finds no intent left removes it.
+func TestPlaintextSpaces_OverlappingReleasesRemoveTheSharedFile(t *testing.T) {
+	gate := newGatedRemover()
+	mem := newTestStore(t)
+	b, mem, _ := newRefTestBackendOver(t, mem, newRetainedLog(t, mem), 0, withGate(gate))
+	space2 := secondPlaintextBucket(t, b, mem)
+	ctx := context.Background()
+	data := testBody(8 << 10)
+
+	putIn(t, b, "bk", "k", data)
+	putIn(t, b, "bk2", "k", data)
+	d := blobDigestOf(t, b, "k", "")
+
+	// Each release is held at its network remove, past its checks, until
+	// both have reached it.
+	deleted := make(chan error, 2)
+	for _, bucket := range []string{"bk", "bk2"} {
+		go func() {
+			_, err := b.DeleteObject(context.Background(), &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String("k")})
+			deleted <- err
+		}()
+		select {
+		case <-gate.waiting:
+		case <-time.After(20 * time.Second):
+			t.Fatalf("the release in %s never reached its remove", bucket)
+		}
+	}
+	close(gate.open)
+	for range 2 {
+		if err := <-deleted; err != nil {
+			t.Fatalf("DeleteObject: %v", err)
+		}
+	}
+	drainReleases(t, b)
+
+	for _, sp := range []did.DID{mem.bk(), space2} {
+		if _, err := mem.GetIntent(ctx, sp, d); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("intent in %s survived (err=%v)", sp, err)
+		}
+	}
+	settleCache(t, b, d)
 	if localCopyExists(b, d) {
 		t.Fatalf("the shared file survived both releases")
 	}
@@ -894,18 +944,18 @@ func TestPlaintextRelease_StalledRemoveTimesOut(t *testing.T) {
 	}
 }
 
-// stallingIntents stalls a release once, after the last of its checks and
+// stallingParks stalls a release once, after the last of its checks and
 // before it touches the network.
-type stallingIntents struct {
-	registry.IntentStore
+type stallingParks struct {
+	registry.ParkStore
 	once  sync.Once
 	stall func(ctx context.Context, space did.DID, digest multihash.Multihash)
 }
 
-func (s *stallingIntents) CountOtherIntents(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
+func (s *stallingParks) GetPark(ctx context.Context, space did.DID, digest multihash.Multihash) (*registry.BlobPark, error) {
 	s.once.Do(func() { s.stall(ctx, space, digest) })
 	// The release carries on as one that did not watch its context would.
-	return s.IntentStore.CountOtherIntents(context.WithoutCancel(ctx), space, digest)
+	return s.ParkStore.GetPark(context.WithoutCancel(ctx), space, digest)
 }
 
 // TestPlaintextRelease_LostLeaseSendsNoRemove: a release that passes its
@@ -934,7 +984,7 @@ func TestPlaintextRelease_LostLeaseSendsNoRemove(t *testing.T) {
 	}
 	b, mem := newDeferredBackend(t, testfakes.NopUploader{},
 		func(d *Deps) { d.Remover = rm },
-		withBlobs(func(d *spaceshardqueue.Deps) { d.Intents = &stallingIntents{IntentStore: d.Intents, stall: stall} }))
+		withBlobs(func(d *spaceshardqueue.Deps) { d.Parks = &stallingParks{ParkStore: d.Parks, stall: stall} }))
 	setNone(t, b)
 
 	putIn(t, b, "bk", "old", testBody(8<<10))

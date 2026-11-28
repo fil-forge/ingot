@@ -136,15 +136,15 @@ func (r *Postgres) ListIntentsByState(ctx context.Context, state string) ([]Uplo
 	return scanIntents(rows)
 }
 
-func (r *Postgres) CountOtherIntents(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
-	var n int
+func (r *Postgres) HasIntent(ctx context.Context, digest multihash.Multihash) (bool, error) {
+	var held bool
 	err := r.pool.QueryRow(ctx,
-		`SELECT count(*) FROM ingot.upload_intents WHERE digest = $2 AND space <> $1`,
-		space, digest).Scan(&n)
+		`SELECT EXISTS (SELECT 1 FROM ingot.upload_intents WHERE digest = $1)`,
+		digest).Scan(&held)
 	if err != nil {
-		return 0, fmt.Errorf("registry: count other intents: %w", err)
+		return false, fmt.Errorf("registry: has intent: %w", err)
 	}
-	return n, nil
+	return held, nil
 }
 
 func (r *Postgres) StalledBytes(ctx context.Context, before time.Time) (int64, error) {

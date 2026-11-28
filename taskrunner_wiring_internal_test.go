@@ -1,16 +1,21 @@
 package ingot
 
 import (
+	"context"
+	"errors"
+
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"path/filepath"
 	"testing"
 
 	"github.com/fil-forge/libforge/identity"
+	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/internal/testfakes"
+	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
 )
 
@@ -30,7 +35,7 @@ func TestTaskRunnerHasTheBackendsQueues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewBlobCache: %v", err)
 	}
-	b, err := s3frontend.New(s3frontend.Deps{Tasks: r, Capturer: testfakes.NopUploader{}, Cache: cache})
+	b, err := s3frontend.New(s3frontend.Deps{Tasks: r, Capturer: testfakes.NopUploader{}, Intents: unusedIntents{t: t}, Cache: cache})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -64,4 +69,17 @@ func TestTaskQueuesGiveTheBucketQueueTwoWorkersWhenTheConfigLeavesItUnset(t *tes
 		}
 	}
 	t.Fatal("no bucket queue")
+}
+
+// unusedIntents is an intent store for a backend that runs no task, so
+// nothing asks it anything. The one question an eviction asks fails the test
+// with a reason; any other would panic on the embedded nil store.
+type unusedIntents struct {
+	registry.IntentStore
+	t *testing.T
+}
+
+func (u unusedIntents) HasIntent(context.Context, multihash.Multihash) (bool, error) {
+	u.t.Errorf("the intent store was asked about a blob, but this backend runs no task")
+	return false, errors.New("unused intent store")
 }
