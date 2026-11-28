@@ -110,34 +110,35 @@ func runIntentSuite(t *testing.T, fresh func(t *testing.T) intentStore) {
 		}
 	})
 
-	t.Run("CountOtherIntents counts the other spaces' intents", func(t *testing.T) {
+	t.Run("HasIntent reports whether any space holds an intent", func(t *testing.T) {
 		st := fresh(t)
 		d := intentDigest(t, "others")
 		other := testutil.RandomDID(t)
-		seed(t, st, d, registry.IntentAccepted, true, false)
-		count := func() int {
+		has := func() bool {
 			t.Helper()
-			n, err := st.CountOtherIntents(ctx, space, d)
+			held, err := st.HasIntent(ctx, d)
 			if err != nil {
-				t.Fatalf("CountOtherIntents: %v", err)
+				t.Fatalf("HasIntent: %v", err)
 			}
-			return n
+			return held
 		}
-		var got []int
-		got = append(got, count())
+		var got []bool
+		got = append(got, has())
+		seed(t, st, d, registry.IntentAccepted, true, false)
+		got = append(got, has())
 		if err := st.PutIntent(ctx, registry.UploadIntent{Space: other, Digest: d, Size: 7, State: registry.IntentUploading}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
-		got = append(got, count())
+		if err := st.DeleteIntent(ctx, space, d); err != nil {
+			t.Fatalf("DeleteIntent: %v", err)
+		}
+		got = append(got, has())
 		if err := st.DeleteIntent(ctx, other, d); err != nil {
 			t.Fatalf("DeleteIntent: %v", err)
 		}
-		got = append(got, count())
-		if _, err := st.GetIntent(ctx, space, d); err != nil {
-			t.Fatalf("the first space's intent after the other's delete: %v", err)
-		}
-		if want := []int{0, 1, 0}; !reflect.DeepEqual(got, want) {
-			t.Fatalf("other intents [alone, shared, other deleted] = %v, want %v", got, want)
+		got = append(got, has())
+		if want := []bool{false, true, true, false}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("held [none, one space, the other, neither] = %v, want %v", got, want)
 		}
 	})
 

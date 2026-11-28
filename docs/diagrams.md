@@ -765,8 +765,8 @@ flowchart TB
   modification time (last renewal) first, down to 90% of the budget. The
   intent keeps its row and state; reads fall through to the network tier.
   Writes in progress are never evicted. A blob's release queues the
-  eviction of its cached copy unless another space holds an intent for the
-  digest.
+  eviction of its cached copy, which leaves it while another space holds an
+  intent for the digest.
 - Digests present in both the old and new version sets never churn: the new
   generation's claim lands before the old one's drops in the same
   transaction, so the digest keeps a claim throughout and no release is

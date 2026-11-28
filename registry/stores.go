@@ -86,7 +86,7 @@ type BlobClaim struct {
 // as received has the digest of its bytes, so the same bytes written to two
 // spaces are one cached copy and two intents, each tracking its own space's
 // upload. The cached copy is shared, so it may go only when no intent for the
-// digest still needs it (see CountOtherIntents).
+// digest still needs it (see HasIntent).
 type UploadIntent struct {
 	Space  did.DID
 	Digest multihash.Multihash
@@ -329,11 +329,10 @@ type IntentStore interface {
 	GetIntent(ctx context.Context, space did.DID, digest multihash.Multihash) (*UploadIntent, error)
 	ListIntentsByState(ctx context.Context, state string) ([]UploadIntent, error)
 	DeleteIntent(ctx context.Context, space did.DID, digest multihash.Multihash) error
-	// CountOtherIntents returns how many spaces other than space hold an
-	// intent for digest. Zero means the cached copy is this space's alone to
-	// remove; otherwise another space's reads may still use it, and its
-	// removal is left to that space's release.
-	CountOtherIntents(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
+	// HasIntent reports whether any space holds an intent for digest. While
+	// one does, that space's reads may still use the cached copy, so a
+	// release's eviction leaves it.
+	HasIntent(ctx context.Context, digest multihash.Multihash) (bool, error)
 	// StalledBytes sums the sizes of 'uploading' intents whose state last
 	// changed before before: bodies whose upload has outlasted any live
 	// request, which nothing reclaims.

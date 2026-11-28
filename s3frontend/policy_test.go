@@ -73,7 +73,7 @@ func policyBackend(t *testing.T, authority bucketauthority.BucketAuthority) *s3f
 	require.NoError(t, err)
 	cache, err := blockstore.NewBlobCache(filepath.Join(t.TempDir(), "cache"))
 	require.NoError(t, err)
-	b, err := s3frontend.New(s3frontend.Deps{Tasks: tasks, Capturer: testfakes.NopUploader{}, Registry: reg, Cache: cache, Authority: authority})
+	b, err := s3frontend.New(s3frontend.Deps{Tasks: tasks, Capturer: testfakes.NopUploader{}, Registry: reg, Intents: reg, Cache: cache, Authority: authority})
 	require.NoError(t, err)
 	return b
 }

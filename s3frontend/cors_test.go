@@ -37,7 +37,7 @@ func TestGetBucketCors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cache: %v", err)
 		}
-		b, err := New(Deps{Tasks: mem.tasks, Capturer: testfakes.NopUploader{}, Registry: mem, Cache: cache, CORS: corsCfg})
+		b, err := New(Deps{Tasks: mem.tasks, Capturer: testfakes.NopUploader{}, Registry: mem, Intents: mem, Cache: cache, CORS: corsCfg})
 		if err != nil {
 			t.Fatalf("backend: %v", err)
 		}
