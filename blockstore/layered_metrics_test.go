@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/fil-forge/ucantone/did"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -18,25 +19,18 @@ func TestLayered_CountBlobReadsByTier(t *testing.T) {
 	hit := NewLayered(fakeBlobTier{data: []byte("from-cache")}, nil, fakeBlobTier{data: []byte("from-base")})
 	miss := NewLayered(fakeBlobTier{data: nil}, nil, fakeBlobTier{data: []byte("from-base")})
 	for _, l := range []*Layered{hit, miss} {
-		if err := l.CountBlobReads(meter); err != nil {
-			t.Fatalf("CountBlobReads: %v", err)
-		}
+		require.NoError(t, l.CountBlobReads(meter), "CountBlobReads")
 	}
 	for _, l := range []*Layered{hit, hit, miss} {
-		if _, err := readOpenBlob(t, l, digest); err != nil {
-			t.Fatalf("OpenBlob: %v", err)
-		}
+		_, err := readOpenBlob(t, l, digest)
+		require.NoError(t, err, "OpenBlob")
 	}
 	rc, err := miss.OpenBlobRange(context.Background(), did.Undef, digest, 0, 1)
-	if err != nil {
-		t.Fatalf("OpenBlobRange: %v", err)
-	}
+	require.NoError(t, err, "OpenBlobRange")
 	_ = rc.Close()
 
 	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("collect: %v", err)
-	}
+	require.NoError(t, reader.Collect(context.Background(), &rm), "collect")
 	got := map[string]int64{}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
@@ -49,7 +43,8 @@ func TestLayered_CountBlobReadsByTier(t *testing.T) {
 			}
 		}
 	}
-	if want := map[string]int64{"local": 2, "network": 2}; len(got) != 2 || got["local"] != want["local"] || got["network"] != want["network"] {
-		t.Fatalf("ingot.local_blobs.reads by tier = %v, want %v", got, want)
-	}
+	want := map[string]int64{"local": 2, "network": 2}
+	require.Len(t, got, 2, "ingot.local_blobs.reads by tier")
+	require.Equal(t, want["local"], got["local"], "ingot.local_blobs.reads by tier")
+	require.Equal(t, want["network"], got["network"], "ingot.local_blobs.reads by tier")
 }

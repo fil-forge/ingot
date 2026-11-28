@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	cmds3 "github.com/fil-forge/libforge/commands/s3"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/internal/reqscope"
 )
@@ -42,26 +43,18 @@ func TestPutObject_ReusesContentMD5ForETag(t *testing.T) {
 	out, err := b.PutObject(ctxWithContentMD5(data), s3response.PutObjectInput{
 		Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data),
 	})
-	if err != nil {
-		t.Fatalf("PutObject with Content-MD5: %v", err)
-	}
-	if out.ETag != want {
-		t.Fatalf("header-path ETag = %q, want %s", out.ETag, want)
-	}
+	require.NoError(t, err, "PutObject with Content-MD5")
+	require.Equal(t, want, out.ETag, "header-path ETag")
 
 	out2, err := b.PutObject(context.Background(), s3response.PutObjectInput{
 		Bucket: &bucket, Key: &key2, Body: bytes.NewReader(data), ContentLength: byteLen(data),
 	})
-	if err != nil {
-		t.Fatalf("PutObject computed: %v", err)
-	}
-	if out2.ETag != want {
-		t.Fatalf("compute-path ETag = %q, want %s", out2.ETag, want)
-	}
+	require.NoError(t, err, "PutObject computed")
+	require.Equal(t, want, out2.ETag, "compute-path ETag")
 
-	if _, body, err := getObjV(t, b, key, ""); err != nil || !bytes.Equal(body, data) {
-		t.Fatalf("round-trip: %d bytes, err=%v", len(body), err)
-	}
+	_, body, err := getObjV(t, b, key, "")
+	require.NoError(t, err, "round-trip")
+	require.True(t, bytes.Equal(data, body), "round-trip: %d bytes, want %d", len(body), len(data))
 }
 
 // An UploadPart whose request carries a Content-MD5 records that value as the
@@ -81,22 +74,16 @@ func TestUploadPart_ReusesContentMD5ForETag(t *testing.T) {
 		Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &one,
 		Body: bytes.NewReader(part), ContentLength: byteLen(part),
 	})
-	if err != nil {
-		t.Fatalf("UploadPart with Content-MD5: %v", err)
-	}
-	if out.ETag == nil || *out.ETag != want {
-		t.Fatalf("part ETag = %v, want %s", out.ETag, want)
-	}
+	require.NoError(t, err, "UploadPart with Content-MD5")
+	require.NotNil(t, out.ETag, "part ETag")
+	require.Equal(t, want, *out.ETag, "part ETag")
 
 	lp, err := b.ListParts(context.Background(), &awss3.ListPartsInput{
 		Bucket: &bucket, Key: &key, UploadId: &uploadID,
 	})
-	if err != nil {
-		t.Fatalf("ListParts: %v", err)
-	}
-	if len(lp.Parts) != 1 || strings_Trim(lp.Parts[0].ETag) != hex.EncodeToString(sum[:]) {
-		t.Fatalf("ListParts ETag = %+v, want %s", lp.Parts, hex.EncodeToString(sum[:]))
-	}
+	require.NoError(t, err, "ListParts")
+	require.Len(t, lp.Parts, 1, "ListParts")
+	require.Equal(t, hex.EncodeToString(sum[:]), strings_Trim(lp.Parts[0].ETag), "ListParts ETag")
 }
 
 func strings_Trim(s string) string {
@@ -124,18 +111,13 @@ func TestPutObject_MD5ChecksumSpecSuppliesETag(t *testing.T) {
 			in := s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)}
 			mod(&in)
 			out, err := b.PutObject(context.Background(), in)
-			if err != nil {
-				t.Fatalf("PutObject: %v", err)
-			}
-			if out.ETag != wantETag {
-				t.Fatalf("ETag = %q, want %s", out.ETag, wantETag)
-			}
-			if out.ChecksumMD5 == nil || *out.ChecksumMD5 != wantB64 {
-				t.Fatalf("ChecksumMD5 echo = %v, want %s", out.ChecksumMD5, wantB64)
-			}
-			if _, body, err := getObjV(t, b, key, ""); err != nil || !bytes.Equal(body, data) {
-				t.Fatalf("round-trip: %d bytes, err=%v", len(body), err)
-			}
+			require.NoError(t, err, "PutObject")
+			require.Equal(t, wantETag, out.ETag, "ETag")
+			require.NotNil(t, out.ChecksumMD5, "ChecksumMD5 echo")
+			require.Equal(t, wantB64, *out.ChecksumMD5, "ChecksumMD5 echo")
+			_, body, err := getObjV(t, b, key, "")
+			require.NoError(t, err, "round-trip")
+			require.True(t, bytes.Equal(data, body), "round-trip: %d bytes, want %d", len(body), len(data))
 		})
 	}
 }
@@ -154,15 +136,11 @@ func TestUploadPart_MD5ChecksumReaderSuppliesETag(t *testing.T) {
 		key := "mp-md5-session"
 		uploadID := mpCreate(t, b, key, types.ChecksumAlgorithmMd5, types.ChecksumTypeFullObject)
 		out, err := mpUploadPart(t, b, key, uploadID, 1, part, nil)
-		if err != nil {
-			t.Fatalf("UploadPart: %v", err)
-		}
-		if out.ETag == nil || *out.ETag != want {
-			t.Fatalf("part ETag = %v, want %s", out.ETag, want)
-		}
-		if out.ChecksumMD5 == nil || *out.ChecksumMD5 != wantB64 {
-			t.Fatalf("ChecksumMD5 echo = %v, want %s", out.ChecksumMD5, wantB64)
-		}
+		require.NoError(t, err, "UploadPart")
+		require.NotNil(t, out.ETag, "part ETag")
+		require.Equal(t, want, *out.ETag, "part ETag")
+		require.NotNil(t, out.ChecksumMD5, "ChecksumMD5 echo")
+		require.Equal(t, wantB64, *out.ChecksumMD5, "ChecksumMD5 echo")
 	})
 	t.Run("MD5 part checksum, undeclared session", func(t *testing.T) {
 		key := "mp-md5-part"
@@ -170,15 +148,11 @@ func TestUploadPart_MD5ChecksumReaderSuppliesETag(t *testing.T) {
 		out, err := mpUploadPart(t, b, key, uploadID, 1, part, func(in *awss3.UploadPartInput) {
 			in.ChecksumAlgorithm = types.ChecksumAlgorithmMd5
 		})
-		if err != nil {
-			t.Fatalf("UploadPart: %v", err)
-		}
-		if out.ETag == nil || *out.ETag != want {
-			t.Fatalf("part ETag = %v, want %s", out.ETag, want)
-		}
-		if out.ChecksumMD5 == nil || *out.ChecksumMD5 != wantB64 {
-			t.Fatalf("ChecksumMD5 echo = %v, want %s", out.ChecksumMD5, wantB64)
-		}
+		require.NoError(t, err, "UploadPart")
+		require.NotNil(t, out.ETag, "part ETag")
+		require.Equal(t, want, *out.ETag, "part ETag")
+		require.NotNil(t, out.ChecksumMD5, "ChecksumMD5 echo")
+		require.Equal(t, wantB64, *out.ChecksumMD5, "ChecksumMD5 echo")
 	})
 }
 
@@ -195,18 +169,14 @@ func TestUploadPartCopy_ExplicitFullRangeIsWholeObject(t *testing.T) {
 	id := mpCreate(t, b, "full-range", "", "")
 	rng := fmt.Sprintf("bytes=0-%d", len(src)-1)
 	res, err := upc(t, b, "full-range", id, 1, "bk/src", func(in *awss3.UploadPartCopyInput) { in.CopySourceRange = &rng })
-	if err != nil {
-		t.Fatalf("UploadPartCopy full range: %v", err)
-	}
-	if res.ETag == nil || *res.ETag != want {
-		t.Fatalf("part ETag = %v, want %s", res.ETag, want)
-	}
-	if _, err := mpComplete(t, b, "full-range", id, []types.CompletedPart{completed(res, 1)}, nil); err != nil {
-		t.Fatalf("complete: %v", err)
-	}
-	if _, got, err := getObjV(t, b, "full-range", ""); err != nil || !bytes.Equal(got, src) {
-		t.Fatalf("GET after full-range copy: %d bytes, %v; want the source", len(got), err)
-	}
+	require.NoError(t, err, "UploadPartCopy full range")
+	require.NotNil(t, res.ETag, "part ETag")
+	require.Equal(t, want, *res.ETag, "part ETag")
+	_, err = mpComplete(t, b, "full-range", id, []types.CompletedPart{completed(res, 1)}, nil)
+	require.NoError(t, err, "complete")
+	_, got, err := getObjV(t, b, "full-range", "")
+	require.NoError(t, err, "GET after full-range copy")
+	require.True(t, bytes.Equal(src, got), "GET after full-range copy: %d bytes; want the source", len(got))
 }
 
 // A zero-byte PutObject carries the constant empty MD5 as its ETag.
@@ -214,10 +184,7 @@ func TestPutObject_ZeroByteETag(t *testing.T) {
 	b, _, _ := newRefTestBackend(t)
 	bucket, key := "bk", "empty"
 	out, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(nil), ContentLength: byteLen(nil)})
-	if err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
-	if want := `"d41d8cd98f00b204e9800998ecf8427e"`; out.ETag != want {
-		t.Fatalf("ETag = %q, want %s", out.ETag, want)
-	}
+	require.NoError(t, err, "PutObject")
+	want := `"d41d8cd98f00b204e9800998ecf8427e"`
+	require.Equal(t, want, out.ETag, "ETag")
 }

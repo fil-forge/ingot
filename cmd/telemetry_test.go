@@ -8,6 +8,8 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -65,12 +67,9 @@ func TestSamplerFromEnv(t *testing.T) {
 			t.Setenv("OTEL_TRACES_SAMPLER", tc.sampler)
 			t.Setenv("OTEL_TRACES_SAMPLER_ARG", tc.arg)
 			sampler, err := samplerFromEnv()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got := sampledNames(t, sampler); !slices.Equal(got, tc.want) {
-				t.Fatalf("expected %v sampled, got %v", tc.want, got)
-			}
+			require.NoError(t, err)
+			got := sampledNames(t, sampler)
+			require.True(t, slices.Equal(got, tc.want), "expected %v sampled, got %v", tc.want, got)
 		})
 	}
 }
@@ -78,9 +77,8 @@ func TestSamplerFromEnv(t *testing.T) {
 func TestSamplerFromEnvRejectsBadRatio(t *testing.T) {
 	for _, arg := range []string{"1.5", "-0.1", "one"} {
 		t.Setenv("OTEL_TRACES_SAMPLER_ARG", arg)
-		if _, err := samplerFromEnv(); err == nil {
-			t.Fatalf("expected an error for OTEL_TRACES_SAMPLER_ARG=%q", arg)
-		}
+		_, err := samplerFromEnv()
+		require.Error(t, err, "expected an error for OTEL_TRACES_SAMPLER_ARG=%q", arg)
 	}
 }
 
@@ -99,21 +97,15 @@ func TestSetupTracingExportsToConfiguredEndpoint(t *testing.T) {
 	t.Cleanup(func() { otel.SetTracerProvider(prev) })
 
 	shutdown, err := setupTracing(context.Background(), zap.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	_, span := otel.Tracer("test").Start(context.Background(), "PutObject", trace.WithSpanKind(trace.SpanKindServer))
 	span.End()
-	if err := shutdown(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, shutdown(context.Background()))
 	select {
 	case path := <-got:
-		if path != "/v1/traces" {
-			t.Fatalf("expected an export to /v1/traces, got %s", path)
-		}
+		require.Equal(t, "/v1/traces", path, "expected an export to /v1/traces")
 	default:
-		t.Fatal("expected shutdown to flush the span to the collector")
+		require.FailNow(t, "expected shutdown to flush the span to the collector")
 	}
 }
 
@@ -128,35 +120,27 @@ func namespaceOf(t *testing.T) string {
 	t.Cleanup(func() { otel.SetTracerProvider(prev) })
 
 	shutdown, err := setupTracing(context.Background(), zap.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	_, span := otel.Tracer("test").Start(context.Background(), "PutObject")
 	ro, ok := span.(sdktrace.ReadOnlySpan)
-	if !ok {
-		t.Fatal("expected an SDK span")
-	}
+	require.True(t, ok, "expected an SDK span")
 	ns, _ := ro.Resource().Set().Value(semconv.ServiceNamespaceKey)
 	span.End()
-	if err := shutdown(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, shutdown(context.Background()))
 	return ns.AsString()
 }
 
 func TestSetupTracingReportsForgeNamespace(t *testing.T) {
 	isolateOTelEnv(t)
-	if got := namespaceOf(t); got != "forge" {
-		t.Fatalf("expected service.namespace forge, got %q", got)
-	}
+	got := namespaceOf(t)
+	require.Equal(t, "forge", got)
 }
 
 func TestSetupTracingNamespaceFromEnvWins(t *testing.T) {
 	isolateOTelEnv(t)
 	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "service.namespace=elsewhere")
-	if got := namespaceOf(t); got != "elsewhere" {
-		t.Fatalf("expected OTEL_RESOURCE_ATTRIBUTES to set service.namespace, got %q", got)
-	}
+	got := namespaceOf(t)
+	require.Equal(t, "elsewhere", got, "expected OTEL_RESOURCE_ATTRIBUTES to set service.namespace")
 }
 
 func TestSetupTracingOffWithoutEndpoint(t *testing.T) {
@@ -165,12 +149,9 @@ func TestSetupTracingOffWithoutEndpoint(t *testing.T) {
 	prev := otel.GetTracerProvider()
 	t.Cleanup(func() { otel.SetTracerProvider(prev) })
 
-	if _, err := setupTracing(context.Background(), zap.NewNop()); err != nil {
-		t.Fatal(err)
-	}
-	if otel.GetTracerProvider() != prev {
-		t.Fatal("expected no tracer provider installed without an endpoint")
-	}
+	_, err := setupTracing(context.Background(), zap.NewNop())
+	require.NoError(t, err)
+	require.True(t, otel.GetTracerProvider() == prev, "expected no tracer provider installed without an endpoint")
 }
 
 // isolateOTelEnv unsets, for the test's duration, the OTEL_* variables that
@@ -199,9 +180,8 @@ func TestCollectorHostOmitsCredentials(t *testing.T) {
 		"https://collector.example.com:4318?token=hunter": "https://collector.example.com:4318",
 		"not a url": "unparsed endpoint",
 	} {
-		if got := collectorHost(endpoint); got != want {
-			t.Errorf("collectorHost(%q) = %q, want %q", endpoint, got, want)
-		}
+		got := collectorHost(endpoint)
+		assert.Equal(t, want, got, "collectorHost(%q)", endpoint)
 	}
 }
 
@@ -212,15 +192,9 @@ func TestSetupMetricsOffWithoutEndpoint(t *testing.T) {
 	t.Cleanup(func() { otel.SetMeterProvider(prev) })
 
 	shutdown, err := setupMetrics(context.Background(), zap.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := shutdown(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if otel.GetMeterProvider() != prev {
-		t.Fatal("expected no meter provider installed without an endpoint")
-	}
+	require.NoError(t, err)
+	require.NoError(t, shutdown(context.Background()))
+	require.True(t, otel.GetMeterProvider() == prev, "expected no meter provider installed without an endpoint")
 }
 
 // With a collector configured, through either the shared or the
@@ -247,24 +221,16 @@ func TestSetupMetricsExportsOnShutdown(t *testing.T) {
 			t.Cleanup(func() { otel.SetMeterProvider(prev) })
 
 			shutdown, err := setupMetrics(context.Background(), zap.NewNop())
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 			counter, err := otel.Meter("test").Int64Counter("test.requests")
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 			counter.Add(context.Background(), 1)
-			if err := shutdown(context.Background()); err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, shutdown(context.Background()))
 			select {
 			case path := <-got:
-				if path != "/v1/metrics" {
-					t.Fatalf("expected an export to /v1/metrics, got %s", path)
-				}
+				require.Equal(t, "/v1/metrics", path, "expected an export to /v1/metrics")
 			default:
-				t.Fatal("expected shutdown to flush the metric to the collector")
+				require.FailNow(t, "expected shutdown to flush the metric to the collector")
 			}
 		})
 	}

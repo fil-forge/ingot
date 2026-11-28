@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -22,6 +21,8 @@ import (
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest"
@@ -45,12 +46,8 @@ func TestApp_GraphValidates(t *testing.T) {
 	_, dsn := pgtest.NewWithDSN(t)
 
 	app, err := buildApp(t.Context(), appConfig(t, dsn), zaptest.NewLogger(t))
-	if err != nil {
-		t.Fatalf("fx graph does not validate: %v", err)
-	}
-	if app == nil {
-		t.Fatal("buildApp returned a nil app")
-	}
+	require.NoError(t, err, "fx graph does not validate")
+	require.NotNil(t, app, "buildApp returned a nil app")
 }
 
 // TestApp_StartTimeoutCoversCatalogRecovery pins the start deadline above
@@ -60,12 +57,9 @@ func TestApp_StartTimeoutCoversCatalogRecovery(t *testing.T) {
 	_, dsn := pgtest.NewWithDSN(t)
 
 	app, err := buildApp(t.Context(), appConfig(t, dsn), zaptest.NewLogger(t))
-	if err != nil {
-		t.Fatalf("build app: %v", err)
-	}
-	if got, want := app.StartTimeout(), time.Minute; got != want {
-		t.Fatalf("start timeout = %v, want %v", got, want)
-	}
+	require.NoError(t, err, "build app")
+	got, want := app.StartTimeout(), time.Minute
+	require.Equal(t, want, got, "start timeout")
 }
 
 // TestApp_StopSavesRevocationCursor starts the app with the revocation
@@ -82,18 +76,14 @@ func TestApp_StopSavesRevocationCursor(t *testing.T) {
 	pool, dsn := pgtest.NewWithDSN(t)
 
 	mh, err := multihash.Sum([]byte("revoked"), multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("hash: %v", err)
-	}
+	require.NoError(t, err, "hash")
 	rec := api.FirehoseRevocation{
 		Revoke:     cid.NewCidV1(cid.DagCBOR, mh),
 		Cause:      cid.NewCidV1(cid.DagCBOR, mh),
 		RecordedAt: jsg.DagJsonTime(time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)),
 	}
 	var payload bytes.Buffer
-	if err := rec.MarshalDagJSON(&payload); err != nil {
-		t.Fatalf("encode record: %v", err)
-	}
+	require.NoError(t, rec.MarshalDagJSON(&payload), "encode record")
 	// The stub answers the head, then streams the record after it and holds
 	// the stream open as an idle feed.
 	const head, recCursor = "41", "42"
@@ -123,39 +113,28 @@ func TestApp_StopSavesRevocationCursor(t *testing.T) {
 		return zapcore.NewTee(c, obs)
 	})))
 	app, err := buildApp(t.Context(), cfg, logger)
-	if err != nil {
-		t.Fatalf("build app: %v", err)
-	}
+	require.NoError(t, err, "build app")
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	if err := app.Start(ctx); err != nil {
-		t.Fatalf("start app: %v", err)
-	}
+	require.NoError(t, app.Start(ctx), "start app")
 	for logs.FilterMessage("revocation: record processed").Len() == 0 {
 		if ctx.Err() != nil {
 			_ = app.Stop(context.Background())
-			t.Fatal("the consumer applied no record")
+			require.FailNow(t, "the consumer applied no record")
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if err := app.Stop(ctx); err != nil {
-		t.Fatalf("stop app: %v", err)
-	}
+	require.NoError(t, app.Stop(ctx), "stop app")
 	// Nothing that stops before the pool, the consumer included, may find it
 	// closed.
 	for _, e := range logs.All() {
-		if msg, _ := e.ContextMap()["error"].(string); strings.Contains(msg, "closed pool") {
-			t.Errorf("%q logged against the closed pool: %s", e.Message, msg)
-		}
+		msg, _ := e.ContextMap()["error"].(string)
+		assert.NotContains(t, msg, "closed pool", "%q logged against the closed pool", e.Message)
 	}
 
 	cur, err := registry.NewPostgres(pool).GetRevocationCursor(ctx)
-	if err != nil {
-		t.Fatalf("read the cursor saved at stop: %v", err)
-	}
-	if cur.Token != recCursor {
-		t.Fatalf("saved cursor is %q, want the applied record's %q", cur.Token, recCursor)
-	}
+	require.NoError(t, err, "read the cursor saved at stop")
+	require.Equal(t, recCursor, cur.Token, "saved cursor")
 }
 
 // appConfig returns a daemon config for an app on dsn. The other services it
@@ -164,17 +143,11 @@ func TestApp_StopSavesRevocationCursor(t *testing.T) {
 func appConfig(t *testing.T, dsn string) *config.Config {
 	t.Helper()
 	signer, err := ed25519.Generate()
-	if err != nil {
-		t.Fatalf("generate agent key: %v", err)
-	}
+	require.NoError(t, err, "generate agent key")
 	pemBytes, err := identity.EncodeSignerToPEM(signer)
-	if err != nil {
-		t.Fatalf("encode agent key: %v", err)
-	}
+	require.NoError(t, err, "encode agent key")
 	keyFile := filepath.Join(t.TempDir(), "agent.pem")
-	if err := os.WriteFile(keyFile, pemBytes, 0o600); err != nil {
-		t.Fatalf("write agent key: %v", err)
-	}
+	require.NoError(t, os.WriteFile(keyFile, pemBytes, 0o600), "write agent key")
 
 	return &config.Config{
 		Addr:             "127.0.0.1:0",
@@ -202,17 +175,11 @@ func appConfig(t *testing.T, dsn string) *config.Config {
 func mintDelegation(t *testing.T) ucan.Delegation {
 	t.Helper()
 	space, err := ed25519.GenerateIssuer()
-	if err != nil {
-		t.Fatalf("generate space: %v", err)
-	}
+	require.NoError(t, err, "generate space")
 	agent, err := ed25519.GenerateIssuer()
-	if err != nil {
-		t.Fatalf("generate agent: %v", err)
-	}
+	require.NoError(t, err, "generate agent")
 	d, err := blobcmds.Add.Delegate(space, agent.DID(), space.DID(), delegation.WithNoExpiration())
-	if err != nil {
-		t.Fatalf("delegate: %v", err)
-	}
+	require.NoError(t, err, "delegate")
 	return d
 }
 
@@ -221,8 +188,6 @@ func mintDelegation(t *testing.T) ucan.Delegation {
 func encodedProofs(t *testing.T, dlgs ...ucan.Delegation) string {
 	t.Helper()
 	encoded, err := container.Encode(container.Base64, container.New(container.WithDelegations(dlgs...)))
-	if err != nil {
-		t.Fatalf("encode proofs container: %v", err)
-	}
+	require.NoError(t, err, "encode proofs container")
 	return string(encoded)
 }

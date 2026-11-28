@@ -7,7 +7,6 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -19,6 +18,7 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 	"github.com/filecoin-project/go-fee"
 	"github.com/filecoin-project/go-fee/cose"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/tenantkey"
 )
@@ -48,14 +48,11 @@ func getRange(t *testing.T, b *Backend, key, rng string) []byte {
 		in.Range = &rng
 	}
 	out, err := b.GetObject(context.Background(), in)
-	if err != nil {
-		t.Fatalf("GetObject %s %q: %v", key, rng, err)
-	}
+	require.NoError(t, err, "GetObject %s %q", key, rng)
 	defer out.Body.Close()
 	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(out.Body); err != nil {
-		t.Fatalf("read body: %v", err)
-	}
+	_, err = buf.ReadFrom(out.Body)
+	require.NoError(t, err, "read body")
 	return buf.Bytes()
 }
 
@@ -68,13 +65,11 @@ func TestEncryptedWrite_RoundTrip(t *testing.T) {
 	data := testBody(700 << 10) // → 3 blobs of ≤300 KiB plaintext
 
 	putObj(t, b, "k1", data)
-	if got := len(blobDigestsOf(t, b, "k1", "")); got != 3 {
-		t.Fatalf("blobs = %d, want 3", got)
-	}
+	got := len(blobDigestsOf(t, b, "k1", ""))
+	require.Equal(t, 3, got, "blobs")
 
-	if got := getRange(t, b, "k1", ""); !bytes.Equal(got, data) {
-		t.Fatalf("whole GET differs from plaintext (%d vs %d bytes)", len(got), len(data))
-	}
+	body := getRange(t, b, "k1", "")
+	require.True(t, bytes.Equal(data, body), "whole GET differs from plaintext (%d vs %d bytes)", len(body), len(data))
 	for _, span := range [][2]int64{
 		{0, 15},                                       // head of the first blob
 		{blobCeiling - 8, blobCeiling + 7},            // across a blob boundary
@@ -82,9 +77,8 @@ func TestEncryptedWrite_RoundTrip(t *testing.T) {
 		{int64(len(data)) - 16, int64(len(data)) - 1}, // tail
 	} {
 		rng := fmt.Sprintf("bytes=%d-%d", span[0], span[1])
-		if got := getRange(t, b, "k1", rng); !bytes.Equal(got, data[span[0]:span[1]+1]) {
-			t.Fatalf("ranged GET %s differs from plaintext", rng)
-		}
+		got := getRange(t, b, "k1", rng)
+		require.Equal(t, data[span[0]:span[1]+1], got, "ranged GET %s differs from plaintext", rng)
 	}
 }
 
@@ -98,44 +92,26 @@ func TestEncryptedWrite_Opacity(t *testing.T) {
 	data := testBody(4 << 10)
 
 	out := putObjV(t, b, "k1", data)
-	if want := `"` + hex.EncodeToString(md5sum(data)) + `"`; out.ETag != want {
-		t.Fatalf("ETag = %q, want the plaintext md5 %q", out.ETag, want)
-	}
+	want := `"` + hex.EncodeToString(md5sum(data)) + `"`
+	require.Equal(t, want, out.ETag, "ETag")
 
 	d := blobDigestOf(t, b, "k1", "")
-	if bytes.Equal(d, digestOf(t, data)) {
-		t.Fatalf("stored digest equals hash(plaintext); blob was not encrypted")
-	}
+	require.False(t, bytes.Equal(d, digestOf(t, data)), "stored digest equals hash(plaintext); blob was not encrypted")
 	stored, err := os.ReadFile(localPath(b, d))
-	if err != nil {
-		t.Fatalf("read stored blob: %v", err)
-	}
-	if len(stored) <= len(data) {
-		t.Fatalf("stored %d bytes for %d plaintext; an envelope must be larger", len(stored), len(data))
-	}
-	if bytes.Contains(stored, data[:32]) {
-		t.Fatalf("stored blob contains plaintext bytes")
-	}
+	require.NoError(t, err, "read stored blob")
+	require.Greater(t, len(stored), len(data), "stored %d bytes for %d plaintext; an envelope must be larger", len(stored), len(data))
+	require.False(t, bytes.Contains(stored, data[:32]), "stored blob contains plaintext bytes")
 
 	params, err := mem.GetEncryptionParams(ctx, mem.bk(), d)
-	if err != nil {
-		t.Fatalf("GetEncryptionParams: %v", err)
-	}
-	if len(params.RegionWrappedCEK) == 0 || params.HeaderLen <= 0 {
-		t.Fatalf("params row incomplete: %+v", params)
-	}
-	if err := (fee.BodyDescriptor{HeaderLen: params.HeaderLen, AAD: params.AAD}).Validate(); err != nil {
-		t.Fatalf("params row does not describe a FEE body: %v", err)
-	}
+	require.NoError(t, err, "GetEncryptionParams")
+	require.NotEmpty(t, params.RegionWrappedCEK, "params row incomplete: %+v", params)
+	require.Greater(t, params.HeaderLen, int64(0), "params row incomplete: %+v", params)
+	require.NoError(t, (fee.BodyDescriptor{HeaderLen: params.HeaderLen, AAD: params.AAD}).Validate(), "params row does not describe a FEE body")
 	// The registry records the STORED size: what decryption geometry is
 	// derived from, and what gets uploaded.
 	loc, err := mem.GetLocation(ctx, mem.bk(), d)
-	if err != nil {
-		t.Fatalf("GetLocation: %v", err)
-	}
-	if loc.Size != int64(len(stored)) {
-		t.Fatalf("recorded location size = %d, want the stored %d", loc.Size, len(stored))
-	}
+	require.NoError(t, err, "GetLocation")
+	require.Equal(t, int64(len(stored)), loc.Size, "recorded location size")
 }
 
 // TestEncryptedWrite_ZeroByteObject: an empty PUT stores nothing — no blobs,
@@ -146,15 +122,10 @@ func TestEncryptedWrite_ZeroByteObject(t *testing.T) {
 	b, _, _ := newRefTestBackend(t)
 
 	out := putObjV(t, b, "k1", nil)
-	if want := `"` + hex.EncodeToString(md5sum(nil)) + `"`; out.ETag != want {
-		t.Fatalf("ETag = %q, want the empty md5 %q", out.ETag, want)
-	}
-	if got := len(blobDigestsOf(t, b, "k1", "")); got != 0 {
-		t.Fatalf("blobs = %d, want 0", got)
-	}
-	if got := getRange(t, b, "k1", ""); len(got) != 0 {
-		t.Fatalf("GET returned %d bytes, want 0", len(got))
-	}
+	want := `"` + hex.EncodeToString(md5sum(nil)) + `"`
+	require.Equal(t, want, out.ETag, "ETag")
+	require.Empty(t, blobDigestsOf(t, b, "k1", ""), "blobs")
+	require.Empty(t, getRange(t, b, "k1", ""), "GET body")
 }
 
 // TestEncryptedWrite_DeleteShredsParams: releasing a blob's last claim
@@ -167,18 +138,15 @@ func TestEncryptedWrite_DeleteShredsParams(t *testing.T) {
 
 	putObj(t, b, "k1", data)
 	d := blobDigestOf(t, b, "k1", "")
-	if _, err := mem.GetEncryptionParams(ctx, mem.bk(), d); err != nil {
-		t.Fatalf("params row missing before delete: %v", err)
-	}
+	_, err := mem.GetEncryptionParams(ctx, mem.bk(), d)
+	require.NoError(t, err, "params row missing before delete")
 
 	deleteObj(t, b, "k1")
 	drainReleases(t, b) // the release is deferred; the sweep executes it
-	if _, err := mem.GetEncryptionParams(ctx, mem.bk(), d); err == nil {
-		t.Fatalf("params row survived the last-claim release; want it crypto-shredded")
-	}
-	if rm.removedDigests()[string(d)] != 1 {
-		t.Fatalf("expected one RemoveBlob; got %v", rm.removedDigests())
-	}
+	_, err = mem.GetEncryptionParams(ctx, mem.bk(), d)
+	require.Error(t, err, "params row survived the last-claim release; want it crypto-shredded")
+	removed := rm.removedDigests()
+	require.Equal(t, 1, removed[string(d)], "RemoveBlob calls for the blob (all: %v)", removed)
 }
 
 func md5sum(data []byte) []byte {
@@ -207,19 +175,11 @@ func testTenantKeys() tenantkey.Source {
 func recipientOf(t *testing.T, stored []byte) *cose.Recipient {
 	t.Helper()
 	tag, err := cose.PeekTag(stored)
-	if err != nil {
-		t.Fatalf("PeekTag: %v", err)
-	}
-	if tag != cose.TagCOSEEncrypt {
-		t.Fatalf("envelope tag = %d, want %d (COSE_Encrypt with recipients)", tag, cose.TagCOSEEncrypt)
-	}
+	require.NoError(t, err, "PeekTag")
+	require.Equal(t, cose.TagCOSEEncrypt, tag, "envelope tag")
 	env, _, err := cose.Decode(stored)
-	if err != nil {
-		t.Fatalf("cose.Decode: %v", err)
-	}
-	if len(env.Recipients) != 1 {
-		t.Fatalf("recipients = %d, want exactly the tenant", len(env.Recipients))
-	}
+	require.NoError(t, err, "cose.Decode")
+	require.Len(t, env.Recipients, 1, "recipients")
 	return env.Recipients[0]
 }
 
@@ -232,27 +192,20 @@ func assertTenantRecipient(t *testing.T, b *Backend, digest []byte, plaintext []
 	stored := storedBytes(t, b, digest)
 	kid := tenantkey.EncodePublicKey(testWrapKey.PublicKey())
 	rec := recipientOf(t, stored)
-	if got, ok := rec.Headers.Unprotected.Bytes(cose.HeaderLabelKID); !ok || string(got) != kid {
-		t.Fatalf("recipient kid = %q, want the wrap key fingerprint %q", got, kid)
-	}
+	got, ok := rec.Headers.Unprotected.Bytes(cose.HeaderLabelKID)
+	require.True(t, ok, "recipient kid = %q, want the wrap key fingerprint %q", got, kid)
+	require.Equal(t, kid, string(got), "recipient kid = %q, want the wrap key fingerprint %q", got, kid)
 
 	pr, err := fee.Decrypt(bytes.NewReader(stored), fee.NewECDHESUnwrapper([]byte(kid), testWrapKey))
-	if err != nil {
-		t.Fatalf("fee.Decrypt with the tenant key: %v", err)
-	}
+	require.NoError(t, err, "fee.Decrypt with the tenant key")
 	recovered, err := io.ReadAll(pr)
-	if err != nil {
-		t.Fatalf("read recovered plaintext: %v", err)
-	}
-	if !bytes.Equal(recovered, plaintext) {
-		t.Fatalf("tenant-key recovery returned %d bytes that differ from the %d plaintext bytes", len(recovered), len(plaintext))
-	}
+	require.NoError(t, err, "read recovered plaintext")
+	require.Equal(t, plaintext, recovered, "tenant-key recovery returned %d bytes that differ from the %d plaintext bytes", len(recovered), len(plaintext))
 
 	// The kid is an exact match: another key's fingerprint unwraps nothing.
 	other, _ := ecdh.X25519().GenerateKey(rand.Reader)
-	if _, err := fee.Decrypt(bytes.NewReader(stored), fee.NewECDHESUnwrapper([]byte(tenantkey.EncodePublicKey(other.PublicKey())), other)); err == nil {
-		t.Fatalf("an unrelated key unwrapped the envelope")
-	}
+	_, err = fee.Decrypt(bytes.NewReader(stored), fee.NewECDHESUnwrapper([]byte(tenantkey.EncodePublicKey(other.PublicKey())), other))
+	require.Error(t, err, "an unrelated key unwrapped the envelope")
 }
 
 // TestEncryptedWrite_TenantRecipient: every blob a PUT stores is a
@@ -265,9 +218,7 @@ func TestEncryptedWrite_TenantRecipient(t *testing.T) {
 
 	putObj(t, b, "k1", data)
 	digests := blobDigestsOf(t, b, "k1", "")
-	if len(digests) != 3 {
-		t.Fatalf("blobs = %d, want 3", len(digests))
-	}
+	require.Len(t, digests, 3, "blobs")
 	for i, d := range digests {
 		lo := i * blobCeiling
 		hi := min(lo+blobCeiling, len(data))
@@ -275,9 +226,8 @@ func TestEncryptedWrite_TenantRecipient(t *testing.T) {
 	}
 	// The read path is indifferent to the recipient: it decrypts from the
 	// region wrap and the stored geometry.
-	if got := getRange(t, b, "k1", ""); !bytes.Equal(got, data) {
-		t.Fatalf("GET differs from plaintext")
-	}
+	got := getRange(t, b, "k1", "")
+	require.Equal(t, data, got, "GET differs from plaintext")
 }
 
 // TestEncryptedWrite_MultipartTenantRecipient: part blobs carry the tenant
@@ -289,13 +239,10 @@ func TestEncryptedWrite_MultipartTenantRecipient(t *testing.T) {
 
 	uploadID := mpCreate(t, b, key, "", "")
 	out, err := mpUploadPart(t, b, key, uploadID, 1, part, nil)
-	if err != nil {
-		t.Fatalf("UploadPart: %v", err)
-	}
+	require.NoError(t, err, "UploadPart")
 	one := int32(1)
-	if _, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}, nil); err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
+	_, err = mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}, nil)
+	require.NoError(t, err, "Complete")
 	assertTenantRecipient(t, b, blobDigestOf(t, b, key, ""), part)
 }
 
@@ -315,24 +262,17 @@ func TestEncryptedWrite_FailsClosedWithoutRecipient(t *testing.T) {
 	data := testBody(4 << 10)
 
 	bucket, key := "bk", "k1"
-	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{
+	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{
 		Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data),
-	}); !errors.Is(err, tenantkey.ErrNoTenant) {
-		t.Fatalf("PutObject err = %v, want ErrNoTenant", err)
-	}
-	if _, _, err := getObjV(t, b, key, ""); err == nil {
-		t.Fatalf("object exists after a refused write")
-	}
+	})
+	require.ErrorIs(t, err, tenantkey.ErrNoTenant, "PutObject")
+	_, _, err = getObjV(t, b, key, "")
+	require.Error(t, err, "object exists after a refused write")
 	entries, err := os.ReadDir(b.cache.Path(nil)) // Path of the empty digest is the cache dir itself
-	if err != nil {
-		t.Fatalf("read cache dir: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("cache holds %d files after a refused write, want 0", len(entries))
-	}
+	require.NoError(t, err, "read cache dir")
+	require.Empty(t, entries, "cache holds %d files after a refused write", len(entries))
 
 	uploadID := mpCreate(t, b, "mp", "", "")
-	if _, err := mpUploadPart(t, b, "mp", uploadID, 1, data, nil); !errors.Is(err, tenantkey.ErrNoTenant) {
-		t.Fatalf("UploadPart err = %v, want ErrNoTenant", err)
-	}
+	_, err = mpUploadPart(t, b, "mp", uploadID, 1, data, nil)
+	require.ErrorIs(t, err, tenantkey.ErrNoTenant, "UploadPart")
 }

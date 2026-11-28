@@ -148,7 +148,7 @@ func TestServerFlushesUsageWhileAReportIsStuck(t *testing.T) {
 	select {
 	case <-reporter.entered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the usage sweeper never reported the count")
+		require.FailNow(t, "the usage sweeper never reported the count")
 	}
 
 	// The report is stuck. Bytes a response sends now are still flushed.

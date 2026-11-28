@@ -2,10 +2,10 @@ package bucket
 
 import (
 	"bytes"
-	"strings"
 	"testing"
 
 	"github.com/ipfs/go-cid"
+	"github.com/stretchr/testify/require"
 	cbg "github.com/whyrusleeping/cbor-gen"
 )
 
@@ -13,9 +13,7 @@ func testCid(t *testing.T, s string) cid.Cid {
 	t.Helper()
 	pref := cid.V1Builder{Codec: cid.DagCBOR, MhType: 0x12}
 	c, err := pref.Sum([]byte(s))
-	if err != nil {
-		t.Fatalf("cid: %v", err)
-	}
+	require.NoError(t, err, "cid")
 	return c
 }
 
@@ -32,34 +30,24 @@ func TestObjectValue_LeafRoundTrip(t *testing.T) {
 		State:   &state,
 	}
 	var buf bytes.Buffer
-	if err := LeafValue(leaf).MarshalCBOR(&buf); err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if buf.Bytes()[0] != 0xa1 {
-		t.Fatalf("header = %#x, want 0xa1 (single-entry map)", buf.Bytes()[0])
-	}
+	require.NoError(t, LeafValue(leaf).MarshalCBOR(&buf), "marshal")
+	require.Equal(t, byte(0xa1), buf.Bytes()[0], "header, want a single-entry map")
 
 	var val ObjectValue
-	if err := val.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if val.Manifest != nil || val.Leaf == nil {
-		t.Fatalf("value = {Manifest:%v Leaf:%v}, want leaf", val.Manifest, val.Leaf)
-	}
+	require.NoError(t, val.UnmarshalCBOR(bytes.NewReader(buf.Bytes())), "unmarshal")
+	require.Nil(t, val.Manifest, "value = {Manifest:%v Leaf:%v}", val.Manifest, val.Leaf)
+	require.NotNil(t, val.Leaf, "value = {Manifest:%v Leaf:%v}", val.Manifest, val.Leaf)
 	got := val.Leaf
-	if got.Current != leaf.Current || got.NullSeq != leaf.NullSeq ||
-		got.Prev == nil || !got.Prev.Equals(prev) ||
-		got.State == nil || !got.State.Equals(state) {
-		t.Fatalf("leaf round-trip = %+v, want %+v", got, leaf)
-	}
+	require.Equal(t, leaf.Current, got.Current, "leaf round-trip: Current")
+	require.Equal(t, leaf.NullSeq, got.NullSeq, "leaf round-trip: NullSeq")
+	require.NotNil(t, got.Prev, "leaf round-trip: Prev")
+	require.True(t, got.Prev.Equals(prev), "leaf round-trip: Prev = %s, want %s", got.Prev, prev)
+	require.NotNil(t, got.State, "leaf round-trip: State")
+	require.True(t, got.State.Equals(state), "leaf round-trip: State = %s, want %s", got.State, state)
 
 	var env EnvelopedLeaf
-	if err := env.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err != nil {
-		t.Fatalf("enveloped unmarshal: %v", err)
-	}
-	if env.Leaf.Current != leaf.Current {
-		t.Fatalf("EnvelopedLeaf round-trip = %+v, want %+v", env.Leaf, leaf)
-	}
+	require.NoError(t, env.UnmarshalCBOR(bytes.NewReader(buf.Bytes())), "enveloped unmarshal")
+	require.Equal(t, leaf.Current, env.Leaf.Current, "EnvelopedLeaf round-trip")
 }
 
 // TestObjectValue_ManifestRoundTrip pins the other arm: a manifest written
@@ -68,44 +56,27 @@ func TestObjectValue_LeafRoundTrip(t *testing.T) {
 func TestObjectValue_ManifestRoundTrip(t *testing.T) {
 	mf := &ObjectManifest{Key: "photos/cat.jpg", Seq: 7, VersionID: "null", ETag: "abc"}
 	var buf bytes.Buffer
-	if err := (&EnvelopedManifest{Manifest: mf}).MarshalCBOR(&buf); err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if buf.Bytes()[0] != 0xa1 {
-		t.Fatalf("header = %#x, want 0xa1 (single-entry map)", buf.Bytes()[0])
-	}
+	require.NoError(t, (&EnvelopedManifest{Manifest: mf}).MarshalCBOR(&buf), "marshal")
+	require.Equal(t, byte(0xa1), buf.Bytes()[0], "header, want a single-entry map")
 
 	var val ObjectValue
-	if err := val.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if val.Leaf != nil || val.Manifest == nil {
-		t.Fatalf("value = {Manifest:%v Leaf:%v}, want manifest", val.Manifest, val.Leaf)
-	}
-	if val.Manifest.Key != mf.Key || val.Manifest.Seq != mf.Seq || val.Manifest.VersionID != mf.VersionID {
-		t.Fatalf("manifest round-trip = %+v, want %+v", val.Manifest, mf)
-	}
+	require.NoError(t, val.UnmarshalCBOR(bytes.NewReader(buf.Bytes())), "unmarshal")
+	require.Nil(t, val.Leaf, "value = {Manifest:%v Leaf:%v}", val.Manifest, val.Leaf)
+	require.NotNil(t, val.Manifest, "value = {Manifest:%v Leaf:%v}", val.Manifest, val.Leaf)
+	require.Equal(t, mf.Key, val.Manifest.Key, "manifest round-trip")
+	require.Equal(t, mf.Seq, val.Manifest.Seq, "manifest round-trip")
+	require.Equal(t, mf.VersionID, val.Manifest.VersionID, "manifest round-trip")
 
 	var em EnvelopedManifest
-	if err := em.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err != nil {
-		t.Fatalf("enveloped manifest unmarshal: %v", err)
-	}
-	if em.Manifest.Key != mf.Key {
-		t.Fatalf("EnvelopedManifest round-trip = %+v, want %+v", em.Manifest, mf)
-	}
+	require.NoError(t, em.UnmarshalCBOR(bytes.NewReader(buf.Bytes())), "enveloped manifest unmarshal")
+	require.Equal(t, mf.Key, em.Manifest.Key, "EnvelopedManifest round-trip")
 
 	// The strict single-arm decoders reject the other arm.
 	var el EnvelopedLeaf
-	if err := el.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err == nil {
-		t.Fatal("EnvelopedLeaf.UnmarshalCBOR(manifest block) = nil error, want rejection")
-	}
+	require.Error(t, el.UnmarshalCBOR(bytes.NewReader(buf.Bytes())), "EnvelopedLeaf.UnmarshalCBOR(manifest block) = nil error, want rejection")
 	var lbuf bytes.Buffer
-	if err := LeafValue(&ObjectLeaf{Current: VersionNode{Manifest: testCid(t, "m")}}).MarshalCBOR(&lbuf); err != nil {
-		t.Fatalf("leaf marshal: %v", err)
-	}
-	if err := em.UnmarshalCBOR(bytes.NewReader(lbuf.Bytes())); err == nil {
-		t.Fatal("EnvelopedManifest.UnmarshalCBOR(leaf block) = nil error, want rejection")
-	}
+	require.NoError(t, LeafValue(&ObjectLeaf{Current: VersionNode{Manifest: testCid(t, "m")}}).MarshalCBOR(&lbuf), "leaf marshal")
+	require.Error(t, em.UnmarshalCBOR(bytes.NewReader(lbuf.Bytes())), "EnvelopedManifest.UnmarshalCBOR(leaf block) = nil error, want rejection")
 }
 
 // TestObjectValue_RejectsNonUnionBlocks pins §10's upgrade safety: a block
@@ -115,41 +86,27 @@ func TestObjectValue_RejectsNonUnionBlocks(t *testing.T) {
 	encodeUnknown := func(key string) []byte {
 		var buf bytes.Buffer
 		cw := cbg.NewCborWriter(&buf)
-		if err := cw.WriteMajorTypeHeader(cbg.MajMap, 1); err != nil {
-			t.Fatalf("header: %v", err)
-		}
-		if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(key))); err != nil {
-			t.Fatalf("key header: %v", err)
-		}
-		if _, err := cw.WriteString(key); err != nil {
-			t.Fatalf("key: %v", err)
-		}
-		if err := (&ObjectManifest{Key: "k"}).MarshalCBOR(cw); err != nil {
-			t.Fatalf("payload: %v", err)
-		}
+		require.NoError(t, cw.WriteMajorTypeHeader(cbg.MajMap, 1), "header")
+		require.NoError(t, cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(key))), "key header")
+		_, err := cw.WriteString(key)
+		require.NoError(t, err, "key")
+		require.NoError(t, (&ObjectManifest{Key: "k"}).MarshalCBOR(cw), "payload")
 		return buf.Bytes()
 	}
 
 	var val ObjectValue
 	err := val.UnmarshalCBOR(bytes.NewReader(encodeUnknown("/objectmanifest/2")))
-	if err == nil || !strings.Contains(err.Error(), "no known value-union key") {
-		t.Fatalf("future union key: err = %v, want no-known-key rejection", err)
-	}
+	require.Error(t, err, "future union key: err = %v, want no-known-key rejection", err)
+	require.Contains(t, err.Error(), "no known value-union key", "future union key: err = %v, want no-known-key rejection", err)
 
 	// A pre-union bare manifest block is not a value block.
 	var mbuf bytes.Buffer
-	if err := (&ObjectManifest{Key: "k"}).MarshalCBOR(&mbuf); err != nil {
-		t.Fatalf("bare manifest marshal: %v", err)
-	}
-	if err := val.UnmarshalCBOR(bytes.NewReader(mbuf.Bytes())); err == nil {
-		t.Fatal("bare manifest block: err = nil, want rejection")
-	}
+	require.NoError(t, (&ObjectManifest{Key: "k"}).MarshalCBOR(&mbuf), "bare manifest marshal")
+	require.Error(t, val.UnmarshalCBOR(bytes.NewReader(mbuf.Bytes())), "bare manifest block: want rejection")
 
 	// Marshalling zero or two arms is refused.
 	var empty ObjectValue
-	if err := empty.MarshalCBOR(&bytes.Buffer{}); err == nil {
-		t.Fatal("marshal of zero-arm value: err = nil, want rejection")
-	}
+	require.Error(t, empty.MarshalCBOR(&bytes.Buffer{}), "marshal of zero-arm value: want rejection")
 }
 
 // TestVersionState_RoundTrip pins the version-state block: the
@@ -163,40 +120,25 @@ func TestVersionState_RoundTrip(t *testing.T) {
 		Tags:      map[string]string{"team": "forge", "env": "dev"},
 	}
 	var buf bytes.Buffer
-	if err := (&EnvelopedVersionState{State: st}).MarshalCBOR(&buf); err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if buf.Bytes()[0] != 0xa1 {
-		t.Fatalf("header = %#x, want 0xa1 (single-entry map)", buf.Bytes()[0])
-	}
+	require.NoError(t, (&EnvelopedVersionState{State: st}).MarshalCBOR(&buf), "marshal")
+	require.Equal(t, byte(0xa1), buf.Bytes()[0], "header, want a single-entry map")
 
 	var env EnvelopedVersionState
-	if err := env.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
+	require.NoError(t, env.UnmarshalCBOR(bytes.NewReader(buf.Bytes())), "unmarshal")
 	got := env.State
-	if !bytes.Equal(got.Retention, st.Retention) || got.LegalHold != LegalHoldOff ||
-		got.Tags["team"] != "forge" || got.Tags["env"] != "dev" || len(got.Tags) != 2 {
-		t.Fatalf("round-trip = %+v, want %+v", got, st)
-	}
-	if got.Empty() {
-		t.Fatal("populated state reports Empty")
-	}
-	if !(&VersionState{}).Empty() {
-		t.Fatal("zero state does not report Empty")
-	}
+	require.Equal(t, st.Retention, got.Retention, "round-trip")
+	require.Equal(t, LegalHoldOff, got.LegalHold, "round-trip")
+	require.Equal(t, "forge", got.Tags["team"], "round-trip")
+	require.Equal(t, "dev", got.Tags["env"], "round-trip")
+	require.Len(t, got.Tags, 2, "round-trip")
+	require.False(t, got.Empty(), "populated state reports Empty")
+	require.True(t, (&VersionState{}).Empty(), "zero state does not report Empty")
 
 	// The strict decoders reject cross-type blocks: a value block is not a
 	// state block, and a state block is not a value block.
 	var lbuf bytes.Buffer
-	if err := LeafValue(&ObjectLeaf{Current: VersionNode{Manifest: testCid(t, "m")}}).MarshalCBOR(&lbuf); err != nil {
-		t.Fatalf("leaf marshal: %v", err)
-	}
-	if err := env.UnmarshalCBOR(bytes.NewReader(lbuf.Bytes())); err == nil {
-		t.Fatal("EnvelopedVersionState.UnmarshalCBOR(leaf block) = nil error, want rejection")
-	}
+	require.NoError(t, LeafValue(&ObjectLeaf{Current: VersionNode{Manifest: testCid(t, "m")}}).MarshalCBOR(&lbuf), "leaf marshal")
+	require.Error(t, env.UnmarshalCBOR(bytes.NewReader(lbuf.Bytes())), "EnvelopedVersionState.UnmarshalCBOR(leaf block) = nil error, want rejection")
 	var val ObjectValue
-	if err := val.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err == nil {
-		t.Fatal("ObjectValue.UnmarshalCBOR(state block) = nil error, want rejection")
-	}
+	require.Error(t, val.UnmarshalCBOR(bytes.NewReader(buf.Bytes())), "ObjectValue.UnmarshalCBOR(state block) = nil error, want rejection")
 }

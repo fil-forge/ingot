@@ -1,6 +1,10 @@
 package pgtest
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
 
 // TestWithDatabase: the database named replaces the DSN's own, wherever the
 // DSN names it, and other options are kept.
@@ -11,8 +15,7 @@ func TestWithDatabase(t *testing.T) {
 		"host=h user=u dbname=postgres":                          "host=h user=u dbname=postgres dbname=clone",
 	} {
 		got, err := withDatabase(dsn, "clone")
-		if err != nil || got != want {
-			t.Errorf("withDatabase(%q) = %q, %v; want %q", dsn, got, err, want)
-		}
+		assert.NoError(t, err, "withDatabase(%q)", dsn)
+		assert.Equal(t, want, got, "withDatabase(%q)", dsn)
 	}
 }

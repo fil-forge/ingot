@@ -3,7 +3,6 @@ package s3frontend
 import (
 	"bytes"
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -12,6 +11,7 @@ import (
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/queue/bucketqueue"
@@ -25,9 +25,7 @@ import (
 func pendingUploadTasks(t *testing.T, mem *testStore, uploadID, action string) []time.Time {
 	t.Helper()
 	tasks, err := mem.queued(context.Background(), multipartqueue.Name)
-	if err != nil {
-		t.Fatalf("queued: %v", err)
-	}
+	require.NoError(t, err, "queued")
 	var due []time.Time
 	for _, task := range tasks {
 		if task.Subject == uploadID && task.Action == action && task.State == "pending" && task.NotBefore != nil {
@@ -40,9 +38,8 @@ func pendingUploadTasks(t *testing.T, mem *testStore, uploadID, action string) [
 func wantAPIError(t *testing.T, what string, err error, code string) {
 	t.Helper()
 	var apiErr s3err.APIError
-	if !errors.As(err, &apiErr) || apiErr.Code != code {
-		t.Fatalf("%s: err = %v, want %s", what, err, code)
-	}
+	require.ErrorAs(t, err, &apiErr, "%s: err", what)
+	require.Equal(t, code, apiErr.Code, "%s: err", what)
 }
 
 // TestCreateSchedulesTheAutoAbortAndCompleteTheReap: an upload's auto-abort
@@ -54,15 +51,13 @@ func TestCreateSchedulesTheAutoAbortAndCompleteTheReap(t *testing.T) {
 	before := time.Now()
 	uploadID, parts := completeTwoParts(t, b, key)
 	due := pendingUploadTasks(t, mem, uploadID, multipartqueue.AbortAction)
-	if len(due) != 1 || due[0].Before(before.Add(multipartqueue.DefaultSessionTTL-time.Minute)) {
-		t.Fatalf("auto-aborts pending = %v, want one a session TTL out", due)
-	}
-	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
-	if due := pendingUploadTasks(t, mem, uploadID, multipartqueue.ReapAction); len(due) != 1 || due[0].Before(before.Add(multipartqueue.DefaultSessionTTL-time.Minute)) {
-		t.Fatalf("reaps pending = %v, want one a session TTL out", due)
-	}
+	require.Len(t, due, 1, "auto-aborts pending = %v, want one a session TTL out", due)
+	require.False(t, due[0].Before(before.Add(multipartqueue.DefaultSessionTTL-time.Minute)), "auto-aborts pending = %v, want one a session TTL out", due)
+	_, err := mpComplete(t, b, key, uploadID, parts, nil)
+	require.NoError(t, err, "Complete")
+	reaps := pendingUploadTasks(t, mem, uploadID, multipartqueue.ReapAction)
+	require.Len(t, reaps, 1, "reaps pending")
+	require.False(t, reaps[0].Before(before.Add(multipartqueue.DefaultSessionTTL-time.Minute)), "reaps pending = %v, want one a session TTL out", reaps)
 }
 
 // TestAbortAndReapLeaveTheOtherState: the auto-abort leaves a completed
@@ -73,36 +68,27 @@ func TestAbortAndReapLeaveTheOtherState(t *testing.T) {
 	ctx := context.Background()
 	key := "states"
 	uploadID, parts := completeTwoParts(t, b, key)
-	if _, err := storeFor(b).tasks.Run(ctx, uploadSpec(uploadID, multipartqueue.ReapAction, nil)); err != nil {
-		t.Fatalf("reap of an open upload: %v", err)
-	}
-	if s, err := mem.GetSession(ctx, uploadID); err != nil || s.State != registry.SessionOpen {
-		t.Fatalf("session after the reap of an open upload = %+v, %v; want open", s, err)
-	}
-	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
+	_, err := storeFor(b).tasks.Run(ctx, uploadSpec(uploadID, multipartqueue.ReapAction, nil))
+	require.NoError(t, err, "reap of an open upload")
+	s, err := mem.GetSession(ctx, uploadID)
+	require.NoError(t, err, "session after the reap of an open upload")
+	require.Equal(t, registry.SessionOpen, s.State, "session after the reap of an open upload")
+	_, err = mpComplete(t, b, key, uploadID, parts, nil)
+	require.NoError(t, err, "Complete")
 	var auto bytes.Buffer
-	if err := (&multipartqueue.AbortTask{Auto: true}).MarshalCBOR(&auto); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := storeFor(b).tasks.Run(ctx, uploadSpec(uploadID, multipartqueue.AbortAction, auto.Bytes())); err != nil {
-		t.Fatalf("auto-abort of a completed upload: %v", err)
-	}
-	if s, err := mem.GetSession(ctx, uploadID); err != nil || s.State != registry.SessionCompleted {
-		t.Fatalf("session after the auto-abort = %+v, %v; want completed", s, err)
-	}
+	require.NoError(t, (&multipartqueue.AbortTask{Auto: true}).MarshalCBOR(&auto))
+	_, err = storeFor(b).tasks.Run(ctx, uploadSpec(uploadID, multipartqueue.AbortAction, auto.Bytes()))
+	require.NoError(t, err, "auto-abort of a completed upload")
+	s, err = mem.GetSession(ctx, uploadID)
+	require.NoError(t, err, "session after the auto-abort")
+	require.Equal(t, registry.SessionCompleted, s.State, "session after the auto-abort")
 	sess, err := mem.GetSession(ctx, uploadID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	wantAPIError(t, "abort of a completed upload", b.abortUpload(ctx, *sess), "NoSuchUpload")
-	if _, err := storeFor(b).tasks.Run(ctx, uploadSpec(uploadID, multipartqueue.ReapAction, nil)); err != nil {
-		t.Fatalf("reap: %v", err)
-	}
-	if _, err := mem.GetSession(ctx, uploadID); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("session after its reap: %v, want ErrNotFound", err)
-	}
+	_, err = storeFor(b).tasks.Run(ctx, uploadSpec(uploadID, multipartqueue.ReapAction, nil))
+	require.NoError(t, err, "reap")
+	_, err = mem.GetSession(ctx, uploadID)
+	require.ErrorIs(t, err, registry.ErrNotFound, "session after its reap")
 }
 
 // TestClosedBucketRefusesWritesAndUploads: once a DeleteBucket has closed a
@@ -112,12 +98,8 @@ func TestClosedBucketRefusesWritesAndUploads(t *testing.T) {
 	b, mem := newDeferredBackend(t, &parkingUploader{})
 	ctx := context.Background()
 	st, err := mem.Get(ctx, "bk")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := runBucketTask(ctx, mem, st.Space, bucketqueue.CloseAction, &bucketqueue.BucketTask{Name: "bk"}); err != nil {
-		t.Fatalf("close: %v", err)
-	}
+	require.NoError(t, err)
+	require.NoError(t, runBucketTask(ctx, mem, st.Space, bucketqueue.CloseAction, &bucketqueue.BucketTask{Name: "bk"}), "close")
 	bucket, key := "bk", "late"
 	_, err = b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader([]byte("x")), ContentLength: byteLen([]byte("x"))})
 	wantAPIError(t, "PutObject to a closed bucket", err, "OperationAborted")
@@ -132,9 +114,7 @@ func TestCloseRefusesANonEmptyBucket(t *testing.T) {
 	ctx := context.Background()
 	putObj(t, b, "kept", []byte("body"))
 	st, err := mem.Get(ctx, "bk")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	wantAPIError(t, "close of a non-empty bucket", runBucketTask(ctx, mem, st.Space, bucketqueue.CloseAction, &bucketqueue.BucketTask{Name: "bk"}), "BucketNotEmpty")
 	putObj(t, b, "after", []byte("body"))
 }
@@ -151,23 +131,15 @@ func TestDeleteBucketAbortsUploadsInFlight(t *testing.T) {
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
 
 	ctx := context.WithValue(context.Background(), reqscope.RequestKey(), cmds3.Request{})
-	if err := b.DeleteBucket(ctx, "bk"); err != nil {
-		t.Fatalf("DeleteBucket with an upload in flight: %v", err)
-	}
-	if _, err := mem.GetSession(ctx, uploadID); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("the upload survived its bucket's delete: %v", err)
-	}
-	if !pu.abortedDigests()[string(d)] {
-		t.Fatalf("the upload's blob %x was not aborted", d)
-	}
-	if _, err := mem.Get(ctx, "bk"); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("the bucket survived its delete: %v", err)
-	}
+	require.NoError(t, b.DeleteBucket(ctx, "bk"), "DeleteBucket with an upload in flight")
+	_, err := mem.GetSession(ctx, uploadID)
+	require.ErrorIs(t, err, registry.ErrNotFound, "the upload survived its bucket's delete")
+	require.True(t, pu.abortedDigests()[string(d)], "the upload's blob %x was not aborted", d)
+	_, err = mem.Get(ctx, "bk")
+	require.ErrorIs(t, err, registry.ErrNotFound, "the bucket survived its delete")
 	bucket := "bk"
-	_, err := b.ListParts(ctx, &s3.ListPartsInput{Bucket: &bucket, Key: &key, UploadId: &uploadID})
-	if err == nil {
-		t.Fatal("ListParts of the aborted upload succeeded")
-	}
+	_, err = b.ListParts(ctx, &s3.ListPartsInput{Bucket: &bucket, Key: &key, UploadId: &uploadID})
+	require.Error(t, err, "ListParts of the aborted upload succeeded")
 }
 
 // TestAnAbandonedAddPartTakesNothing: an add-part left queued by an
@@ -180,20 +152,16 @@ func TestAnAbandonedAddPartTakesNothing(t *testing.T) {
 	key := "abandoned-add-part"
 	uploadID := mpCreate(t, b, key, "", "")
 	abandoned, err := storeFor(b).tasks.Submit(ctx, uploadSpec(uploadID, multipartqueue.AddPartAction, nil))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
-	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err != nil {
-		t.Fatalf("UploadPart behind an abandoned add-part: %v", err)
-	}
+	_, err = mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil)
+	require.NoError(t, err, "UploadPart behind an abandoned add-part")
 	var failed *taskrunner.HandlerError
-	if _, err := storeFor(b).tasks.Wait(ctx, multipartqueue.Name, abandoned); !errors.As(err, &failed) {
-		t.Fatalf("the abandoned add-part: %v, want it failed", err)
-	}
-	if parts, err := mem.ListParts(ctx, uploadID); err != nil || len(parts) != 1 {
-		t.Fatalf("parts after the UploadPart = %d, %v; want its own", len(parts), err)
-	}
+	_, err = storeFor(b).tasks.Wait(ctx, multipartqueue.Name, abandoned)
+	require.ErrorAs(t, err, &failed, "the abandoned add-part, want it failed")
+	parts, err := mem.ListParts(ctx, uploadID)
+	require.NoError(t, err, "parts after the UploadPart")
+	require.Len(t, parts, 1, "parts after the UploadPart")
 }
 
 // uploadSpec is a queue-multipart-upload task on uploadID.

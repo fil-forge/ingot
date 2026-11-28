@@ -379,7 +379,7 @@ func TestStreamedPutObjectStalledAbort(t *testing.T) {
 		require.ErrorAs(t, err, &apiErr)
 		require.Equal(t, "IncompleteBody", apiErr.Code)
 	case <-time.After(10 * time.Second):
-		t.Fatal("the request waited on the stalled abort")
+		require.FailNow(t, "the request waited on the stalled abort")
 	}
 	require.Len(t, su.aborted, 2, "each allocation's abort was tried")
 }

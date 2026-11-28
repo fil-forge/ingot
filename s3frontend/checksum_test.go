@@ -6,6 +6,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/versitygw/s3api/utils"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/stretchr/testify/require"
 )
 
 // TestChecksumFromInput_DefaultsToCRC64NVME locks S3's default-checksum-on-store
@@ -48,16 +49,11 @@ func TestChecksumFromInput_DefaultsToCRC64NVME(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			spec, err := checksumFromInput(tc.in)
-			if err != nil {
-				t.Fatalf("unexpected err: %v", err)
-			}
-			if spec == nil {
-				t.Fatal("spec = nil, want non-nil (every object carries at least a CRC64NVME)")
-			}
-			if spec.algo != tc.wantAlgo || spec.hashType != tc.wantHash || spec.expected != tc.wantExpected {
-				t.Fatalf("got {algo=%s hash=%v expected=%q}, want {algo=%s hash=%v expected=%q}",
-					spec.algo, spec.hashType, spec.expected, tc.wantAlgo, tc.wantHash, tc.wantExpected)
-			}
+			require.NoError(t, err, "unexpected err")
+			require.NotNil(t, spec, "spec = nil, want non-nil (every object carries at least a CRC64NVME)")
+			require.Equal(t, tc.wantAlgo, spec.algo, "got {algo=%s hash=%v expected=%q}, want {algo=%s hash=%v expected=%q}", spec.algo, spec.hashType, spec.expected, tc.wantAlgo, tc.wantHash, tc.wantExpected)
+			require.Equal(t, tc.wantHash, spec.hashType, "got {algo=%s hash=%v expected=%q}, want {algo=%s hash=%v expected=%q}", spec.algo, spec.hashType, spec.expected, tc.wantAlgo, tc.wantHash, tc.wantExpected)
+			require.Equal(t, tc.wantExpected, spec.expected, "got {algo=%s hash=%v expected=%q}, want {algo=%s hash=%v expected=%q}", spec.algo, spec.hashType, spec.expected, tc.wantAlgo, tc.wantHash, tc.wantExpected)
 		})
 	}
 }

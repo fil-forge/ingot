@@ -9,8 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
-	"github.com/aws/smithy-go"
 	"io"
 	"log"
 	"net/http"
@@ -23,6 +21,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/smithy-go"
+	"github.com/stretchr/testify/require"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -96,9 +98,7 @@ func localIngotBinary(t *testing.T) string {
 		}
 		builtBinary = out
 	})
-	if buildErr != nil {
-		t.Fatalf("build local ingot binary: %v", buildErr)
-	}
+	require.NoError(t, buildErr, "build local ingot binary")
 	return builtBinary
 }
 
@@ -210,9 +210,7 @@ func withUncachedWritesConfig() stack.Option {
 func ingotSQL(t *testing.T, ctx context.Context, s *stack.Stack, q string) string {
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot-postgres", "psql", "-U", "ingot", "-d", "ingot", "-tAc", q)
-	if err != nil {
-		t.Fatalf("ingot sql %q: %v (stderr=%s)", q, err, errOut)
-	}
+	require.NoError(t, err, "ingot sql %q: %v (stderr=%s)", q, err, errOut)
 	return strings.TrimSpace(out)
 }
 
@@ -220,18 +218,14 @@ func ingotSQL(t *testing.T, ctx context.Context, s *stack.Stack, q string) strin
 // any of the hex-encoded digests.
 func countRowsForDigests(t *testing.T, ctx context.Context, s *stack.Stack, table, digestCol string, hexDigests []string) int {
 	t.Helper()
-	if len(hexDigests) == 0 {
-		t.Fatalf("countRowsForDigests: no digests given")
-	}
+	require.NotEmpty(t, hexDigests, "countRowsForDigests: no digests given")
 	terms := make([]string, len(hexDigests))
 	for i, h := range hexDigests {
 		terms[i] = fmt.Sprintf("decode('%s','hex')", h)
 	}
 	q := fmt.Sprintf("SELECT count(*) FROM %s WHERE %s IN (%s)", table, digestCol, strings.Join(terms, ","))
 	n, err := strconv.Atoi(ingotSQL(t, ctx, s, q))
-	if err != nil {
-		t.Fatalf("parse count from %s: %v", table, err)
-	}
+	require.NoError(t, err, "parse count from %s", table)
 	return n
 }
 
@@ -247,9 +241,7 @@ func objectBlobDigestsHex(t *testing.T, ctx context.Context, s *stack.Stack, buc
 			digests = append(digests, line)
 		}
 	}
-	if len(digests) == 0 {
-		t.Fatalf("no blob_refs rows for %s/%s", bucket, key)
-	}
+	require.NotEmpty(t, digests, "no blob_refs rows for %s/%s", bucket, key)
 	return digests
 }
 
@@ -269,9 +261,7 @@ func partBlobDigestsHex(t *testing.T, ctx context.Context, s *stack.Stack, uploa
 			digests = append(digests, line)
 		}
 	}
-	if len(digests) == 0 {
-		t.Fatalf("no blob digests recorded for upload %s part %d", uploadID, partNumber)
-	}
+	require.NotEmpty(t, digests, "no blob digests recorded for upload %s part %d", uploadID, partNumber)
 	return digests
 }
 
@@ -316,7 +306,7 @@ func waitHTTPOK(t *testing.T, url string, timeout time.Duration) {
 		}
 		time.Sleep(time.Second)
 	}
-	t.Fatalf("%s not healthy after %s", url, timeout)
+	require.FailNow(t, "not healthy", "%s after %s", url, timeout)
 }
 
 // hiltAllPermissions is every S3 permission hilt recognizes (its pkg/s3perm
@@ -388,9 +378,7 @@ var hiltAllPermissions = []string{
 func hiltProvisionTenant(t *testing.T, ctx context.Context, s *stack.Stack, tenantID string) (accessKey, secretKey string) {
 	t.Helper()
 	accessKey, secretKey, err := hiltProvisionTenantErr(ctx, s, tenantID)
-	if err != nil {
-		t.Fatalf("%v", err)
-	}
+	require.NoError(t, err, "%v", err)
 	t.Logf("hilt tenant %q provisioned; access key %s", tenantID, accessKey)
 	return accessKey, secretKey
 }
@@ -454,9 +442,8 @@ func uploadIntentSizes(t *testing.T, ctx context.Context, s *stack.Stack) map[st
 		}
 		hexDigest, size, ok := strings.Cut(line, " ")
 		n, err := strconv.ParseInt(size, 10, 64)
-		if !ok || err != nil {
-			t.Fatalf("parse upload intent row %q", line)
-		}
+		require.True(t, ok, "parse upload intent row %q", line)
+		require.NoError(t, err, "parse upload intent row %q", line)
 		sizes[hexDigest] = n
 	}
 	return sizes
@@ -480,13 +467,9 @@ func localBlobCount(t *testing.T, ctx context.Context, s *stack.Stack) int {
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
 		`find /data/cache -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null | wc -l`)
-	if err != nil {
-		t.Fatalf("count cached blobs: %v (stderr=%s)", err, errOut)
-	}
+	require.NoError(t, err, "count cached blobs: %v (stderr=%s)", err, errOut)
 	n, err := strconv.Atoi(strings.TrimSpace(out))
-	if err != nil {
-		t.Fatalf("parse cached blob count %q: %v", out, err)
-	}
+	require.NoError(t, err, "parse cached blob count %q", out)
 	return n
 }
 
@@ -496,15 +479,11 @@ func localBlobBytes(t *testing.T, ctx context.Context, s *stack.Stack) int64 {
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
 		`find /data/cache -maxdepth 1 -type f ! -name '.tmp*' -printf '%s\n' 2>/dev/null`)
-	if err != nil {
-		t.Fatalf("list cached blob sizes: %v (stderr=%s)", err, errOut)
-	}
+	require.NoError(t, err, "list cached blob sizes: %v (stderr=%s)", err, errOut)
 	var total int64
 	for _, line := range strings.Fields(out) {
 		n, err := strconv.ParseInt(line, 10, 64)
-		if err != nil {
-			t.Fatalf("parse cached blob size %q: %v", line, err)
-		}
+		require.NoError(t, err, "parse cached blob size %q", line)
 		total += n
 	}
 	return total
@@ -518,9 +497,7 @@ func localBlobPaths(t *testing.T, ctx context.Context, s *stack.Stack) map[strin
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
 		`find /data/cache -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null`)
-	if err != nil {
-		t.Fatalf("list cached blobs: %v (stderr=%s)", err, errOut)
-	}
+	require.NoError(t, err, "list cached blobs: %v (stderr=%s)", err, errOut)
 	paths := map[string]bool{}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		if line != "" {
@@ -556,18 +533,15 @@ func corruptLocalFileTail(t *testing.T, ctx context.Context, s *stack.Stack, pat
 		after=$(md5sum "$f")
 		[ "$before" != "$after" ] || { echo "file unchanged" >&2; exit 1; }
 	`, path, tailOffset)
-	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", script); err != nil {
-		t.Fatalf("corrupt cached file %s: %v (stdout=%s stderr=%s)", path, err, out, errOut)
-	}
+	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", script)
+	require.NoError(t, err, "corrupt cached file %s: %v (stdout=%s stderr=%s)", path, err, out, errOut)
 }
 
 // sha256Digest is the sha2-256 multihash of a sha256 sum.
 func sha256Digest(t *testing.T, sum [32]byte) mh.Multihash {
 	t.Helper()
 	digest, err := mh.Encode(sum[:], mh.SHA2_256)
-	if err != nil {
-		t.Fatalf("encode multihash: %v", err)
-	}
+	require.NoError(t, err, "encode multihash")
 	return digest
 }
 
@@ -576,9 +550,7 @@ func sha256Digest(t *testing.T, sum [32]byte) mh.Multihash {
 func hexDigest(t *testing.T, hexMH string) mh.Multihash {
 	t.Helper()
 	digest, err := hex.DecodeString(hexMH)
-	if err != nil {
-		t.Fatalf("decode digest %q: %v", hexMH, err)
-	}
+	require.NoError(t, err, "decode digest %q", hexMH)
 	return digest
 }
 
@@ -592,9 +564,7 @@ func hexDigest(t *testing.T, hexMH string) mh.Multihash {
 func piriBlobPath(t *testing.T, digest mh.Multihash) string {
 	t.Helper()
 	b32, err := multibase.Encode(multibase.Base32, digest)
-	if err != nil {
-		t.Fatalf("encode base32: %v", err)
-	}
+	require.NoError(t, err, "encode base32")
 	key := b32[1:]
 	return fmt.Sprintf("/data/piri/pdp/datastore/%s/%s.data", key[len(key)-3:len(key)-1], key)
 }
@@ -607,9 +577,7 @@ func piriHoldsBlob(t *testing.T, ctx context.Context, s *stack.Stack, digest mh.
 	t.Helper()
 	path := piriBlobPath(t, digest)
 	out, errOut, err := s.Exec(ctx, "piri-0", "sh", "-c", fmt.Sprintf(`test -f %q && echo yes || echo no`, path))
-	if err != nil {
-		t.Fatalf("stat piri blob %s: %v (stderr=%s)", path, err, errOut)
-	}
+	require.NoError(t, err, "stat piri blob %s: %v (stderr=%s)", path, err, errOut)
 	return strings.TrimSpace(out) == "yes"
 }
 
@@ -624,11 +592,11 @@ func waitForPiriBlob(t *testing.T, ctx context.Context, s *stack.Stack, digest m
 		}
 		select {
 		case <-ctx.Done():
-			t.Fatalf("context done waiting for piri blob %s: %v", digest.HexString(), ctx.Err())
+			require.FailNow(t, "context done waiting for piri blob", "%s: %v", digest.HexString(), ctx.Err())
 		case <-time.After(time.Second):
 		}
 	}
-	t.Fatalf("piri-0 never held blob %s within %s", digest.HexString(), timeout)
+	require.FailNow(t, "piri-0 never held blob", "%s within %s", digest.HexString(), timeout)
 }
 
 // waitForPiriLog polls piri-0's container logs until substr appears.
@@ -642,11 +610,11 @@ func waitForPiriLog(t *testing.T, ctx context.Context, s *stack.Stack, substr st
 		}
 		select {
 		case <-ctx.Done():
-			t.Fatalf("context done waiting for piri log %q: %v", substr, ctx.Err())
+			require.FailNow(t, "context done waiting for piri log", "%q: %v", substr, ctx.Err())
 		case <-time.After(2 * time.Second):
 		}
 	}
-	t.Fatalf("piri-0 logs never contained %q within %s", substr, timeout)
+	require.FailNow(t, "piri-0 logs never contained the line", "%q within %s", substr, timeout)
 }
 
 // --- raw-SDK helpers for the scenario tests (ported from the old
@@ -668,9 +636,7 @@ func bigObjectClient(t *testing.T, endpoint, accessKey, secretKey string) *s3.Cl
 		awsconfig.WithHTTPClient(&http.Client{}), // no Timeout: cancellation is the test context's job
 		awsconfig.WithRetryMaxAttempts(1),
 	)
-	if err != nil {
-		t.Fatalf("load aws config: %v", err)
-	}
+	require.NoError(t, err, "load aws config")
 	return s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(endpoint)
 		o.UsePathStyle = true
@@ -761,14 +727,10 @@ func getBody(t *testing.T, ctx context.Context, cl *s3.Client, bucket, key, rang
 		in.Range = aws.String(rangeHdr)
 	}
 	out, err := cl.GetObject(ctx, in)
-	if err != nil {
-		t.Fatalf("GetObject %s (range %q): %v", key, rangeHdr, err)
-	}
+	require.NoError(t, err, "GetObject %s (range %q)", key, rangeHdr)
 	defer out.Body.Close()
 	b, err := io.ReadAll(out.Body)
-	if err != nil {
-		t.Fatalf("read body %s: %v", key, err)
-	}
+	require.NoError(t, err, "read body %s", key)
 	return b
 }
 
@@ -778,13 +740,9 @@ func getBody(t *testing.T, ctx context.Context, cl *s3.Client, bucket, key, rang
 // those.
 func apiErrorOf(t *testing.T, err error) (code string, status int) {
 	t.Helper()
-	if err == nil {
-		t.Fatal("request succeeded, want an S3 error")
-	}
+	require.Error(t, err, "request succeeded, want an S3 error")
 	var respErr *awshttp.ResponseError
-	if !errors.As(err, &respErr) {
-		t.Fatalf("no HTTP response in error: %v", err)
-	}
+	require.ErrorAs(t, err, &respErr, "no HTTP response in error")
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		code = apiErr.ErrorCode()

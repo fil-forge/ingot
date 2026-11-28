@@ -175,9 +175,7 @@ func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatal("condition not reached in time")
-		}
+		require.False(t, time.Now().After(deadline), "condition not reached in time")
 		time.Sleep(time.Millisecond)
 	}
 }
@@ -247,7 +245,7 @@ func TestConsumerStopsWhileWaitingForTheHead(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after ctx cancel")
+		require.FailNow(t, "Run did not return after ctx cancel")
 	}
 	require.Empty(t, src.calls())
 }
@@ -732,7 +730,7 @@ func TestConsumerStopsOnCancel(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after ctx cancel")
+		require.FailNow(t, "Run did not return after ctx cancel")
 	}
 	require.Empty(t, logs.All(), "a stop is not a stream fault")
 }

@@ -1,11 +1,12 @@
 package fasthttputil
 
 import (
-	"errors"
 	"io"
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 )
 
@@ -25,9 +26,8 @@ func TestRequestFromHTTPContext_RepeatedHeader(t *testing.T) {
 	got := RequestFromHTTPContext(&rc)
 
 	const want = "ETag,Checksum,ObjectParts,StorageClass,ObjectSize"
-	if v := got.Headers["X-Amz-Object-Attributes"]; v != want {
-		t.Errorf("X-Amz-Object-Attributes = %q, want %q", v, want)
-	}
+	v := got.Headers["X-Amz-Object-Attributes"]
+	assert.Equal(t, want, v, "X-Amz-Object-Attributes")
 }
 
 // TestRequestFromHTTPContext_SingleHeader confirms the common single-valued
@@ -40,9 +40,8 @@ func TestRequestFromHTTPContext_SingleHeader(t *testing.T) {
 
 	got := RequestFromHTTPContext(&rc)
 
-	if v := got.Headers["Content-Encoding"]; v != "gzip" {
-		t.Errorf("Content-Encoding = %q, want %q", v, "gzip")
-	}
+	v := got.Headers["Content-Encoding"]
+	assert.Equal(t, "gzip", v, "Content-Encoding")
 }
 
 // TestLimitedBody covers the capture of a body hilt decides on: a streamed
@@ -55,19 +54,12 @@ func TestLimitedBody(t *testing.T) {
 		rc.Request.Header.SetMethod("POST")
 		rc.Request.SetBodyStream(strings.NewReader("<Delete/>"), -1)
 		got, err := LimitedBody(&rc, 16)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(got) != "<Delete/>" {
-			t.Errorf("body = %q", got)
-		}
-		if rc.Request.IsBodyStream() || string(rc.Request.Body()) != "<Delete/>" {
-			t.Errorf("handler body = %q, stream=%v", rc.Request.Body(), rc.Request.IsBodyStream())
-		}
+		require.NoError(t, err)
+		assert.Equal(t, "<Delete/>", string(got), "body")
+		assert.False(t, rc.Request.IsBodyStream(), "handler body is still a stream")
+		assert.Equal(t, "<Delete/>", string(rc.Request.Body()), "handler body")
 		got[0] = 'x'
-		if string(rc.Request.Body()) != "<Delete/>" {
-			t.Error("the returned body must be the caller's own copy")
-		}
+		assert.Equal(t, "<Delete/>", string(rc.Request.Body()), "the returned body must be the caller's own copy")
 	})
 	t.Run("streamed over the limit", func(t *testing.T) {
 		var rc fasthttp.RequestCtx
@@ -75,24 +67,18 @@ func TestLimitedBody(t *testing.T) {
 		src := &countingReader{Reader: strings.NewReader(strings.Repeat("x", 100))}
 		rc.Request.SetBodyStream(src, -1)
 		_, err := LimitedBody(&rc, 16)
-		if !errors.Is(err, ErrBodyTooLarge) {
-			t.Fatalf("err = %v, want ErrBodyTooLarge", err)
-		}
-		if src.n > 17 {
-			t.Errorf("read %d bytes of a refused body, want at most 17", src.n)
-		}
+		require.ErrorIs(t, err, ErrBodyTooLarge, "err")
+		assert.LessOrEqual(t, src.n, 17, "read %d bytes of a refused body", src.n)
 	})
 	t.Run("in memory", func(t *testing.T) {
 		var rc fasthttp.RequestCtx
 		rc.Request.SetBody([]byte("<Delete/>"))
 		got, err := LimitedBody(&rc, 16)
-		if err != nil || string(got) != "<Delete/>" {
-			t.Fatalf("got %q, %v", got, err)
-		}
+		require.NoError(t, err)
+		require.Equal(t, "<Delete/>", string(got))
 		rc.Request.SetBody([]byte(strings.Repeat("x", 17)))
-		if _, err := LimitedBody(&rc, 16); !errors.Is(err, ErrBodyTooLarge) {
-			t.Fatalf("err = %v, want ErrBodyTooLarge", err)
-		}
+		_, err = LimitedBody(&rc, 16)
+		require.ErrorIs(t, err, ErrBodyTooLarge)
 	})
 }
 

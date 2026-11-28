@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	msbucket "github.com/fil-forge/ingot/bucket"
-	"github.com/google/uuid"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/ucantone/did"
@@ -77,9 +79,7 @@ func newRetainedLog(t *testing.T, mem *testStore) blockstore.Log {
 		Catalog: logstore.PlaneConfig{Ship: false}, // retained locally; no uploader needed
 		Logger:  zaptest.NewLogger(t),
 	})
-	if err != nil {
-		t.Fatalf("logstore: %v", err)
-	}
+	require.NoError(t, err, "logstore")
 	t.Cleanup(func() { _ = log.Close(ctx) })
 	return log
 }
@@ -91,9 +91,7 @@ func newRefTestBackendOver(t *testing.T, mem *testStore, log blockstore.Log, mbs
 	ctx := context.Background()
 	dir := t.TempDir()
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
-	if err != nil {
-		t.Fatalf("cache: %v", err)
-	}
+	require.NoError(t, err, "cache")
 
 	rm := &recordingRemover{}
 	deps := Deps{
@@ -122,9 +120,7 @@ func newRefTestBackendOver(t *testing.T, mem *testStore, log blockstore.Log, mbs
 	}
 	withStreaming(t, &deps, dir)
 	b := mem.newBackend(t, deps)
-	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, mem.Create(ctx, "bk", did.Undef, registry.CreateState{}), "create bucket")
 	return b, mem, rm
 }
 
@@ -137,9 +133,7 @@ func newRefTestBackendOver(t *testing.T, mem *testStore, log blockstore.Log, mbs
 func blobDigestsOf(t *testing.T, b *Backend, key, versionID string) []multihash.Multihash {
 	t.Helper()
 	rv, err := b.resolveVersion(context.Background(), "bk", key, versionID)
-	if err != nil {
-		t.Fatalf("resolve %s@%q: %v", key, versionID, err)
-	}
+	require.NoError(t, err, "resolve %s@%q", key, versionID)
 	ds := make([]multihash.Multihash, 0)
 	for _, ref := range storedBlobs(t, b, rv) {
 		ds = append(ds, ref.Digest)
@@ -151,9 +145,7 @@ func blobDigestsOf(t *testing.T, b *Backend, key, versionID string) []multihash.
 func storedBlobs(t testing.TB, b *Backend, rv *resolvedVersion) msbucket.BlobRefs {
 	t.Helper()
 	refs, err := msbucket.ReadBlobRefs(context.Background(), rv.mf.Body.Index(b.read, rv.st.Space))
-	if err != nil {
-		t.Fatalf("read blobs of %s: %v", rv.mf.Key, err)
-	}
+	require.NoError(t, err, "read blobs of %s", rv.mf.Key)
 	return refs
 }
 
@@ -161,39 +153,33 @@ func storedBlobs(t testing.TB, b *Backend, rv *resolvedVersion) msbucket.BlobRef
 func blobDigestOf(t *testing.T, b *Backend, key, versionID string) multihash.Multihash {
 	t.Helper()
 	ds := blobDigestsOf(t, b, key, versionID)
-	if len(ds) != 1 {
-		t.Fatalf("object %s@%q has %d blobs, want 1", key, versionID, len(ds))
-	}
+	require.Len(t, ds, 1, "object %s@%q has %d blobs", key, versionID, len(ds))
 	return ds[0]
 }
 
 func digestOf(t *testing.T, data []byte) multihash.Multihash {
 	t.Helper()
 	mh, err := multihash.Sum(data, multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash: %v", err)
-	}
+	require.NoError(t, err, "multihash")
 	return mh
 }
 
 func putObj(t *testing.T, b *Backend, key string, data []byte) {
 	t.Helper()
 	bucket := "bk"
-	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{
+	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{
 		Bucket: &bucket,
 		Key:    &key,
 		Body:   bytes.NewReader(data), ContentLength: byteLen(data),
-	}); err != nil {
-		t.Fatalf("PutObject %s: %v", key, err)
-	}
+	})
+	require.NoError(t, err, "PutObject %s", key)
 }
 
 func deleteObj(t *testing.T, b *Backend, key string) {
 	t.Helper()
 	bucket := "bk"
-	if _, err := b.DeleteObject(context.Background(), &s3.DeleteObjectInput{Bucket: &bucket, Key: &key}); err != nil {
-		t.Fatalf("DeleteObject %s: %v", key, err)
-	}
+	_, err := b.DeleteObject(context.Background(), &s3.DeleteObjectInput{Bucket: &bucket, Key: &key})
+	require.NoError(t, err, "DeleteObject %s", key)
 }
 
 func claims(t *testing.T, mem *testStore, digest []byte) int {
@@ -202,9 +188,7 @@ func claims(t *testing.T, mem *testStore, digest []byte) int {
 	// the backend are keyed under mem.bk(); count under the same key.
 	// Space-keyed claim counting is covered by the live Postgres test.
 	n, err := mem.CountReferences(context.Background(), mem.bk(), digest, uuid.Nil)
-	if err != nil {
-		t.Fatalf("CountReferences: %v", err)
-	}
+	require.NoError(t, err, "CountReferences")
 	return n
 }
 
@@ -220,18 +204,12 @@ func TestRefIndex_IdenticalContentDistinctBlobs(t *testing.T) {
 
 	d1 := blobDigestOf(t, b, "k1", "")
 	d2 := blobDigestOf(t, b, "k2", "")
-	if bytes.Equal(d1, d2) {
-		t.Fatalf("identical content produced the same stored digest %x; encryption must make them distinct", d1)
-	}
-	if bytes.Equal(d1, digestOf(t, data)) {
-		t.Fatalf("stored digest equals hash(plaintext); blob was not encrypted")
-	}
-	if got1, got2 := claims(t, mem, d1), claims(t, mem, d2); got1 != 1 || got2 != 1 {
-		t.Fatalf("claims = %d/%d, want 1/1 (one claim per distinct blob)", got1, got2)
-	}
-	if len(rm.removed) != 0 {
-		t.Fatalf("removed %d blobs, want 0 (both still referenced)", len(rm.removed))
-	}
+	require.False(t, bytes.Equal(d1, d2), "identical content produced the same stored digest %x; encryption must make them distinct", d1)
+	require.False(t, bytes.Equal(d1, digestOf(t, data)), "stored digest equals hash(plaintext); blob was not encrypted")
+	got1, got2 := claims(t, mem, d1), claims(t, mem, d2)
+	require.Equal(t, 1, got1, "claims = %d/%d, want 1/1 (one claim per distinct blob)", got1, got2)
+	require.Equal(t, 1, got2, "claims = %d/%d, want 1/1 (one claim per distinct blob)", got1, got2)
+	require.Empty(t, rm.removed, "removed %d blobs, want 0 (both still referenced)", len(rm.removed))
 }
 
 // TestRefIndex_OverwriteSameContentReleasesOld: with encryption an
@@ -246,19 +224,13 @@ func TestRefIndex_OverwriteSameContentReleasesOld(t *testing.T) {
 	putObj(t, b, "k1", data) // overwrite with identical bytes
 	cur := blobDigestOf(t, b, "k1", "")
 
-	if bytes.Equal(old, cur) {
-		t.Fatalf("overwrite reused stored digest %x; encryption must mint a new one", old)
-	}
-	if got := claims(t, mem, old); got != 0 {
-		t.Fatalf("claims(old) = %d, want 0 (superseded)", got)
-	}
-	if got := claims(t, mem, cur); got != 1 {
-		t.Fatalf("claims(current) = %d, want 1", got)
-	}
+	require.False(t, bytes.Equal(old, cur), "overwrite reused stored digest %x; encryption must mint a new one", old)
+	got := claims(t, mem, old)
+	require.Zero(t, got, "claims(old) (superseded)")
+	require.Equal(t, 1, claims(t, mem, cur), "claims(current)")
 	drainReleases(t, b)
-	if rm.removedDigests()[string(old)] != 1 {
-		t.Fatalf("expected exactly one RemoveBlob(old); got removals %v", rm.removedDigests())
-	}
+	removed := rm.removedDigests()
+	require.Equal(t, 1, removed[string(old)], "RemoveBlob(old) calls (all removals: %v)", removed)
 }
 
 func TestRefIndex_OverwriteDifferentContentReleasesOld(t *testing.T) {
@@ -271,19 +243,13 @@ func TestRefIndex_OverwriteDifferentContentReleasesOld(t *testing.T) {
 	putObj(t, b, "k1", bb) // overwrite-in-place with new content
 	db := blobDigestOf(t, b, "k1", "")
 
-	if got := claims(t, mem, da); got != 0 {
-		t.Fatalf("claims(A) = %d, want 0 (superseded)", got)
-	}
-	if got := claims(t, mem, db); got != 1 {
-		t.Fatalf("claims(B) = %d, want 1", got)
-	}
+	got := claims(t, mem, da)
+	require.Zero(t, got, "claims(A) (superseded)")
+	require.Equal(t, 1, claims(t, mem, db), "claims(B)")
 	drainReleases(t, b)
-	if rm.removedDigests()[string(da)] != 1 {
-		t.Fatalf("expected exactly one RemoveBlob(A); got removals %v", rm.removedDigests())
-	}
-	if rm.removedDigests()[string(db)] != 0 {
-		t.Fatalf("B must not be removed; got removals %v", rm.removedDigests())
-	}
+	removed := rm.removedDigests()
+	require.Equal(t, 1, removed[string(da)], "RemoveBlob(A) calls (all removals: %v)", removed)
+	require.Zero(t, removed[string(db)], "B must not be removed (all removals: %v)", removed)
 }
 
 func TestRefIndex_DeleteReleasesAtZero(t *testing.T) {
@@ -294,13 +260,11 @@ func TestRefIndex_DeleteReleasesAtZero(t *testing.T) {
 	d := blobDigestOf(t, b, "k1", "")
 	deleteObj(t, b, "k1")
 
-	if got := claims(t, mem, d); got != 0 {
-		t.Fatalf("claims = %d, want 0 after delete", got)
-	}
+	got := claims(t, mem, d)
+	require.Zero(t, got, "claims after delete")
 	drainReleases(t, b)
-	if rm.removedDigests()[string(d)] != 1 {
-		t.Fatalf("expected one RemoveBlob; got %v", rm.removedDigests())
-	}
+	removed := rm.removedDigests()
+	require.Equal(t, 1, removed[string(d)], "RemoveBlob calls (all removals: %v)", removed)
 }
 
 // TestRefIndex_IdenticalPiecesInOneBody: a body of two identical 1 KiB
@@ -314,27 +278,20 @@ func TestRefIndex_IdenticalPiecesInOneBody(t *testing.T) {
 
 	putObj(t, b, "k1", data)
 	ds := blobDigestsOf(t, b, "k1", "")
-	if len(ds) != 2 {
-		t.Fatalf("blobs = %d, want 2", len(ds))
-	}
-	if bytes.Equal(ds[0], ds[1]) {
-		t.Fatalf("identical pieces share stored digest %x; encryption must make them distinct", ds[0])
-	}
+	require.Len(t, ds, 2, "blobs")
+	require.False(t, bytes.Equal(ds[0], ds[1]), "identical pieces share stored digest %x; encryption must make them distinct", ds[0])
 	for i, d := range ds {
-		if got := claims(t, mem, d); got != 1 {
-			t.Fatalf("claims(blob %d) = %d, want 1", i, got)
-		}
+		got := claims(t, mem, d)
+		require.Equal(t, 1, got, "claims(blob %d)", i)
 	}
 
 	deleteObj(t, b, "k1")
 	drainReleases(t, b)
 	for i, d := range ds {
-		if got := claims(t, mem, d); got != 0 {
-			t.Fatalf("claims(blob %d) after delete = %d, want 0", i, got)
-		}
-		if n := rm.removedDigests()[string(d)]; n != 1 {
-			t.Fatalf("RemoveBlob called %d times for blob %d, want exactly 1", n, i)
-		}
+		got := claims(t, mem, d)
+		require.Zero(t, got, "claims(blob %d) after delete", i)
+		n := rm.removedDigests()[string(d)]
+		require.Equal(t, 1, n, "RemoveBlob called %d times for blob %d", n, i)
 	}
 }
 
@@ -350,37 +307,27 @@ func TestRefIndex_SharedDigestAcrossKeys(t *testing.T) {
 	d := blobDigestOf(t, b, "k1", "")
 
 	bucket, dstKey, src := "bk", "k2", "bk/k1"
-	if _, err := b.CopyObject(context.Background(), s3response.CopyObjectInput{
+	_, err := b.CopyObject(context.Background(), s3response.CopyObjectInput{
 		Bucket:     &bucket,
 		Key:        &dstKey,
 		CopySource: &src,
-	}); err != nil {
-		t.Fatalf("CopyObject: %v", err)
-	}
-	if d2 := blobDigestOf(t, b, "k2", ""); !bytes.Equal(d, d2) {
-		t.Fatalf("copy stored digest %x, want the source's %x (copies share blobs)", d2, d)
-	}
-	if got := claims(t, mem, d); got != 2 {
-		t.Fatalf("claims after copy = %d, want 2", got)
-	}
+	})
+	require.NoError(t, err, "CopyObject")
+	d2 := blobDigestOf(t, b, "k2", "")
+	require.True(t, bytes.Equal(d, d2), "copy stored digest %x, want the source's %x (copies share blobs)", d2, d)
+	got := claims(t, mem, d)
+	require.Equal(t, 2, got, "claims after copy")
 
 	deleteObj(t, b, "k1")
 	drainReleases(t, b)
-	if got := claims(t, mem, d); got != 1 {
-		t.Fatalf("claims after first delete = %d, want 1 (k2 still references it)", got)
-	}
-	if len(rm.removed) != 0 {
-		t.Fatalf("removed %d blobs after first delete, want 0", len(rm.removed))
-	}
+	require.Equal(t, 1, claims(t, mem, d), "claims after first delete (k2 still references it)")
+	require.Empty(t, rm.removed, "removed blobs after first delete")
 
 	deleteObj(t, b, "k2")
 	drainReleases(t, b)
-	if got := claims(t, mem, d); got != 0 {
-		t.Fatalf("claims after second delete = %d, want 0", got)
-	}
-	if rm.removedDigests()[string(d)] != 1 {
-		t.Fatalf("expected one RemoveBlob after the last reference dropped; got %v", rm.removedDigests())
-	}
+	require.Zero(t, claims(t, mem, d), "claims after second delete")
+	removed := rm.removedDigests()
+	require.Equal(t, 1, removed[string(d)], "RemoveBlob calls after the last reference dropped (all removals: %v)", removed)
 }
 
 // failCommitRoot is a registry whose next root commits fail, as a Postgres
@@ -414,48 +361,35 @@ func TestCommitFailureWritesNoClaim(t *testing.T) {
 
 	putObj(t, b, key, []byte("first body"))
 	old := blobDigestOf(t, b, key, "")
-	if n := claims(t, mem, old); n != 1 {
-		t.Fatalf("claims on the first version = %d, want 1", n)
-	}
+	n := claims(t, mem, old)
+	require.Equal(t, 1, n, "claims on the first version")
 
 	reg.fails = 1
 	bucket := "bk"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader([]byte("second body")), ContentLength: byteLen([]byte("second body"))}); err == nil {
-		t.Fatal("PutObject succeeded although its root swap failed")
-	}
+	_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader([]byte("second body")), ContentLength: byteLen([]byte("second body"))})
+	require.Error(t, err, "PutObject succeeded although its root swap failed")
 	// The overwrite published nothing: the first version stands, with its
 	// claim, and no release is recorded.
-	if got := blobDigestOf(t, b, key, ""); string(got) != string(old) {
-		t.Fatalf("current version after the failed overwrite names %x, want the first version's %x", got, old)
-	}
-	if n := claims(t, mem, old); n != 1 {
-		t.Fatalf("claims on the first version after the failed overwrite = %d, want 1", n)
-	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
-		t.Fatalf("a failed overwrite recorded releases: %v", pending)
-	}
+	got := blobDigestOf(t, b, key, "")
+	require.Equal(t, string(old), string(got), "current version after the failed overwrite names %x", got)
+	require.Equal(t, 1, claims(t, mem, old), "claims on the first version after the failed overwrite")
+	pending, _ := mem.ListReleasesBySpace(ctx, mem.bk())
+	require.Empty(t, pending, "a failed overwrite recorded releases")
 	// A claim publishes its blob's intent; the failed write's blob was never
 	// claimed, so the first version's is the only published intent.
 	published, err := mem.ListIntentsByState(ctx, registry.IntentPublished)
-	if err != nil {
-		t.Fatalf("ListIntentsByState: %v", err)
-	}
-	if len(published) != 1 || string(published[0].Digest) != string(old) {
-		t.Fatalf("published intents after the failed overwrite = %v, want the first version's blob only", published)
-	}
+	require.NoError(t, err, "ListIntentsByState")
+	require.Len(t, published, 1, "published intents after the failed overwrite = %v, want the first version's blob only", published)
+	require.Equal(t, string(old), string(published[0].Digest), "published intents after the failed overwrite = %v, want the first version's blob only", published)
 
 	// The retry commits, claims its blob and drops the first version's.
 	putObj(t, b, key, []byte("second body"))
 	next := blobDigestOf(t, b, key, "")
-	if n := claims(t, mem, next); n != 1 {
-		t.Fatalf("claims on the retried version = %d, want 1", n)
-	}
-	if n := claims(t, mem, old); n != 0 {
-		t.Fatalf("claims on the superseded version = %d, want 0", n)
-	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 1 || string(pending[0].Digest) != string(old) {
-		t.Fatalf("releases after the retry = %v, want the superseded blob's", pending)
-	}
+	require.Equal(t, 1, claims(t, mem, next), "claims on the retried version")
+	require.Zero(t, claims(t, mem, old), "claims on the superseded version")
+	pending, _ = mem.ListReleasesBySpace(ctx, mem.bk())
+	require.Len(t, pending, 1, "releases after the retry")
+	require.Equal(t, string(old), string(pending[0].Digest), "releases after the retry")
 }
 
 // stallCommitRoot is a registry whose root commits wait delay before they
@@ -491,10 +425,8 @@ func TestReleaseGraceRunsFromTheCommit(t *testing.T) {
 	start := time.Now()
 	putObj(t, b, key, []byte("second body"))
 	pending, err := mem.ListReleasesBySpace(ctx, mem.bk())
-	if err != nil || len(pending) != 1 || string(pending[0].Digest) != string(old) {
-		t.Fatalf("releases after the overwrite = %v (err %v), want the superseded blob's", pending, err)
-	}
-	if earliest := start.Add(stall + grace); pending[0].NotBefore.Before(earliest) {
-		t.Fatalf("release due %v after the overwrite began, want at least the stall plus the grace (%v): the grace ran from staging, not the commit", pending[0].NotBefore.Sub(start), stall+grace)
-	}
+	require.NoError(t, err, "releases after the overwrite")
+	require.Len(t, pending, 1, "releases after the overwrite")
+	require.Equal(t, string(old), string(pending[0].Digest), "releases after the overwrite")
+	require.False(t, pending[0].NotBefore.Before(start.Add(stall+grace)), "release due %v after the overwrite began, want at least the stall plus the grace (%v): the grace ran from staging, not the commit", pending[0].NotBefore.Sub(start), stall+grace)
 }

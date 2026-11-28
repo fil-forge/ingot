@@ -16,6 +16,7 @@ import (
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -223,14 +224,10 @@ func (f *fakeMeta) RehydrateSegment(_ context.Context, m SegmentMeta) error {
 func makeBlock(t *testing.T, payload []byte) block.Block {
 	t.Helper()
 	mh, err := multihash.Sum(payload, multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash: %v", err)
-	}
+	require.NoError(t, err, "multihash")
 	c := cid.NewCidV1(cid.DagCBOR, mh)
 	blk, err := block.NewBlockWithCid(payload, c)
-	if err != nil {
-		t.Fatalf("block: %v", err)
-	}
+	require.NoError(t, err, "block")
 	return blk
 }
 
@@ -239,9 +236,7 @@ func makeBlock(t *testing.T, payload []byte) block.Block {
 func makeRoot(t *testing.T, name string) cid.Cid {
 	t.Helper()
 	mh, err := multihash.Sum([]byte("root:"+name), multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("mh: %v", err)
-	}
+	require.NoError(t, err, "mh")
 	return cid.NewCidV1(cid.DagCBOR, mh)
 }
 
@@ -263,9 +258,7 @@ func newTestStore(t *testing.T, sealBytes int64, sealAge time.Duration, retain i
 		Logger:  logger,
 	}
 	s, err := Open(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	require.NoError(t, err, "Open")
 	sh.start(t, s)
 	return s, meta, flushCalls
 }
@@ -334,17 +327,12 @@ func TestAppendThenGetSameProcess(t *testing.T) {
 
 	blk := makeBlock(t, []byte("hello world"))
 	root := makeRoot(t, "alpha")
-	if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
-		t.Fatalf("AppendBatch: %v", err)
-	}
+	_, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{Bucket: "bk", Root: root})
+	require.NoError(t, err, "AppendBatch")
 
 	got, err := s.Get(context.Background(), blk.Cid())
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if string(got.RawData()) != "hello world" {
-		t.Fatalf("got %q want %q", got.RawData(), "hello world")
-	}
+	require.NoError(t, err, "Get")
+	require.Equal(t, "hello world", string(got.RawData()))
 }
 
 func TestSealBySize(t *testing.T) {
@@ -358,12 +346,11 @@ func TestSealBySize(t *testing.T) {
 	}
 	for i := 0; i < 6; i++ {
 		blk := makeBlock(t, append([]byte(fmt.Sprintf("rec-%02d-", i)), payload...))
-		if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+		_, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 			Bucket: "bk",
 			Root:   makeRoot(t, fmt.Sprintf("size-%d", i)),
-		}); err != nil {
-			t.Fatalf("append %d: %v", i, err)
-		}
+		})
+		require.NoError(t, err, "append %d", i)
 	}
 
 	// Wait for at least one flush.
@@ -374,9 +361,7 @@ func TestSealBySize(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if flushes.load() == 0 {
-		t.Fatalf("expected at least one flush after size threshold; got 0")
-	}
+	require.NotZero(t, flushes.load(), "expected at least one flush after size threshold; got 0")
 
 	// At least one segment should now have shipped.
 	meta.mu.Lock()
@@ -387,21 +372,18 @@ func TestSealBySize(t *testing.T) {
 		}
 	}
 	meta.mu.Unlock()
-	if shipped == 0 {
-		t.Fatalf("expected at least one shipped segment")
-	}
+	require.NotZero(t, shipped, "expected at least one shipped segment")
 }
 
 func TestSealByAge(t *testing.T) {
 	s, _, flushes := newTestStore(t, 1<<30, 80*time.Millisecond, 6)
 
 	blk := makeBlock(t, []byte("age-trigger"))
-	if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	_, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk",
 		Root:   makeRoot(t, "age"),
-	}); err != nil {
-		t.Fatalf("append: %v", err)
-	}
+	})
+	require.NoError(t, err, "append")
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -410,9 +392,7 @@ func TestSealByAge(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if flushes.load() == 0 {
-		t.Fatalf("expected age-triggered seal to produce a flush")
-	}
+	require.NotZero(t, flushes.load(), "expected age-triggered seal to produce a flush")
 }
 
 // TestRetentionDropsOldFlushed: retention unlinks shipped segments past the
@@ -434,21 +414,18 @@ func TestRetentionDropsOldFlushed(t *testing.T) {
 			payload[j] = byte(i)
 		}
 		blk := makeBlock(t, append([]byte(fmt.Sprintf("retain-%02d-", i)), payload...))
-		if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+		_, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 			Bucket: "bk",
 			Root:   makeRoot(t, fmt.Sprintf("ret-%d", i)),
-		}); err != nil {
-			t.Fatalf("append %d: %v", i, err)
-		}
+		})
+		require.NoError(t, err, "append %d", i)
 	}
 
 	// Wait for retention to converge.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		entries, err := readSegmentSeqs(dir, "catalog")
-		if err != nil {
-			t.Fatalf("readDir: %v", err)
-		}
+		require.NoError(t, err, "readDir")
 		// 1 active open + 2 retained
 		if len(entries) <= 3 {
 			break
@@ -457,40 +434,30 @@ func TestRetentionDropsOldFlushed(t *testing.T) {
 	}
 
 	entries, err := readSegmentSeqs(dir, "catalog")
-	if err != nil {
-		t.Fatalf("readDir: %v", err)
-	}
-	if len(entries) > 3 {
-		t.Fatalf("retain=2 should leave at most 3 segments (open + retained); got %d (%v)",
-			len(entries), entries)
-	}
+	require.NoError(t, err, "readDir")
+	require.LessOrEqual(t, len(entries), 3, "retain=2 should leave at most 3 segments (open + retained)")
 
 	// The retired stamp lands after the unlink; wait for it. newTestStore
 	// opens the store with no bucket, so its rows carry the empty name.
 	var retired []SegmentMeta
 	for deadline := time.Now().Add(3 * time.Second); len(retired) == 0 && time.Now().Before(deadline); {
-		if retired, err = meta.ListRetiredSegments(context.Background(), blockstore.PlaneCatalog, ""); err != nil {
-			t.Fatalf("ListRetiredSegments: %v", err)
-		}
+		retired, err = meta.ListRetiredSegments(context.Background(), blockstore.PlaneCatalog, "")
+		require.NoError(t, err, "ListRetiredSegments")
 		time.Sleep(20 * time.Millisecond)
 	}
-	if len(retired) == 0 {
-		t.Fatalf("expected retired segment rows to survive retention")
-	}
-	if entries, err = readSegmentSeqs(dir, "catalog"); err != nil {
-		t.Fatalf("readDir: %v", err)
-	}
+	require.NotEmpty(t, retired, "expected retired segment rows to survive retention")
+	entries, err = readSegmentSeqs(dir, "catalog")
+	require.NoError(t, err, "readDir")
 	onDisk := map[string]bool{}
 	for _, e := range entries {
 		onDisk[e] = true
 	}
 	for _, r := range retired {
-		if r.RetiredAt == 0 || r.ShippedAt == 0 || len(r.SHA256) == 0 || len(r.OpRoots) != 0 {
-			t.Fatalf("retired row %d = %+v, want retired_at, shipped_at and sha256 set and no op-roots", r.Seq, r)
-		}
-		if onDisk[carName(r.Seq)] {
-			t.Fatalf("retired segment %d still has its CAR on disk", r.Seq)
-		}
+		require.NotZero(t, r.RetiredAt, "retired row %d = %+v, want retired_at, shipped_at and sha256 set and no op-roots", r.Seq, r)
+		require.NotZero(t, r.ShippedAt, "retired row %d = %+v, want retired_at, shipped_at and sha256 set and no op-roots", r.Seq, r)
+		require.NotEmpty(t, r.SHA256, "retired row %d = %+v, want retired_at, shipped_at and sha256 set and no op-roots", r.Seq, r)
+		require.Empty(t, r.OpRoots, "retired row %d = %+v, want retired_at, shipped_at and sha256 set and no op-roots", r.Seq, r)
+		require.False(t, onDisk[carName(r.Seq)], "retired segment %d still has its CAR on disk", r.Seq)
 	}
 }
 
@@ -510,50 +477,37 @@ func TestRecoveryRetiresSealedRowWithoutCAR(t *testing.T) {
 		Logger:  zaptest.NewLogger(t),
 	}
 	s, err := Open(ctx, cfg)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	if _, err := s.AppendBatch(ctx, []block.Block{makeBlock(t, []byte("sealed-then-lost"))}, blockstore.OpRoot{
+	require.NoError(t, err, "Open")
+	_, err = s.AppendBatch(ctx, []block.Block{makeBlock(t, []byte("sealed-then-lost"))}, blockstore.OpRoot{
 		Bucket: "bk",
 		Root:   makeRoot(t, "lost"),
-	}); err != nil {
-		t.Fatalf("append: %v", err)
-	}
+	})
+	require.NoError(t, err, "append")
 	catDir := s.catalog.dir
-	if err := s.Close(ctx); err != nil { // seals the open segment
-		t.Fatalf("Close: %v", err)
-	}
+	// seals the open segment
+	require.NoError(t, s.Close(ctx), "Close")
 	rows, err := meta.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
-	if err != nil || len(rows) != 1 || rows[0].State != StateSealed {
-		t.Fatalf("want one sealed row before the loss, got %+v (err %v)", rows, err)
-	}
+	require.NoError(t, err, "want one sealed row before the loss, got %+v (err %v)", rows, err)
+	require.Len(t, rows, 1, "want one sealed row before the loss, got %+v (err %v)", rows, err)
+	require.Equal(t, StateSealed, rows[0].State, "want one sealed row before the loss, got %+v (err %v)", rows, err)
 	sealedSeq := rows[0].Seq
-	if err := os.Remove(filepath.Join(catDir, carName(sealedSeq))); err != nil {
-		t.Fatalf("remove CAR: %v", err)
-	}
+	require.NoError(t, os.Remove(filepath.Join(catDir, carName(sealedSeq))), "remove CAR")
 	const openSeq = 1 << 40
-	if err := meta.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, openSeq, "bk"); err != nil {
-		t.Fatalf("InsertSegmentOpen: %v", err)
-	}
+	require.NoError(t, meta.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, openSeq, "bk"), "InsertSegmentOpen")
 
 	s2, err := Open(ctx, cfg)
-	if err != nil {
-		t.Fatalf("re-Open: %v", err)
-	}
+	require.NoError(t, err, "re-Open")
 	t.Cleanup(func() { _ = s2.Close(ctx) })
 
 	retired, err := meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk")
-	if err != nil || len(retired) != 1 || retired[0].Seq != sealedSeq {
-		t.Fatalf("want sealed seg %d retired, got %+v (err %v)", sealedSeq, retired, err)
-	}
+	require.NoError(t, err, "want sealed seg %d retired, got %+v (err %v)", sealedSeq, retired, err)
+	require.Len(t, retired, 1, "want sealed seg %d retired, got %+v (err %v)", sealedSeq, retired, err)
+	require.Equal(t, sealedSeq, retired[0].Seq, "want sealed seg %d retired, got %+v (err %v)", sealedSeq, retired, err)
 	live, err := meta.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
-	if err != nil {
-		t.Fatalf("ListSegments: %v", err)
-	}
+	require.NoError(t, err, "ListSegments")
 	for _, r := range live {
-		if r.Seq == sealedSeq || r.Seq == openSeq {
-			t.Fatalf("seg %d should not be live after recovery: %+v", r.Seq, r)
-		}
+		require.NotEqual(t, sealedSeq, r.Seq, "seg %d should not be live after recovery: %+v", r.Seq, r)
+		require.NotEqual(t, uint64(openSeq), r.Seq, "seg %d should not be live after recovery: %+v", r.Seq, r)
 	}
 }
 
@@ -570,20 +524,17 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 			Logger:  logger,
 		}
 		s, err := Open(context.Background(), cfg)
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
+		require.NoError(t, err, "Open")
 		return s
 	}
 
 	s := openStore()
 	blk := makeBlock(t, []byte("survives-restart"))
-	if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	_, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk",
 		Root:   makeRoot(t, "survive"),
-	}); err != nil {
-		t.Fatalf("append: %v", err)
-	}
+	})
+	require.NoError(t, err, "append")
 
 	// Simulate process exit without orderly Close (don't seal): stop the
 	// goroutines and forget the in-memory state. On disk the segment is
@@ -598,23 +549,17 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 	// The previously-open segment should have been force-sealed on
 	// startup; the write must still be readable.
 	got, err := s2.Get(context.Background(), blk.Cid())
-	if err != nil {
-		t.Fatalf("Get after restart: %v", err)
-	}
-	if string(got.RawData()) != "survives-restart" {
-		t.Fatalf("got %q", got.RawData())
-	}
+	require.NoError(t, err, "Get after restart")
+	require.Equal(t, "survives-restart", string(got.RawData()))
 }
 
 func TestAppendBatchEmptyBlocksAccepted(t *testing.T) {
 	s, _, _ := newTestStore(t, 64<<20, 5*time.Second, 6)
 	root := makeRoot(t, "x")
-	if _, err := s.AppendBatch(context.Background(), nil, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
-		t.Fatalf("empty blocks with defined root should succeed, got %v", err)
-	}
-	if _, err := s.AppendBatch(context.Background(), []block.Block{makeBlock(t, []byte("x"))}, blockstore.OpRoot{Bucket: "bk"}); err == nil {
-		t.Fatalf("expected error on undefined root")
-	}
+	_, err := s.AppendBatch(context.Background(), nil, blockstore.OpRoot{Bucket: "bk", Root: root})
+	require.NoError(t, err, "empty blocks with defined root should succeed")
+	_, err = s.AppendBatch(context.Background(), []block.Block{makeBlock(t, []byte("x"))}, blockstore.OpRoot{Bucket: "bk"})
+	require.Error(t, err, "expected error on undefined root")
 }
 
 func TestGetMissReturnsErrNotFound(t *testing.T) {
@@ -622,9 +567,7 @@ func TestGetMissReturnsErrNotFound(t *testing.T) {
 
 	want := makeRoot(t, "absent")
 	_, err := s.Get(context.Background(), want)
-	if !errors.Is(err, blockstore.ErrNotFound) {
-		t.Fatalf("expected ErrNotFound, got %v", err)
-	}
+	require.ErrorIs(t, err, blockstore.ErrNotFound)
 }
 
 // TestAppendBatchDedupesAcrossOps confirms that a CID written in
@@ -639,12 +582,11 @@ func TestAppendBatchDedupesAcrossOps(t *testing.T) {
 	uniqB := makeBlock(t, []byte("unique-B"))
 
 	// First batch: shared + uniqA.
-	if _, err := s.AppendBatch(context.Background(),
+	_, err := s.AppendBatch(context.Background(),
 		[]block.Block{shared, uniqA},
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "op-a")},
-	); err != nil {
-		t.Fatalf("append A: %v", err)
-	}
+	)
+	require.NoError(t, err, "append A")
 
 	// Snapshot the open-segment size after the first append.
 	s.catalog.catMu.RLock()
@@ -652,12 +594,11 @@ func TestAppendBatchDedupesAcrossOps(t *testing.T) {
 	s.catalog.catMu.RUnlock()
 
 	// Second batch: shared (duplicate of first batch) + uniqB.
-	if _, err := s.AppendBatch(context.Background(),
+	_, err = s.AppendBatch(context.Background(),
 		[]block.Block{shared, uniqB},
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "op-b")},
-	); err != nil {
-		t.Fatalf("append B: %v", err)
-	}
+	)
+	require.NoError(t, err, "append B")
 
 	s.catalog.catMu.RLock()
 	sizeAfterB := s.catalog.open.Size()
@@ -669,20 +610,13 @@ func TestAppendBatchDedupesAcrossOps(t *testing.T) {
 	growthB := sizeAfterB - sizeAfterA
 	growthFirstBatch := sizeAfterA // includes header + 2 frames; can't isolate
 
-	if growthB >= growthFirstBatch {
-		t.Fatalf("second batch grew %d bytes, expected ~half of first-batch growth (%d) since shared was deduped",
-			growthB, growthFirstBatch)
-	}
+	require.Less(t, growthB, growthFirstBatch, "second batch grew %d bytes, expected ~half of first-batch growth (%d) since shared was deduped", growthB, growthFirstBatch)
 
 	// All three blocks must be readable.
 	for _, blk := range []block.Block{shared, uniqA, uniqB} {
 		got, err := s.Get(context.Background(), blk.Cid())
-		if err != nil {
-			t.Fatalf("Get %s: %v", blk.Cid(), err)
-		}
-		if string(got.RawData()) != string(blk.RawData()) {
-			t.Fatalf("Get %s payload mismatch", blk.Cid())
-		}
+		require.NoError(t, err, "Get %s", blk.Cid())
+		require.Equal(t, blk.RawData(), got.RawData(), "Get %s payload mismatch", blk.Cid())
 	}
 }
 
@@ -696,32 +630,26 @@ func TestAppendBatchAllDuplicatesStillRecordsOpRoot(t *testing.T) {
 
 	blk := makeBlock(t, []byte("only-block"))
 
-	if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	_, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk", Root: makeRoot(t, "first"),
-	}); err != nil {
-		t.Fatalf("first append: %v", err)
-	}
+	})
+	require.NoError(t, err, "first append")
 	s.catalog.catMu.RLock()
 	sizeBefore := s.catalog.open.Size()
 	opRootsBefore := len(s.catalog.open.OpRoots())
 	s.catalog.catMu.RUnlock()
 
-	if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	_, err = s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk", Root: makeRoot(t, "second"),
-	}); err != nil {
-		t.Fatalf("dup append: %v", err)
-	}
+	})
+	require.NoError(t, err, "dup append")
 	s.catalog.catMu.RLock()
 	sizeAfter := s.catalog.open.Size()
 	opRootsAfter := len(s.catalog.open.OpRoots())
 	s.catalog.catMu.RUnlock()
 
-	if sizeAfter != sizeBefore {
-		t.Fatalf("all-duplicate batch grew CAR by %d bytes; expected 0", sizeAfter-sizeBefore)
-	}
-	if opRootsAfter != opRootsBefore+1 {
-		t.Fatalf("op-root count went %d→%d; expected +1", opRootsBefore, opRootsAfter)
-	}
+	require.Equal(t, sizeBefore, sizeAfter, "an all-duplicate batch grew the CAR")
+	require.Equal(t, opRootsBefore+1, opRootsAfter, "op-root count")
 }
 
 // TestFailedShipStampRetriedWithoutReshipping checks that a segment whose
@@ -740,25 +668,21 @@ func TestFailedShipStampRetriedWithoutReshipping(t *testing.T) {
 	blk := makeBlock(t, append([]byte("stamp-"), make([]byte, 80)...))
 	seq, err := s.AppendBatch(context.Background(), []block.Block{blk},
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "stamp")})
-	if err != nil {
-		t.Fatalf("append: %v", err)
-	}
+	require.NoError(t, err, "append")
 
 	// Between the failed stamp and its retry, a backoff away, the segment
 	// must not count as shipped.
 	select {
 	case failed := <-stampFailed:
-		if failed != seq {
-			t.Fatalf("stamp failed for seq %d, want %d", failed, seq)
-		}
+		require.Equal(t, seq, failed, "seq whose stamp failed")
 	case <-time.After(5 * time.Second):
-		t.Fatal("the stamp never failed")
+		require.FailNow(t, "the stamp never failed")
 	}
 	s.catalog.catMu.RLock()
 	for _, sealed := range s.catalog.sealed {
 		if sealed.Seq() == seq && sealed.IsShipped() {
 			s.catalog.catMu.RUnlock()
-			t.Fatalf("segment %d counts as shipped while its stamp is failing", seq)
+			require.FailNowf(t, "a segment counts as shipped while its stamp is failing", "segment %d", seq)
 		}
 	}
 	s.catalog.catMu.RUnlock()
@@ -771,19 +695,16 @@ func TestFailedShipStampRetriedWithoutReshipping(t *testing.T) {
 		if shipped > 0 {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("segment %d was never stamped shipped", seq)
-		}
+		require.False(t, time.Now().After(deadline), "segment %d was never stamped shipped", seq)
 		time.Sleep(50 * time.Millisecond)
 	}
-	if got := flushes.load(); got != 1 {
-		t.Fatalf("segment shipped %d times, want 1", got)
-	}
+	got := flushes.load()
+	require.Equal(t, int64(1), got, "segment shipped %d times", got)
 	meta.mu.Lock()
 	defer meta.mu.Unlock()
-	if m, ok := meta.segments[seq]; !ok || m.ShippedAt == 0 {
-		t.Fatalf("segment %d row = %+v (present %v), want stamped shipped", seq, m, ok)
-	}
+	m, ok := meta.segments[seq]
+	require.True(t, ok, "segment %d row = %+v (present %v), want stamped shipped", seq, m, ok)
+	require.NotZero(t, m.ShippedAt, "segment %d row = %+v (present %v)", seq, m, ok)
 }
 
 // TestFailedSealStampRecordedBeforeShip: a seal whose stamp in Meta fails
@@ -803,30 +724,22 @@ func TestFailedSealStampRecordedBeforeShip(t *testing.T) {
 	blk := makeBlock(t, append([]byte("seal-"), make([]byte, 80)...))
 	seq, err := s.AppendBatch(ctx, []block.Block{blk},
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "seal")})
-	if err != nil {
-		t.Fatalf("append: %v", err)
-	}
+	require.NoError(t, err, "append")
 	select {
 	case failed := <-sealFailed:
-		if failed != seq {
-			t.Fatalf("seal stamp failed for seq %d, want %d", failed, seq)
-		}
+		require.Equal(t, seq, failed, "seq whose seal stamp failed")
 	case <-time.After(5 * time.Second):
-		t.Fatal("the seal stamp never failed")
+		require.FailNow(t, "the seal stamp never failed")
 	}
 
-	if got, err := s.Get(ctx, blk.Cid()); err != nil || string(got.RawData()) != string(blk.RawData()) {
-		t.Fatalf("Get after a failed seal stamp: %v", err)
-	}
+	got, err := s.Get(ctx, blk.Cid())
+	require.NoError(t, err, "Get after a failed seal stamp")
+	require.Equal(t, blk.RawData(), got.RawData(), "Get after a failed seal stamp")
 	next := makeBlock(t, append([]byte("next-"), make([]byte, 80)...))
 	seq2, err := s.AppendBatch(ctx, []block.Block{next},
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "next")})
-	if err != nil {
-		t.Fatalf("append after a failed seal stamp: %v", err)
-	}
-	if seq2 == seq {
-		t.Fatalf("append after a failed seal stamp went to the frozen segment %d", seq)
-	}
+	require.NoError(t, err, "append after a failed seal stamp")
+	require.NotEqual(t, seq, seq2, "append after a failed seal stamp went to the frozen segment %d", seq)
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -839,19 +752,17 @@ func TestFailedSealStampRecordedBeforeShip(t *testing.T) {
 		}
 		meta.mu.Unlock()
 		if ship != nil {
-			if !ship.rowSealed {
-				t.Fatalf("segment %d shipped while its row wasn't stamped sealed", seq)
-			}
+			require.True(t, ship.rowSealed, "segment %d shipped while its row wasn't stamped sealed", seq)
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("segment %d never shipped (%d flushes)", seq, flushes.load())
+			require.FailNowf(t, "segment never shipped", "segment %d (%d flushes)", seq, flushes.load())
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if got, err := s.Get(ctx, blk.Cid()); err != nil || string(got.RawData()) != string(blk.RawData()) {
-		t.Fatalf("Get after the ship: %v", err)
-	}
+	got, err = s.Get(ctx, blk.Cid())
+	require.NoError(t, err, "Get after the ship")
+	require.Equal(t, blk.RawData(), got.RawData(), "Get after the ship")
 }
 
 // TestReadsGoOnWhileTheSealStampWaits: a seal stamp that hangs, as on a
@@ -876,16 +787,12 @@ func TestReadsGoOnWhileTheSealStampWaits(t *testing.T) {
 	blk := makeBlock(t, append([]byte("hang-"), make([]byte, 80)...))
 	seq, err := s.AppendBatch(ctx, []block.Block{blk},
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "hang")})
-	if err != nil {
-		t.Fatalf("append: %v", err)
-	}
+	require.NoError(t, err, "append")
 	select {
 	case waited := <-waiting:
-		if waited != seq {
-			t.Fatalf("seal stamp waiting for seq %d, want %d", waited, seq)
-		}
+		require.Equal(t, seq, waited, "seq whose seal stamp waits")
 	case <-time.After(5 * time.Second):
-		t.Fatal("the seal never reached its stamp")
+		require.FailNow(t, "the seal never reached its stamp")
 	}
 
 	got := make(chan error, 1)
@@ -898,11 +805,9 @@ func TestReadsGoOnWhileTheSealStampWaits(t *testing.T) {
 	}()
 	select {
 	case err := <-got:
-		if err != nil {
-			t.Fatalf("Get while the seal stamp waits: %v", err)
-		}
+		require.NoError(t, err, "Get while the seal stamp waits")
 	case <-time.After(2 * time.Second):
-		t.Fatal("a read waited on the seal's stamp")
+		require.FailNow(t, "a read waited on the seal's stamp")
 	}
 }
 
@@ -930,9 +835,7 @@ func TestCatalogNeverShips(t *testing.T) {
 		Logger: logger,
 	}
 	s, err := Open(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	require.NoError(t, err, "Open")
 	t.Cleanup(func() { _ = s.Close(context.Background()) })
 
 	const n = 4
@@ -940,19 +843,16 @@ func TestCatalogNeverShips(t *testing.T) {
 	for i := 0; i < n; i++ {
 		c := makeBlock(t, []byte(fmt.Sprintf("cat-%02d", i)))
 		blocks = append(blocks, c)
-		if _, err := s.AppendBatch(context.Background(), []block.Block{c},
+		_, err := s.AppendBatch(context.Background(), []block.Block{c},
 			blockstore.OpRoot{Bucket: "bk", Root: c.Cid()},
-		); err != nil {
-			t.Fatalf("append %d: %v", i, err)
-		}
+		)
+		require.NoError(t, err, "append %d", i)
 		time.Sleep(30 * time.Millisecond) // let each batch seal separately
 	}
 
 	// Give the (absent) ship pipeline time to NOT run.
 	time.Sleep(200 * time.Millisecond)
-	if ships.load() != 0 {
-		t.Fatalf("catalog Ship=false should never flush; got %d", ships.load())
-	}
+	require.Zero(t, ships.load(), "catalog Ship=false should never flush")
 
 	// No sealed segment ever ships.
 	meta.mu.Lock()
@@ -962,25 +862,18 @@ func TestCatalogNeverShips(t *testing.T) {
 			continue
 		}
 		sealed++
-		if m.ShippedAt != 0 {
-			t.Fatalf("catalog seg %d shipped (%d) but Ship=false", seq, m.ShippedAt)
-		}
+		require.Zero(t, m.ShippedAt, "catalog seg %d shipped (%d) but Ship=false", seq, m.ShippedAt)
 	}
 	meta.mu.Unlock()
-	if sealed == 0 {
-		t.Fatalf("expected sealed segments; got none")
-	}
+	require.NotZero(t, sealed, "expected sealed segments; got none")
 
 	// Every block stays readable from local disk (CARs retained).
 	for _, c := range blocks {
-		if _, err := s.Get(context.Background(), c.Cid()); err != nil {
-			t.Fatalf("catalog block %s should be retained locally: %v", c.Cid(), err)
-		}
+		_, err := s.Get(context.Background(), c.Cid())
+		require.NoError(t, err, "catalog block %s should be retained locally", c.Cid())
 	}
 	cars, _ := filepath.Glob(filepath.Join(dir, "catalog", "seg-*.car"))
-	if len(cars) < n {
-		t.Fatalf("expected >= %d catalog CARs retained; got %d", n, len(cars))
-	}
+	require.GreaterOrEqual(t, len(cars), n, "expected >= %d catalog CARs retained; got %d", n, len(cars))
 }
 
 // readSegmentSeqs lists a plane's segment CARs on disk (the
@@ -1022,18 +915,15 @@ func TestShipStopsAtTheFirstFailure(t *testing.T) {
 			}},
 		Logger: zaptest.NewLogger(t),
 	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	require.NoError(t, err, "Open")
 	t.Cleanup(func() { _ = s.Close(context.Background()) })
 
 	// Each batch is over SealBytes, so it seals its segment.
 	for i := 0; i < 3; i++ {
 		blk := makeBlock(t, append([]byte(fmt.Sprintf("order-%d-", i)), make([]byte, 80)...))
-		if _, err := s.AppendBatch(context.Background(), []block.Block{blk},
-			blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, fmt.Sprintf("order-%d", i))}); err != nil {
-			t.Fatalf("append %d: %v", i, err)
-		}
+		_, err := s.AppendBatch(context.Background(), []block.Block{blk},
+			blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, fmt.Sprintf("order-%d", i))})
+		require.NoError(t, err, "append %d", i)
 		waitFor(t, fmt.Sprintf("segment %d to seal", i), func() bool {
 			s.catalog.catMu.RLock()
 			defer s.catalog.catMu.RUnlock()
@@ -1048,41 +938,31 @@ func TestShipStopsAtTheFirstFailure(t *testing.T) {
 	s.catalog.catMu.RUnlock()
 	slices.Sort(seqs)
 
-	if err := s.Ship(context.Background()); err == nil {
-		t.Fatal("Ship succeeded with the upload service down")
-	}
+	require.Error(t, s.Ship(context.Background()), "Ship succeeded with the upload service down")
 	mu.Lock()
 	if !slices.Equal(tried, seqs[:1]) {
 		mu.Unlock()
-		t.Fatalf("a failing Ship tried %v; want one attempt, on the oldest (%d)", tried, seqs[0])
+		require.FailNowf(t, "a failing Ship must try once, on the oldest segment", "tried %v, oldest %d", tried, seqs[0])
 	}
 	mu.Unlock()
 
 	down.Store(false)
-	if err := s.Ship(context.Background()); err != nil {
-		t.Fatalf("Ship: %v", err)
-	}
+	require.NoError(t, s.Ship(context.Background()), "Ship")
 	meta.mu.Lock()
 	shippedSeqs := make([]uint64, len(meta.shipped))
 	for i, ev := range meta.shipped {
 		shippedSeqs[i] = ev.seq
 	}
 	meta.mu.Unlock()
-	if !slices.Equal(shippedSeqs, seqs) {
-		t.Fatalf("shipped seqs %v, want %v in order", shippedSeqs, seqs)
-	}
+	require.True(t, slices.Equal(shippedSeqs, seqs), "shipped seqs %v, want %v in order", shippedSeqs, seqs)
 
 	mu.Lock()
 	before := len(tried)
 	mu.Unlock()
-	if err := s.Ship(context.Background()); err != nil {
-		t.Fatalf("Ship of nothing: %v", err)
-	}
+	require.NoError(t, s.Ship(context.Background()), "Ship of nothing")
 	mu.Lock()
 	defer mu.Unlock()
-	if len(tried) != before {
-		t.Fatalf("shipped segments went to Flush again: %v", tried[before:])
-	}
+	require.Len(t, tried, before, "shipped segments went to Flush again")
 }
 
 // waitFor polls cond until it holds, failing the test after a few seconds.
@@ -1090,9 +970,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
+		require.False(t, time.Now().After(deadline), "timed out waiting for %s", what)
 		time.Sleep(10 * time.Millisecond)
 	}
 }

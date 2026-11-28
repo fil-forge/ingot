@@ -3,9 +3,7 @@ package registry_test
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -15,6 +13,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/internal/pgtest"
@@ -31,18 +30,14 @@ import (
 func liveDigest(t *testing.T, s string) multihash.Multihash {
 	t.Helper()
 	d, err := multihash.Sum([]byte(s), multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash: %v", err)
-	}
+	require.NoError(t, err, "multihash")
 	return d
 }
 
 func liveCid(t *testing.T, s string) cid.Cid {
 	t.Helper()
 	mh, err := multihash.Sum([]byte(s), multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash: %v", err)
-	}
+	require.NoError(t, err, "multihash")
 	return cid.NewCidV1(cid.DagCBOR, mh)
 }
 
@@ -62,10 +57,9 @@ func TestPostgresStores(t *testing.T) {
 	seedBucket := func(t *testing.T, name string) did.DID {
 		t.Helper()
 		space := testutil.RandomDID(t)
-		if _, err := pool.Exec(ctx, `INSERT INTO ingot.buckets (name, space, tenant) VALUES ($1, $2, $3)`,
-			name, space.String(), registry.UnknownTenant.String()); err != nil {
-			t.Fatalf("seed bucket %q: %v", name, err)
-		}
+		_, err := pool.Exec(ctx, `INSERT INTO ingot.buckets (name, space, tenant) VALUES ($1, $2, $3)`,
+			name, space.String(), registry.UnknownTenant.String())
+		require.NoError(t, err, "seed bucket %q", name)
 		return space
 	}
 	digest := []byte{0x12, 0x20, 0xab, 0xcd} // binary, to exercise bytea round-trips
@@ -73,39 +67,24 @@ func TestPostgresStores(t *testing.T) {
 	t.Run("bucket space round trips", func(t *testing.T) {
 		space := seedBucket(t, "b")
 		st, err := r.Get(ctx, "b")
-		if err != nil {
-			t.Fatalf("Get: %v", err)
-		}
-		if st.Space != space {
-			t.Fatalf("space = %q, want %q", st.Space, space)
-		}
+		require.NoError(t, err, "Get")
+		require.Equal(t, space, st.Space, "space")
 		// The backfill sentinel reads back as the constant, no special case.
-		if st.Tenant != registry.UnknownTenant {
-			t.Fatalf("tenant = %q, want the sentinel %q", st.Tenant, registry.UnknownTenant)
-		}
+		require.Equal(t, registry.UnknownTenant, st.Tenant, "tenant")
 	})
 
 	t.Run("bucket tenant round trips", func(t *testing.T) {
 		tenant := testutil.RandomDID(t)
-		if err := r.Create(ctx, "owned", testutil.RandomDID(t), registry.CreateState{Tenant: tenant}); err != nil {
-			t.Fatalf("Create: %v", err)
-		}
+		require.NoError(t, r.Create(ctx, "owned", testutil.RandomDID(t), registry.CreateState{Tenant: tenant}), "Create")
 		st, err := r.Get(ctx, "owned")
-		if err != nil {
-			t.Fatalf("Get: %v", err)
-		}
-		if st.Tenant != tenant {
-			t.Fatalf("tenant = %q, want %q", st.Tenant, tenant)
-		}
+		require.NoError(t, err, "Get")
+		require.Equal(t, tenant, st.Tenant, "tenant")
 	})
 
 	t.Run("create rejects an undefined tenant", func(t *testing.T) {
-		if err := r.Create(ctx, "tenantless", testutil.RandomDID(t), registry.CreateState{}); err == nil {
-			t.Fatal("Create without a tenant succeeded; the row would be unreadable")
-		}
-		if _, err := r.Get(ctx, "tenantless"); !errors.Is(err, registry.ErrNotFound) {
-			t.Fatalf("Get after rejected Create = %v, want ErrNotFound (no row written)", err)
-		}
+		require.Error(t, r.Create(ctx, "tenantless", testutil.RandomDID(t), registry.CreateState{}), "Create without a tenant succeeded; the row would be unreadable")
+		_, err := r.Get(ctx, "tenantless")
+		require.ErrorIs(t, err, registry.ErrNotFound, "Get after rejected Create = %v, want ErrNotFound (no row written)", err)
 	})
 
 	t.Run("blob claims count to zero", func(t *testing.T) {
@@ -116,48 +95,37 @@ func TestPostgresStores(t *testing.T) {
 		space := testutil.RandomDID(t)
 		space2 := testutil.RandomDID(t)
 		add := func(bucket, key string, sp did.DID) {
-			if err := r.PutLocation(ctx, registry.BlobLocation{Space: sp, Digest: digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
-				t.Fatalf("PutLocation: %v", err)
-			}
+			require.NoError(t, r.PutLocation(ctx, registry.BlobLocation{Space: sp, Digest: digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}), "PutLocation")
 			mustClaim(t, r, registry.BlobClaim{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: registry.NullVersionID, Space: sp})
 		}
 		add("b", "k1", space)
 		add("b", "k2", space)
 		add("b", "k1", space) // ON CONFLICT DO NOTHING — does not inflate the count
 		add("b2", "k1", space2)
-		if n, _ := r.CountReferences(ctx, space, digest, uuid.Nil); n != 2 {
-			t.Fatalf("count space1 = %d, want 2", n)
-		}
-		if n, _ := r.CountReferences(ctx, space2, digest, uuid.Nil); n != 1 {
-			t.Fatalf("count space2 = %d, want 1", n)
-		}
+		n, _ := r.CountReferences(ctx, space, digest, uuid.Nil)
+		require.Equal(t, 2, n, "count space1")
+		n, _ = r.CountReferences(ctx, space2, digest, uuid.Nil)
+		require.Equal(t, 1, n, "count space2")
 		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "b", ObjectKey: "k1", VersionID: registry.NullVersionID, Space: space})
 		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "b", ObjectKey: "k2", VersionID: registry.NullVersionID, Space: space})
-		if n, _ := r.CountReferences(ctx, space, digest, uuid.Nil); n != 0 {
-			t.Fatalf("count after release = %d, want 0", n)
-		}
+		n, _ = r.CountReferences(ctx, space, digest, uuid.Nil)
+		require.Zero(t, n, "count after release")
 
 		// A claim publishes the digest's upload intent, and the state stays
 		// once the claims are gone: it is the durable mark of a committed blob.
 		pubDigest := multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa1})
-		if err := r.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: pubDigest, Size: 1, State: registry.IntentAccepted, Bucket: "b"}); err != nil {
-			t.Fatalf("PutIntent: %v", err)
-		}
-		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: pubDigest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
-			t.Fatalf("PutLocation: %v", err)
-		}
+		require.NoError(t, r.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: pubDigest, Size: 1, State: registry.IntentAccepted, Bucket: "b"}), "PutIntent")
+		require.NoError(t, r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: pubDigest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}), "PutLocation")
 		mustClaim(t, r, registry.BlobClaim{Digest: pubDigest, Bucket: "b", ObjectKey: "kp", VersionID: registry.NullVersionID, Space: space})
-		if in, err := r.GetIntent(ctx, space, pubDigest); err != nil || in.State != registry.IntentPublished {
-			t.Fatalf("intent after claim = %+v, err %v (want published)", in, err)
-		}
+		in, err := r.GetIntent(ctx, space, pubDigest)
+		require.NoError(t, err, "intent after claim")
+		require.Equal(t, registry.IntentPublished, in.State, "intent after claim")
 		drop(t, r, registry.ClaimDrop{Digest: pubDigest, Bucket: "b", ObjectKey: "kp", VersionID: registry.NullVersionID, Space: space})
-		if in, err := r.GetIntent(ctx, space, pubDigest); err != nil || in.State != registry.IntentPublished {
-			t.Fatalf("intent after the claim dropped = %+v, err %v (want still published)", in, err)
-		}
+		in, err = r.GetIntent(ctx, space, pubDigest)
+		require.NoError(t, err, "intent after the claim dropped")
+		require.Equal(t, registry.IntentPublished, in.State, "intent after the claim dropped")
 		// A claim on a digest with no intent row (a shipped segment) is fine.
-		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
-			t.Fatalf("PutLocation: %v", err)
-		}
+		require.NoError(t, r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Provider: "did:key:p", URL: "http://p/blob", Size: 1}), "PutLocation")
 		mustClaim(t, r, registry.BlobClaim{Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Bucket: "b", ObjectKey: "kn", VersionID: registry.NullVersionID, Space: space})
 	})
 
@@ -168,61 +136,46 @@ func TestPostgresStores(t *testing.T) {
 			t.Helper()
 			add, expire := uuid.New(), uuid.New()
 			st := registry.PendingRef(add, expire, space, d, time.Now().Add(time.Hour))
-			if _, err := pool.Exec(ctx, st.SQL, st.Args...); err != nil {
-				t.Fatalf("pending ref: %v", err)
-			}
+			_, err := pool.Exec(ctx, st.SQL, st.Args...)
+			require.NoError(t, err, "pending ref")
 			return add
 		}
 		count := func(t *testing.T, except uuid.UUID) int {
 			t.Helper()
 			n, err := r.CountReferences(ctx, space, d, except)
-			if err != nil {
-				t.Fatalf("CountReferences: %v", err)
-			}
+			require.NoError(t, err, "CountReferences")
 			return n
 		}
 		first, second := ref(t), ref(t)
-		if got := [2]int{count(t, uuid.Nil), count(t, first)}; got != [2]int{2, 1} {
-			t.Fatalf("[references, references but the first] = %v, want [2 1]", got)
-		}
+		require.Equal(t, [2]int{2, 1}, [2]int{count(t, uuid.Nil), count(t, first)}, "[references, references but the first]")
 		// The claim takes the first reference over: still two references.
 		mustClaim(t, r, registry.BlobClaim{Digest: d, Bucket: "pb", ObjectKey: "k", VersionID: "null#1", Space: space, Ref: first})
-		if n := count(t, uuid.Nil); n != 2 {
-			t.Fatalf("references after the claim = %d, want 2 (the claim and the second reference)", n)
-		}
+		n := count(t, uuid.Nil)
+		require.Equal(t, 2, n, "references after the claim, want the claim and the second reference")
 		// A reference already taken over, or dropped, refuses the commit,
 		// and the root stays where it was.
 		before, _ := r.Get(ctx, "pb")
 		err := claim(t, r, registry.BlobClaim{Digest: d, Bucket: "pb", ObjectKey: "k2", VersionID: "null#2", Space: space, Ref: first})
-		if !errors.Is(err, registry.ErrReferenceExpired) {
-			t.Fatalf("claim of a reference taken over: err=%v, want ErrReferenceExpired", err)
-		}
-		if after, _ := r.Get(ctx, "pb"); before != nil && !after.Root.Equals(before.Root) {
-			t.Fatalf("a refused claim advanced the root: %v -> %v", before.Root, after.Root)
+		require.ErrorIs(t, err, registry.ErrReferenceExpired, "claim of a reference taken over")
+		after, _ := r.Get(ctx, "pb")
+		if before != nil {
+			require.True(t, after.Root.Equals(before.Root), "a refused claim advanced the root: %v -> %v", before.Root, after.Root)
 		}
 		// A part takes the second reference over in its own write.
 		seedBucket(t, "pp")
-		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: "refs-up", Bucket: "pp", ObjectKey: "o", Space: space}); err != nil {
-			t.Fatalf("CreateSession: %v", err)
-		}
+		require.NoError(t, r.CreateSession(ctx, registry.MultipartSession{UploadID: "refs-up", Bucket: "pp", ObjectKey: "o", Space: space}), "CreateSession")
 		t.Cleanup(func() { _ = r.DeleteSession(context.Background(), "refs-up") })
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "refs-up", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, Refs: []uuid.UUID{second}}, nil); err != nil {
-			t.Fatalf("PutPart: %v", err)
-		}
-		if n := count(t, uuid.Nil); n != 2 {
-			t.Fatalf("references after the part = %d, want 2 (the claim and the part)", n)
-		}
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "refs-up", PartNumber: 2, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, Refs: []uuid.UUID{second}}, nil); !errors.Is(err, registry.ErrReferenceExpired) {
-			t.Fatalf("part with a reference taken over: err=%v, want ErrReferenceExpired", err)
-		}
+		_, err = r.PutPart(ctx, registry.MultipartPart{UploadID: "refs-up", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, Refs: []uuid.UUID{second}}, nil)
+		require.NoError(t, err, "PutPart")
+		require.Equal(t, 2, count(t, uuid.Nil), "references after the part, want the claim and the part")
+		_, err = r.PutPart(ctx, registry.MultipartPart{UploadID: "refs-up", PartNumber: 2, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, Refs: []uuid.UUID{second}}, nil)
+		require.ErrorIs(t, err, registry.ErrReferenceExpired, "part with a reference taken over")
 	})
 
 	t.Run("drop claim enqueues release atomically", func(t *testing.T) {
 		space := testutil.RandomDID(t)
 		add := func(key string) {
-			if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
-				t.Fatalf("PutLocation: %v", err)
-			}
+			require.NoError(t, r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}), "PutLocation")
 			mustClaim(t, r, registry.BlobClaim{Digest: digest, Bucket: "rb", ObjectKey: key, VersionID: "null#1", Space: space})
 		}
 		add("k1")
@@ -230,13 +183,9 @@ func TestPostgresStores(t *testing.T) {
 
 		// A zero grace (the commit helper's) makes the record due at once.
 		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "rb", ObjectKey: "k1", VersionID: "null#1", Space: space})
-		if releaseRecorded(t, pool, space, digest) {
-			t.Fatalf("first drop recorded a release while a claim remains")
-		}
+		require.False(t, releaseRecorded(t, pool, space, digest), "first drop recorded a release while a claim remains")
 		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "rb", ObjectKey: "k2", VersionID: "null#1", Space: space})
-		if !releaseRecorded(t, pool, space, digest) {
-			t.Fatalf("last drop recorded no release")
-		}
+		require.True(t, releaseRecorded(t, pool, space, digest), "last drop recorded no release")
 
 		// A later queueing of the same release keeps the later time, and a
 		// batch of digests queues each once.
@@ -245,74 +194,53 @@ func TestPostgresStores(t *testing.T) {
 			specs := make([]taskrunner.Spec, len(digests))
 			for i, d := range digests {
 				var err error
-				if specs[i], err = (spaceshardqueue.ReleaseTask{}).Spec(space, d, at); err != nil {
-					t.Fatal(err)
-				}
+				specs[i], err = (spaceshardqueue.ReleaseTask{}).Spec(space, d, at)
+				require.NoError(t, err)
 			}
-			if _, err := tasks.SubmitAll(ctx, specs); err != nil {
-				t.Fatalf("queue releases: %v", err)
-			}
+			_, err := tasks.SubmitAll(ctx, specs)
+			require.NoError(t, err, "queue releases")
 		}
 		later := time.Now().Add(time.Hour).Truncate(time.Millisecond)
 		queue(later, digest)
 		d2 := multihash.Multihash([]byte{0xbb, 0x02})
 		queue(registry.DueNow(), digest, d2, d2)
 		queued := mustListReleases(t, pool, space)
-		if len(queued) != 2 {
-			t.Fatalf("queued releases = %v, want two", queued)
-		}
+		require.Len(t, queued, 2, "queued releases")
 		for _, q := range queued {
-			if string(q.Digest) == string(digest) && !q.NotBefore.Equal(later) {
-				t.Fatalf("release of %x due %v, want the later time %v", digest, q.NotBefore, later)
+			if string(q.Digest) == string(digest) {
+				require.True(t, q.NotBefore.Equal(later), "release of %x due %v, want the later time %v", digest, q.NotBefore, later)
 			}
 		}
 	})
 
 	t.Run("intent lifecycle", func(t *testing.T) {
 		space := testutil.RandomDID(t)
-		if err := r.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: digest, Size: 9, State: registry.IntentUploading, Bucket: "b"}); err != nil {
-			t.Fatalf("PutIntent: %v", err)
-		}
-		if err := r.SetIntentState(ctx, space, digest, registry.IntentUploading); err != nil {
-			t.Fatalf("SetIntentState (uploading, the constraint admits it): %v", err)
-		}
-		if err := r.SetIntentState(ctx, space, digest, registry.IntentParked); err != nil {
-			t.Fatalf("SetIntentState: %v", err)
-		}
+		require.NoError(t, r.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: digest, Size: 9, State: registry.IntentUploading, Bucket: "b"}), "PutIntent")
+		require.NoError(t, r.SetIntentState(ctx, space, digest, registry.IntentUploading), "SetIntentState (uploading, the constraint admits it)")
+		require.NoError(t, r.SetIntentState(ctx, space, digest, registry.IntentParked), "SetIntentState")
 		got, err := r.GetIntent(ctx, space, digest)
-		if err != nil || got.State != registry.IntentParked || got.Bucket != "b" {
-			t.Fatalf("GetIntent = %+v, err %v", got, err)
-		}
+		require.NoError(t, err, "GetIntent")
+		require.Equal(t, registry.IntentParked, got.State, "GetIntent = %+v", got)
+		require.Equal(t, "b", got.Bucket, "GetIntent = %+v", got)
 		parked, _ := r.ListIntentsByState(ctx, registry.IntentParked)
-		if len(parked) != 1 {
-			t.Fatalf("parked = %d, want 1", len(parked))
-		}
-		if err := r.SetIntentState(ctx, space, []byte("missing"), registry.IntentParked); err != registry.ErrNotFound {
-			t.Fatalf("SetIntentState missing = %v, want ErrNotFound", err)
-		}
-		if err := r.DeleteIntent(ctx, space, digest); err != nil {
-			t.Fatalf("DeleteIntent: %v", err)
-		}
-		if _, err := r.GetIntent(ctx, space, digest); err != registry.ErrNotFound {
-			t.Fatalf("GetIntent after delete = %v, want ErrNotFound", err)
-		}
+		require.Len(t, parked, 1, "parked")
+		err = r.SetIntentState(ctx, space, []byte("missing"), registry.IntentParked)
+		require.ErrorIs(t, err, registry.ErrNotFound, "SetIntentState missing")
+		require.NoError(t, r.DeleteIntent(ctx, space, digest), "DeleteIntent")
+		_, err = r.GetIntent(ctx, space, digest)
+		require.ErrorIs(t, err, registry.ErrNotFound, "GetIntent after delete")
 	})
 
 	t.Run("location round trip", func(t *testing.T) {
 		space := testutil.RandomDID(t)
-		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:piri", URL: "http://piri/b", Size: 100}); err != nil {
-			t.Fatalf("PutLocation: %v", err)
-		}
+		require.NoError(t, r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:piri", URL: "http://piri/b", Size: 100}), "PutLocation")
 		loc, err := r.GetLocation(ctx, space, digest)
-		if err != nil || loc.URL != "http://piri/b" || loc.Size != 100 {
-			t.Fatalf("GetLocation = %+v, err %v", loc, err)
-		}
-		if err := r.DeleteLocation(ctx, space, digest); err != nil {
-			t.Fatalf("DeleteLocation: %v", err)
-		}
-		if _, err := r.GetLocation(ctx, space, digest); err != registry.ErrNotFound {
-			t.Fatalf("GetLocation after delete = %v, want ErrNotFound", err)
-		}
+		require.NoError(t, err, "GetLocation")
+		require.Equal(t, "http://piri/b", loc.URL, "GetLocation = %+v", loc)
+		require.Equal(t, int64(100), loc.Size, "GetLocation = %+v", loc)
+		require.NoError(t, r.DeleteLocation(ctx, space, digest), "DeleteLocation")
+		_, err = r.GetLocation(ctx, space, digest)
+		require.ErrorIs(t, err, registry.ErrNotFound, "GetLocation after delete")
 	})
 
 	t.Run("locations batch", func(t *testing.T) {
@@ -325,29 +253,23 @@ func TestPostgresStores(t *testing.T) {
 			{Space: space, Digest: b, Provider: "did:piri", URL: "http://piri/b", Size: 20},
 			{Space: other, Digest: missing, Provider: "did:piri", URL: "http://piri/c", Size: 30},
 		} {
-			if err := r.PutLocation(ctx, loc); err != nil {
-				t.Fatalf("PutLocation: %v", err)
-			}
+			require.NoError(t, r.PutLocation(ctx, loc), "PutLocation")
 		}
 		got, err := r.GetLocations(ctx, space, []multihash.Multihash{a, b, missing})
-		if err != nil {
-			t.Fatalf("GetLocations: %v", err)
-		}
-		if len(got) != 2 || got[string(a)].URL != "http://piri/a" || got[string(b)].Size != 20 ||
-			!bytes.Equal(got[string(b)].Digest, b) || got[string(a)].Space != space {
-			t.Fatalf("GetLocations = %+v", got)
-		}
-		if empty, err := r.GetLocations(ctx, space, nil); err != nil || len(empty) != 0 {
-			t.Fatalf("GetLocations(nil) = %+v, %v", empty, err)
-		}
+		require.NoError(t, err, "GetLocations")
+		require.Len(t, got, 2, "GetLocations = %+v", got)
+		require.Equal(t, "http://piri/a", got[string(a)].URL, "GetLocations = %+v", got)
+		require.Equal(t, int64(20), got[string(b)].Size, "GetLocations = %+v", got)
+		require.Equal(t, b, got[string(b)].Digest, "GetLocations = %+v", got)
+		require.Equal(t, space, got[string(a)].Space, "GetLocations = %+v", got)
+		empty, err := r.GetLocations(ctx, space, nil)
+		require.NoError(t, err, "GetLocations(nil)")
+		require.Empty(t, empty, "GetLocations(nil)")
 		// A stored digest that is not a multihash fails the read.
 		bad := []byte{0x0c}
-		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: bad, Provider: "did:piri", URL: "http://piri/x", Size: 1}); err != nil {
-			t.Fatalf("PutLocation: %v", err)
-		}
-		if _, err := r.GetLocations(ctx, space, []multihash.Multihash{a, bad}); err == nil {
-			t.Fatal("GetLocations over a non-multihash digest: want an error")
-		}
+		require.NoError(t, r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: bad, Provider: "did:piri", URL: "http://piri/x", Size: 1}), "PutLocation")
+		_, err = r.GetLocations(ctx, space, []multihash.Multihash{a, bad})
+		require.Error(t, err, "GetLocations over a non-multihash digest")
 	})
 
 	// liveFEEParams is a complete parameter set whose bytea values carry
@@ -367,16 +289,10 @@ func TestPostgresStores(t *testing.T) {
 		space := testutil.RandomDID(t)
 		encDigest := []byte{0x00, 0x01, 0x02, 0xff}
 		want := liveFEEParams(space, encDigest)
-		if err := r.PutEncryptionParams(ctx, want); err != nil {
-			t.Fatalf("PutEncryptionParams: %v", err)
-		}
+		require.NoError(t, r.PutEncryptionParams(ctx, want), "PutEncryptionParams")
 		got, err := r.GetEncryptionParams(ctx, space, encDigest)
-		if err != nil {
-			t.Fatalf("GetEncryptionParams: %v", err)
-		}
-		if !reflect.DeepEqual(*got, want) {
-			t.Fatalf("GetEncryptionParams = %+v, want %+v", *got, want)
-		}
+		require.NoError(t, err, "GetEncryptionParams")
+		require.Equal(t, want, *got, "GetEncryptionParams")
 	})
 
 	t.Run("encryption params batch", func(t *testing.T) {
@@ -385,47 +301,31 @@ func TestPostgresStores(t *testing.T) {
 		for _, p := range []registry.BlobEncryptionParams{
 			liveFEEParams(space, a), liveFEEParams(space, b), liveFEEParams(other, missing),
 		} {
-			if err := r.PutEncryptionParams(ctx, p); err != nil {
-				t.Fatalf("PutEncryptionParams: %v", err)
-			}
+			require.NoError(t, r.PutEncryptionParams(ctx, p), "PutEncryptionParams")
 		}
 		got, err := r.GetEncryptionParamsBatch(ctx, space, []multihash.Multihash{a, b, missing})
-		if err != nil {
-			t.Fatalf("GetEncryptionParamsBatch: %v", err)
-		}
-		if len(got) != 2 {
-			t.Fatalf("GetEncryptionParamsBatch returned %d rows, want 2", len(got))
-		}
+		require.NoError(t, err, "GetEncryptionParamsBatch")
+		require.Len(t, got, 2, "GetEncryptionParamsBatch rows")
 		for _, d := range []multihash.Multihash{a, b} {
-			if want := liveFEEParams(space, d); !reflect.DeepEqual(got[string(d)], want) {
-				t.Fatalf("row %x = %+v, want %+v", d, got[string(d)], want)
-			}
+			require.Equal(t, liveFEEParams(space, d), got[string(d)], "row %x", d)
 		}
-		if empty, err := r.GetEncryptionParamsBatch(ctx, space, nil); err != nil || len(empty) != 0 {
-			t.Fatalf("GetEncryptionParamsBatch(nil) = %+v, %v", empty, err)
-		}
+		empty, err := r.GetEncryptionParamsBatch(ctx, space, nil)
+		require.NoError(t, err, "GetEncryptionParamsBatch(nil)")
+		require.Empty(t, empty, "GetEncryptionParamsBatch(nil)")
 		// A stored digest that is not a multihash fails the read.
 		bad := []byte{0x1c}
-		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, bad)); err != nil {
-			t.Fatalf("PutEncryptionParams: %v", err)
-		}
-		if _, err := r.GetEncryptionParamsBatch(ctx, space, []multihash.Multihash{a, bad}); err == nil {
-			t.Fatal("GetEncryptionParamsBatch over a non-multihash digest: want an error")
-		}
+		require.NoError(t, r.PutEncryptionParams(ctx, liveFEEParams(space, bad)), "PutEncryptionParams")
+		_, err = r.GetEncryptionParamsBatch(ctx, space, []multihash.Multihash{a, bad})
+		require.Error(t, err, "GetEncryptionParamsBatch over a non-multihash digest")
 	})
 
 	t.Run("encryption params delete removes the row", func(t *testing.T) {
 		space := testutil.RandomDID(t)
 		encDigest := []byte{0x05, 0x06}
-		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)); err != nil {
-			t.Fatalf("PutEncryptionParams: %v", err)
-		}
-		if err := r.DeleteEncryptionParams(ctx, space, encDigest); err != nil {
-			t.Fatalf("DeleteEncryptionParams: %v", err)
-		}
-		if _, err := r.GetEncryptionParams(ctx, space, encDigest); !errors.Is(err, registry.ErrNotFound) {
-			t.Fatalf("GetEncryptionParams after delete = %v, want ErrNotFound", err)
-		}
+		require.NoError(t, r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)), "PutEncryptionParams")
+		require.NoError(t, r.DeleteEncryptionParams(ctx, space, encDigest), "DeleteEncryptionParams")
+		_, err := r.GetEncryptionParams(ctx, space, encDigest)
+		require.ErrorIs(t, err, registry.ErrNotFound, "GetEncryptionParams after delete")
 	})
 
 	t.Run("encryption params rewrap in place", func(t *testing.T) {
@@ -433,30 +333,20 @@ func TestPostgresStores(t *testing.T) {
 		// parameters describing the unchanged ciphertext must survive.
 		space := testutil.RandomDID(t)
 		encDigest := []byte{0x0a, 0x0b}
-		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)); err != nil {
-			t.Fatalf("PutEncryptionParams: %v", err)
-		}
-		if err := r.RewrapEncryptionParams(ctx, space, encDigest, []byte{0xca, 0xfe, 0x00, 0x01}, "region-kek-v2"); err != nil {
-			t.Fatalf("RewrapEncryptionParams: %v", err)
-		}
+		require.NoError(t, r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)), "PutEncryptionParams")
+		require.NoError(t, r.RewrapEncryptionParams(ctx, space, encDigest, []byte{0xca, 0xfe, 0x00, 0x01}, "region-kek-v2"), "RewrapEncryptionParams")
 		got, err := r.GetEncryptionParams(ctx, space, encDigest)
-		if err != nil {
-			t.Fatalf("GetEncryptionParams: %v", err)
-		}
+		require.NoError(t, err, "GetEncryptionParams")
 		want := liveFEEParams(space, encDigest)
 		want.RegionWrappedCEK = []byte{0xca, 0xfe, 0x00, 0x01}
 		want.RegionKeyVersion = "region-kek-v2"
-		if !reflect.DeepEqual(*got, want) {
-			t.Fatalf("after rewrap = %+v, want %+v", *got, want)
-		}
+		require.Equal(t, want, *got, "after rewrap")
 	})
 
 	t.Run("encryption params rewrap of a missing row is ErrNotFound", func(t *testing.T) {
 		space := testutil.RandomDID(t)
 		err := r.RewrapEncryptionParams(ctx, space, []byte{0x0c}, []byte{0x01}, "region-kek-v2")
-		if !errors.Is(err, registry.ErrNotFound) {
-			t.Fatalf("RewrapEncryptionParams(absent) = %v, want ErrNotFound", err)
-		}
+		require.ErrorIs(t, err, registry.ErrNotFound, "RewrapEncryptionParams(absent)")
 	})
 
 	t.Run("incomplete encryption params rejected", func(t *testing.T) {
@@ -471,24 +361,15 @@ func TestPostgresStores(t *testing.T) {
 		} {
 			partial := liveFEEParams(space, d)
 			mutate(&partial)
-			if err := r.PutEncryptionParams(ctx, partial); err == nil {
-				t.Fatalf("PutEncryptionParams(%s) = nil, want a constraint error", name)
-			}
-			if _, err := r.GetEncryptionParams(ctx, space, d); !errors.Is(err, registry.ErrNotFound) {
-				t.Fatalf("incomplete params (%s) leaked a row: %v", name, err)
-			}
+			require.Error(t, r.PutEncryptionParams(ctx, partial), "PutEncryptionParams(%s) = nil, want a constraint error", name)
+			_, err := r.GetEncryptionParams(ctx, space, d)
+			require.ErrorIs(t, err, registry.ErrNotFound, "incomplete params (%s) leaked a row", name)
 		}
 		// A rewrap cannot blank out the key material either.
 		encDigest := []byte{0x78}
-		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)); err != nil {
-			t.Fatalf("PutEncryptionParams: %v", err)
-		}
-		if err := r.RewrapEncryptionParams(ctx, space, encDigest, nil, "region-kek-v2"); err == nil {
-			t.Fatal("RewrapEncryptionParams(nil CEK) = nil, want a constraint error")
-		}
-		if err := r.RewrapEncryptionParams(ctx, space, encDigest, []byte{0x01}, ""); err == nil {
-			t.Fatal("RewrapEncryptionParams(empty version) = nil, want a constraint error")
-		}
+		require.NoError(t, r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)), "PutEncryptionParams")
+		require.Error(t, r.RewrapEncryptionParams(ctx, space, encDigest, nil, "region-kek-v2"), "RewrapEncryptionParams(nil CEK) = nil, want a constraint error")
+		require.Error(t, r.RewrapEncryptionParams(ctx, space, encDigest, []byte{0x01}, ""), "RewrapEncryptionParams(empty version) = nil, want a constraint error")
 	})
 
 	t.Run("encryption params independent of location", func(t *testing.T) {
@@ -496,18 +377,11 @@ func TestPostgresStores(t *testing.T) {
 		// so a caller removing a blob must delete from both tables.
 		space := testutil.RandomDID(t)
 		encDigest := []byte{0x08, 0x09}
-		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)); err != nil {
-			t.Fatalf("PutEncryptionParams: %v", err)
-		}
-		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: encDigest, Provider: "did:piri", URL: "http://piri/enc", Size: 4096}); err != nil {
-			t.Fatalf("PutLocation: %v", err)
-		}
-		if err := r.DeleteLocation(ctx, space, encDigest); err != nil {
-			t.Fatalf("DeleteLocation: %v", err)
-		}
-		if _, err := r.GetEncryptionParams(ctx, space, encDigest); err != nil {
-			t.Fatalf("DeleteLocation shredded the encryption params: %v", err)
-		}
+		require.NoError(t, r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)), "PutEncryptionParams")
+		require.NoError(t, r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: encDigest, Provider: "did:piri", URL: "http://piri/enc", Size: 4096}), "PutLocation")
+		require.NoError(t, r.DeleteLocation(ctx, space, encDigest), "DeleteLocation")
+		_, err := r.GetEncryptionParams(ctx, space, encDigest)
+		require.NoError(t, err, "DeleteLocation shredded the encryption params")
 	})
 
 	t.Run("park round trip", func(t *testing.T) {
@@ -520,144 +394,125 @@ func TestPostgresStores(t *testing.T) {
 			PutInvocation: []byte("sealed-inv"),
 			Size:          42,
 		}
-		if recorded, err := r.PutPark(ctx, park); err != nil || !recorded {
-			t.Fatalf("PutPark = %v, %v; want recorded", recorded, err)
-		}
+		recorded, err := r.PutPark(ctx, park)
+		require.NoError(t, err, "PutPark")
+		require.True(t, recorded, "PutPark: want recorded")
 		got, err := r.GetPark(ctx, space, digest)
-		if err != nil || string(got.PutInvocation) != "sealed-inv" || got.Size != 42 {
-			t.Fatalf("GetPark = %+v, err %v", got, err)
-		}
+		require.NoError(t, err, "GetPark")
+		require.Equal(t, "sealed-inv", string(got.PutInvocation), "GetPark = %+v", got)
+		require.Equal(t, int64(42), got.Size, "GetPark = %+v", got)
 		// A second park for the key is refused and the first stands.
 		park.Size = 43
-		if recorded, err := r.PutPark(ctx, park); err != nil || recorded {
-			t.Fatalf("PutPark (duplicate) = %v, %v; want refused", recorded, err)
-		}
-		if got, err := r.GetPark(ctx, space, digest); err != nil || got.Size != 42 {
-			t.Fatalf("GetPark after the refused put = %+v, err %v; want the first park", got, err)
-		}
-		if err := r.DeletePark(ctx, space, digest); err != nil {
-			t.Fatalf("DeletePark: %v", err)
-		}
-		if _, err := r.GetPark(ctx, space, digest); err != registry.ErrNotFound {
-			t.Fatalf("GetPark after delete = %v, want ErrNotFound", err)
-		}
+		recorded, err = r.PutPark(ctx, park)
+		require.NoError(t, err, "PutPark (duplicate)")
+		require.False(t, recorded, "PutPark (duplicate): want refused")
+		got, err = r.GetPark(ctx, space, digest)
+		require.NoError(t, err, "GetPark after the refused put")
+		require.Equal(t, int64(42), got.Size, "GetPark after the refused put")
+		require.NoError(t, r.DeletePark(ctx, space, digest), "DeletePark")
+		_, err = r.GetPark(ctx, space, digest)
+		require.ErrorIs(t, err, registry.ErrNotFound, "GetPark after delete")
 	})
 
 	t.Run("multipart session parts latch metadata", func(t *testing.T) {
 		const id = "upl-1"
 		meta := map[string]string{"x-amz-meta-foo": "bar"}
 		bSpace := testutil.RandomDID(t)
-		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k", Space: bSpace, ContentType: "text/plain", Metadata: meta}); err != nil {
-			t.Fatalf("CreateSession: %v", err)
-		}
-		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k", Space: bSpace}); err != registry.ErrExists {
-			t.Fatalf("duplicate CreateSession = %v, want ErrExists", err)
-		}
+		require.NoError(t, r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k", Space: bSpace, ContentType: "text/plain", Metadata: meta}), "CreateSession")
+		err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k", Space: bSpace})
+		require.ErrorIs(t, err, registry.ErrExists, "duplicate CreateSession")
 		s, err := r.GetSession(ctx, id)
-		if err != nil || s.ContentType != "text/plain" || s.Metadata["x-amz-meta-foo"] != "bar" || s.Space != bSpace {
-			t.Fatalf("GetSession = %+v, err %v (metadata jsonb round-trip, space)", s, err)
-		}
+		require.NoError(t, err, "GetSession")
+		// The metadata jsonb and the space round-trip.
+		require.Equal(t, "text/plain", s.ContentType, "GetSession = %+v", s)
+		require.Equal(t, "bar", s.Metadata["x-amz-meta-foo"], "GetSession = %+v", s)
+		require.Equal(t, bSpace, s.Space, "GetSession = %+v", s)
 		// The space is required: a session without one is refused.
-		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id + "-nospace", Bucket: "b", ObjectKey: "k"}); err == nil {
-			t.Fatal("CreateSession without a space was accepted")
-		}
+		require.Error(t, r.CreateSession(ctx, registry.MultipartSession{UploadID: id + "-nospace", Bucket: "b", ObjectKey: "k"}), "CreateSession without a space was accepted")
 		// The bucket's space rides on the session, for teardown once the
 		// bucket row is gone.
 		space := testutil.RandomDID(t)
-		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id + "-space", Bucket: "b", ObjectKey: "k", Space: space}); err != nil {
-			t.Fatalf("CreateSession (space): %v", err)
-		}
-		if got, err := r.GetSession(ctx, id+"-space"); err != nil || got.Space != space {
-			t.Fatalf("GetSession space = %v, err %v (want %v)", got.Space, err, space)
-		}
+		require.NoError(t, r.CreateSession(ctx, registry.MultipartSession{UploadID: id + "-space", Bucket: "b", ObjectKey: "k", Space: space}), "CreateSession (space)")
+		got, err := r.GetSession(ctx, id+"-space")
+		require.NoError(t, err, "GetSession (space)")
+		require.Equal(t, space, got.Space, "GetSession space")
 		_ = r.DeleteSession(ctx, id+"-space")
 
 		// bytea[] round trip + ordering.
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}, nil); err != nil {
-			t.Fatalf("PutPart 2: %v", err)
-		}
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1, 0xa}, {0xd1, 0xb}}},
-			&registry.PartTree{Offset: 0, ChunkLog: 4, Nodes: []byte{0x0a}, Blocks: []byte{0x0b, 0x0c}, Head: []byte{0x0d}, Tail: []byte{0x0e}, Root: []byte{0x0f}}); err != nil {
-			t.Fatalf("PutPart 1: %v", err)
-		}
+		_, err = r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}, nil)
+		require.NoError(t, err, "PutPart 2")
+		_, err = r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1, 0xa}, {0xd1, 0xb}}},
+			&registry.PartTree{Offset: 0, ChunkLog: 4, Nodes: []byte{0x0a}, Blocks: []byte{0x0b, 0x0c}, Head: []byte{0x0d}, Tail: []byte{0x0e}, Root: []byte{0x0f}})
+		require.NoError(t, err, "PutPart 1")
 		parts, err := r.ListParts(ctx, id)
-		if err != nil || len(parts) != 2 || parts[0].PartNumber != 1 || len(parts[0].BlobDigests) != 2 {
-			t.Fatalf("ListParts = %+v, err %v", parts, err)
-		}
+		require.NoError(t, err, "ListParts")
+		require.Len(t, parts, 2, "ListParts = %+v", parts)
+		require.Equal(t, 1, parts[0].PartNumber, "ListParts = %+v", parts)
+		require.Len(t, parts[0].BlobDigests, 2, "ListParts = %+v", parts)
 		// The tree listing round-trips the tree rows by part number, absent
 		// where none was recorded.
 		trees, err := r.ListPartTrees(ctx, id)
-		if err != nil || len(trees) != 1 || trees[1] == nil {
-			t.Fatalf("ListPartTrees = %+v, err %v; want part 1's tree only", trees, err)
-		}
-		if tr := trees[1]; tr.ChunkLog != 4 || !bytes.Equal(tr.Blocks, []byte{0x0b, 0x0c}) || !bytes.Equal(tr.Head, []byte{0x0d}) || !bytes.Equal(tr.Tail, []byte{0x0e}) || !bytes.Equal(tr.Root, []byte{0x0f}) {
-			t.Fatalf("part 1 tree = %+v", tr)
-		}
+		require.NoError(t, err, "ListPartTrees")
+		require.Len(t, trees, 1, "ListPartTrees: want part 1's tree only")
+		require.NotNil(t, trees[1], "ListPartTrees = %+v; want part 1's tree only", trees)
+		tr := trees[1]
+		require.Equal(t, uint8(4), tr.ChunkLog, "part 1 tree = %+v", tr)
+		require.Equal(t, []byte{0x0b, 0x0c}, tr.Blocks, "part 1 tree = %+v", tr)
+		require.Equal(t, []byte{0x0d}, tr.Head, "part 1 tree = %+v", tr)
+		require.Equal(t, []byte{0x0e}, tr.Tail, "part 1 tree = %+v", tr)
+		require.Equal(t, []byte{0x0f}, tr.Root, "part 1 tree = %+v", tr)
 		// A superseding part without a tree drops its predecessor's row; one
 		// with a tree replaces it.
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil); err != nil {
-			t.Fatalf("PutPart 1 again: %v", err)
-		}
-		if again, _ := r.ListPartTrees(ctx, id); again[1] != nil {
-			t.Fatalf("superseded part kept its tree: %+v", again[1])
-		}
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}},
-			&registry.PartTree{Offset: 1, ChunkLog: 5, Nodes: []byte{0x1a}, Blocks: []byte{0x1b}}); err != nil {
-			t.Fatalf("PutPart 2 with tree: %v", err)
-		}
-		if again, _ := r.ListPartTrees(ctx, id); again[2] == nil || again[2].Offset != 1 || again[2].ChunkLog != 5 || again[2].Head != nil {
-			t.Fatalf("part 2 tree = %+v", again[2])
-		}
+		_, err = r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil)
+		require.NoError(t, err, "PutPart 1 again")
+		again, _ := r.ListPartTrees(ctx, id)
+		require.Nil(t, again[1], "superseded part kept its tree")
+		_, err = r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}},
+			&registry.PartTree{Offset: 1, ChunkLog: 5, Nodes: []byte{0x1a}, Blocks: []byte{0x1b}})
+		require.NoError(t, err, "PutPart 2 with tree")
+		again, _ = r.ListPartTrees(ctx, id)
+		require.NotNil(t, again[2], "part 2 tree")
+		require.Equal(t, int64(1), again[2].Offset, "part 2 tree = %+v", again[2])
+		require.Equal(t, uint8(5), again[2].ChunkLog, "part 2 tree = %+v", again[2])
+		require.Nil(t, again[2].Head, "part 2 tree = %+v", again[2])
 		// Deleting the trees keeps the part records.
-		if err := r.DeletePartTrees(ctx, id); err != nil {
-			t.Fatalf("DeletePartTrees: %v", err)
-		}
-		if after, _ := r.ListPartTrees(ctx, id); len(after) != 0 {
-			t.Fatalf("after DeletePartTrees = %+v, want no trees", after)
-		}
-		if after, _ := r.ListParts(ctx, id); len(after) != 2 {
-			t.Fatalf("after DeletePartTrees = %+v, want two part records", after)
-		}
+		require.NoError(t, r.DeletePartTrees(ctx, id), "DeletePartTrees")
+		after, _ := r.ListPartTrees(ctx, id)
+		require.Empty(t, after, "after DeletePartTrees")
+		parts, _ = r.ListParts(ctx, id)
+		require.Len(t, parts, 2, "after DeletePartTrees")
 
 		// A Complete records the session completed, once.
 		completed := registry.CompletedSession(id, "etag", "v1")
-		if tag, err := pool.Exec(ctx, completed.SQL, completed.Args...); err != nil || tag.RowsAffected() != 1 {
-			t.Fatalf("complete the session: %v rows, err %v", tag.RowsAffected(), err)
-		}
+		tag, err := pool.Exec(ctx, completed.SQL, completed.Args...)
+		require.NoError(t, err, "complete the session")
+		require.Equal(t, int64(1), tag.RowsAffected(), "complete the session")
 		// A part cannot land once the session has left 'open', nor on a
 		// session that does not exist.
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagMD5: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}, nil); !errors.Is(err, registry.ErrNotFound) {
-			t.Fatalf("PutPart on a completed session = %v, want ErrNotFound", err)
-		}
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil); !errors.Is(err, registry.ErrNotFound) {
-			t.Fatalf("PutPart on a missing session = %v, want ErrNotFound", err)
-		}
-		if parts, _ := r.ListParts(ctx, id); len(parts) != 2 {
-			t.Fatalf("parts after the refused writes = %d, want 2", len(parts))
-		}
-		if tag, err := pool.Exec(ctx, completed.SQL, completed.Args...); err != nil || tag.RowsAffected() != 0 {
-			t.Fatalf("complete the completed session again: %v rows, err %v; want none", tag.RowsAffected(), err)
-		}
+		_, err = r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagMD5: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}, nil)
+		require.ErrorIs(t, err, registry.ErrNotFound, "PutPart on a completed session")
+		_, err = r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil)
+		require.ErrorIs(t, err, registry.ErrNotFound, "PutPart on a missing session")
+		parts, _ = r.ListParts(ctx, id)
+		require.Len(t, parts, 2, "parts after the refused writes")
+		tag, err = pool.Exec(ctx, completed.SQL, completed.Args...)
+		require.NoError(t, err, "complete the completed session again")
+		require.Zero(t, tag.RowsAffected(), "complete the completed session again")
 
 		// delete cascades parts
-		if err := r.DeleteSession(ctx, id); err != nil {
-			t.Fatalf("DeleteSession: %v", err)
-		}
-		if after, _ := r.ListParts(ctx, id); len(after) != 0 {
-			t.Fatalf("parts after session delete = %d, want 0 (cascade)", len(after))
-		}
+		require.NoError(t, r.DeleteSession(ctx, id), "DeleteSession")
+		parts, _ = r.ListParts(ctx, id)
+		require.Empty(t, parts, "parts after session delete (cascade)")
 	})
 
 	t.Run("multipart listing and part refs", func(t *testing.T) {
 		lsSpace := testutil.RandomDID(t)
 		mk := func(id, key string) {
 			t.Helper()
-			if err := r.CreateSession(ctx, registry.MultipartSession{
+			require.NoError(t, r.CreateSession(ctx, registry.MultipartSession{
 				UploadID: id, Bucket: "b", ObjectKey: key, Space: lsSpace,
 				ContentEncoding: "testenc", ChecksumAlgorithm: "CRC32", ChecksumType: "FULL_OBJECT",
-			}); err != nil {
-				t.Fatalf("CreateSession %s: %v", id, err)
-			}
+			}), "CreateSession %s", id)
 		}
 		mk("ls-2", "zeta")
 		mk("ls-1", "alpha")
@@ -665,58 +520,55 @@ func TestPostgresStores(t *testing.T) {
 
 		// New session columns round-trip.
 		s, err := r.GetSession(ctx, "ls-1")
-		if err != nil || s.ContentEncoding != "testenc" || s.ChecksumAlgorithm != "CRC32" ||
-			s.ChecksumType != "FULL_OBJECT" || s.CreatedAt.IsZero() {
-			t.Fatalf("GetSession new columns = %+v, err %v", s, err)
-		}
+		require.NoError(t, err, "GetSession new columns")
+		require.Equal(t, "testenc", s.ContentEncoding, "GetSession new columns = %+v", s)
+		require.Equal(t, "CRC32", s.ChecksumAlgorithm, "GetSession new columns = %+v", s)
+		require.Equal(t, "FULL_OBJECT", s.ChecksumType, "GetSession new columns = %+v", s)
+		require.False(t, s.CreatedAt.IsZero(), "GetSession new columns = %+v", s)
 
 		// ListSessions: (object_key, created_at, upload_id) order.
 		sessions, err := r.ListSessions(ctx, "b", lsSpace)
-		if err != nil || len(sessions) != 3 ||
-			sessions[0].UploadID != "ls-1" || sessions[1].UploadID != "ls-3" || sessions[2].UploadID != "ls-2" {
-			ids := make([]string, len(sessions))
-			for i, x := range sessions {
-				ids[i] = x.UploadID
-			}
-			t.Fatalf("ListSessions order = %v, err %v (want [ls-1 ls-3 ls-2])", ids, err)
+		require.NoError(t, err, "ListSessions")
+		ids := make([]string, len(sessions))
+		for i, x := range sessions {
+			ids[i] = x.UploadID
 		}
+		require.Equal(t, []string{"ls-1", "ls-3", "ls-2"}, ids, "ListSessions order")
 		// A bucket of the same name in another space lists none of them.
-		if other, err := r.ListSessions(ctx, "b", testutil.RandomDID(t)); err != nil || len(other) != 0 {
-			t.Fatalf("ListSessions for another space = %v, err %v; want none", other, err)
-		}
+		other, err := r.ListSessions(ctx, "b", testutil.RandomDID(t))
+		require.NoError(t, err, "ListSessions for another space")
+		require.Empty(t, other, "ListSessions for another space")
 
 		// CountPartRefs: bytea[] ANY-match across sessions, excluding one.
 		shared := []byte{0xee, 0x01}
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{shared}}, nil); err != nil {
-			t.Fatalf("PutPart ls-1: %v", err)
-		}
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-2", PartNumber: 1, ETagMD5: []byte{2}, Size: 1, BlobDigests: []multihash.Multihash{shared, {0xee, 0x02}}}, nil); err != nil {
-			t.Fatalf("PutPart ls-2: %v", err)
-		}
-		if n, err := r.CountPartRefs(ctx, shared, "ls-1"); err != nil || n != 1 {
-			t.Fatalf("CountPartRefs(shared, exclude ls-1) = %d, err %v (want 1)", n, err)
-		}
-		if n, err := r.CountPartRefs(ctx, []byte{0xee, 0x02}, "ls-2"); err != nil || n != 0 {
-			t.Fatalf("CountPartRefs(unique, exclude owner) = %d, err %v (want 0)", n, err)
-		}
+		_, err = r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{shared}}, nil)
+		require.NoError(t, err, "PutPart ls-1")
+		_, err = r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-2", PartNumber: 1, ETagMD5: []byte{2}, Size: 1, BlobDigests: []multihash.Multihash{shared, {0xee, 0x02}}}, nil)
+		require.NoError(t, err, "PutPart ls-2")
+		n, err := r.CountPartRefs(ctx, shared, "ls-1")
+		require.NoError(t, err, "CountPartRefs(shared, exclude ls-1)")
+		require.Equal(t, 1, n, "CountPartRefs(shared, exclude ls-1)")
+		n, err = r.CountPartRefs(ctx, []byte{0xee, 0x02}, "ls-2")
+		require.NoError(t, err, "CountPartRefs(unique, exclude owner)")
+		require.Zero(t, n, "CountPartRefs(unique, exclude owner)")
 
 		// CountReferences: parts of open sessions count.
-		if n, err := r.CountReferences(ctx, lsSpace, shared, uuid.Nil); err != nil || n != 2 {
-			t.Fatalf("CountReferences(shared) = %d, err %v (want 2)", n, err)
-		}
+		n, err = r.CountReferences(ctx, lsSpace, shared, uuid.Nil)
+		require.NoError(t, err, "CountReferences(shared)")
+		require.Equal(t, 2, n, "CountReferences(shared)")
 
 		// A completed session's parts are no longer live, and the
 		// completion stamps the state's change.
 		completed := registry.CompletedSession("ls-1", "etag", "")
-		if _, err := pool.Exec(ctx, completed.SQL, completed.Args...); err != nil {
-			t.Fatalf("complete ls-1: %v", err)
-		}
-		if s, err := r.GetSession(ctx, "ls-1"); err != nil || s.StateChangedAt.Before(s.CreatedAt) || s.StateChangedAt.IsZero() {
-			t.Fatalf("StateChangedAt after the completion = %v (created %v), err %v", s.StateChangedAt, s.CreatedAt, err)
-		}
-		if n, err := r.CountReferences(ctx, lsSpace, shared, uuid.Nil); err != nil || n != 1 {
-			t.Fatalf("CountReferences(shared) after ls-1 completed = %d, err %v (want 1)", n, err)
-		}
+		_, err = pool.Exec(ctx, completed.SQL, completed.Args...)
+		require.NoError(t, err, "complete ls-1")
+		s, err = r.GetSession(ctx, "ls-1")
+		require.NoError(t, err, "GetSession after the completion")
+		require.False(t, s.StateChangedAt.Before(s.CreatedAt), "StateChangedAt after the completion = %v (created %v)", s.StateChangedAt, s.CreatedAt)
+		require.False(t, s.StateChangedAt.IsZero(), "StateChangedAt after the completion = %v (created %v)", s.StateChangedAt, s.CreatedAt)
+		n, err = r.CountReferences(ctx, lsSpace, shared, uuid.Nil)
+		require.NoError(t, err, "CountReferences(shared) after ls-1 completed")
+		require.Equal(t, 1, n, "CountReferences(shared) after ls-1 completed")
 
 		for _, id := range []string{"ls-1", "ls-2", "ls-3"} {
 			_ = r.DeleteSession(ctx, id)
@@ -724,121 +576,79 @@ func TestPostgresStores(t *testing.T) {
 	})
 
 	t.Run("revocation cursor upsert round trip", func(t *testing.T) {
-		if _, err := r.GetRevocationCursor(ctx); err != registry.ErrNotFound {
-			t.Fatalf("GetRevocationCursor before put err = %v, want ErrNotFound", err)
-		}
+		_, err := r.GetRevocationCursor(ctx)
+		require.ErrorIs(t, err, registry.ErrNotFound, "GetRevocationCursor before put")
 		first := registry.RevocationCursor{Token: "1733"}
-		if err := r.PutRevocationCursor(ctx, first); err != nil {
-			t.Fatalf("PutRevocationCursor: %v", err)
-		}
+		require.NoError(t, r.PutRevocationCursor(ctx, first), "PutRevocationCursor")
 		got, err := r.GetRevocationCursor(ctx)
-		if err != nil {
-			t.Fatalf("GetRevocationCursor: %v", err)
-		}
-		if *got != first {
-			t.Fatalf("cursor = %+v, want %+v", got, first)
-		}
+		require.NoError(t, err, "GetRevocationCursor")
+		require.Equal(t, first, *got, "cursor")
 		// The row is a single latch: a second put overwrites, never adds.
 		second := registry.RevocationCursor{Token: "1734"}
-		if err := r.PutRevocationCursor(ctx, second); err != nil {
-			t.Fatalf("PutRevocationCursor (upsert): %v", err)
-		}
+		require.NoError(t, r.PutRevocationCursor(ctx, second), "PutRevocationCursor (upsert)")
 		got, err = r.GetRevocationCursor(ctx)
-		if err != nil {
-			t.Fatalf("GetRevocationCursor after upsert: %v", err)
-		}
-		if *got != second {
-			t.Fatalf("cursor after upsert = %+v, want %+v", got, second)
-		}
+		require.NoError(t, err, "GetRevocationCursor after upsert")
+		require.Equal(t, second, *got, "cursor after upsert")
 	})
 
 	t.Run("forge_root advance guarded on root", func(t *testing.T) {
 		committed := liveCid(t, "fg-committed")
 		stale := liveCid(t, "fg-stale")
 		seedBucket(t, "fg")
-		if err := r.CASRoot(ctx, "fg", cid.Undef, committed); err != nil {
-			t.Fatalf("CASRoot: %v", err)
-		}
+		require.NoError(t, r.CASRoot(ctx, "fg", cid.Undef, committed), "CASRoot")
 		seq, err := r.NextSegmentSeq(ctx)
-		if err != nil {
-			t.Fatalf("NextSegmentSeq: %v", err)
-		}
-		if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, "fg"); err != nil {
-			t.Fatalf("InsertSegmentOpen: %v", err)
-		}
+		require.NoError(t, err, "NextSegmentSeq")
+		require.NoError(t, r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, "fg"), "InsertSegmentOpen")
 		// Ship a segment whose op-roots include a stale root the bucket never
 		// adopted; only the committed root may advance forge_root.
-		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), nil, -1,
-			[]blockstore.OpRoot{{Bucket: "fg", Root: stale}, {Bucket: "fg", Root: committed}}); err != nil {
-			t.Fatalf("MarkSegmentShipped: %v", err)
-		}
+		require.NoError(t, r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), nil, -1,
+			[]blockstore.OpRoot{{Bucket: "fg", Root: stale}, {Bucket: "fg", Root: committed}}), "MarkSegmentShipped")
 		st, err := r.Get(ctx, "fg")
-		if err != nil {
-			t.Fatalf("Get: %v", err)
-		}
-		if !st.ForgeRoot.Equals(committed) {
-			t.Fatalf("forge_root = %v, want committed root (stale op-root must be skipped)", st.ForgeRoot)
-		}
+		require.NoError(t, err, "Get")
+		require.True(t, st.ForgeRoot.Equals(committed), "forge_root = %v, want committed root (stale op-root must be skipped)", st.ForgeRoot)
 	})
 
 	t.Run("retired segment keeps its row", func(t *testing.T) {
 		seq, err := r.NextSegmentSeq(ctx)
-		if err != nil {
-			t.Fatalf("NextSegmentSeq: %v", err)
-		}
+		require.NoError(t, err, "NextSegmentSeq")
 		bucket := fmt.Sprintf("rt-%d", seq)
 		sha := make([]byte, 32)
 		sha[0] = 0x5e
 		indexDigest := multihash.Multihash(digest)
 		now := time.Now().Unix()
-		if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, bucket); err != nil {
-			t.Fatalf("InsertSegmentOpen: %v", err)
-		}
-		if err := r.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, seq, now, 10, sha,
-			[]blockstore.OpRoot{{Bucket: bucket, Root: liveCid(t, "rt-root")}}); err != nil {
-			t.Fatalf("MarkSegmentSealed: %v", err)
-		}
-		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, now, indexDigest, 7, nil); err != nil {
-			t.Fatalf("MarkSegmentShipped: %v", err)
-		}
+		require.NoError(t, r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, bucket), "InsertSegmentOpen")
+		require.NoError(t, r.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, seq, now, 10, sha,
+			[]blockstore.OpRoot{{Bucket: bucket, Root: liveCid(t, "rt-root")}}), "MarkSegmentSealed")
+		require.NoError(t, r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, now, indexDigest, 7, nil), "MarkSegmentShipped")
 		for range 2 { // idempotent
-			if err := r.RetireSegment(ctx, blockstore.PlaneCatalog, seq, now); err != nil {
-				t.Fatalf("RetireSegment: %v", err)
-			}
+			require.NoError(t, r.RetireSegment(ctx, blockstore.PlaneCatalog, seq, now), "RetireSegment")
 		}
 
 		live, err := r.ListSegments(ctx, blockstore.PlaneCatalog, bucket)
-		if err != nil || len(live) != 0 {
-			t.Fatalf("ListSegments = %+v (err %v), want none", live, err)
-		}
+		require.NoError(t, err, "ListSegments = %+v (err %v)", live, err)
+		require.Empty(t, live, "ListSegments = %+v (err %v)", live, err)
 		retired, err := r.ListRetiredSegments(ctx, blockstore.PlaneCatalog, bucket)
-		if err != nil || len(retired) != 1 {
-			t.Fatalf("ListRetiredSegments = %+v (err %v), want one row", retired, err)
-		}
+		require.NoError(t, err, "ListRetiredSegments = %+v (err %v)", retired, err)
+		require.Len(t, retired, 1, "ListRetiredSegments = %+v (err %v)", retired, err)
 		got := retired[0]
-		if got.Seq != seq || got.RetiredAt != now || got.ShippedAt != now || got.DeadBytes != 7 ||
-			!bytes.Equal(got.SHA256, sha) || !bytes.Equal(got.IndexDigest, indexDigest) {
-			t.Fatalf("retired row = %+v", got)
-		}
+		require.Equal(t, seq, got.Seq, "retired row = %+v", got)
+		require.Equal(t, now, got.RetiredAt, "retired row = %+v", got)
+		require.Equal(t, now, got.ShippedAt, "retired row = %+v", got)
+		require.Equal(t, int64(7), got.DeadBytes, "retired row = %+v", got)
+		require.Equal(t, sha, got.SHA256, "retired row = %+v", got)
+		require.True(t, bytes.Equal(got.IndexDigest, indexDigest), "retired row = %+v", got)
 		var opRoots int
-		if err := pool.QueryRow(ctx, `SELECT count(*) FROM ingot.segment_op_roots WHERE seq = $1`,
-			int64(seq)).Scan(&opRoots); err != nil || opRoots != 0 {
-			t.Fatalf("op-root rows after retirement = %d (err %v), want 0", opRoots, err)
-		}
+		require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM ingot.segment_op_roots WHERE seq = $1`,
+			int64(seq)).Scan(&opRoots), "count op-root rows")
+		require.Zero(t, opRoots, "op-root rows after retirement")
 		buckets, err := r.ListSegmentBuckets(ctx, blockstore.PlaneCatalog)
-		if err != nil {
-			t.Fatalf("ListSegmentBuckets: %v", err)
-		}
-		if slices.Contains(buckets, bucket) {
-			t.Fatalf("ListSegmentBuckets lists %q, which has only retired segments", bucket)
-		}
+		require.NoError(t, err, "ListSegmentBuckets")
+		require.False(t, slices.Contains(buckets, bucket), "ListSegmentBuckets lists %q, which has only retired segments", bucket)
 
-		if err := r.DeleteSegment(ctx, blockstore.PlaneCatalog, seq); err != nil {
-			t.Fatalf("DeleteSegment: %v", err)
-		}
-		if retired, err := r.ListRetiredSegments(ctx, blockstore.PlaneCatalog, bucket); err != nil || len(retired) != 0 {
-			t.Fatalf("ListRetiredSegments after delete = %+v (err %v)", retired, err)
-		}
+		require.NoError(t, r.DeleteSegment(ctx, blockstore.PlaneCatalog, seq), "DeleteSegment")
+		retired, err = r.ListRetiredSegments(ctx, blockstore.PlaneCatalog, bucket)
+		require.NoError(t, err, "ListRetiredSegments after delete")
+		require.Empty(t, retired, "ListRetiredSegments after delete")
 	})
 
 	t.Run("catalog usage sums shipped segments", func(t *testing.T) {
@@ -849,24 +659,14 @@ func TestPostgresStores(t *testing.T) {
 		segment := func(b string, size int64, dead *int64, indexDigest multihash.Multihash, retire bool) uint64 {
 			t.Helper()
 			seq, err := r.NextSegmentSeq(ctx)
-			if err != nil {
-				t.Fatalf("NextSegmentSeq: %v", err)
-			}
-			if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, b); err != nil {
-				t.Fatalf("InsertSegmentOpen: %v", err)
-			}
-			if err := r.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, seq, 1, size, nil, nil); err != nil {
-				t.Fatalf("MarkSegmentSealed: %v", err)
-			}
+			require.NoError(t, err, "NextSegmentSeq")
+			require.NoError(t, r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, b), "InsertSegmentOpen")
+			require.NoError(t, r.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, seq, 1, size, nil, nil), "MarkSegmentSealed")
 			if dead != nil {
-				if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, 2, indexDigest, *dead, nil); err != nil {
-					t.Fatalf("MarkSegmentShipped: %v", err)
-				}
+				require.NoError(t, r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, 2, indexDigest, *dead, nil), "MarkSegmentShipped")
 			}
 			if retire {
-				if err := r.RetireSegment(ctx, blockstore.PlaneCatalog, seq, 3); err != nil {
-					t.Fatalf("RetireSegment: %v", err)
-				}
+				require.NoError(t, r.RetireSegment(ctx, blockstore.PlaneCatalog, seq, 3), "RetireSegment")
 			}
 			return seq
 		}
@@ -881,35 +681,24 @@ func TestPostgresStores(t *testing.T) {
 		segment(orphan, 4000, dead(0), digest, false)
 
 		usage, err := r.CatalogUsage(ctx)
-		if err != nil {
-			t.Fatalf("CatalogUsage: %v", err)
-		}
+		require.NoError(t, err, "CatalogUsage")
 		want := registry.CatalogUsage{Bucket: bucket, Space: space, Bytes: 3500, DeadOnArrivalBytes: 1200, UnmeasuredBytes: 500}
 		i := slices.IndexFunc(usage, func(u registry.CatalogUsage) bool { return u.Bucket == bucket })
-		if i < 0 || usage[i] != want {
-			t.Fatalf("CatalogUsage = %+v, want an entry %+v", usage, want)
-		}
-		if slices.ContainsFunc(usage, func(u registry.CatalogUsage) bool { return u.Bucket == orphan }) {
-			t.Fatalf("CatalogUsage = %+v, lists %q, which has no bucket row", usage, orphan)
-		}
-		if !slices.IsSortedFunc(usage, func(a, b registry.CatalogUsage) int { return strings.Compare(a.Bucket, b.Bucket) }) {
-			t.Fatalf("CatalogUsage = %+v, not ordered by bucket", usage)
-		}
+		require.GreaterOrEqual(t, i, 0, "CatalogUsage")
+		require.Equal(t, want, usage[i], "CatalogUsage entry")
+		require.False(t, slices.ContainsFunc(usage, func(u registry.CatalogUsage) bool { return u.Bucket == orphan }), "CatalogUsage = %+v, lists %q, which has no bucket row", usage, orphan)
+		require.True(t, slices.IsSortedFunc(usage, func(a, b registry.CatalogUsage) int { return strings.Compare(a.Bucket, b.Bucket) }), "CatalogUsage = %+v, not ordered by bucket", usage)
 
 		// An unmeasured segment's dead_bytes is NULL, read back as -1.
 		segs, err := r.ListSegments(ctx, blockstore.PlaneCatalog, bucket)
-		if err != nil {
-			t.Fatalf("ListSegments: %v", err)
-		}
+		require.NoError(t, err, "ListSegments")
 		j := slices.IndexFunc(segs, func(m logstore.SegmentMeta) bool { return m.Seq == unmeasured })
-		if j < 0 || segs[j].DeadBytes != -1 {
-			t.Fatalf("ListSegments = %+v, want seq %d with DeadBytes -1", segs, unmeasured)
-		}
+		require.GreaterOrEqual(t, j, 0, "ListSegments = %+v, want seq %d with DeadBytes -1", segs, unmeasured)
+		require.Equal(t, int64(-1), segs[j].DeadBytes, "ListSegments = %+v, want seq %d with DeadBytes -1", segs, unmeasured)
 		var isNull bool
-		if err := pool.QueryRow(ctx, `SELECT dead_bytes IS NULL FROM ingot.segments WHERE seq = $1`,
-			int64(unmeasured)).Scan(&isNull); err != nil || !isNull {
-			t.Fatalf("unmeasured segment's dead_bytes IS NULL = %v (err %v), want true", isNull, err)
-		}
+		require.NoError(t, pool.QueryRow(ctx, `SELECT dead_bytes IS NULL FROM ingot.segments WHERE seq = $1`,
+			int64(unmeasured)).Scan(&isNull), "read dead_bytes")
+		require.True(t, isNull, "unmeasured segment's dead_bytes IS NULL")
 	})
 }
 
@@ -927,14 +716,10 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 	setupPool, dsn := pgtest.NewWithDSN(t)
 
 	cfg, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		t.Fatalf("parse dsn: %v", err)
-	}
+	require.NoError(t, err, "parse dsn")
 	cfg.MaxConns, cfg.MinConns = 1, 1
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		t.Fatalf("pool: %v", err)
-	}
+	require.NoError(t, err, "pool")
 	defer pool.Close()
 	tasks := liveUploadTasks(t, setupPool)
 	reg := liveRegistry(pool, tasks)
@@ -948,9 +733,7 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 		c, cancel := context.WithTimeout(ctx, 20*time.Second)
 		defer cancel()
 		err := fn(c)
-		if c.Err() != nil {
-			t.Fatalf("%s: needed a second pooled connection: %v", name, c.Err())
-		}
+		require.NoError(t, c.Err(), "%s: needed a second pooled connection", name)
 		return err
 	}
 
@@ -959,32 +742,24 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 	err = bounded("missing bucket", func(c context.Context) error {
 		return reg.CommitRoot(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), counted)
 	})
-	if !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("missing bucket: got %v, want ErrNotFound", err)
-	}
+	require.ErrorIs(t, err, registry.ErrNotFound, "missing bucket")
 
-	if err := setup.Create(ctx, "cas-single-conn", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, setup.Create(ctx, "cas-single-conn", space, registry.CreateState{Tenant: testutil.RandomDID(t)}), "create bucket")
 	t.Cleanup(func() { _ = setup.Delete(context.Background(), "cas-single-conn", space) })
 
 	// A root that does not match: the same path, reporting a conflict.
 	err = bounded("stale root", func(c context.Context) error {
 		return reg.CommitRoot(c, "cas-single-conn", liveCid(t, "stale"), liveCid(t, "next"), counted)
 	})
-	if !errors.Is(err, registry.ErrConflict) {
-		t.Fatalf("stale root: got %v, want ErrConflict", err)
-	}
+	require.ErrorIs(t, err, registry.ErrConflict, "stale root")
 
 	// And the happy path still commits both the root and its rows.
-	if err := bounded("commit", func(c context.Context) error {
+	require.NoError(t, bounded("commit", func(c context.Context) error {
 		return reg.CommitRoot(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), counted)
-	}); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
-	if got := spaceObjects(t, setup, space); len(got) != 1 || got[0].Added != 1 {
-		t.Fatalf("counted %+v for the space, want one object added", got)
-	}
+	}), "commit")
+	got := spaceObjects(t, setup, space)
+	require.Len(t, got, 1, "counted %+v for the space", got)
+	require.Equal(t, int64(1), got[0].Added, "counted %+v for the space", got)
 }
 
 // liveRegistry is a registry over pool whose CommitRoot and PutPart queue
@@ -1009,18 +784,12 @@ func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
 	r, err := taskrunner.New(pool, taskrunner.Options{Schema: "ingot", Queues: []taskrunner.QueueOptions{
 		{Name: spaceshardqueue.Name},
 	}})
-	if err != nil {
-		t.Fatalf("task runner: %v", err)
-	}
+	require.NoError(t, err, "task runner")
 	// Submitting a task needs its handler registered, though these tests
 	// never run one.
 	noop := func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil }
-	if err := r.Handle(spaceshardqueue.Name, spaceshardqueue.ReleaseAction, noop); err != nil {
-		t.Fatalf("register release: %v", err)
-	}
-	if err := r.Migrate(context.Background()); err != nil {
-		t.Fatalf("task runner migrate: %v", err)
-	}
+	require.NoError(t, r.Handle(spaceshardqueue.Name, spaceshardqueue.ReleaseAction, noop), "register release")
+	require.NoError(t, r.Migrate(context.Background()), "task runner migrate")
 	return r
 }
 
@@ -1028,9 +797,7 @@ func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
 func spaceObjects(t *testing.T, r *registry.Postgres, space did.DID) []registry.ObjectCount {
 	t.Helper()
 	due, err := r.DueObjects(context.Background(), 1000)
-	if err != nil {
-		t.Fatalf("DueObjects: %v", err)
-	}
+	require.NoError(t, err, "DueObjects")
 	var out []registry.ObjectCount
 	for _, c := range due {
 		if c.Space == space {
@@ -1054,28 +821,19 @@ func TestCommitRootCountsObjects(t *testing.T) {
 	ctx := context.Background()
 	r := liveRegistry(pool, liveUploadTasks(t, pool))
 	space := testutil.RandomDID(t)
-	if err := r.Create(ctx, "count-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, r.Create(ctx, "count-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}), "create bucket")
 	t.Cleanup(func() { _ = r.Delete(context.Background(), "count-bucket", space) })
 
 	change := registry.RootCommit{ObjectsAdded: 2, ObjectsRemoved: 1}
-	if err := r.CommitRoot(ctx, "count-bucket", liveCid(t, "stale"), liveCid(t, "root"), change); !errors.Is(err, registry.ErrConflict) {
-		t.Fatalf("stale commit: %v, want ErrConflict", err)
-	}
-	if got := spaceObjects(t, r, space); len(got) != 0 {
-		t.Fatalf("a failed commit counted %+v", got)
-	}
-	if err := r.CommitRoot(ctx, "count-bucket", cid.Undef, liveCid(t, "root"), change); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
-	if err := r.CommitRoot(ctx, "count-bucket", liveCid(t, "root"), liveCid(t, "next"), registry.RootCommit{ObjectsRemoved: 1}); err != nil {
-		t.Fatalf("second commit: %v", err)
-	}
+	err := r.CommitRoot(ctx, "count-bucket", liveCid(t, "stale"), liveCid(t, "root"), change)
+	require.ErrorIs(t, err, registry.ErrConflict, "stale commit")
+	require.Empty(t, spaceObjects(t, r, space), "a failed commit counted")
+	require.NoError(t, r.CommitRoot(ctx, "count-bucket", cid.Undef, liveCid(t, "root"), change), "commit")
+	require.NoError(t, r.CommitRoot(ctx, "count-bucket", liveCid(t, "root"), liveCid(t, "next"), registry.RootCommit{ObjectsRemoved: 1}), "second commit")
 	// The latest hour holds the bucket's totals: the commits share an hour
 	// unless one fell either side of its turn.
 	got := spaceObjects(t, r, space)
-	if len(got) == 0 || got[len(got)-1].Added != 2 || got[len(got)-1].Removed != 2 {
-		t.Fatalf("counted %+v, want 2 added and 2 removed", got)
-	}
+	require.NotEmpty(t, got, "counted %+v, want 2 added and 2 removed", got)
+	require.Equal(t, int64(2), got[len(got)-1].Added, "counted %+v, want 2 added and 2 removed", got)
+	require.Equal(t, int64(2), got[len(got)-1].Removed, "counted %+v, want 2 added and 2 removed", got)
 }

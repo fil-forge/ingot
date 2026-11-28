@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/versitygw/backend"
+	"github.com/stretchr/testify/require"
 )
 
 // taggedBody is testBody with every byte XORed by tag, so parts of equal
@@ -46,31 +47,19 @@ func TestMultipartPartsArriveOutOfOrder(t *testing.T) {
 	etags := make([]*string, len(parts))
 	for _, pn := range []int32{3, 1, 2} {
 		out, err := mpUploadPart(t, b, key, uploadID, pn, parts[pn-1], nil)
-		if err != nil {
-			t.Fatalf("UploadPart %d: %v", pn, err)
-		}
+		require.NoError(t, err, "UploadPart %d", pn)
 		etags[pn-1] = out.ETag
 	}
 
 	// ListParts orders by part number regardless of arrival order.
 	lp, err := b.ListParts(context.Background(), &s3.ListPartsInput{Bucket: &bucket, Key: &key, UploadId: &uploadID})
-	if err != nil {
-		t.Fatalf("ListParts: %v", err)
-	}
-	if len(lp.Parts) != len(parts) {
-		t.Fatalf("ListParts returned %d parts, want %d", len(lp.Parts), len(parts))
-	}
+	require.NoError(t, err, "ListParts")
+	require.Len(t, lp.Parts, len(parts), "ListParts")
 	for i, p := range lp.Parts {
 		want := int32(i + 1)
-		if int32(p.PartNumber) != want {
-			t.Fatalf("ListParts[%d].PartNumber = %d, want %d", i, p.PartNumber, want)
-		}
-		if p.Size != int64(len(parts[i])) {
-			t.Fatalf("ListParts part %d size = %d, want %d", want, p.Size, len(parts[i]))
-		}
-		if strings.Trim(p.ETag, `"`) != strings.Trim(*etags[i], `"`) {
-			t.Fatalf("ListParts part %d ETag = %q, want %s", want, p.ETag, *etags[i])
-		}
+		require.Equal(t, want, int32(p.PartNumber), "ListParts[%d].PartNumber", i)
+		require.Equal(t, int64(len(parts[i])), p.Size, "ListParts part %d size", want)
+		require.Equal(t, strings.Trim(*etags[i], `"`), strings.Trim(p.ETag, `"`), "ListParts part %d ETag", want)
 	}
 
 	var completed []types.CompletedPart
@@ -86,37 +75,25 @@ func TestMultipartPartsArriveOutOfOrder(t *testing.T) {
 	wantETag := hex.EncodeToString(etagCat.Sum(nil)) + "-3"
 
 	res, err := mpComplete(t, b, key, uploadID, completed, nil)
-	if err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
-	if res.ETag == nil {
-		t.Fatal("Complete returned no ETag")
-	}
-	if got := strings.Trim(*res.ETag, `"`); got != wantETag {
-		t.Fatalf("Complete ETag = %q, want %q (md5-of-md5s in part-number order)", got, wantETag)
-	}
+	require.NoError(t, err, "Complete")
+	require.NotNil(t, res.ETag, "Complete returned no ETag")
+	got := strings.Trim(*res.ETag, `"`)
+	require.Equal(t, wantETag, got, "Complete ETag (md5-of-md5s in part-number order)")
 
-	if got := getRange(t, b, key, ""); !bytes.Equal(got, whole) {
-		t.Fatalf("GET body mismatch after out-of-order upload (%d bytes, want %d)", len(got), len(whole))
-	}
+	body := getRange(t, b, key, "")
+	require.True(t, bytes.Equal(whole, body), "GET body mismatch after out-of-order upload (%d bytes, want %d)", len(body), len(whole))
 	// A range across the part-1→part-2 boundary reads from the re-sequenced
 	// blob list, not the arrival order.
 	p1 := len(parts[0])
-	if got := getRange(t, b, key, fmt.Sprintf("bytes=%d-%d", p1-10, p1+2000)); !bytes.Equal(got, whole[p1-10:p1+2001]) {
-		t.Fatalf("ranged GET across the part boundary mismatch (%d bytes)", len(got))
-	}
+	body = getRange(t, b, key, fmt.Sprintf("bytes=%d-%d", p1-10, p1+2000))
+	require.True(t, bytes.Equal(whole[p1-10:p1+2001], body), "ranged GET across the part boundary mismatch (%d bytes)", len(body))
 	// ?partNumber=2 is the part uploaded last, addressed by its number.
 	two := int32(2)
 	out, err := b.GetObject(context.Background(), &s3.GetObjectInput{Bucket: &bucket, Key: &key, PartNumber: &two})
-	if err != nil {
-		t.Fatalf("GetObject partNumber=2: %v", err)
-	}
+	require.NoError(t, err, "GetObject partNumber=2")
 	defer out.Body.Close()
 	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(out.Body); err != nil {
-		t.Fatalf("read part 2: %v", err)
-	}
-	if !bytes.Equal(buf.Bytes(), parts[1]) {
-		t.Fatalf("GET partNumber=2 returned %d bytes that are not part 2", buf.Len())
-	}
+	_, err = buf.ReadFrom(out.Body)
+	require.NoError(t, err, "read part 2")
+	require.True(t, bytes.Equal(parts[1], buf.Bytes()), "GET partNumber=2 returned %d bytes that are not part 2", buf.Len())
 }

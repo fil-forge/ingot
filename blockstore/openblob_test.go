@@ -3,10 +3,11 @@ package blockstore
 import (
 	"bytes"
 	"context"
-	"errors"
-	"github.com/fil-forge/ucantone/did"
 	"io"
 	"testing"
+
+	"github.com/fil-forge/ucantone/did"
+	"github.com/stretchr/testify/require"
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
@@ -47,27 +48,26 @@ func TestLayered_OpenBlob_Tiering(t *testing.T) {
 
 	// cache hit — base is not consulted.
 	l := NewLayered(fakeBlobTier{data: []byte("from-cache")}, nil, fakeBlobTier{data: []byte("from-base")})
-	if got, err := readOpenBlob(t, l, digest); err != nil || got != "from-cache" {
-		t.Fatalf("cache hit: got %q err %v, want from-cache", got, err)
-	}
+	got, err := readOpenBlob(t, l, digest)
+	require.NoError(t, err, "cache hit")
+	require.Equal(t, "from-cache", got, "cache hit")
 
 	// cache miss → base hit (the after-eviction path).
 	l = NewLayered(fakeBlobTier{data: nil}, nil, fakeBlobTier{data: []byte("from-base")})
-	if got, err := readOpenBlob(t, l, digest); err != nil || got != "from-base" {
-		t.Fatalf("cache miss → base: got %q err %v, want from-base", got, err)
-	}
+	got, err = readOpenBlob(t, l, digest)
+	require.NoError(t, err, "cache miss → base")
+	require.Equal(t, "from-base", got, "cache miss → base")
 
 	// both miss → ErrNotFound.
 	l = NewLayered(fakeBlobTier{data: nil}, nil, fakeBlobTier{data: nil})
-	if _, err := l.OpenBlob(context.Background(), did.Undef, digest); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("both miss: err = %v, want ErrNotFound", err)
-	}
+	_, err = l.OpenBlob(context.Background(), did.Undef, digest)
+	require.ErrorIs(t, err, ErrNotFound, "both miss")
 
 	// nil cache is skipped, not panicked.
 	l = NewLayered(nil, nil, fakeBlobTier{data: []byte("from-base")})
-	if got, err := readOpenBlob(t, l, digest); err != nil || got != "from-base" {
-		t.Fatalf("nil cache → base: got %q err %v, want from-base", got, err)
-	}
+	got, err = readOpenBlob(t, l, digest)
+	require.NoError(t, err, "nil cache → base")
+	require.Equal(t, "from-base", got, "nil cache → base")
 }
 
 // TestCached_OpenBlob_BypassesCache confirms OpenBlob streams straight from the
@@ -75,9 +75,9 @@ func TestLayered_OpenBlob_Tiering(t *testing.T) {
 func TestCached_OpenBlob_BypassesCache(t *testing.T) {
 	digest, _ := mh.Sum([]byte("digest"), mh.SHA2_256, -1)
 	c := NewCached(fakeBlobTier{data: []byte("streamed")}, 1<<20).(*Cached)
-	if got, err := readOpenBlob(t, c, digest); err != nil || got != "streamed" {
-		t.Fatalf("cached OpenBlob: got %q err %v, want streamed", got, err)
-	}
+	got, err := readOpenBlob(t, c, digest)
+	require.NoError(t, err, "cached OpenBlob")
+	require.Equal(t, "streamed", got, "cached OpenBlob")
 }
 
 // TestBlobCache_OpenBlobRange: the section reader serves exactly the
@@ -101,23 +101,16 @@ func TestBlobCache_OpenBlobRange(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			rc, err := sp.OpenBlobRange(ctx, did.Undef, digest, c.start, c.end)
-			if err != nil {
-				t.Fatalf("OpenBlobRange: %v", err)
-			}
+			require.NoError(t, err, "OpenBlobRange")
 			defer rc.Close()
 			got, err := io.ReadAll(rc)
-			if err != nil {
-				t.Fatalf("read: %v", err)
-			}
-			if string(got) != c.want {
-				t.Fatalf("range [%d,%d] = %q, want %q", c.start, c.end, got, c.want)
-			}
+			require.NoError(t, err, "read")
+			require.Equal(t, c.want, string(got), "range [%d,%d]", c.start, c.end)
 		})
 	}
 
-	if _, err := sp.OpenBlobRange(ctx, did.Undef, mustDigest(t, []byte("absent")), 0, 1); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("missing blob err = %v, want ErrNotFound", err)
-	}
+	_, err := sp.OpenBlobRange(ctx, did.Undef, mustDigest(t, []byte("absent")), 0, 1)
+	require.ErrorIs(t, err, ErrNotFound, "missing blob err")
 }
 
 // TestOpenBlobRangeOf_Fallback: a tier without the BlobRangeReader capability
@@ -127,25 +120,17 @@ func TestOpenBlobRangeOf_Fallback(t *testing.T) {
 	tier := fakeBlobTier{data: []byte("0123456789abcdef")}
 
 	rc, err := OpenBlobRangeOf(ctx, tier, did.Undef, nil, 4, 9)
-	if err != nil {
-		t.Fatalf("OpenBlobRangeOf: %v", err)
-	}
+	require.NoError(t, err, "OpenBlobRangeOf")
 	defer rc.Close()
 	got, err := io.ReadAll(rc)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if string(got) != "456789" {
-		t.Fatalf("fallback range = %q, want %q", got, "456789")
-	}
+	require.NoError(t, err, "read")
+	require.Equal(t, "456789", string(got), "fallback range")
 }
 
 // mustDigest hashes data into the multihash form blobs are keyed by.
 func mustDigest(t *testing.T, data []byte) mh.Multihash {
 	t.Helper()
 	d, err := mh.Sum(data, mh.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash: %v", err)
-	}
+	require.NoError(t, err, "multihash")
 	return d
 }

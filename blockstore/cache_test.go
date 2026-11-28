@@ -2,8 +2,10 @@ package blockstore
 
 import (
 	"context"
-	"github.com/fil-forge/ucantone/did"
 	"testing"
+
+	"github.com/fil-forge/ucantone/did"
+	"github.com/stretchr/testify/require"
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
@@ -40,9 +42,7 @@ func mkcid(b byte) cid.Cid {
 
 func TestCached_Disabled(t *testing.T) {
 	base := &countingReader{}
-	if got := NewCached(base, 0); got != BlockReader(base) {
-		t.Fatalf("maxBytes<=0 should return the base reader unchanged")
-	}
+	require.Same(t, base, NewCached(base, 0), "maxBytes<=0 should return the base reader unchanged")
 }
 
 func TestCached_Hit(t *testing.T) {
@@ -51,13 +51,11 @@ func TestCached_Hit(t *testing.T) {
 	k := mkcid(7)
 
 	for i := 0; i < 3; i++ {
-		if _, err := c.GetBlock(context.Background(), did.Undef, k); err != nil {
-			t.Fatalf("get: %v", err)
-		}
+		_, err := c.GetBlock(context.Background(), did.Undef, k)
+		require.NoError(t, err, "get")
 	}
-	if got := base.calls[k.KeyString()]; got != 1 {
-		t.Fatalf("expected base hit once (rest cached), got %d", got)
-	}
+	got := base.calls[k.KeyString()]
+	require.Equal(t, 1, got, "expected base hit once (rest cached)")
 }
 
 func TestCached_EvictsByBytes(t *testing.T) {
@@ -67,23 +65,17 @@ func TestCached_EvictsByBytes(t *testing.T) {
 
 	first, second, third := mkcid(1), mkcid(2), mkcid(3)
 	for _, k := range []cid.Cid{first, second, third} {
-		if _, err := c.GetBlock(context.Background(), did.Undef, k); err != nil {
-			t.Fatalf("get: %v", err)
-		}
+		_, err := c.GetBlock(context.Background(), did.Undef, k)
+		require.NoError(t, err, "get")
 	}
 
 	// first was evicted -> refetched (2 base hits).
-	if _, err := c.GetBlock(context.Background(), did.Undef, first); err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if got := base.calls[first.KeyString()]; got != 2 {
-		t.Fatalf("expected first block evicted and refetched (2 base hits), got %d", got)
-	}
+	_, err := c.GetBlock(context.Background(), did.Undef, first)
+	require.NoError(t, err, "get")
+	got := base.calls[first.KeyString()]
+	require.Equal(t, 2, got, "expected first block evicted and refetched (2 base hits)")
 	// third is the most-recently-used and still cached (1 base hit).
-	if _, err := c.GetBlock(context.Background(), did.Undef, third); err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if got := base.calls[third.KeyString()]; got != 1 {
-		t.Fatalf("expected third block still cached (1 base hit), got %d", got)
-	}
+	_, err = c.GetBlock(context.Background(), did.Undef, third)
+	require.NoError(t, err, "get")
+	require.Equal(t, 1, base.calls[third.KeyString()], "expected third block still cached (1 base hit)")
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -139,45 +140,33 @@ func (m *pgMeta) commitJournaled(t *testing.T, bucket string, segment uint64, bl
 	t.Helper()
 	ctx := context.Background()
 	tx, err := m.pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin commit: %v", err)
-	}
+	require.NoError(t, err, "begin commit")
 	defer func() { _ = tx.Rollback(ctx) }()
 	for _, b := range blocks {
-		if _, err := tx.Exec(ctx,
+		_, err := tx.Exec(ctx,
 			`INSERT INTO ingot.catalog_journal (seq, bucket, cid, data) VALUES ($1, $2, $3, $4)`,
-			int64(segment), bucket, b.Cid().Bytes(), b.RawData()); err != nil {
-			t.Fatalf("journal block: %v", err)
-		}
+			int64(segment), bucket, b.Cid().Bytes(), b.RawData())
+		require.NoError(t, err, "journal block")
 	}
-	if _, err := tx.Exec(ctx, `UPDATE ingot.buckets SET root_cid = $1 WHERE name = $2`,
-		blocks[len(blocks)-1].Cid().Bytes(), bucket); err != nil {
-		t.Fatalf("advance root: %v", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
+	_, err = tx.Exec(ctx, `UPDATE ingot.buckets SET root_cid = $1 WHERE name = $2`,
+		blocks[len(blocks)-1].Cid().Bytes(), bucket)
+	require.NoError(t, err, "advance root")
+	require.NoError(t, tx.Commit(ctx), "commit")
 }
 
 // JournaledBlocks returns the journal's blocks under segment, by CID.
 func (m *pgMeta) JournaledBlocks(t *testing.T, segment uint64) map[string][]byte {
 	t.Helper()
 	rows, err := m.pool.Query(context.Background(), `SELECT cid, data FROM ingot.catalog_journal WHERE seq = $1`, int64(segment))
-	if err != nil {
-		t.Fatalf("read journal: %v", err)
-	}
+	require.NoError(t, err, "read journal")
 	defer rows.Close()
 	out := map[string][]byte{}
 	for rows.Next() {
 		var c, data []byte
-		if err := rows.Scan(&c, &data); err != nil {
-			t.Fatalf("read journal: %v", err)
-		}
+		require.NoError(t, rows.Scan(&c, &data), "read journal")
 		out[string(c)] = data
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("read journal: %v", err)
-	}
+	require.NoError(t, rows.Err(), "read journal")
 	return out
 }
 
@@ -195,12 +184,8 @@ func journalSegmentPadded(t *testing.T, mem *pgMeta, bucket string, n, pad int) 
 	t.Helper()
 	ctx := context.Background()
 	seq, err := mem.NextSegmentSeq(ctx)
-	if err != nil {
-		t.Fatalf("NextSegmentSeq: %v", err)
-	}
-	if err := mem.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, bucket); err != nil {
-		t.Fatalf("InsertSegmentOpen: %v", err)
-	}
+	require.NoError(t, err, "NextSegmentSeq")
+	require.NoError(t, mem.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, bucket), "InsertSegmentOpen")
 	blocks := make([]block.Block, n)
 	for i := range blocks {
 		blocks[i] = block.NewBlock([]byte(fmt.Sprintf("%s/seg-%d/block-%04d/%s", bucket, seq, i, strings.Repeat("x", pad))))
@@ -213,12 +198,8 @@ func requireReadable(t *testing.T, m *logstore.Manager, blocks []block.Block) {
 	t.Helper()
 	for _, b := range blocks {
 		got, err := m.Get(context.Background(), b.Cid())
-		if err != nil {
-			t.Fatalf("Get %s after the rebuild: %v", b.Cid(), err)
-		}
-		if string(got.RawData()) != string(b.RawData()) {
-			t.Fatalf("Get %s returned other bytes", b.Cid())
-		}
+		require.NoError(t, err, "Get %s after the rebuild", b.Cid())
+		require.Equal(t, b.RawData(), got.RawData(), "Get %s returned other bytes", b.Cid())
 	}
 }
 
@@ -227,9 +208,7 @@ func requireReadable(t *testing.T, m *logstore.Manager, blocks []block.Block) {
 func onDiskSeqs(t *testing.T, dir, bucket string) map[uint64]bool {
 	t.Helper()
 	entries, err := os.ReadDir(filepath.Join(dir, bucket, blockstore.PlaneCatalog.String()))
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
-	}
+	require.NoError(t, err, "ReadDir")
 	out := map[uint64]bool{}
 	for _, e := range entries {
 		stem, ok := strings.CutSuffix(strings.TrimPrefix(e.Name(), "seg-"), ".car")
@@ -237,9 +216,7 @@ func onDiskSeqs(t *testing.T, dir, bucket string) map[uint64]bool {
 			continue
 		}
 		seq, err := strconv.ParseUint(stem, 10, 64)
-		if err != nil {
-			t.Fatalf("parse %s: %v", e.Name(), err)
-		}
+		require.NoError(t, err, "parse %s", e.Name())
 		out[seq] = true
 	}
 	return out
@@ -253,67 +230,46 @@ func onDiskSeqs(t *testing.T, dir, bucket string) map[uint64]bool {
 func TestRebuild_WipedVolume(t *testing.T) {
 	ctx := context.Background()
 	mem := newPGMeta(t)
-	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	require.NoError(t, mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}), "Create")
 	sealedSeq, sealedBlocks := journalSegment(t, mem, "bk", 10)
-	if err := mem.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, sealedSeq, time.Now().Unix(), 1, make([]byte, 32), nil); err != nil {
-		t.Fatalf("MarkSegmentSealed: %v", err)
-	}
+	require.NoError(t, mem.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, sealedSeq, time.Now().Unix(), 1, make([]byte, 32), nil), "MarkSegmentSealed")
 	// More than two journal pages, so the rebuild pages and splits.
 	openSeq, openBlocks := journalSegment(t, mem, "bk", 600)
 
 	dir := t.TempDir()
 	ship := &shipRecorder{}
 	m, err := openRebuildManager(t, dir, mem, ship)
-	if err != nil {
-		t.Fatalf("OpenManager: %v", err)
-	}
+	require.NoError(t, err, "OpenManager")
 	requireReadable(t, m, append(sealedBlocks, openBlocks...))
 
 	for _, lost := range []uint64{sealedSeq, openSeq} {
-		if rows := mem.JournaledBlocks(t, lost); len(rows) != 0 {
-			t.Fatalf("%d journal rows still under lost segment %d", len(rows), lost)
-		}
+		rows := mem.JournaledBlocks(t, lost)
+		require.Empty(t, rows, "%d journal rows still under lost segment %d", len(rows), lost)
 	}
 	live, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
-	if err != nil {
-		t.Fatalf("ListSegments: %v", err)
-	}
+	require.NoError(t, err, "ListSegments")
 	for _, r := range live {
-		if r.Seq == sealedSeq || r.Seq == openSeq {
-			t.Fatalf("lost segment %d still has a live row (%v)", r.Seq, r.State)
-		}
+		require.NotEqual(t, sealedSeq, r.Seq, "lost segment %d still has a live row (%v)", r.Seq, r.State)
+		require.NotEqual(t, openSeq, r.Seq, "lost segment %d still has a live row (%v)", r.Seq, r.State)
 	}
 	retired, err := mem.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk")
-	if err != nil {
-		t.Fatalf("ListRetiredSegments: %v", err)
-	}
-	if len(retired) != 1 || retired[0].Seq != sealedSeq {
-		t.Fatalf("retired rows = %+v, want the lost sealed segment %d", retired, sealedSeq)
-	}
+	require.NoError(t, err, "ListRetiredSegments")
+	require.Len(t, retired, 1, "retired rows = %+v, want the lost sealed segment %d", retired, sealedSeq)
+	require.Equal(t, sealedSeq, retired[0].Seq, "retired rows = %+v, want the lost sealed segment %d", retired, sealedSeq)
 
 	rebuilt := onDiskSeqs(t, dir, "bk")
-	if len(rebuilt) < 2 {
-		t.Fatalf("rebuilt into %d segments, want the small SealBytes to split it", len(rebuilt))
-	}
+	require.GreaterOrEqual(t, len(rebuilt), 2, "rebuilt into %d segments, want the small SealBytes to split it", len(rebuilt))
 	rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
-	if err != nil {
-		t.Fatalf("ListSegments: %v", err)
-	}
+	require.NoError(t, err, "ListSegments")
 	for _, r := range rows {
 		// The blocks are small, so no segment needs to pass SealBytes: one
 		// seals once the next block would carry it past.
-		if r.Size > 8<<10 {
-			t.Fatalf("rebuilt segment %d is %d bytes, past SealBytes (8 KiB)", r.Seq, r.Size)
-		}
+		require.LessOrEqual(t, r.Size, int64(8<<10), "rebuilt segment %d is %d bytes, past SealBytes (8 KiB)", r.Seq, r.Size)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		stats, err := mem.CatalogJournalStats(ctx)
-		if err != nil {
-			t.Fatalf("CatalogJournalStats: %v", err)
-		}
+		require.NoError(t, err, "CatalogJournalStats")
 		shipped := ship.shipped()
 		all := true
 		for seq := range rebuilt {
@@ -322,9 +278,7 @@ func TestRebuild_WipedVolume(t *testing.T) {
 		if all && stats.Blocks == 0 {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("rebuilt segments %v, shipped %v, %d journal rows left", rebuilt, shipped, stats.Blocks)
-		}
+		require.False(t, time.Now().After(deadline), "rebuilt segments %v, shipped %v, %d journal rows left", rebuilt, shipped, stats.Blocks)
 		time.Sleep(20 * time.Millisecond)
 	}
 }
@@ -335,27 +289,19 @@ func TestRebuild_WipedVolume(t *testing.T) {
 func TestRebuild_SegmentsStayUnderSealBytes(t *testing.T) {
 	ctx := context.Background()
 	mem := newPGMeta(t)
-	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	require.NoError(t, mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}), "Create")
 	// Each lost segment's blocks fill most of a rebuilt one, so the next
 	// lost segment's first block doesn't fit after them.
 	_, first := journalSegmentPadded(t, mem, "bk", 7, 1000)
 	_, second := journalSegmentPadded(t, mem, "bk", 7, 1000)
 
 	m, err := openRebuildManager(t, t.TempDir(), mem, &shipRecorder{})
-	if err != nil {
-		t.Fatalf("OpenManager: %v", err)
-	}
+	require.NoError(t, err, "OpenManager")
 	requireReadable(t, m, append(first, second...))
 	rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
-	if err != nil {
-		t.Fatalf("ListSegments: %v", err)
-	}
+	require.NoError(t, err, "ListSegments")
 	for _, r := range rows {
-		if r.Size > 8<<10 {
-			t.Fatalf("rebuilt segment %d is %d bytes, past SealBytes (8 KiB)", r.Seq, r.Size)
-		}
+		require.LessOrEqual(t, r.Size, int64(8<<10), "rebuilt segment %d is %d bytes, past SealBytes (8 KiB)", r.Seq, r.Size)
 	}
 }
 
@@ -364,21 +310,14 @@ func TestRebuild_SegmentsStayUnderSealBytes(t *testing.T) {
 func TestRebuild_JournalOnlyBucket(t *testing.T) {
 	ctx := context.Background()
 	mem := newPGMeta(t)
-	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	require.NoError(t, mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}), "Create")
 	seq, blocks := journalSegment(t, mem, "bk", 5)
-	if err := mem.DeleteSegment(ctx, blockstore.PlaneCatalog, seq); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
-	}
-	if b, _ := mem.ListSegmentBuckets(ctx, blockstore.PlaneCatalog); len(b) != 0 {
-		t.Fatalf("segment buckets = %v, want none; the test proves nothing", b)
-	}
+	require.NoError(t, mem.DeleteSegment(ctx, blockstore.PlaneCatalog, seq), "DeleteSegment")
+	b, _ := mem.ListSegmentBuckets(ctx, blockstore.PlaneCatalog)
+	require.Empty(t, b, "segment buckets = %v, want none; the test proves nothing", b)
 
 	m, err := openRebuildManager(t, t.TempDir(), mem, &shipRecorder{})
-	if err != nil {
-		t.Fatalf("OpenManager: %v", err)
-	}
+	require.NoError(t, err, "OpenManager")
 	requireReadable(t, m, blocks)
 }
 
@@ -404,39 +343,28 @@ func (f *failSecondMove) MoveJournal(ctx context.Context, bucket string, from, t
 func TestRebuild_ResumesAfterFailure(t *testing.T) {
 	ctx := context.Background()
 	mem := newPGMeta(t)
-	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	require.NoError(t, mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}), "Create")
 	lost, blocks := journalSegment(t, mem, "bk", 600)
 	dir := t.TempDir()
 
 	// Two starts fail partway, each leaving an open segment behind.
 	for range 2 {
-		if _, err := openRebuildManager(t, dir, &failSecondMove{pgMeta: mem}, &shipRecorder{}); err == nil {
-			t.Fatal("OpenManager with a failing move succeeded; the test proves nothing")
-		}
+		_, err := openRebuildManager(t, dir, &failSecondMove{pgMeta: mem}, &shipRecorder{})
+		require.Error(t, err, "OpenManager with a failing move succeeded; the test proves nothing")
 	}
-	if rows := mem.JournaledBlocks(t, lost); len(rows) == 0 || len(rows) == len(blocks) {
-		t.Fatalf("%d of %d rows under the lost segment after the failure, want some moved and some not", len(rows), len(blocks))
-	}
+	rows := mem.JournaledBlocks(t, lost)
+	require.NotEmpty(t, rows, "%d of %d rows under the lost segment after the failure, want some moved and some not", len(rows), len(blocks))
+	require.NotEqual(t, len(blocks), len(rows), "%d of %d rows under the lost segment after the failure, want some moved and some not", len(rows), len(blocks))
 
 	m, err := openRebuildManager(t, dir, mem, &shipRecorder{})
-	if err != nil {
-		t.Fatalf("OpenManager after the failure: %v", err)
-	}
+	require.NoError(t, err, "OpenManager after the failure")
 	requireReadable(t, m, blocks)
-	if rows := mem.JournaledBlocks(t, lost); len(rows) != 0 {
-		t.Fatalf("%d journal rows still under the lost segment", len(rows))
-	}
+	require.Empty(t, mem.JournaledBlocks(t, lost), "journal rows still under the lost segment")
 	onDisk := onDiskSeqs(t, dir, "bk")
 	segs, err := mem.JournalSegments(ctx, "bk")
-	if err != nil {
-		t.Fatalf("JournalSegments: %v", err)
-	}
+	require.NoError(t, err, "JournalSegments")
 	for _, seq := range segs {
-		if !onDisk[seq] {
-			t.Fatalf("journal rows under segment %d, which is not on disk (on disk: %v)", seq, onDisk)
-		}
+		require.True(t, onDisk[seq], "journal rows under segment %d, which is not on disk (on disk: %v)", seq, onDisk)
 	}
 }
 
@@ -449,17 +377,14 @@ func TestOpenManager_SeqPastDisk(t *testing.T) {
 	dir := t.TempDir()
 	ahead := newPGMeta(t)
 	m, err := openRebuildManager(t, dir, ahead, &shipRecorder{})
-	if err != nil {
-		t.Fatalf("OpenManager: %v", err)
-	}
+	require.NoError(t, err, "OpenManager")
 	// Each append outgrows SealBytes; wait for its seal so every block lands
 	// in a segment of its own.
 	var written []block.Block
 	for i := range 3 {
 		b := block.NewBlock([]byte(fmt.Sprintf("written-%d/%s", i, strings.Repeat("y", 9<<10))))
-		if _, err := m.AppendBatch(ctx, []block.Block{b}, blockstore.OpRoot{Bucket: "bk", Root: b.Cid()}); err != nil {
-			t.Fatalf("AppendBatch: %v", err)
-		}
+		_, err := m.AppendBatch(ctx, []block.Block{b}, blockstore.OpRoot{Bucket: "bk", Root: b.Cid()})
+		require.NoError(t, err, "AppendBatch")
 		written = append(written, b)
 		deadline := time.Now().Add(5 * time.Second)
 		for {
@@ -467,48 +392,31 @@ func TestOpenManager_SeqPastDisk(t *testing.T) {
 			if len(idx) > i {
 				break
 			}
-			if time.Now().After(deadline) {
-				t.Fatalf("append %d never sealed", i)
-			}
+			require.False(t, time.Now().After(deadline), "append %d never sealed", i)
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	if err := m.Close(ctx); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	require.NoError(t, m.Close(ctx), "Close")
 	var top uint64
 	for seq := range onDiskSeqs(t, dir, "bk") {
 		top = max(top, seq)
 	}
-	if top == 0 {
-		t.Fatal("no segment on disk; the test proves nothing")
-	}
+	require.NotZero(t, top, "no segment on disk; the test proves nothing")
 
 	behind := newPGMeta(t)
 	m2, err := openRebuildManager(t, dir, behind, &shipRecorder{})
-	if err != nil {
-		t.Fatalf("OpenManager over a Meta behind the disk: %v", err)
-	}
+	require.NoError(t, err, "OpenManager over a Meta behind the disk")
 	requireReadable(t, m2, written)
 	rows, err := behind.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
-	if err != nil {
-		t.Fatalf("ListSegments: %v", err)
-	}
-	if len(rows) != 3 {
-		t.Fatalf("%d rows restored, want one per sealed segment on disk (3)", len(rows))
-	}
+	require.NoError(t, err, "ListSegments")
+	require.Len(t, rows, 3, "%d rows restored, want one per sealed segment on disk (3)", len(rows))
 	for _, r := range rows {
-		if r.State != logstore.StateSealed || len(r.SHA256) == 0 {
-			t.Fatalf("restored row %d is %v (sha %x), want sealed from its .idx", r.Seq, r.State, r.SHA256)
-		}
+		require.Equal(t, logstore.StateSealed, r.State, "restored row %d is %v (sha %x), want sealed from its .idx", r.Seq, r.State, r.SHA256)
+		require.NotEmpty(t, r.SHA256, "restored row %d is %v (sha %x), want sealed from its .idx", r.Seq, r.State, r.SHA256)
 	}
 	next, err := behind.NextSegmentSeq(ctx)
-	if err != nil {
-		t.Fatalf("NextSegmentSeq: %v", err)
-	}
-	if next <= top {
-		t.Fatalf("NextSegmentSeq = %d after opening over segments up to %d", next, top)
-	}
+	require.NoError(t, err, "NextSegmentSeq")
+	require.Greater(t, next, top, "NextSegmentSeq = %d after opening over segments up to %d", next, top)
 }
 
 // sealedSegments writes one block per segment into bucket "bk" under dir,
@@ -518,15 +426,12 @@ func sealedSegments(t *testing.T, dir string, mem *pgMeta, n int) []block.Block 
 	t.Helper()
 	ctx := context.Background()
 	m, err := openManagerShipping(t, dir, mem, &shipRecorder{}, false)
-	if err != nil {
-		t.Fatalf("OpenManager: %v", err)
-	}
+	require.NoError(t, err, "OpenManager")
 	var written []block.Block
 	for i := range n {
 		b := block.NewBlock([]byte(fmt.Sprintf("sealed-%d/%s", i, strings.Repeat("z", 9<<10))))
-		if _, err := m.AppendBatch(ctx, []block.Block{b}, blockstore.OpRoot{Bucket: "bk", Root: b.Cid()}); err != nil {
-			t.Fatalf("AppendBatch: %v", err)
-		}
+		_, err := m.AppendBatch(ctx, []block.Block{b}, blockstore.OpRoot{Bucket: "bk", Root: b.Cid()})
+		require.NoError(t, err, "AppendBatch")
 		written = append(written, b)
 		deadline := time.Now().Add(5 * time.Second)
 		for {
@@ -534,15 +439,11 @@ func sealedSegments(t *testing.T, dir string, mem *pgMeta, n int) []block.Block 
 			if len(idx) > i {
 				break
 			}
-			if time.Now().After(deadline) {
-				t.Fatalf("append %d never sealed", i)
-			}
+			require.False(t, time.Now().After(deadline), "append %d never sealed", i)
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	if err := m.Close(ctx); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	require.NoError(t, m.Close(ctx), "Close")
 	return written
 }
 
@@ -565,32 +466,23 @@ func TestRecover_MetaBehindAnOpenRow(t *testing.T) {
 	seqs := sortedSeqs(onDiskSeqs(t, dir, "bk"))
 	a, b := seqs[0], seqs[1]
 	// B was still open at the crash: no .idx.
-	if err := os.Remove(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), fmt.Sprintf("seg-%020d.idx", b))); err != nil {
-		t.Fatalf("remove B's .idx: %v", err)
-	}
+	require.NoError(t, os.Remove(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), fmt.Sprintf("seg-%020d.idx", b))), "remove B's .idx")
 	behind := newPGMeta(t)
-	if err := behind.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, a, "bk"); err != nil {
-		t.Fatalf("InsertSegmentOpen: %v", err)
-	}
+	require.NoError(t, behind.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, a, "bk"), "InsertSegmentOpen")
 
 	m, err := openRebuildManager(t, dir, behind, &shipRecorder{})
-	if err != nil {
-		t.Fatalf("OpenManager over a Meta behind an open row: %v", err)
-	}
+	require.NoError(t, err, "OpenManager over a Meta behind an open row")
 	requireReadable(t, m, written)
 	rows, err := behind.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
-	if err != nil {
-		t.Fatalf("ListSegments: %v", err)
-	}
+	require.NoError(t, err, "ListSegments")
 	sealed := map[uint64]bool{}
 	for _, r := range rows {
 		if r.State == logstore.StateSealed && len(r.SHA256) > 0 {
 			sealed[r.Seq] = true
 		}
 	}
-	if !sealed[a] || !sealed[b] {
-		t.Fatalf("sealed rows %v, want A (%d) brought up to its .idx and B (%d) force-sealed", sealed, a, b)
-	}
+	require.True(t, sealed[a], "sealed rows %v, want A (%d) brought up to its .idx and B (%d) force-sealed", sealed, a, b)
+	require.True(t, sealed[b], "sealed rows %v, want A (%d) brought up to its .idx and B (%d) force-sealed", sealed, a, b)
 }
 
 // TestRecover_RetiredFilesReappear: a retire whose unlink never reached the
@@ -604,29 +496,20 @@ func TestRecover_RetiredFilesReappear(t *testing.T) {
 	sealedSegments(t, dir, mem, 1)
 	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
 	index := multihash.Multihash("retired-index")
-	if err := mem.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), index, -1, nil); err != nil {
-		t.Fatalf("MarkSegmentShipped: %v", err)
-	}
-	if err := mem.RetireSegment(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix()); err != nil {
-		t.Fatalf("RetireSegment: %v", err)
-	}
+	require.NoError(t, mem.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), index, -1, nil), "MarkSegmentShipped")
+	require.NoError(t, mem.RetireSegment(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix()), "RetireSegment")
 
-	if _, err := openRebuildManager(t, dir, mem, &shipRecorder{}); err != nil {
-		t.Fatalf("OpenManager: %v", err)
-	}
-	if left := onDiskSeqs(t, dir, "bk"); left[seq] {
-		t.Fatalf("the retired segment's CAR is still on disk")
-	}
+	_, err := openRebuildManager(t, dir, mem, &shipRecorder{})
+	require.NoError(t, err, "OpenManager")
+	left := onDiskSeqs(t, dir, "bk")
+	require.False(t, left[seq], "the retired segment's CAR is still on disk")
 	retired, err := mem.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk")
-	if err != nil {
-		t.Fatalf("ListRetiredSegments: %v", err)
-	}
-	if len(retired) != 1 || retired[0].Seq != seq || string(retired[0].IndexDigest) != string(index) {
-		t.Fatalf("retired rows = %+v, want segment %d with its index digest kept", retired, seq)
-	}
-	if live, _ := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk"); len(live) != 0 {
-		t.Fatalf("live rows = %+v, want none", live)
-	}
+	require.NoError(t, err, "ListRetiredSegments")
+	require.Len(t, retired, 1, "retired rows = %+v, want segment %d with its index digest kept", retired, seq)
+	require.Equal(t, seq, retired[0].Seq, "retired rows = %+v, want segment %d with its index digest kept", retired, seq)
+	require.Equal(t, string(index), string(retired[0].IndexDigest), "retired rows = %+v, want segment %d with its index digest kept", retired, seq)
+	live, _ := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
+	require.Empty(t, live, "live rows")
 }
 
 // TestRecover_UnshippedRetiredFileReappears: a segment that never shipped
@@ -641,35 +524,26 @@ func TestRecover_UnshippedRetiredFileReappears(t *testing.T) {
 	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
 	// Sealed but never shipped, whatever the manager above got to.
 	rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
-	if err != nil || len(rows) != 1 {
-		t.Fatalf("ListSegments = %+v, %v; want the one sealed row", rows, err)
-	}
+	require.NoError(t, err, "ListSegments = %+v, %v; want the one sealed row", rows, err)
+	require.Len(t, rows, 1, "ListSegments = %+v, %v; want the one sealed row", rows, err)
 	row := rows[0]
 	row.ShippedAt, row.IndexDigest = 0, nil
-	if err := mem.RehydrateSegment(ctx, row); err != nil {
-		t.Fatalf("RehydrateSegment: %v", err)
-	}
-	if err := mem.RetireSegment(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix()); err != nil {
-		t.Fatalf("RetireSegment: %v", err)
-	}
+	require.NoError(t, mem.RehydrateSegment(ctx, row), "RehydrateSegment")
+	require.NoError(t, mem.RetireSegment(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix()), "RetireSegment")
 
 	ship := &shipRecorder{}
 	m, err := openRebuildManager(t, dir, mem, ship)
-	if err != nil {
-		t.Fatalf("OpenManager: %v", err)
-	}
+	require.NoError(t, err, "OpenManager")
 	requireReadable(t, m, written)
-	if retired, _ := mem.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk"); len(retired) != 0 {
-		t.Fatalf("retired rows = %+v, want the segment's row restored", retired)
-	}
-	if live, _ := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk"); len(live) != 1 || live[0].Seq != seq || live[0].State != logstore.StateSealed {
-		t.Fatalf("live rows = %+v, want segment %d restored as sealed", live, seq)
-	}
+	retired, _ := mem.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk")
+	require.Empty(t, retired, "retired rows = %+v, want the segment's row restored", retired)
+	live, _ := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
+	require.Len(t, live, 1, "live rows = %+v, want segment %d restored as sealed", live, seq)
+	require.Equal(t, seq, live[0].Seq, "live rows = %+v, want segment %d restored as sealed", live, seq)
+	require.Equal(t, logstore.StateSealed, live[0].State, "live rows = %+v, want segment %d restored as sealed", live, seq)
 	deadline := time.Now().Add(5 * time.Second)
 	for !ship.shipped()[seq] {
-		if time.Now().After(deadline) {
-			t.Fatalf("segment %d never shipped", seq)
-		}
+		require.False(t, time.Now().After(deadline), "segment %d never shipped", seq)
 		time.Sleep(20 * time.Millisecond)
 	}
 }
@@ -685,28 +559,19 @@ func TestRecover_UnshippedRetiredCARWithoutIdx(t *testing.T) {
 	written := sealedSegments(t, dir, mem, 1)
 	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
 	rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
-	if err != nil || len(rows) != 1 {
-		t.Fatalf("ListSegments = %+v, %v; want the one sealed row", rows, err)
-	}
+	require.NoError(t, err, "ListSegments = %+v, %v; want the one sealed row", rows, err)
+	require.Len(t, rows, 1, "ListSegments = %+v, %v; want the one sealed row", rows, err)
 	row := rows[0]
 	row.ShippedAt, row.IndexDigest = 0, nil
-	if err := mem.RehydrateSegment(ctx, row); err != nil {
-		t.Fatalf("RehydrateSegment: %v", err)
-	}
-	if err := mem.RetireSegment(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix()); err != nil {
-		t.Fatalf("RetireSegment: %v", err)
-	}
+	require.NoError(t, mem.RehydrateSegment(ctx, row), "RehydrateSegment")
+	require.NoError(t, mem.RetireSegment(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix()), "RetireSegment")
 	for _, name := range []string{fmt.Sprintf("seg-%020d.idx", seq), fmt.Sprintf("seg-%020d.ops", seq)} {
-		if err := os.Remove(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), name)); err != nil {
-			t.Fatalf("remove %s: %v", name, err)
-		}
+		require.NoError(t, os.Remove(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), name)), "remove %s", name)
 	}
 
 	ship := &shipRecorder{}
 	m, err := openRebuildManager(t, dir, mem, ship)
-	if err != nil {
-		t.Fatalf("OpenManager: %v", err)
-	}
+	require.NoError(t, err, "OpenManager")
 	requireReadable(t, m, written)
 	// Wait for the retired row to record the ship, not for the flush: the
 	// ship writes the row after the flush returns, on queueShips's
@@ -715,34 +580,25 @@ func TestRecover_UnshippedRetiredCARWithoutIdx(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		retired, err := mem.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk")
-		if err != nil {
-			t.Fatalf("ListRetiredSegments: %v", err)
-		}
+		require.NoError(t, err, "ListRetiredSegments")
 		if len(retired) == 1 && retired[0].Seq == seq && retired[0].ShippedAt != 0 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("segment %d never shipped (flushed: %v, retired rows: %+v)", seq, ship.shipped()[seq], retired)
+			require.FailNowf(t, "segment never shipped", "segment %d (flushed: %v, retired rows: %+v)", seq, ship.shipped()[seq], retired)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if err := m.Close(ctx); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	require.NoError(t, m.Close(ctx), "Close")
 
-	if _, err := openRebuildManager(t, dir, mem, &shipRecorder{}); err != nil {
-		t.Fatalf("OpenManager again: %v", err)
-	}
-	if onDiskSeqs(t, dir, "bk")[seq] {
-		t.Fatalf("segment %d's CAR is still on disk after it shipped under its retired row", seq)
-	}
+	_, err = openRebuildManager(t, dir, mem, &shipRecorder{})
+	require.NoError(t, err, "OpenManager again")
+	require.False(t, onDiskSeqs(t, dir, "bk")[seq], "segment %d's CAR is still on disk after it shipped under its retired row", seq)
 	retired, err := mem.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk")
-	if err != nil {
-		t.Fatalf("ListRetiredSegments: %v", err)
-	}
-	if len(retired) != 1 || retired[0].Seq != seq || retired[0].ShippedAt == 0 {
-		t.Fatalf("retired rows = %+v, want segment %d retired and shipped", retired, seq)
-	}
+	require.NoError(t, err, "ListRetiredSegments")
+	require.Len(t, retired, 1, "retired rows = %+v, want segment %d retired and shipped", retired, seq)
+	require.Equal(t, seq, retired[0].Seq, "retired rows = %+v, want segment %d retired and shipped", retired, seq)
+	require.NotZero(t, retired[0].ShippedAt, "retired rows = %+v, want segment %d retired and shipped", retired, seq)
 }
 
 // TestRecover_UnreadableIdx: a row-less CAR whose .idx didn't survive (a
@@ -752,13 +608,9 @@ func TestRecover_UnreadableIdx(t *testing.T) {
 	dir := t.TempDir()
 	written := sealedSegments(t, dir, newPGMeta(t), 1)
 	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
-	if err := os.WriteFile(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), fmt.Sprintf("seg-%020d.idx", seq)), nil, 0o644); err != nil {
-		t.Fatalf("truncate .idx: %v", err)
-	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), fmt.Sprintf("seg-%020d.idx", seq)), nil, 0o644), "truncate .idx")
 	m, err := openRebuildManager(t, dir, newPGMeta(t), &shipRecorder{})
-	if err != nil {
-		t.Fatalf("OpenManager over an unreadable .idx: %v", err)
-	}
+	require.NoError(t, err, "OpenManager over an unreadable .idx")
 	requireReadable(t, m, written)
 }
 
@@ -782,48 +634,37 @@ func TestRecover_SealedRowWithoutIdx(t *testing.T) {
 			written := sealedSegments(t, dir, mem, 1)
 			seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
 			rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
-			if err != nil || len(rows) != 1 || rows[0].State != logstore.StateSealed {
-				t.Fatalf("ListSegments = %+v, %v; want the one sealed row", rows, err)
-			}
+			require.NoError(t, err, "ListSegments = %+v, %v; want the one sealed row", rows, err)
+			require.Len(t, rows, 1, "ListSegments = %+v, %v; want the one sealed row", rows, err)
+			require.Equal(t, logstore.StateSealed, rows[0].State, "ListSegments = %+v, %v; want the one sealed row", rows, err)
 			row := rows[0]
 			row.ShippedAt, row.IndexDigest = 0, nil
 			if tc.shipped {
 				row.ShippedAt = time.Now().Unix()
 			}
-			if err := mem.RehydrateSegment(ctx, row); err != nil {
-				t.Fatalf("RehydrateSegment: %v", err)
-			}
+			require.NoError(t, mem.RehydrateSegment(ctx, row), "RehydrateSegment")
 			idx := filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), fmt.Sprintf("seg-%020d.idx", seq))
 			if tc.idx == nil {
 				err = os.Remove(idx)
 			} else {
 				err = os.WriteFile(idx, tc.idx, 0o644)
 			}
-			if err != nil {
-				t.Fatalf("break .idx: %v", err)
-			}
+			require.NoError(t, err, "break .idx")
 
 			ship := &shipRecorder{}
 			m, err := openRebuildManager(t, dir, mem, ship)
-			if err != nil {
-				t.Fatalf("OpenManager over a sealed row without its .idx: %v", err)
-			}
+			require.NoError(t, err, "OpenManager over a sealed row without its .idx")
 			requireReadable(t, m, written)
-			if _, err := os.Stat(idx); err != nil {
-				t.Fatalf("no fresh .idx after the rebuild: %v", err)
-			}
+			_, err = os.Stat(idx)
+			require.NoError(t, err, "no fresh .idx after the rebuild")
 			if tc.shipped {
 				time.Sleep(200 * time.Millisecond)
-				if ship.shipped()[seq] {
-					t.Fatalf("shipped segment %d was shipped again", seq)
-				}
+				require.False(t, ship.shipped()[seq], "shipped segment %d was shipped again", seq)
 				return
 			}
 			deadline := time.Now().Add(5 * time.Second)
 			for !ship.shipped()[seq] {
-				if time.Now().After(deadline) {
-					t.Fatalf("segment %d never shipped", seq)
-				}
+				require.False(t, time.Now().After(deadline), "segment %d never shipped", seq)
 				time.Sleep(20 * time.Millisecond)
 			}
 		})
@@ -840,34 +681,24 @@ func TestRecover_SealedRowWithoutIdxOrOps(t *testing.T) {
 	written := sealedSegments(t, dir, mem, 1)
 	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
 	rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
-	if err != nil || len(rows) != 1 || len(rows[0].OpRoots) == 0 {
-		t.Fatalf("ListSegments = %+v, %v; want one sealed row with op-roots", rows, err)
-	}
+	require.NoError(t, err, "ListSegments = %+v, %v; want one sealed row with op-roots", rows, err)
+	require.Len(t, rows, 1, "ListSegments = %+v, %v; want one sealed row with op-roots", rows, err)
+	require.NotEmpty(t, rows[0].OpRoots, "ListSegments = %+v, %v; want one sealed row with op-roots", rows, err)
 	catalog := filepath.Join(dir, "bk", blockstore.PlaneCatalog.String())
 	for _, name := range []string{fmt.Sprintf("seg-%020d.idx", seq), fmt.Sprintf("seg-%020d.ops", seq)} {
-		if err := os.Remove(filepath.Join(catalog, name)); err != nil {
-			t.Fatalf("remove %s: %v", name, err)
-		}
+		require.NoError(t, os.Remove(filepath.Join(catalog, name)), "remove %s", name)
 	}
 
 	m, err := openRebuildManager(t, dir, mem, &shipRecorder{})
-	if err != nil {
-		t.Fatalf("OpenManager: %v", err)
-	}
+	require.NoError(t, err, "OpenManager")
 	requireReadable(t, m, written)
 	data, err := os.ReadFile(filepath.Join(catalog, fmt.Sprintf("seg-%020d.idx", seq)))
-	if err != nil {
-		t.Fatalf("read the fresh .idx: %v", err)
-	}
+	require.NoError(t, err, "read the fresh .idx")
 	var idx struct {
 		OpRoots []json.RawMessage `json:"op_roots"`
 	}
-	if err := json.Unmarshal(data, &idx); err != nil {
-		t.Fatalf("parse the fresh .idx: %v", err)
-	}
-	if len(idx.OpRoots) != len(rows[0].OpRoots) {
-		t.Fatalf("fresh .idx has %d op-roots, want the row's %d", len(idx.OpRoots), len(rows[0].OpRoots))
-	}
+	require.NoError(t, json.Unmarshal(data, &idx), "parse the fresh .idx")
+	require.Len(t, idx.OpRoots, len(rows[0].OpRoots), "fresh .idx op-roots")
 }
 
 // TestRecover_SealedRowDamagedCAR: a sealed row whose .idx is gone and whose
@@ -893,59 +724,43 @@ func TestRecover_SealedRowDamagedCAR(t *testing.T) {
 			written := sealedSegments(t, dir, mem, 1)
 			seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
 			rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
-			if err != nil || len(rows) != 1 || rows[0].State != logstore.StateSealed {
-				t.Fatalf("ListSegments = %+v, %v; want the one sealed row", rows, err)
-			}
+			require.NoError(t, err, "ListSegments = %+v, %v; want the one sealed row", rows, err)
+			require.Len(t, rows, 1, "ListSegments = %+v, %v; want the one sealed row", rows, err)
+			require.Equal(t, logstore.StateSealed, rows[0].State, "ListSegments = %+v, %v; want the one sealed row", rows, err)
 			row := rows[0]
 			row.ShippedAt, row.IndexDigest = 0, nil
 			if tc.shipped {
 				row.ShippedAt = time.Now().Unix()
 			}
-			if err := mem.RehydrateSegment(ctx, row); err != nil {
-				t.Fatalf("RehydrateSegment: %v", err)
-			}
+			require.NoError(t, mem.RehydrateSegment(ctx, row), "RehydrateSegment")
 			if tc.journaled {
-				if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-					t.Fatalf("Create bk: %v", err)
-				}
+				require.NoError(t, mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}), "Create bk")
 				mem.commitJournaled(t, "bk", seq, written)
 			}
 			catalog := filepath.Join(dir, "bk", blockstore.PlaneCatalog.String())
 			car := filepath.Join(catalog, fmt.Sprintf("seg-%020d.car", seq))
-			if err := os.Remove(filepath.Join(catalog, fmt.Sprintf("seg-%020d.idx", seq))); err != nil {
-				t.Fatalf("remove .idx: %v", err)
-			}
-			if err := os.Truncate(car, row.Size-100); err != nil {
-				t.Fatalf("cut the CAR short: %v", err)
-			}
+			require.NoError(t, os.Remove(filepath.Join(catalog, fmt.Sprintf("seg-%020d.idx", seq))), "remove .idx")
+			require.NoError(t, os.Truncate(car, row.Size-100), "cut the CAR short")
 
 			ship := &shipRecorder{}
 			m, err := openRebuildManager(t, dir, mem, ship)
 			if tc.wantErr {
-				if err == nil {
-					t.Fatal("OpenManager over a damaged, unjournaled sealed CAR succeeded")
-				}
-				if info, serr := os.Stat(car); serr != nil || info.Size() != row.Size-100 {
-					t.Fatalf("the damaged CAR was moved or changed: %v", serr)
-				}
+				require.Error(t, err, "OpenManager over a damaged, unjournaled sealed CAR succeeded")
+				info, serr := os.Stat(car)
+				require.NoError(t, serr, "the damaged CAR was moved or changed")
+				require.Equal(t, row.Size-100, info.Size(), "the damaged CAR was moved or changed")
 				return
 			}
-			if err != nil {
-				t.Fatalf("OpenManager: %v", err)
-			}
-			if onDiskSeqs(t, dir, "bk")[seq] {
-				t.Fatalf("segment %d's damaged CAR is still in place", seq)
-			}
-			if _, err := os.Stat(car + ".damaged"); err != nil {
-				t.Fatalf("the damaged CAR wasn't set aside: %v", err)
-			}
-			if _, err := os.Stat(filepath.Join(catalog, fmt.Sprintf("seg-%020d.ops", seq))); !errors.Is(err, fs.ErrNotExist) {
-				t.Fatalf("the damaged segment's .ops is still there: %v", err)
-			}
+			require.NoError(t, err, "OpenManager")
+			require.False(t, onDiskSeqs(t, dir, "bk")[seq], "segment %d's damaged CAR is still in place", seq)
+			_, err = os.Stat(car + ".damaged")
+			require.NoError(t, err, "the damaged CAR wasn't set aside")
+			_, err = os.Stat(filepath.Join(catalog, fmt.Sprintf("seg-%020d.ops", seq)))
+			require.ErrorIs(t, err, fs.ErrNotExist, "the damaged segment's .ops is still there")
 			retired, err := mem.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk")
-			if err != nil || len(retired) != 1 || retired[0].Seq != seq {
-				t.Fatalf("retired rows = %+v, %v; want segment %d retired", retired, err, seq)
-			}
+			require.NoError(t, err, "retired rows = %+v, %v", retired, err)
+			require.Len(t, retired, 1, "retired rows = %+v, %v", retired, err)
+			require.Equal(t, seq, retired[0].Seq, "retired rows = %+v, %v", retired, err)
 			if tc.journaled {
 				requireReadable(t, m, written)
 			}
@@ -960,13 +775,9 @@ func TestRecover_SeveralOpenSegments(t *testing.T) {
 	dir := t.TempDir()
 	written := sealedSegments(t, dir, newPGMeta(t), 2)
 	for seq := range onDiskSeqs(t, dir, "bk") {
-		if err := os.Remove(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), fmt.Sprintf("seg-%020d.idx", seq))); err != nil {
-			t.Fatalf("remove .idx: %v", err)
-		}
+		require.NoError(t, os.Remove(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), fmt.Sprintf("seg-%020d.idx", seq))), "remove .idx")
 	}
 	m, err := openRebuildManager(t, dir, newPGMeta(t), &shipRecorder{})
-	if err != nil {
-		t.Fatalf("OpenManager over two open segments: %v", err)
-	}
+	require.NoError(t, err, "OpenManager over two open segments")
 	requireReadable(t, m, written)
 }

@@ -7,6 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/queue/bucketqueue"
 	"github.com/fil-forge/libforge/taskrunner"
@@ -16,9 +17,7 @@ import (
 func commitTasks(t *testing.T, mem *testStore) int {
 	t.Helper()
 	tasks, err := mem.queued(context.Background(), bucketqueue.Name)
-	if err != nil {
-		t.Fatalf("queued: %v", err)
-	}
+	require.NoError(t, err, "queued")
 	n := 0
 	for _, task := range tasks {
 		if task.Action == bucketqueue.CommitAction {
@@ -48,20 +47,17 @@ func TestDeleteObjectsIsOneCommit(t *testing.T) {
 			{Key: aws.String("c")},
 		}},
 	})
-	if err != nil {
-		t.Fatalf("DeleteObjects: %v", err)
-	}
-	if n := commitTasks(t, mem) - before; n != 1 {
-		t.Fatalf("DeleteObjects ran %d commits, want 1", n)
-	}
-	if len(res.Deleted) != 2 || len(res.Error) != 1 || *res.Error[0].Key != "b" || *res.Error[0].Code != "PreconditionFailed" {
-		t.Fatalf("result = deleted %v, errors %v; want a and c deleted and b PreconditionFailed", res.Deleted, res.Error)
-	}
+	require.NoError(t, err, "DeleteObjects")
+	n := commitTasks(t, mem) - before
+	require.Equal(t, 1, n, "DeleteObjects ran %d commits", n)
+	require.Len(t, res.Deleted, 2, "result = deleted %v, errors %v; want a and c deleted and b PreconditionFailed", res.Deleted, res.Error)
+	require.Len(t, res.Error, 1, "result = deleted %v, errors %v; want a and c deleted and b PreconditionFailed", res.Deleted, res.Error)
+	require.Equal(t, "b", *res.Error[0].Key, "result = deleted %v, errors %v; want a and c deleted and b PreconditionFailed", res.Deleted, res.Error)
+	require.Equal(t, "PreconditionFailed", *res.Error[0].Code, "result = deleted %v, errors %v; want a and c deleted and b PreconditionFailed", res.Deleted, res.Error)
 	for k, want := range map[string]bool{"a": false, "b": true, "c": false} {
 		_, err := b.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &bucket, Key: aws.String(k)})
-		if exists := err == nil; exists != want {
-			t.Fatalf("%s exists = %v after the delete, want %v (err %v)", k, exists, want, err)
-		}
+		exists := err == nil
+		require.Equal(t, want, exists, "%s exists = %v after the delete", k, exists)
 	}
 }
 
@@ -73,10 +69,7 @@ func TestDeleteBucketWithoutItsRequestDoesNothing(t *testing.T) {
 	_, mem, _ := newRefTestBackend(t)
 	ctx := context.Background()
 	err := runBucketTaskRaw(ctx, mem, mem.bk(), bucketqueue.DeleteAction, &bucketqueue.BucketTask{Name: "bk"})
-	if !taskrunner.IsPermanent(err) {
-		t.Fatalf("delete without its request = %v, want a permanent failure", err)
-	}
-	if _, err := mem.Get(ctx, "bk"); err != nil {
-		t.Fatalf("the bucket is gone after a delete that did nothing: %v", err)
-	}
+	require.True(t, taskrunner.IsPermanent(err), "delete without its request = %v, want a permanent failure", err)
+	_, err = mem.Get(ctx, "bk")
+	require.NoError(t, err, "the bucket is gone after a delete that did nothing")
 }

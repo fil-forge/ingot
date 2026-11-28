@@ -1,6 +1,10 @@
 package s3frontend
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
 
 // TestNormalizeContentEncoding locks S3's aws-chunked handling: the streaming
 // transfer marker is stripped from the stored Content-Encoding, and a value
@@ -20,8 +24,7 @@ func TestNormalizeContentEncoding(t *testing.T) {
 		{"", ""},
 	}
 	for _, c := range cases {
-		if got := normalizeContentEncoding(c.in); got != c.want {
-			t.Errorf("normalizeContentEncoding(%q) = %q, want %q", c.in, got, c.want)
-		}
+		got := normalizeContentEncoding(c.in)
+		assert.Equal(t, c.want, got, "normalizeContentEncoding(%q)", c.in)
 	}
 }

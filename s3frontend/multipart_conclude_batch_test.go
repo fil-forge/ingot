@@ -13,6 +13,8 @@ import (
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // batchRecordingUploader is a parking uploader that records how many blobs
@@ -56,43 +58,31 @@ func TestCompleteConcludesEachPartBlobOnce(t *testing.T) {
 		// collapse the batch.
 		body := append(testBody(int(backend.MinPartSize)), byte(i))
 		out, err := mpUploadPart(t, b, key, uploadID, n, body, nil)
-		if err != nil {
-			t.Fatalf("UploadPart %d: %v", n, err)
-		}
+		require.NoError(t, err, "UploadPart %d", n)
 		completed = append(completed, types.CompletedPart{PartNumber: &n, ETag: out.ETag})
 		digests = append(digests, hygienePartDigests(t, mem, uploadID, i)...)
 	}
 
-	if _, err := mpComplete(t, b, key, uploadID, completed, nil); err != nil {
-		t.Fatalf("CompleteMultipartUpload: %v", err)
-	}
+	_, err := mpComplete(t, b, key, uploadID, completed, nil)
+	require.NoError(t, err, "CompleteMultipartUpload")
 
 	up.mu.Lock()
 	calls := append([]int{}, up.calls...)
 	up.mu.Unlock()
 
-	if len(calls) != len(digests) {
-		t.Fatalf("Complete made %d ConcludeBlobs calls (%v), want one per blob (%d)", len(calls), calls, len(digests))
-	}
+	require.Len(t, calls, len(digests), "Complete made %d ConcludeBlobs calls (%v)", len(calls), calls)
 	for _, n := range calls {
-		if n != 1 {
-			t.Fatalf("ConcludeBlobs calls = %v, want one blob each", calls)
-		}
+		require.Equal(t, 1, n, "ConcludeBlobs calls")
 	}
 
 	// Every part blob is accepted, and its park is gone.
 	for _, d := range digests {
 		in, err := mem.IntentByDigest(ctx, d)
-		if err != nil {
-			t.Fatalf("intent for %x: %v", d, err)
-		}
+		require.NoError(t, err, "intent for %x", d)
 		// Committed by the Complete: the claim published the intent.
-		if in.State != registry.IntentPublished {
-			t.Errorf("blob %x intent = %v, want published", d, in.State)
-		}
-		if _, err := mem.ParkByDigest(ctx, d); err == nil {
-			t.Errorf("park row for %x survived the conclude", d)
-		}
+		assert.Equal(t, registry.IntentPublished, in.State, "blob %x intent", d)
+		_, err = mem.ParkByDigest(ctx, d)
+		assert.Error(t, err, "park row for %x survived the conclude", d)
 	}
 }
 

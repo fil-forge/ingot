@@ -10,6 +10,7 @@ import (
 
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -24,9 +25,7 @@ import (
 func collectLocalBlobMetrics(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("collect: %v", err)
-	}
+	require.NoError(t, reader.Collect(context.Background(), &rm), "collect")
 	got := map[string]int64{}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
@@ -74,17 +73,12 @@ func TestLocalBlobMetrics_BudgetPass(t *testing.T) {
 		"ingot.local_blobs.removed_bytes/budget": 2 * size,
 	}
 	for name, v := range want {
-		if got[name] != v {
-			t.Fatalf("%s = %d, want %d (all: %v)", name, got[name], v, got)
-		}
+		require.Equal(t, v, got[name], "%s (all: %v)", name, got)
 	}
 
-	if err := b.CloseMetrics(); err != nil {
-		t.Fatalf("CloseMetrics: %v", err)
-	}
-	if _, ok := collectLocalBlobMetrics(t, reader)["ingot.local_blobs.usage/cache"]; ok {
-		t.Fatal("usage gauge still reported after CloseMetrics")
-	}
+	require.NoError(t, b.CloseMetrics(), "CloseMetrics")
+	_, ok := collectLocalBlobMetrics(t, reader)["ingot.local_blobs.usage/cache"]
+	require.False(t, ok, "usage gauge still reported after CloseMetrics")
 }
 
 // TestLocalBlobMetrics_ParkedPart: a part keeps no local copy, so its upload
@@ -95,19 +89,16 @@ func TestLocalBlobMetrics_ParkedPart(t *testing.T) {
 	key := "parked"
 
 	uploadID := mpCreate(t, b, key, "", "")
-	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err != nil {
-		t.Fatalf("UploadPart: %v", err)
-	}
+	_, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil)
+	require.NoError(t, err, "UploadPart")
 
 	got := collectLocalBlobMetrics(t, reader)
 	for name, v := range got {
-		if strings.HasPrefix(name, "ingot.local_blobs.removals/") && v != 0 {
-			t.Fatalf("%s = %d after a part upload, want none (all: %v)", name, v, got)
+		if strings.HasPrefix(name, "ingot.local_blobs.removals/") {
+			require.Zero(t, v, "%s after a part upload (all: %v)", name, got)
 		}
 	}
-	if got["ingot.local_blobs.usage/cache"] != 0 {
-		t.Fatalf("usage after the part parked = %d in the cache, want none", got["ingot.local_blobs.usage/cache"])
-	}
+	require.Zero(t, got["ingot.local_blobs.usage/cache"], "usage in the cache after the part parked")
 }
 
 func TestLocalBlobMetrics_Release(t *testing.T) {
@@ -118,9 +109,9 @@ func TestLocalBlobMetrics_Release(t *testing.T) {
 	size := blobSize(t, b, blobDigestOf(t, b, key, ""))
 	deleteObj(t, b, key)
 
-	if n, err := b.SweepPendingReleases(context.Background()); err != nil || n != 1 {
-		t.Fatalf("release sweep executed %d releases (err=%v), want 1", n, err)
-	}
+	n, err := b.SweepPendingReleases(context.Background())
+	require.NoError(t, err, "release sweep executed %d releases (err=%v), want 1", n, err)
+	require.Equal(t, 1, n, "release sweep executed %d releases (err=%v), want 1", n, err)
 
 	// A cached copy goes by an eviction the release queues, a moment later.
 	var got map[string]int64
@@ -129,10 +120,8 @@ func TestLocalBlobMetrics_Release(t *testing.T) {
 			break
 		}
 	}
-	if got["ingot.local_blobs.removals/released"] != 1 || got["ingot.local_blobs.removed_bytes/released"] != size {
-		t.Fatalf("released removals = %d files, %d bytes; want 1 file, %d bytes (all: %v)",
-			got["ingot.local_blobs.removals/released"], got["ingot.local_blobs.removed_bytes/released"], size, got)
-	}
+	require.Equal(t, int64(1), got["ingot.local_blobs.removals/released"], "released removals (all: %v)", got)
+	require.Equal(t, size, got["ingot.local_blobs.removed_bytes/released"], "released bytes (all: %v)", got)
 }
 
 // TestLocalBlobMetrics_BudgetPassSkipsAFileAlreadyGone: a row whose file was
@@ -143,19 +132,15 @@ func TestLocalBlobMetrics_BudgetPassSkipsAFileAlreadyGone(t *testing.T) {
 	digests := putSweepObjects(t, b, 2)
 	size := blobSize(t, b, digests[1])
 	budgetToEvict(b, 1, size)
-	if err := os.Remove(localPath(b, digests[0])); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Remove(localPath(b, digests[0])))
 
 	sweepLocalBlobs(t, b)
 
 	// The usage count still held the missing file's bytes, so the pass went
 	// on to evict the second blob, the only removal counted.
 	got := collectLocalBlobMetrics(t, reader)
-	if got["ingot.local_blobs.removals/budget"] != 1 || got["ingot.local_blobs.removed_bytes/budget"] != size {
-		t.Fatalf("budget removals = %d files, %d bytes; want 1 file, %d bytes (all: %v)",
-			got["ingot.local_blobs.removals/budget"], got["ingot.local_blobs.removed_bytes/budget"], size, got)
-	}
+	require.Equal(t, int64(1), got["ingot.local_blobs.removals/budget"], "budget removals (all: %v)", got)
+	require.Equal(t, size, got["ingot.local_blobs.removed_bytes/budget"], "budget bytes (all: %v)", got)
 }
 
 // TestLocalBlobMetrics_OrphanPass: the orphan pass counts the temp files it
@@ -167,22 +152,16 @@ func TestLocalBlobMetrics_OrphanPass(t *testing.T) {
 	dir := filepath.Dir(b.cache.Path(multihash.Multihash{0}))
 	for _, name := range []string{".tmp-old", ".tmp-older"} {
 		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, []byte("partial"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chtimes(path, old, old); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.WriteFile(path, []byte("partial"), 0o644))
+		require.NoError(t, os.Chtimes(path, old, old))
 	}
 
 	sweepLocalBlobs(t, b)
 
 	got := collectLocalBlobMetrics(t, reader)
 	wantBytes := int64(2 * len("partial"))
-	if got["ingot.local_blobs.removals/orphan"] != 2 || got["ingot.local_blobs.removed_bytes/orphan"] != wantBytes {
-		t.Fatalf("orphan removals = %d files, %d bytes; want 2 files, %d bytes (all: %v)",
-			got["ingot.local_blobs.removals/orphan"], got["ingot.local_blobs.removed_bytes/orphan"], wantBytes, got)
-	}
+	require.Equal(t, int64(2), got["ingot.local_blobs.removals/orphan"], "orphan removals (all: %v)", got)
+	require.Equal(t, wantBytes, got["ingot.local_blobs.removed_bytes/orphan"], "orphan bytes (all: %v)", got)
 }
 
 // TestLocalBlobMetrics_ReleaseOfACopyAlreadyGone: a release whose cached copy
@@ -192,20 +171,16 @@ func TestLocalBlobMetrics_ReleaseOfACopyAlreadyGone(t *testing.T) {
 	b, _ := newDeferredBackend(t, testfakes.NopUploader{}, meteredBackend(reader))
 	key := "deleted"
 	putObj(t, b, key, testBody(1<<10))
-	if err := os.Remove(localPath(b, blobDigestOf(t, b, key, ""))); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Remove(localPath(b, blobDigestOf(t, b, key, ""))))
 	deleteObj(t, b, key)
 
-	if n, err := b.SweepPendingReleases(context.Background()); err != nil || n != 1 {
-		t.Fatalf("release sweep executed %d releases (err=%v), want 1", n, err)
-	}
+	n, err := b.SweepPendingReleases(context.Background())
+	require.NoError(t, err, "release sweep executed %d releases (err=%v), want 1", n, err)
+	require.Equal(t, 1, n, "release sweep executed %d releases (err=%v), want 1", n, err)
 
 	got := collectLocalBlobMetrics(t, reader)
-	if got["ingot.local_blobs.removals/released"] != 0 || got["ingot.local_blobs.removed_bytes/released"] != 0 {
-		t.Fatalf("released removals = %d files, %d bytes; want none (all: %v)",
-			got["ingot.local_blobs.removals/released"], got["ingot.local_blobs.removed_bytes/released"], got)
-	}
+	require.Zero(t, got["ingot.local_blobs.removals/released"], "released removals (all: %v)", got)
+	require.Zero(t, got["ingot.local_blobs.removed_bytes/released"], "released bytes (all: %v)", got)
 }
 
 // TestLocalBlobMetrics_StalledBytes: the stalled_bytes gauge reports nothing
@@ -219,9 +194,7 @@ func TestLocalBlobMetrics_StalledBytes(t *testing.T) {
 		t.Helper()
 		d := mustSum([]byte(body))
 		n := int64(len(body))
-		if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, Size: n, State: registry.IntentUploading}); err != nil {
-			t.Fatalf("PutIntent: %v", err)
-		}
+		require.NoError(t, mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, Size: n, State: registry.IntentUploading}), "PutIntent")
 		return d, n
 	}
 	stalled, n := uploading("an upload that started and failed an hour ago")
@@ -229,13 +202,11 @@ func TestLocalBlobMetrics_StalledBytes(t *testing.T) {
 	uploading("an upload in progress")
 
 	for key := range collectLocalBlobMetrics(t, reader) {
-		if strings.HasPrefix(key, "ingot.local_blobs.stalled_bytes") {
-			t.Fatalf("%s reported before a sweep", key)
-		}
+		require.False(t, strings.HasPrefix(key, "ingot.local_blobs.stalled_bytes"), "%s reported before a sweep", key)
 	}
 	sweepLocalBlobs(t, b)
 	got := collectLocalBlobMetrics(t, reader)
-	if v, ok := got["ingot.local_blobs.stalled_bytes/uploading"]; !ok || v != n {
-		t.Fatalf("stalled_bytes after a sweep: uploading %d (reported %v); want %d", v, ok, n)
-	}
+	v, ok := got["ingot.local_blobs.stalled_bytes/uploading"]
+	require.True(t, ok, "stalled_bytes after a sweep: uploading %d (reported %v); want %d", v, ok, n)
+	require.Equal(t, n, v, "stalled_bytes after a sweep: uploading %d (reported %v)", v, ok)
 }

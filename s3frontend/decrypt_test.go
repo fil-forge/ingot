@@ -5,10 +5,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"errors"
 	"io"
 	"os"
-	"strings"
 	"testing"
 
 	"github.com/fil-forge/libforge/testutil"
@@ -16,6 +14,7 @@ import (
 	"github.com/filecoin-project/go-fee"
 	"github.com/filecoin-project/go-fee/aesstream"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/blockstore"
 	msbucket "github.com/fil-forge/ingot/bucket"
@@ -49,14 +48,10 @@ func newEncFixture(t *testing.T, plaintext []byte, blobSize int) *encFixture {
 	ctx := context.Background()
 
 	cache, err := blockstore.NewBlobCache(t.TempDir())
-	if err != nil {
-		t.Fatalf("NewBlobCache: %v", err)
-	}
+	require.NoError(t, err, "NewBlobCache")
 	mem := newTestStore(t)
 	provider, err := regionkey.NewInProcessProvider("v1", randBytes(t, regionkey.KEKLen))
-	if err != nil {
-		t.Fatalf("NewInProcessProvider: %v", err)
-	}
+	require.NoError(t, err, "NewInProcessProvider")
 	space := testutil.RandomDID(t)
 
 	var blobs msbucket.BlobRefs
@@ -70,31 +65,23 @@ func newEncFixture(t *testing.T, plaintext []byte, blobSize int) *encFixture {
 		cek := randBytes(t, 32)
 		rc, desc, err := fee.EncryptWithCEK(bytes.NewReader(piece), cek, nil,
 			fee.WithChunkSize(encChunkSize), fee.WithPlaintextLength(int64(len(piece))))
-		if err != nil {
-			t.Fatalf("EncryptWithCEK: %v", err)
-		}
+		require.NoError(t, err, "EncryptWithCEK")
 		digest, n := cacheBlob(t, cache, rc)
 		_ = rc.Close()
 
 		wrapped, err := provider.Wrap(ctx, regionkey.BindingContext{Space: space, Digest: digest}, cek)
-		if err != nil {
-			t.Fatalf("Wrap CEK: %v", err)
-		}
-		if err := mem.PutEncryptionParams(ctx, registry.BlobEncryptionParams{
+		require.NoError(t, err, "Wrap CEK")
+		require.NoError(t, mem.PutEncryptionParams(ctx, registry.BlobEncryptionParams{
 			Space:            space,
 			Digest:           digest,
 			RegionWrappedCEK: wrapped.Ciphertext,
 			RegionKeyVersion: string(wrapped.Version),
 			HeaderLen:        desc.HeaderLen,
 			AAD:              desc.AAD,
-		}); err != nil {
-			t.Fatalf("PutEncryptionParams: %v", err)
-		}
-		if err := mem.PutLocation(ctx, registry.BlobLocation{
+		}), "PutEncryptionParams")
+		require.NoError(t, mem.PutLocation(ctx, registry.BlobLocation{
 			Space: space, Digest: digest, Provider: "did:web:piri.test", URL: "http://piri.test/blob", Size: n,
-		}); err != nil {
-			t.Fatalf("PutLocation: %v", err)
-		}
+		}), "PutLocation")
 		blobs = append(blobs, msbucket.BlobRef{Digest: digest, Start: int64(off), End: int64(end - 1)})
 		off = end
 	}
@@ -121,18 +108,15 @@ func newEncFixture(t *testing.T, plaintext []byte, blobSize int) *encFixture {
 func testRegionKeys(t *testing.T) regionkey.Provider {
 	t.Helper()
 	p, err := regionkey.NewInProcessProvider("v1", randBytes(t, regionkey.KEKLen))
-	if err != nil {
-		t.Fatalf("NewInProcessProvider: %v", err)
-	}
+	require.NoError(t, err, "NewInProcessProvider")
 	return p
 }
 
 func randBytes(t *testing.T, n int) []byte {
 	t.Helper()
 	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		t.Fatalf("rand: %v", err)
-	}
+	_, err := rand.Read(b)
+	require.NoError(t, err, "rand")
 	return b
 }
 
@@ -156,17 +140,11 @@ func TestDecryptingRead_Ranges(t *testing.T) {
 	fx := newEncFixture(t, patterned(24000), 10000)
 
 	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 0, fx.body.Size()-1)
-	if err != nil {
-		t.Fatalf("bodyOpener: %v", err)
-	}
+	require.NoError(t, err, "bodyOpener")
 
 	whole, err := io.ReadAll(msbucket.OpenBody(ctx, opener, fx.space, fx.body))
-	if err != nil {
-		t.Fatalf("OpenBody read: %v", err)
-	}
-	if !bytes.Equal(whole, fx.plaintext) {
-		t.Fatalf("whole-body decrypt mismatch (%d bytes)", len(whole))
-	}
+	require.NoError(t, err, "OpenBody read")
+	require.Equal(t, fx.plaintext, whole, "whole-body decrypt mismatch (%d bytes)", len(whole))
 
 	cases := []struct {
 		name       string
@@ -182,12 +160,8 @@ func TestDecryptingRead_Ranges(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got, err := io.ReadAll(msbucket.OpenBodyRange(ctx, opener, fx.space, fx.body, c.start, c.end))
-			if err != nil {
-				t.Fatalf("range read: %v", err)
-			}
-			if !bytes.Equal(got, fx.plaintext[c.start:c.end+1]) {
-				t.Fatalf("range [%d,%d] mismatch (%d bytes)", c.start, c.end, len(got))
-			}
+			require.NoError(t, err, "range read")
+			require.Equal(t, fx.plaintext[c.start:c.end+1], got, "range [%d,%d] mismatch (%d bytes)", c.start, c.end, len(got))
 		})
 	}
 }
@@ -201,14 +175,10 @@ func TestDecryptingRead_MissingParamsRowFailsClosed(t *testing.T) {
 	fx := newEncFixture(t, patterned(24000), 10000)
 
 	// Shred one blob's row out from under the body.
-	if err := fx.mem.DeleteEncryptionParams(ctx, fx.space, fx.body[1].Digest); err != nil {
-		t.Fatalf("DeleteEncryptionParams: %v", err)
-	}
-	if _, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 0, fx.body.Size()-1); err == nil {
-		t.Fatal("bodyOpener over a shredded row succeeded — raw ciphertext would have been served")
-	} else if !strings.Contains(err.Error(), "no encryption-params row") {
-		t.Fatalf("bodyOpener error = %v, want the missing-row rejection", err)
-	}
+	require.NoError(t, fx.mem.DeleteEncryptionParams(ctx, fx.space, fx.body[1].Digest), "DeleteEncryptionParams")
+	_, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 0, fx.body.Size()-1)
+	require.Error(t, err, "bodyOpener over a shredded row succeeded — raw ciphertext would have been served")
+	require.ErrorContains(t, err, "no encryption-params row", "bodyOpener error, want the missing-row rejection")
 }
 
 // countingEncStores wraps the encryption-params and location stores,
@@ -264,25 +234,16 @@ func TestDecryptingRead_PrefetchIsTwoQueries(t *testing.T) {
 	c := countLookups(fx)
 
 	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 0, fx.body.Size()-1)
-	if err != nil {
-		t.Fatalf("bodyOpener: %v", err)
-	}
-	if c.singleParams != 0 || c.singleLocs != 0 {
-		t.Fatalf("per-blob lookups: %d params, %d locations; want none", c.singleParams, c.singleLocs)
-	}
-	if len(c.paramBatches) != 1 || len(c.locBatches) != 1 {
-		t.Fatalf("batches: %d params, %d locations; want 1 and 1", len(c.paramBatches), len(c.locBatches))
-	}
-	if n := len(c.paramBatches[0]); n != len(fx.body) {
-		t.Fatalf("params batch named %d digests, want %d", n, len(fx.body))
-	}
+	require.NoError(t, err, "bodyOpener")
+	require.Zero(t, c.singleParams, "per-blob lookups: %d params, %d locations", c.singleParams, c.singleLocs)
+	require.Zero(t, c.singleLocs, "per-blob lookups: %d params, %d locations", c.singleParams, c.singleLocs)
+	require.Len(t, c.paramBatches, 1, "batches: %d params, %d locations", len(c.paramBatches), len(c.locBatches))
+	require.Len(t, c.locBatches, 1, "batches: %d params, %d locations", len(c.paramBatches), len(c.locBatches))
+	n := len(c.paramBatches[0])
+	require.Equal(t, len(fx.body), n, "params batch named %d digests", n)
 	got, err := io.ReadAll(msbucket.OpenBody(ctx, opener, fx.space, fx.body))
-	if err != nil {
-		t.Fatalf("OpenBody read: %v", err)
-	}
-	if !bytes.Equal(got, fx.plaintext) {
-		t.Fatal("whole-body decrypt mismatch")
-	}
+	require.NoError(t, err, "OpenBody read")
+	require.Equal(t, fx.plaintext, got, "whole-body decrypt mismatch")
 }
 
 // A ranged read prefetches only the blobs its range covers, reads them, and
@@ -294,26 +255,18 @@ func TestDecryptingRead_RangePrefetchesCoveredBlobs(t *testing.T) {
 	c := countLookups(fx)
 
 	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 12000, 15000)
-	if err != nil {
-		t.Fatalf("bodyOpener: %v", err)
-	}
+	require.NoError(t, err, "bodyOpener")
 	want := fx.body[1].Digest
 	for _, batch := range [][][]multihash.Multihash{c.paramBatches, c.locBatches} {
-		if len(batch) != 1 || len(batch[0]) != 1 || !bytes.Equal(batch[0][0], want) {
-			t.Fatalf("batches = %x, want one naming only the middle blob %x", batch, want)
-		}
+		require.Len(t, batch, 1, "batches = %x, want one naming only the middle blob %x", batch, want)
+		require.Len(t, batch[0], 1, "batches = %x, want one naming only the middle blob %x", batch, want)
+		require.True(t, bytes.Equal(batch[0][0], want), "batches = %x, want one naming only the middle blob %x", batch, want)
 	}
 	got, err := io.ReadAll(msbucket.OpenBodyRange(ctx, opener, fx.space, fx.body, 12000, 15000))
-	if err != nil {
-		t.Fatalf("range read: %v", err)
-	}
-	if !bytes.Equal(got, fx.plaintext[12000:15001]) {
-		t.Fatal("range decrypt mismatch")
-	}
-	if _, err := opener.OpenBlobRange(ctx, fx.space, fx.body[0], 0, 99); err == nil ||
-		!strings.Contains(err.Error(), "no prefetched encryption state") {
-		t.Fatalf("OpenBlobRange outside the range: err = %v, want the fail-closed refusal", err)
-	}
+	require.NoError(t, err, "range read")
+	require.Equal(t, fx.plaintext[12000:15001], got, "range decrypt mismatch")
+	_, err = opener.OpenBlobRange(ctx, fx.space, fx.body[0], 0, 99)
+	require.ErrorContains(t, err, "no prefetched encryption state", "OpenBlobRange outside the range, want the fail-closed refusal")
 }
 
 // extentIndex serves a flat list as extents of per blobs each, the shape of
@@ -346,23 +299,14 @@ func TestDecryptingRead_HoldsOneExtentAtATime(t *testing.T) {
 	idx := extentIndex{BlobRefs: fx.body, per: 3} // extents of 3, 3, 3, 1
 
 	opener, err := fx.backend.bodyOpener(ctx, fx.space, idx, false, 0, fx.body.Size()-1)
-	if err != nil {
-		t.Fatalf("bodyOpener: %v", err)
-	}
+	require.NoError(t, err, "bodyOpener")
 	held := &maxHeld{opener: opener.(*decryptingOpener)}
 	got, err := io.ReadAll(msbucket.OpenBody(ctx, held, fx.space, idx))
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if !bytes.Equal(got, fx.plaintext) {
-		t.Fatal("decrypt mismatch")
-	}
-	if len(c.paramBatches) != 4 || len(c.locBatches) != 4 {
-		t.Fatalf("batches: %d params, %d locations; want one per extent, 4", len(c.paramBatches), len(c.locBatches))
-	}
-	if held.max != 3 {
-		t.Fatalf("held state for up to %d blobs at once, want 3 (one extent)", held.max)
-	}
+	require.NoError(t, err, "read")
+	require.Equal(t, fx.plaintext, got, "decrypt mismatch")
+	require.Len(t, c.paramBatches, 4, "batches: %d params, %d locations; want one per extent, 4", len(c.paramBatches), len(c.locBatches))
+	require.Len(t, c.locBatches, 4, "batches: %d params, %d locations; want one per extent, 4", len(c.paramBatches), len(c.locBatches))
+	require.Equal(t, 3, held.max, "held state for up to %d blobs at once", held.max)
 }
 
 // maxHeld records the most blobs the opener held state for after any open.
@@ -382,25 +326,15 @@ func (m *maxHeld) OpenBlobRange(ctx context.Context, space did.DID, ref msbucket
 func TestDecryptingRead_MissingRowOutsideRangeIsNotRead(t *testing.T) {
 	ctx := context.Background()
 	fx := newEncFixture(t, patterned(24000), 10000)
-	if err := fx.mem.DeleteEncryptionParams(ctx, fx.space, fx.body[0].Digest); err != nil {
-		t.Fatalf("DeleteEncryptionParams: %v", err)
-	}
+	require.NoError(t, fx.mem.DeleteEncryptionParams(ctx, fx.space, fx.body[0].Digest), "DeleteEncryptionParams")
 
 	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 10000, 23999)
-	if err != nil {
-		t.Fatalf("bodyOpener over blobs 2-3: %v", err)
-	}
+	require.NoError(t, err, "bodyOpener over blobs 2-3")
 	got, err := io.ReadAll(msbucket.OpenBodyRange(ctx, opener, fx.space, fx.body, 10000, 23999))
-	if err != nil {
-		t.Fatalf("range read: %v", err)
-	}
-	if !bytes.Equal(got, fx.plaintext[10000:]) {
-		t.Fatal("range decrypt mismatch")
-	}
-	if _, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 9999, 10000); err == nil ||
-		!strings.Contains(err.Error(), "no encryption-params row") {
-		t.Fatalf("bodyOpener over the shredded blob: err = %v, want the missing-row rejection", err)
-	}
+	require.NoError(t, err, "range read")
+	require.Equal(t, fx.plaintext[10000:], got, "range decrypt mismatch")
+	_, err = fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 9999, 10000)
+	require.ErrorContains(t, err, "no encryption-params row", "bodyOpener over the shredded blob, want the missing-row rejection")
 }
 
 // The network-tier shape: a read store WITHOUT the BlobRangeReader capability
@@ -412,17 +346,11 @@ func TestDecryptingRead_UnrangedUnseekableStore(t *testing.T) {
 	fx := newEncFixture(t, patterned(24000), 10000)
 
 	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 0, fx.body.Size()-1)
-	if err != nil {
-		t.Fatalf("bodyOpener: %v", err)
-	}
+	require.NoError(t, err, "bodyOpener")
 	opener.(*decryptingOpener).read = unseekableBlobs{fx.cache}
 	got, err := io.ReadAll(msbucket.OpenBodyRange(ctx, opener, fx.space, fx.body, 9500, 15000))
-	if err != nil {
-		t.Fatalf("range read: %v", err)
-	}
-	if !bytes.Equal(got, fx.plaintext[9500:15001]) {
-		t.Fatal("fallback-path range mismatch")
-	}
+	require.NoError(t, err, "range read")
+	require.Equal(t, fx.plaintext[9500:15001], got, "fallback-path range mismatch")
 }
 
 // Tampered ciphertext fails authentication mid-stream rather than yielding
@@ -434,22 +362,14 @@ func TestDecryptingRead_TamperFails(t *testing.T) {
 	// Flip one ciphertext byte on disk, past the envelope header.
 	path := fx.cache.Path(fx.body[0].Digest)
 	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read cached envelope: %v", err)
-	}
+	require.NoError(t, err, "read cached envelope")
 	raw[len(raw)-1] ^= 0x01
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		t.Fatalf("write tampered envelope: %v", err)
-	}
+	require.NoError(t, os.WriteFile(path, raw, 0o600), "write tampered envelope")
 
 	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 0, fx.body.Size()-1)
-	if err != nil {
-		t.Fatalf("bodyOpener: %v", err)
-	}
+	require.NoError(t, err, "bodyOpener")
 	_, err = io.ReadAll(msbucket.OpenBody(ctx, opener, fx.space, fx.body))
-	if !errors.Is(err, aesstream.ErrCorrupted) {
-		t.Fatalf("tampered read err = %v, want aesstream.ErrCorrupted", err)
-	}
+	require.ErrorIs(t, err, aesstream.ErrCorrupted, "tampered read err")
 }
 
 // A params row transplanted from another blob fails the CEK unwrap: the wrap
@@ -460,23 +380,15 @@ func TestDecryptingRead_TransplantedRowFails(t *testing.T) {
 
 	a, b := fx.body[0].Digest, fx.body[1].Digest
 	rowB, err := fx.backend.encParams.GetEncryptionParams(ctx, fx.space, b)
-	if err != nil {
-		t.Fatalf("GetEncryptionParams: %v", err)
-	}
+	require.NoError(t, err, "GetEncryptionParams")
 	transplant := *rowB
 	transplant.Digest = a
-	if err := fx.backend.encParams.PutEncryptionParams(ctx, transplant); err != nil {
-		t.Fatalf("PutEncryptionParams: %v", err)
-	}
+	require.NoError(t, fx.backend.encParams.PutEncryptionParams(ctx, transplant), "PutEncryptionParams")
 
 	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 0, fx.body.Size()-1)
-	if err != nil {
-		t.Fatalf("bodyOpener: %v", err)
-	}
+	require.NoError(t, err, "bodyOpener")
 	_, err = io.ReadAll(msbucket.OpenBody(ctx, opener, fx.space, fx.body))
-	if !errors.Is(err, regionkey.ErrAuthentication) {
-		t.Fatalf("transplanted-row read err = %v, want regionkey.ErrAuthentication", err)
-	}
+	require.ErrorIs(t, err, regionkey.ErrAuthentication, "transplanted-row read err")
 }
 
 // The encryption dependencies are required: a Backend missing them fails a
@@ -487,10 +399,9 @@ func TestDecryptingRead_MissingDepsFails(t *testing.T) {
 	fx := newEncFixture(t, patterned(9000), 10000)
 
 	fx.backend.regionKeys = nil
-	if _, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 0, fx.body.Size()-1); err == nil ||
-		!strings.Contains(err.Error(), "encryption dependencies not configured") {
-		t.Fatalf("bodyOpener err = %v, want encryption-dependencies error", err)
-	}
+	_, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 0, fx.body.Size()-1)
+	require.Error(t, err, "bodyOpener err = %v, want encryption-dependencies error", err)
+	require.Contains(t, err.Error(), "encryption dependencies not configured", "bodyOpener err")
 }
 
 // An encrypted blob whose location row is missing fails at opener
@@ -499,13 +410,10 @@ func TestDecryptingRead_MissingLocationFails(t *testing.T) {
 	ctx := context.Background()
 	fx := newEncFixture(t, patterned(9000), 10000)
 
-	if err := fx.backend.locations.DeleteLocation(ctx, fx.space, fx.body[0].Digest); err != nil {
-		t.Fatalf("DeleteLocation: %v", err)
-	}
+	require.NoError(t, fx.backend.locations.DeleteLocation(ctx, fx.space, fx.body[0].Digest), "DeleteLocation")
 	_, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 0, fx.body.Size()-1)
-	if err == nil || !strings.Contains(err.Error(), "no recorded location") {
-		t.Fatalf("bodyOpener err = %v, want missing-location error", err)
-	}
+	require.Error(t, err, "bodyOpener err = %v, want missing-location error", err)
+	require.Contains(t, err.Error(), "no recorded location", "bodyOpener err")
 }
 
 // An encrypted blob whose recorded stored size contradicts the plaintext
@@ -518,17 +426,11 @@ func TestDecryptingRead_StoredSizeMismatchFails(t *testing.T) {
 			fx := newEncFixture(t, patterned(9000), 10000)
 			ref := fx.body[0]
 			loc, err := fx.backend.locations.GetLocation(ctx, fx.space, ref.Digest)
-			if err != nil {
-				t.Fatalf("GetLocation: %v", err)
-			}
+			require.NoError(t, err, "GetLocation")
 			loc.Size += delta
-			if err := fx.mem.PutLocation(ctx, *loc); err != nil {
-				t.Fatalf("PutLocation: %v", err)
-			}
+			require.NoError(t, fx.mem.PutLocation(ctx, *loc), "PutLocation")
 			_, err = fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 0, fx.body.Size()-1)
-			if !errors.Is(err, fee.ErrSizeMismatch) {
-				t.Fatalf("bodyOpener err = %v, want fee.ErrSizeMismatch", err)
-			}
+			require.ErrorIs(t, err, fee.ErrSizeMismatch, "bodyOpener err")
 		})
 	}
 }
@@ -556,13 +458,10 @@ func TestDecryptingRead_RangePastBlobEndFails(t *testing.T) {
 	ctx := context.Background()
 	fx := newEncFixture(t, patterned(9000), 10000)
 	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 0, fx.body.Size()-1)
-	if err != nil {
-		t.Fatalf("bodyOpener: %v", err)
-	}
+	require.NoError(t, err, "bodyOpener")
 	_, err = opener.OpenBlobRange(ctx, fx.space, fx.body[0], 0, 9000)
-	if err == nil || !strings.Contains(err.Error(), "exceeds the 9000 bytes its ciphertext holds") {
-		t.Fatalf("OpenBlobRange err = %v, want a range-past-end error", err)
-	}
+	require.Error(t, err, "OpenBlobRange err = %v, want a range-past-end error", err)
+	require.Contains(t, err.Error(), "exceeds the 9000 bytes its ciphertext holds", "OpenBlobRange err = %v, want a range-past-end error", err)
 }
 
 // spanReaderAt only serves in-order reads of an opened span, and reports a
@@ -571,27 +470,26 @@ func TestSpanReaderAt(t *testing.T) {
 	data := []byte("0123456789")
 
 	var unopened spanReaderAt
-	if _, err := unopened.ReadAt(make([]byte, 2), 0); err == nil {
-		t.Fatal("ReadAt before the span is fetched: want an error")
-	}
+	_, err := unopened.ReadAt(make([]byte, 2), 0)
+	require.Error(t, err, "ReadAt before the span is fetched: want an error")
 
 	s := &spanReaderAt{span: bytes.NewReader(data), pos: 100}
 	buf := make([]byte, 4)
-	if n, err := s.ReadAt(buf, 100); err != nil || n != 4 || string(buf) != "0123" {
-		t.Fatalf("first ReadAt = %d, %v, %q", n, err, buf[:n])
-	}
-	if _, err := s.ReadAt(buf, 100); err == nil {
-		t.Fatal("ReadAt repeating an offset: want an error")
-	}
-	if _, err := s.ReadAt(buf, 105); err == nil {
-		t.Fatal("ReadAt skipping ahead: want an error")
-	}
-	if n, err := s.ReadAt(buf, 104); err != nil || n != 4 || string(buf) != "4567" {
-		t.Fatalf("second ReadAt = %d, %v, %q", n, err, buf[:n])
-	}
-	if n, err := s.ReadAt(buf, 108); !errors.Is(err, io.ErrUnexpectedEOF) || n != 2 {
-		t.Fatalf("ReadAt past the span's end = %d, %v, want 2, io.ErrUnexpectedEOF", n, err)
-	}
+	n, err := s.ReadAt(buf, 100)
+	require.NoError(t, err, "first ReadAt")
+	require.Equal(t, 4, n, "first ReadAt")
+	require.Equal(t, "0123", string(buf), "first ReadAt")
+	_, err = s.ReadAt(buf, 100)
+	require.Error(t, err, "ReadAt repeating an offset: want an error")
+	_, err = s.ReadAt(buf, 105)
+	require.Error(t, err, "ReadAt skipping ahead: want an error")
+	n, err = s.ReadAt(buf, 104)
+	require.NoError(t, err, "second ReadAt")
+	require.Equal(t, 4, n, "second ReadAt")
+	require.Equal(t, "4567", string(buf), "second ReadAt")
+	n, err = s.ReadAt(buf, 108)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF, "ReadAt past the span's end")
+	require.Equal(t, 2, n, "ReadAt past the span's end")
 }
 
 // trackingBlobs wraps a read store, counting the ranged fetches it opens and
@@ -625,26 +523,15 @@ func TestDecryptingRead_CloseReleasesFetch(t *testing.T) {
 	fx.backend.read = tracked
 
 	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false, 0, fx.body.Size()-1)
-	if err != nil {
-		t.Fatalf("bodyOpener: %v", err)
-	}
+	require.NoError(t, err, "bodyOpener")
 	rc, err := opener.OpenBlobRange(ctx, fx.space, fx.body[0], 100, 199)
-	if err != nil {
-		t.Fatalf("OpenBlobRange: %v", err)
-	}
+	require.NoError(t, err, "OpenBlobRange")
 	got, err := io.ReadAll(rc)
-	if err != nil {
-		t.Fatalf("ReadAll: %v", err)
-	}
-	if !bytes.Equal(got, fx.plaintext[100:200]) {
-		t.Fatal("decrypted range does not match the plaintext")
-	}
-	if err := rc.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if tracked.opened != 1 || tracked.closed != 1 {
-		t.Fatalf("fetches opened %d, closed %d; want 1 and 1", tracked.opened, tracked.closed)
-	}
+	require.NoError(t, err, "ReadAll")
+	require.Equal(t, fx.plaintext[100:200], got, "decrypted range does not match the plaintext")
+	require.NoError(t, rc.Close(), "Close")
+	require.Equal(t, 1, tracked.opened, "fetches opened %d, closed %d", tracked.opened, tracked.closed)
+	require.Equal(t, 1, tracked.closed, "fetches opened %d, closed %d", tracked.opened, tracked.closed)
 }
 
 // cacheBlob stores r's bytes in cache under their sha256 digest, and returns
@@ -652,20 +539,13 @@ func TestDecryptingRead_CloseReleasesFetch(t *testing.T) {
 func cacheBlob(t testing.TB, cache *blockstore.BlobCache, r io.Reader) (multihash.Multihash, int64) {
 	t.Helper()
 	local, err := cache.CreateTemp()
-	if err != nil {
-		t.Fatalf("CreateTemp: %v", err)
-	}
+	require.NoError(t, err, "CreateTemp")
 	h := sha256.New()
 	n, err := io.Copy(io.MultiWriter(local, h), r)
-	if err != nil {
-		t.Fatalf("write blob: %v", err)
-	}
+	require.NoError(t, err, "write blob")
 	digest, err := multihash.Encode(h.Sum(nil), multihash.SHA2_256)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := cache.Adopt(local, digest); err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
+	require.NoError(t, err)
+	_, err = cache.Adopt(local, digest)
+	require.NoError(t, err, "Adopt")
 	return digest, n
 }

@@ -1,12 +1,11 @@
 package registry_test
 
 import (
-	"errors"
-	"reflect"
 	"testing"
 	"time"
 
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/registry"
@@ -29,9 +28,7 @@ func TestIntentQueries(t *testing.T) {
 func intentDigest(t *testing.T, s string) multihash.Multihash {
 	t.Helper()
 	d, err := multihash.Sum([]byte(s), multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash: %v", err)
-	}
+	require.NoError(t, err, "multihash")
 	return d
 }
 
@@ -42,23 +39,16 @@ func runIntentSuite(t *testing.T, fresh func(t *testing.T) intentStore) {
 	// seed records an intent in state, optionally with a location or a park.
 	seed := func(t *testing.T, st intentStore, d multihash.Multihash, state string, located, parked bool) {
 		t.Helper()
-		if err := st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: d, Size: 7, State: registry.IntentUploading}); err != nil {
-			t.Fatalf("PutIntent: %v", err)
-		}
+		require.NoError(t, st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: d, Size: 7, State: registry.IntentUploading}), "PutIntent")
 		if state != registry.IntentUploading {
-			if err := st.SetIntentState(ctx, space, d, state); err != nil {
-				t.Fatalf("SetIntentState: %v", err)
-			}
+			require.NoError(t, st.SetIntentState(ctx, space, d, state), "SetIntentState")
 		}
 		if located {
-			if err := st.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 7}); err != nil {
-				t.Fatalf("PutLocation: %v", err)
-			}
+			require.NoError(t, st.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 7}), "PutLocation")
 		}
 		if parked {
-			if _, err := st.PutPark(ctx, registry.BlobPark{Space: space, Digest: d, AddTask: []byte{1}, AcceptTask: []byte{2}, PutInvocation: []byte{3}, Size: 7}); err != nil {
-				t.Fatalf("PutPark: %v", err)
-			}
+			_, err := st.PutPark(ctx, registry.BlobPark{Space: space, Digest: d, AddTask: []byte{1}, AcceptTask: []byte{2}, PutInvocation: []byte{3}, Size: 7})
+			require.NoError(t, err, "PutPark")
 		}
 	}
 	t.Run("SetIntentState to the current state keeps updated_at", func(t *testing.T) {
@@ -66,28 +56,16 @@ func runIntentSuite(t *testing.T, fresh func(t *testing.T) intentStore) {
 		d := intentDigest(t, "retried")
 		seed(t, st, d, registry.IntentAccepted, true, false)
 		before, err := st.GetIntent(ctx, space, d)
-		if err != nil {
-			t.Fatalf("GetIntent: %v", err)
-		}
+		require.NoError(t, err, "GetIntent")
 		time.Sleep(5 * time.Millisecond)
-		if err := st.SetIntentState(ctx, space, d, registry.IntentAccepted); err != nil {
-			t.Fatalf("SetIntentState: %v", err)
-		}
+		require.NoError(t, st.SetIntentState(ctx, space, d, registry.IntentAccepted), "SetIntentState")
 		repeated, err := st.GetIntent(ctx, space, d)
-		if err != nil {
-			t.Fatalf("GetIntent: %v", err)
-		}
-		if err := st.SetIntentState(ctx, space, d, registry.IntentPublished); err != nil {
-			t.Fatalf("SetIntentState: %v", err)
-		}
+		require.NoError(t, err, "GetIntent")
+		require.NoError(t, st.SetIntentState(ctx, space, d, registry.IntentPublished), "SetIntentState")
 		changed, err := st.GetIntent(ctx, space, d)
-		if err != nil {
-			t.Fatalf("GetIntent: %v", err)
-		}
+		require.NoError(t, err, "GetIntent")
 		got := [2]bool{repeated.UpdatedAt.Equal(before.UpdatedAt), changed.UpdatedAt.After(before.UpdatedAt)}
-		if got != [2]bool{true, true} {
-			t.Fatalf("[repeat kept updated_at, change advanced it] = %v, want [true true]", got)
-		}
+		require.Equal(t, [2]bool{true, true}, got, "[repeat kept updated_at, change advanced it]")
 	})
 
 	t.Run("StalledBytes sums uploading intents older than the cutoff", func(t *testing.T) {
@@ -100,14 +78,11 @@ func runIntentSuite(t *testing.T, fresh func(t *testing.T) intentStore) {
 		// one by less still puts every row on the same side.
 		for _, before := range []time.Time{time.Now().Add(-time.Hour), time.Now().Add(time.Hour)} {
 			n, err := st.StalledBytes(ctx, before)
-			if err != nil {
-				t.Fatalf("StalledBytes: %v", err)
-			}
+			require.NoError(t, err, "StalledBytes")
 			got = append(got, n)
 		}
-		if want := []int64{0, 7}; !reflect.DeepEqual(got, want) {
-			t.Fatalf("StalledBytes before [an hour ago, an hour from now] = %v, want %v", got, want)
-		}
+		want := []int64{0, 7}
+		require.Equal(t, want, got, "StalledBytes before [an hour ago, an hour from now]")
 	})
 
 	t.Run("HasIntent reports whether any space holds an intent", func(t *testing.T) {
@@ -117,50 +92,34 @@ func runIntentSuite(t *testing.T, fresh func(t *testing.T) intentStore) {
 		has := func() bool {
 			t.Helper()
 			held, err := st.HasIntent(ctx, d)
-			if err != nil {
-				t.Fatalf("HasIntent: %v", err)
-			}
+			require.NoError(t, err, "HasIntent")
 			return held
 		}
 		var got []bool
 		got = append(got, has())
 		seed(t, st, d, registry.IntentAccepted, true, false)
 		got = append(got, has())
-		if err := st.PutIntent(ctx, registry.UploadIntent{Space: other, Digest: d, Size: 7, State: registry.IntentUploading}); err != nil {
-			t.Fatalf("PutIntent: %v", err)
-		}
-		if err := st.DeleteIntent(ctx, space, d); err != nil {
-			t.Fatalf("DeleteIntent: %v", err)
-		}
+		require.NoError(t, st.PutIntent(ctx, registry.UploadIntent{Space: other, Digest: d, Size: 7, State: registry.IntentUploading}), "PutIntent")
+		require.NoError(t, st.DeleteIntent(ctx, space, d), "DeleteIntent")
 		got = append(got, has())
-		if err := st.DeleteIntent(ctx, other, d); err != nil {
-			t.Fatalf("DeleteIntent: %v", err)
-		}
+		require.NoError(t, st.DeleteIntent(ctx, other, d), "DeleteIntent")
 		got = append(got, has())
-		if want := []bool{false, true, true, false}; !reflect.DeepEqual(got, want) {
-			t.Fatalf("held [none, one space, the other, neither] = %v, want %v", got, want)
-		}
+		require.Equal(t, []bool{false, true, true, false}, got, "held [none, one space, the other, neither]")
 	})
 
 	t.Run("parks are one space's", func(t *testing.T) {
 		st := fresh(t)
 		d := intentDigest(t, "parked-twice")
 		other := testutil.RandomDID(t)
-		if _, err := st.PutPark(ctx, registry.BlobPark{Space: space, Digest: d, AddTask: []byte{1}, AcceptTask: []byte{2}, PutInvocation: []byte{3}, Size: 7}); err != nil {
-			t.Fatalf("PutPark: %v", err)
-		}
-		if _, err := st.GetPark(ctx, other, d); !errors.Is(err, registry.ErrNotFound) {
-			t.Fatalf("GetPark in another space err = %v, want ErrNotFound", err)
-		}
-		if _, err := st.PutPark(ctx, registry.BlobPark{Space: other, Digest: d, AddTask: []byte{4}, AcceptTask: []byte{5}, PutInvocation: []byte{6}, Size: 7}); err != nil {
-			t.Fatalf("PutPark: %v", err)
-		}
-		if err := st.DeletePark(ctx, other, d); err != nil {
-			t.Fatalf("DeletePark: %v", err)
-		}
+		_, err := st.PutPark(ctx, registry.BlobPark{Space: space, Digest: d, AddTask: []byte{1}, AcceptTask: []byte{2}, PutInvocation: []byte{3}, Size: 7})
+		require.NoError(t, err, "PutPark")
+		_, err = st.GetPark(ctx, other, d)
+		require.ErrorIs(t, err, registry.ErrNotFound, "GetPark in another space")
+		_, err = st.PutPark(ctx, registry.BlobPark{Space: other, Digest: d, AddTask: []byte{4}, AcceptTask: []byte{5}, PutInvocation: []byte{6}, Size: 7})
+		require.NoError(t, err, "PutPark")
+		require.NoError(t, st.DeletePark(ctx, other, d), "DeletePark")
 		park, err := st.GetPark(ctx, space, d)
-		if err != nil || park.AddTask[0] != 1 {
-			t.Fatalf("the first space's park after the other's delete = %+v, %v", park, err)
-		}
+		require.NoError(t, err, "the first space's park after the other's delete")
+		require.Equal(t, byte(1), park.AddTask[0], "the first space's park after the other's delete = %+v", park)
 	})
 }

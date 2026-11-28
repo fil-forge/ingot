@@ -1,10 +1,10 @@
 package s3frontend
 
 import (
-	"errors"
 	"testing"
 
 	"github.com/fil-forge/versitygw/s3err"
+	"github.com/stretchr/testify/require"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 )
@@ -53,25 +53,19 @@ func TestPartRange(t *testing.T) {
 			start, length, isRange, count, err := partRange(tc.body, tc.part)
 			if tc.wantErr != "" {
 				var apiErr s3err.APIError
-				if !errors.As(err, &apiErr) || apiErr.Code != tc.wantErr {
-					t.Fatalf("err = %v, want code %s", err, tc.wantErr)
-				}
+				require.ErrorAs(t, err, &apiErr, "err = %v, want code %s", err, tc.wantErr)
+				require.Equal(t, tc.wantErr, apiErr.Code, "err")
 				return
 			}
-			if err != nil {
-				t.Fatalf("unexpected err: %v", err)
-			}
-			if start != tc.wantStart || length != tc.wantLength || isRange != tc.wantRange {
-				t.Fatalf("got (start=%d len=%d range=%v), want (start=%d len=%d range=%v)",
-					start, length, isRange, tc.wantStart, tc.wantLength, tc.wantRange)
-			}
-			switch {
-			case tc.wantCount == nil && count != nil:
-				t.Fatalf("PartsCount = %d, want nil (non-multipart)", *count)
-			case tc.wantCount != nil && count == nil:
-				t.Fatalf("PartsCount = nil, want %d", *tc.wantCount)
-			case tc.wantCount != nil && *count != *tc.wantCount:
-				t.Fatalf("PartsCount = %d, want %d", *count, *tc.wantCount)
+			require.NoError(t, err, "unexpected err")
+			require.Equal(t, tc.wantStart, start, "start")
+			require.Equal(t, tc.wantLength, length, "length")
+			require.Equal(t, tc.wantRange, isRange, "range")
+			if tc.wantCount == nil {
+				require.Nil(t, count, "PartsCount (non-multipart)")
+			} else {
+				require.NotNil(t, count, "PartsCount")
+				require.Equal(t, *tc.wantCount, *count, "PartsCount")
 			}
 		})
 	}
@@ -86,19 +80,26 @@ func TestSelectBytes_Dispatch(t *testing.T) {
 	// partNumber path: part 2 spans [40,100).
 	pn := int32(2)
 	start, length, isRange, count, err := selectBytes(body, &pn, "")
-	if err != nil || start != 40 || length != 60 || !isRange || count == nil || *count != 2 {
-		t.Fatalf("partNumber dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
-	}
+	require.NoError(t, err, "partNumber dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
+	require.Equal(t, int64(40), start, "partNumber dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
+	require.Equal(t, int64(60), length, "partNumber dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
+	require.True(t, isRange, "partNumber dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
+	require.NotNil(t, count, "partNumber dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
+	require.Equal(t, int32(2), *count, "partNumber dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
 
 	// Range path: no partNumber, a byte range yields a nil parts-count.
 	start, length, isRange, count, err = selectBytes(body, nil, "bytes=10-19")
-	if err != nil || start != 10 || length != 10 || !isRange || count != nil {
-		t.Fatalf("range dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
-	}
+	require.NoError(t, err, "range dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
+	require.Equal(t, int64(10), start, "range dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
+	require.Equal(t, int64(10), length, "range dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
+	require.True(t, isRange, "range dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
+	require.Nil(t, count, "range dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
 
 	// No selector: whole object, not a range.
 	start, length, isRange, count, err = selectBytes(body, nil, "")
-	if err != nil || start != 0 || length != 100 || isRange || count != nil {
-		t.Fatalf("whole-object dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
-	}
+	require.NoError(t, err, "whole-object dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
+	require.Zero(t, start, "whole-object dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
+	require.Equal(t, int64(100), length, "whole-object dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
+	require.False(t, isRange, "whole-object dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
+	require.Nil(t, count, "whole-object dispatch: start=%d len=%d range=%v count=%v err=%v", start, length, isRange, count, err)
 }

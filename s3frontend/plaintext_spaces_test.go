@@ -3,10 +3,7 @@ package s3frontend
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"github.com/google/uuid"
-	"github.com/ipfs/go-cid"
 	"os"
 	"strings"
 	"sync"
@@ -16,7 +13,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/google/uuid"
+	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
@@ -40,44 +41,35 @@ func secondPlaintextBucket(t *testing.T, b *Backend, mem *testStore) did.DID {
 	t.Helper()
 	ctx := context.Background()
 	space := testutil.RandomDID(t)
-	if err := mem.Create(ctx, "bk2", space, registry.CreateState{}); err != nil {
-		t.Fatalf("create bk2: %v", err)
-	}
+	require.NoError(t, mem.Create(ctx, "bk2", space, registry.CreateState{}), "create bk2")
 	b.allowNoneEncryption = true
 	for _, bucket := range []string{"bk", "bk2"} {
-		if err := b.PutBucketEncryption(ctx, bucket, sseConfig(sseNone)); err != nil {
-			t.Fatalf("PutBucketEncryption %s none: %v", bucket, err)
-		}
+		require.NoError(t, b.PutBucketEncryption(ctx, bucket, sseConfig(sseNone)), "PutBucketEncryption %s none", bucket)
 	}
 	return space
 }
 
 func putIn(t *testing.T, b *Backend, bucket, key string, data []byte) {
 	t.Helper()
-	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)}); err != nil {
-		t.Fatalf("PutObject %s/%s: %v", bucket, key, err)
-	}
+	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
+	require.NoError(t, err, "PutObject %s/%s", bucket, key)
 }
 
 func getFrom(t *testing.T, b *Backend, bucket, key string) []byte {
 	t.Helper()
 	out, err := b.GetObject(context.Background(), &s3.GetObjectInput{Bucket: &bucket, Key: &key})
-	if err != nil {
-		t.Fatalf("GetObject %s/%s: %v", bucket, key, err)
-	}
+	require.NoError(t, err, "GetObject %s/%s", bucket, key)
 	defer out.Body.Close()
 	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(out.Body); err != nil {
-		t.Fatalf("read body: %v", err)
-	}
+	_, err = buf.ReadFrom(out.Body)
+	require.NoError(t, err, "read body")
 	return buf.Bytes()
 }
 
 func deleteFrom(t *testing.T, b *Backend, bucket, key string) {
 	t.Helper()
-	if _, err := b.DeleteObject(context.Background(), &s3.DeleteObjectInput{Bucket: &bucket, Key: &key}); err != nil {
-		t.Fatalf("DeleteObject %s/%s: %v", bucket, key, err)
-	}
+	_, err := b.DeleteObject(context.Background(), &s3.DeleteObjectInput{Bucket: &bucket, Key: &key})
+	require.NoError(t, err, "DeleteObject %s/%s", bucket, key)
 }
 
 // uploadOnePart starts a multipart upload of key in bucket, uploads part as
@@ -86,24 +78,19 @@ func uploadOnePart(t *testing.T, b *Backend, bucket, key string, part []byte) (s
 	t.Helper()
 	ctx := context.Background()
 	res, err := b.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{Bucket: &bucket, Key: &key})
-	if err != nil {
-		t.Fatalf("CreateMultipartUpload %s/%s: %v", bucket, key, err)
-	}
+	require.NoError(t, err, "CreateMultipartUpload %s/%s", bucket, key)
 	n := int32(1)
 	out, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &res.UploadId, PartNumber: &n, Body: bytes.NewReader(part), ContentLength: byteLen(part)})
-	if err != nil {
-		t.Fatalf("UploadPart %s/%s: %v", bucket, key, err)
-	}
+	require.NoError(t, err, "UploadPart %s/%s", bucket, key)
 	return res.UploadId, []types.CompletedPart{{ETag: out.ETag, PartNumber: &n}}
 }
 
 func completeIn(t *testing.T, b *Backend, bucket, key, uploadID string, parts []types.CompletedPart) {
 	t.Helper()
-	if _, _, err := b.CompleteMultipartUpload(context.Background(), &s3.CompleteMultipartUploadInput{
+	_, _, err := b.CompleteMultipartUpload(context.Background(), &s3.CompleteMultipartUploadInput{
 		Bucket: &bucket, Key: &key, UploadId: &uploadID, MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
-	}); err != nil {
-		t.Fatalf("CompleteMultipartUpload %s/%s: %v", bucket, key, err)
-	}
+	})
+	require.NoError(t, err, "CompleteMultipartUpload %s/%s", bucket, key)
 }
 
 // localCopyExists reports whether the blob is cached.
@@ -124,21 +111,18 @@ func TestPlaintextSpaces_EachSpaceParksItsOwnCopy(t *testing.T) {
 	id1, parts1 := uploadOnePart(t, b, "bk", "k", part)
 	id2, parts2 := uploadOnePart(t, b, "bk2", "k", part)
 	d := hygienePartDigests(t, mem, id1, 1)[0]
-	if d2 := hygienePartDigests(t, mem, id2, 1)[0]; !bytes.Equal(d, d2) {
-		t.Fatalf("identical parts parked under different digests")
-	}
+	d2 := hygienePartDigests(t, mem, id2, 1)[0]
+	require.True(t, bytes.Equal(d, d2), "identical parts parked under different digests")
 	for _, space := range []did.DID{mem.bk(), space2} {
-		if _, err := mem.GetPark(ctx, space, d); err != nil {
-			t.Fatalf("park for %x in %s: %v", d, space, err)
-		}
+		_, err := mem.GetPark(ctx, space, d)
+		require.NoError(t, err, "park for %x in %s", d, space)
 	}
 
 	completeIn(t, b, "bk", "k", id1, parts1)
 	completeIn(t, b, "bk2", "k", id2, parts2)
 	for _, bucket := range []string{"bk", "bk2"} {
-		if got := getFrom(t, b, bucket, "k"); !bytes.Equal(got, part) {
-			t.Fatalf("%s/k reads back %d bytes, want the %d-byte part", bucket, len(got), len(part))
-		}
+		got := getFrom(t, b, bucket, "k")
+		require.Equal(t, part, got, "%s/k reads back %d bytes", bucket, len(got))
 	}
 }
 
@@ -155,39 +139,28 @@ func TestPlaintextSpaces_ReleaseInOneSpaceKeepsTheOther(t *testing.T) {
 	putIn(t, b, "bk", "k", data)
 	putIn(t, b, "bk2", "k", data)
 	d := blobDigestOf(t, b, "k", "")
-	if !localCopyExists(b, d) {
-		t.Fatalf("no local copy after the writes")
-	}
+	require.True(t, localCopyExists(b, d), "no local copy after the writes")
 
 	deleteFrom(t, b, "bk", "k")
 	drainReleases(t, b)
 
-	if _, err := mem.GetIntent(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("the deleted space's intent survived its release (err=%v)", err)
-	}
+	_, err := mem.GetIntent(ctx, mem.bk(), d)
+	require.ErrorIs(t, err, registry.ErrNotFound, "the deleted space's intent survived its release")
 	in, err := mem.GetIntent(ctx, space2, d)
-	if err != nil || in.State != registry.IntentPublished {
-		t.Fatalf("the other space's intent after the release = %+v, %v; want published", in, err)
-	}
-	if !localCopyExists(b, d) {
-		t.Fatalf("the release removed the local copy the other space's intent still names")
-	}
-	if got := getFrom(t, b, "bk2", "k"); !bytes.Equal(got, data) {
-		t.Fatalf("bk2/k no longer reads back after bk/k was deleted")
-	}
-	if n := rm.removedDigests()[string(d)]; n != 1 {
-		t.Fatalf("network removes of %x = %d, want 1 (the deleted space's)", d, n)
-	}
+	require.NoError(t, err, "the other space's intent after the release = %+v, %v", in, err)
+	require.Equal(t, registry.IntentPublished, in.State, "the other space's intent after the release = %+v, %v", in, err)
+	require.True(t, localCopyExists(b, d), "the release removed the local copy the other space's intent still names")
+	got := getFrom(t, b, "bk2", "k")
+	require.Equal(t, data, got, "bk2/k no longer reads back after bk/k was deleted")
+	n := rm.removedDigests()[string(d)]
+	require.Equal(t, 1, n, "network removes of %x = %d, want 1 (the deleted space's)", d, n)
 
 	deleteFrom(t, b, "bk2", "k")
 	drainReleases(t, b)
-	if _, err := mem.GetIntent(ctx, space2, d); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("the last intent survived its release (err=%v)", err)
-	}
+	_, err = mem.GetIntent(ctx, space2, d)
+	require.ErrorIs(t, err, registry.ErrNotFound, "the last intent survived its release")
 	settleCache(t, b, d) // the release queues the eviction as its own task
-	if localCopyExists(b, d) {
-		t.Fatalf("the local copy survived the last intent")
-	}
+	require.False(t, localCopyExists(b, d), "the local copy survived the last intent")
 }
 
 // TestPlaintextSpaces_ReleaseInOneSpaceKeepsTheOthersPark: a release in one
@@ -203,26 +176,20 @@ func TestPlaintextSpaces_ReleaseInOneSpaceKeepsTheOthersPark(t *testing.T) {
 	putIn(t, b, "bk", "k", data)
 	d := blobDigestOf(t, b, "k", "")
 	id, parts := uploadOnePart(t, b, "bk2", "k", data)
-	if pd := hygienePartDigests(t, mem, id, 1)[0]; !bytes.Equal(pd, d) {
-		t.Fatalf("the part and the object stored different digests for the same bytes")
-	}
-	if _, err := mem.GetPark(ctx, space2, d); err != nil {
-		t.Fatalf("bk2's part is not parked: %v", err)
-	}
+	pd := hygienePartDigests(t, mem, id, 1)[0]
+	require.True(t, bytes.Equal(pd, d), "the part and the object stored different digests for the same bytes")
+	_, err := mem.GetPark(ctx, space2, d)
+	require.NoError(t, err, "bk2's part is not parked")
 
 	deleteFrom(t, b, "bk", "k")
 	drainReleases(t, b)
 
-	if _, err := mem.GetPark(ctx, space2, d); err != nil {
-		t.Fatalf("bk's release took bk2's park: %v", err)
-	}
-	if pu.abortedDigests()[string(d)] {
-		t.Fatalf("bk's release aborted bk2's allocation on the provider")
-	}
+	_, err = mem.GetPark(ctx, space2, d)
+	require.NoError(t, err, "bk's release took bk2's park")
+	require.False(t, pu.abortedDigests()[string(d)], "bk's release aborted bk2's allocation on the provider")
 	completeIn(t, b, "bk2", "k", id, parts)
-	if got := getFrom(t, b, "bk2", "k"); !bytes.Equal(got, data) {
-		t.Fatalf("bk2/k does not read back after bk/k was deleted")
-	}
+	got := getFrom(t, b, "bk2", "k")
+	require.Equal(t, data, got, "bk2/k does not read back after bk/k was deleted")
 }
 
 // TestPlaintextSpaces_SameSpaceRewriteMakesTheReleaseStale: within one
@@ -243,23 +210,17 @@ func TestPlaintextSpaces_SameSpaceRewriteMakesTheReleaseStale(t *testing.T) {
 	d := blobDigestOf(t, b, "old", "")
 	deleteFrom(t, b, "bk", "old")
 	putIn(t, b, "bk", "new", data)
-	if err := b.blobs.DrainSpace(ctx, mem.bk()); err != nil {
-		t.Fatalf("run the space's releases: %v", err)
-	}
+	require.NoError(t, b.blobs.DrainSpace(ctx, mem.bk()), "run the space's releases")
 
-	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
-		t.Fatalf("release records after the drain = %v, want none (stale, dropped)", pending)
-	}
-	if n := rm.removedDigests()[string(d)]; n != 0 {
-		t.Fatalf("the re-claimed blob was removed from the network %d times", n)
-	}
+	pending, _ := mem.ListReleasesBySpace(ctx, mem.bk())
+	require.Empty(t, pending, "release records after the drain")
+	n := rm.removedDigests()[string(d)]
+	require.Zero(t, n, "the re-claimed blob was removed from the network %d times", n)
 	in, err := mem.GetIntent(ctx, mem.bk(), d)
-	if err != nil || in.State != registry.IntentPublished {
-		t.Fatalf("intent after the rewrite = %+v, %v; want published", in, err)
-	}
-	if got := getFrom(t, b, "bk", "new"); !bytes.Equal(got, data) {
-		t.Fatalf("the rewritten object does not read back")
-	}
+	require.NoError(t, err, "intent after the rewrite = %+v, %v", in, err)
+	require.Equal(t, registry.IntentPublished, in.State, "intent after the rewrite = %+v, %v", in, err)
+	got := getFrom(t, b, "bk", "new")
+	require.Equal(t, data, got, "the rewritten object does not read back")
 }
 
 // Within one space, a write of bytes whose previous object was deleted meets
@@ -279,21 +240,18 @@ func TestPlaintextRelease_WriteCancelsAPendingRelease(t *testing.T) {
 	putIn(t, b, "bk", "old", data)
 	d := blobDigestOf(t, b, "old", "")
 	deleteFrom(t, b, "bk", "old")
-	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 1 {
-		t.Fatalf("release records after the delete = %d, want 1", len(pending))
-	}
+	pending, _ := mem.ListReleasesBySpace(ctx, mem.bk())
+	require.Len(t, pending, 1, "release records after the delete")
 	putIn(t, b, "bk", "new", data)
 
-	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
-		t.Fatalf("the write left the release record in place: %v", pending)
-	}
-	if sent, accepted, _ := streamCounts(t, b, d); sent != 2 || accepted != 2 {
-		t.Fatalf("streams of %x: %d sent, %d accepted; want 2 and 2 (uploaded afresh after the cancel)", d, sent, accepted)
-	}
+	pending, _ = mem.ListReleasesBySpace(ctx, mem.bk())
+	require.Empty(t, pending, "the write left the release record in place")
+	sent, accepted, _ := streamCounts(t, b, d)
+	require.Equal(t, 2, sent, "streams of %x: %d sent, %d accepted; want 2 and 2 (uploaded afresh after the cancel)", d, sent, accepted)
+	require.Equal(t, 2, accepted, "streams of %x: %d sent, %d accepted; want 2 and 2 (uploaded afresh after the cancel)", d, sent, accepted)
 	drainReleases(t, b)
-	if got := getFrom(t, b, "bk", "new"); !bytes.Equal(got, data) {
-		t.Fatalf("the rewritten object does not read back")
-	}
+	got := getFrom(t, b, "bk", "new")
+	require.Equal(t, data, got, "the rewritten object does not read back")
 }
 
 // TestPlaintextRelease_WriteWaitsOutAStartedRelease: the release has taken
@@ -322,32 +280,25 @@ func TestPlaintextRelease_WriteWaitsOutAStartedRelease(t *testing.T) {
 	// in progress, for the cache once the write is accepted.
 	select {
 	case err := <-done:
-		t.Fatalf("PutObject returned %v while the release was started", err)
+		require.FailNow(t, "PutObject returned while the release was started", "err: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	if b.cache.InFlight() == 0 {
-		t.Fatalf("no local copy in progress while the write waits")
-	}
+	require.NotZero(t, b.cache.InFlight(), "no local copy in progress while the write waits")
 
 	// The release finishes: it removes the blob from the provider, and leaves
 	// the waiting write's intent alone.
 	finish()
-	if err := <-done; err != nil {
-		t.Fatalf("PutObject after the release: %v", err)
-	}
-	if sent, accepted, _ := streamCounts(t, b, d); sent != 2 || accepted != 2 {
-		t.Fatalf("streams of %x: %d sent, %d accepted; want 2 and 2 (the blob was uploaded again after its release)", d, sent, accepted)
-	}
-	if _, err := mem.GetLocation(ctx, mem.bk(), d); err != nil {
-		t.Fatalf("no location after the fresh upload: %v", err)
-	}
+	require.NoError(t, <-done, "PutObject after the release")
+	sent, accepted, _ := streamCounts(t, b, d)
+	require.Equal(t, 2, sent, "streams of %x sent (the blob was uploaded again after its release)", d)
+	require.Equal(t, 2, accepted, "streams of %x accepted (the blob was uploaded again after its release)", d)
+	_, err := mem.GetLocation(ctx, mem.bk(), d)
+	require.NoError(t, err, "no location after the fresh upload")
 	in, err := mem.GetIntent(ctx, mem.bk(), d)
-	if err != nil || in.State != registry.IntentPublished {
-		t.Fatalf("intent after the rewrite = %+v, %v; want published", in, err)
-	}
-	if got := getFrom(t, b, "bk", "new"); !bytes.Equal(got, data) {
-		t.Fatalf("the rewritten object does not read back")
-	}
+	require.NoError(t, err, "intent after the rewrite = %+v, %v", in, err)
+	require.Equal(t, registry.IntentPublished, in.State, "intent after the rewrite = %+v, %v", in, err)
+	got := getFrom(t, b, "bk", "new")
+	require.Equal(t, data, got, "the rewritten object does not read back")
 }
 
 // TestPlaintextRelease_WaitIsBounded: a release that does not finish holds the
@@ -368,18 +319,17 @@ func TestPlaintextRelease_WaitIsBounded(t *testing.T) {
 		if err == nil {
 			break
 		}
-		if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" || time.Now().After(deadline) {
-			t.Fatalf("PutObject bk/old: %v", err)
-		}
+		require.ErrorAs(t, err, &apiErr, "PutObject bk/old")
+		require.Equal(t, "SlowDown", apiErr.Code, "PutObject bk/old")
+		require.False(t, time.Now().After(deadline), "PutObject bk/old")
 	}
 	deleteFrom(t, b, "bk", "old")
 	holdRelease(t, b, gate)
 
 	bucket, key := "bk", "new"
 	_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
-	if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" {
-		t.Fatalf("PutObject during a release that never finishes: err = %v, want SlowDown", err)
-	}
+	require.ErrorAs(t, err, &apiErr, "PutObject during a release that never finishes: err = %v, want SlowDown", err)
+	require.Equal(t, "SlowDown", apiErr.Code, "PutObject during a release that never finishes: err")
 }
 
 // TestPlaintextRelease_WriteWaitsOutAStartedReleaseWithNoLocation: a
@@ -399,9 +349,7 @@ func TestPlaintextRelease_WriteWaitsOutAStartedReleaseWithNoLocation(t *testing.
 	deleteFrom(t, b, "bk", "old")
 	// The release is under way, and the blob's location already gone.
 	finish := holdRelease(t, b, gate)
-	if err := mem.DeleteLocation(ctx, mem.bk(), d); err != nil {
-		t.Fatalf("DeleteLocation: %v", err)
-	}
+	require.NoError(t, mem.DeleteLocation(ctx, mem.bk(), d), "DeleteLocation")
 
 	done := make(chan error, 1)
 	go func() {
@@ -411,23 +359,19 @@ func TestPlaintextRelease_WriteWaitsOutAStartedReleaseWithNoLocation(t *testing.
 	}()
 	select {
 	case err := <-done:
-		t.Fatalf("PutObject returned %v while the release was started", err)
+		require.FailNow(t, "PutObject returned while the release was started", "err: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	if _, accepted, _ := streamCounts(t, b, d); accepted != 1 {
-		t.Fatalf("streams of %x accepted while the release was started = %d, want 1 (the write waited)", d, accepted)
-	}
+	_, accepted, _ := streamCounts(t, b, d)
+	require.Equal(t, 1, accepted, "streams of %x accepted while the release was started = %d, want 1 (the write waited)", d, accepted)
 
 	finish()
-	if err := <-done; err != nil {
-		t.Fatalf("PutObject after the release: %v", err)
-	}
-	if sent, accepted, _ := streamCounts(t, b, d); sent != 2 || accepted != 2 {
-		t.Fatalf("streams of %x: %d sent, %d accepted; want 2 and 2", d, sent, accepted)
-	}
-	if got := getFrom(t, b, "bk", "new"); !bytes.Equal(got, data) {
-		t.Fatalf("the rewritten object does not read back")
-	}
+	require.NoError(t, <-done, "PutObject after the release")
+	sent, accepted, _ := streamCounts(t, b, d)
+	require.Equal(t, 2, sent, "streams of %x sent", d)
+	require.Equal(t, 2, accepted, "streams of %x accepted", d)
+	got := getFrom(t, b, "bk", "new")
+	require.Equal(t, data, got, "the rewritten object does not read back")
 }
 
 // releaseBeforeCommit is a registry that, before the first commit of the
@@ -459,9 +403,7 @@ func TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease(t *testing.T) {
 	setNone(t, b)
 	data := testBody(8 << 10)
 
-	if err := putSized(t, b, "old", data, int64(len(data))); err != nil {
-		t.Fatalf("PutObject old: %v", err)
-	}
+	require.NoError(t, putSized(t, b, "old", data, int64(len(data))), "PutObject old")
 	d := blobDigestOf(t, b, "old", "")
 	deleteFrom(t, b, "bk", "old")
 	finish := holdRelease(t, b, gate)
@@ -470,13 +412,11 @@ func TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease(t *testing.T) {
 	go func() { done <- putSized(t, b, "new", data, int64(len(data))) }()
 	select {
 	case err := <-done:
-		t.Fatalf("PutObject returned %v while the release was started", err)
+		require.FailNow(t, "PutObject returned while the release was started", "err: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 	finish()
-	if err := <-done; err != nil {
-		t.Fatalf("PutObject after the release: %v", err)
-	}
+	require.NoError(t, <-done, "PutObject after the release")
 
 	su.mu.Lock()
 	var concluded int
@@ -487,15 +427,12 @@ func TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease(t *testing.T) {
 	}
 	aborted := len(su.aborted)
 	su.mu.Unlock()
-	if aborted != 0 || concluded != 2 {
-		t.Fatalf("after the waited-out release: streams of %x aborted = %d, concluded = %d; want 0 and 2", d, aborted, concluded)
-	}
-	if _, err := mem.GetLocation(ctx, mem.bk(), d); err != nil {
-		t.Fatalf("no location after the fresh upload: %v", err)
-	}
-	if got := getFrom(t, b, "bk", "new"); !bytes.Equal(got, data) {
-		t.Fatalf("the rewritten object does not read back")
-	}
+	require.Zero(t, aborted, "after the waited-out release: streams of %x aborted = %d, concluded", d, aborted)
+	require.Equal(t, 2, concluded, "after the waited-out release: streams of %x aborted = %d, concluded", d, aborted)
+	_, err := mem.GetLocation(ctx, mem.bk(), d)
+	require.NoError(t, err, "no location after the fresh upload")
+	got := getFrom(t, b, "bk", "new")
+	require.Equal(t, data, got, "the rewritten object does not read back")
 }
 
 // TestPlaintextSpaces_ConcurrentWritesOfTheSameBytesAcceptOnce: writes of the
@@ -523,17 +460,15 @@ func TestPlaintextSpaces_ConcurrentWritesOfTheSameBytesAcceptOnce(t *testing.T) 
 	wg.Wait()
 	close(errs)
 	for err := range errs {
-		if err != nil {
-			t.Fatalf("PutObject: %v", err)
-		}
+		require.NoError(t, err, "PutObject")
 	}
-	if sent, accepted, aborted := streamCounts(t, b, d); sent != 4 || accepted != 1 || aborted != 3 {
-		t.Fatalf("streams of %x by four concurrent writes: %d sent, %d accepted, %d aborted; want 4, 1, 3", d, sent, accepted, aborted)
-	}
+	sent, accepted, aborted := streamCounts(t, b, d)
+	require.Equal(t, 4, sent, "streams of %x by four concurrent writes: %d sent, %d accepted, %d aborted", d, sent, accepted, aborted)
+	require.Equal(t, 1, accepted, "streams of %x by four concurrent writes: %d sent, %d accepted, %d aborted", d, sent, accepted, aborted)
+	require.Equal(t, 3, aborted, "streams of %x by four concurrent writes: %d sent, %d accepted, %d aborted", d, sent, accepted, aborted)
 	for i := range 4 {
-		if got := getFrom(t, b, "bk", fmt.Sprintf("k%d", i)); !bytes.Equal(got, data) {
-			t.Fatalf("k%d does not read back", i)
-		}
+		got := getFrom(t, b, "bk", fmt.Sprintf("k%d", i))
+		require.Equal(t, data, got, "k%d does not read back", i)
 	}
 }
 
@@ -561,16 +496,14 @@ func TestPlaintextSpaces_ConcurrentPartsOfTheSameBytesParkOnce(t *testing.T) {
 	wg.Wait()
 	close(ids)
 	for id := range ids {
-		if got := hygienePartDigests(t, mem, id, 1)[0]; !bytes.Equal(got, d) {
-			t.Fatalf("part of %s stored under %x, want %x", id, got, d)
-		}
+		got := hygienePartDigests(t, mem, id, 1)[0]
+		require.True(t, bytes.Equal(got, d), "part of %s stored under %x, want %x", id, got, d)
 	}
-	if sent, _, aborted := streamCounts(t, b, d); sent != 3 || aborted != 2 {
-		t.Fatalf("streams of %x by three concurrent part uploads: %d sent, %d aborted; want 3 and 2", d, sent, aborted)
-	}
-	if _, err := mem.ParkByDigest(context.Background(), d); err != nil {
-		t.Fatalf("the shared park: %v", err)
-	}
+	sent, _, aborted := streamCounts(t, b, d)
+	require.Equal(t, 3, sent, "streams of %x by three concurrent part uploads: %d sent, %d aborted", d, sent, aborted)
+	require.Equal(t, 2, aborted, "streams of %x by three concurrent part uploads: %d sent, %d aborted", d, sent, aborted)
+	_, err := mem.ParkByDigest(context.Background(), d)
+	require.NoError(t, err, "the shared park")
 }
 
 // TestPlaintextRelease_StaleReleaseRemovesNothing: a release of a digest
@@ -583,22 +516,16 @@ func TestPlaintextRelease_StaleReleaseRemovesNothing(t *testing.T) {
 	data := testBody(8 << 10)
 	putIn(t, b, "bk", "k", data)
 	d := blobDigestOf(t, b, "k", "")
-	if err := mem.EnqueueRelease(ctx, mem.bk(), d, registry.DueNow()); err != nil {
-		t.Fatalf("EnqueueRelease: %v", err)
-	}
+	require.NoError(t, mem.EnqueueRelease(ctx, mem.bk(), d, registry.DueNow()), "EnqueueRelease")
 
-	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 0 {
-		t.Fatalf("SweepPendingReleases = %d, %v; want nothing released", n, err)
-	}
-	if rm.removedDigests()[string(d)] > 0 {
-		t.Fatalf("the stale release removed %x from the network", d)
-	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
-		t.Fatalf("releases after the sweep = %v, want none", pending)
-	}
-	if got := getFrom(t, b, "bk", "k"); !bytes.Equal(got, data) {
-		t.Fatalf("the object does not read back")
-	}
+	n, err := b.SweepPendingReleases(ctx)
+	require.NoError(t, err, "SweepPendingReleases = %d, %v", n, err)
+	require.Zero(t, n, "SweepPendingReleases = %d, %v", n, err)
+	require.LessOrEqual(t, rm.removedDigests()[string(d)], 0, "the stale release removed %x from the network", d)
+	pending, _ := mem.ListReleasesBySpace(ctx, mem.bk())
+	require.Empty(t, pending, "releases after the sweep")
+	got := getFrom(t, b, "bk", "k")
+	require.Equal(t, data, got, "the object does not read back")
 }
 
 // TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile: two spaces release
@@ -618,14 +545,11 @@ func TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile(t *testing.T) {
 	drainReleases(t, b)
 
 	for _, sp := range []did.DID{mem.bk(), space2} {
-		if _, err := mem.GetIntent(ctx, sp, d); !errors.Is(err, registry.ErrNotFound) {
-			t.Fatalf("intent in %s survived (err=%v)", sp, err)
-		}
+		_, err := mem.GetIntent(ctx, sp, d)
+		require.ErrorIs(t, err, registry.ErrNotFound, "intent in %s survived (err=%v)", sp, err)
 	}
 	settleCache(t, b, d) // the release queues the eviction as its own task
-	if localCopyExists(b, d) {
-		t.Fatalf("the shared file survived both releases")
-	}
+	require.False(t, localCopyExists(b, d), "the shared file survived both releases")
 }
 
 // TestPlaintextSpaces_OverlappingReleasesRemoveTheSharedFile: two spaces'
@@ -655,26 +579,21 @@ func TestPlaintextSpaces_OverlappingReleasesRemoveTheSharedFile(t *testing.T) {
 		select {
 		case <-gate.waiting:
 		case <-time.After(20 * time.Second):
-			t.Fatalf("the release in %s never reached its remove", bucket)
+			require.FailNow(t, "release never reached its network remove", "bucket %s", bucket)
 		}
 	}
 	close(gate.open)
 	for range 2 {
-		if err := <-deleted; err != nil {
-			t.Fatalf("DeleteObject: %v", err)
-		}
+		require.NoError(t, <-deleted, "DeleteObject")
 	}
 	drainReleases(t, b)
 
 	for _, sp := range []did.DID{mem.bk(), space2} {
-		if _, err := mem.GetIntent(ctx, sp, d); !errors.Is(err, registry.ErrNotFound) {
-			t.Fatalf("intent in %s survived (err=%v)", sp, err)
-		}
+		_, err := mem.GetIntent(ctx, sp, d)
+		require.ErrorIs(t, err, registry.ErrNotFound, "intent in %s", sp)
 	}
 	settleCache(t, b, d)
-	if localCopyExists(b, d) {
-		t.Fatalf("the shared file survived both releases")
-	}
+	require.False(t, localCopyExists(b, d), "the shared file survived both releases")
 }
 
 // TestPlaintextRelease_ReleaseBeforeTheCommitIsStale: a release of the
@@ -693,22 +612,16 @@ func TestPlaintextRelease_ReleaseBeforeTheCommitIsStale(t *testing.T) {
 	data := testBody(8 << 10)
 	d := digestOf(t, data)
 	reg.start = func() {
-		if err := mem.EnqueueRelease(context.Background(), mem.bk(), d, registry.DueNow()); err != nil {
-			t.Fatalf("EnqueueRelease: %v", err)
-		}
+		require.NoError(t, mem.EnqueueRelease(context.Background(), mem.bk(), d, registry.DueNow()), "EnqueueRelease")
 		drainReleases(t, b)
 	}
 
 	putIn(t, b, "bk", "k", data)
-	if reg.start != nil {
-		t.Fatal("the release never ran")
-	}
-	if n := rm.removedDigests()[string(d)]; n != 0 {
-		t.Fatalf("the referenced blob was removed from the network %d times", n)
-	}
-	if got := getFrom(t, b, "bk", "k"); !bytes.Equal(got, data) {
-		t.Fatalf("the object does not read back")
-	}
+	require.Nil(t, reg.start, "the release never ran")
+	n := rm.removedDigests()[string(d)]
+	require.Zero(t, n, "the referenced blob was removed from the network %d times", n)
+	got := getFrom(t, b, "bk", "k")
+	require.Equal(t, data, got, "the object does not read back")
 }
 
 // TestPlaintextRelease_ExpiredReferenceRefusesTheCommit: a write whose
@@ -733,19 +646,13 @@ func TestPlaintextRelease_ExpiredReferenceRefusesTheCommit(t *testing.T) {
 	bucket, key := "bk", "k"
 	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
 	var apiErr s3err.APIError
-	if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" {
-		t.Fatalf("PutObject whose reference expired before its commit: err = %v, want SlowDown", err)
-	}
-	if n := rm.removedDigests()[string(second)]; n != 1 {
-		t.Fatalf("the expired reference's blob was removed %d times, want 1", n)
-	}
+	require.ErrorAs(t, err, &apiErr, "PutObject whose reference expired before its commit")
+	require.Equal(t, "SlowDown", apiErr.Code, "PutObject whose reference expired before its commit")
+	require.Equal(t, 1, rm.removedDigests()[string(second)], "removals of the expired reference's blob")
 	n, _ := mem.CountReferences(context.Background(), mem.bk(), first, uuid.Nil)
-	if n != 1 {
-		t.Fatalf("references to the first blob = %d, want only the write's pending one", n)
-	}
-	if claims, _ := mem.CountClaimRows(context.Background(), mem.bk(), first); claims != 0 {
-		t.Fatalf("a claim on the first blob landed although the commit was refused: %d", claims)
-	}
+	require.Equal(t, 1, n, "references to the first blob: want only the write's pending one")
+	rows, _ := mem.CountClaimRows(context.Background(), mem.bk(), first)
+	require.Zero(t, rows, "a claim on the first blob landed although the commit was refused")
 }
 
 // TestPlaintextRelease_ConcurrentStreamedWritesConcludeOnce: two streamed
@@ -770,20 +677,17 @@ func TestPlaintextRelease_ConcurrentStreamedWritesConcludeOnce(t *testing.T) {
 	wg.Wait()
 	close(errs)
 	for err := range errs {
-		if err != nil {
-			t.Fatalf("PutObject: %v", err)
-		}
+		require.NoError(t, err, "PutObject")
 	}
 	su.mu.Lock()
 	started, concluded, aborted := len(su.started), len(su.concluded), len(su.aborted)
 	su.mu.Unlock()
-	if started != 3 || concluded != 1 || aborted != 2 {
-		t.Fatalf("streams started/concluded/aborted = %d/%d/%d, want 3/1/2", started, concluded, aborted)
-	}
+	require.Equal(t, 3, started, "streams started/concluded/aborted = %d/%d/%d", started, concluded, aborted)
+	require.Equal(t, 1, concluded, "streams started/concluded/aborted = %d/%d/%d", started, concluded, aborted)
+	require.Equal(t, 2, aborted, "streams started/concluded/aborted = %d/%d/%d", started, concluded, aborted)
 	for i := range 3 {
-		if got := getFrom(t, b, "bk", fmt.Sprintf("s%d", i)); !bytes.Equal(got, data) {
-			t.Fatalf("s%d does not read back", i)
-		}
+		got := getFrom(t, b, "bk", fmt.Sprintf("s%d", i))
+		require.Equal(t, data, got, "s%d does not read back", i)
 	}
 }
 
@@ -802,39 +706,28 @@ func TestPlaintextRelease_StreamedPartLocatedMeanwhileReuses(t *testing.T) {
 	d := digestOf(t, part)
 
 	// The object write accepts the bytes for the space first.
-	if err := putSized(t, b, "obj", part, int64(len(part))); err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
+	require.NoError(t, putSized(t, b, "obj", part, int64(len(part))), "PutObject")
 	// A streamed part declares its length, as a streamed object does.
 	bucket, key := "bk", "k"
 	created, err := b.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{Bucket: &bucket, Key: &key})
-	if err != nil {
-		t.Fatalf("CreateMultipartUpload: %v", err)
-	}
+	require.NoError(t, err, "CreateMultipartUpload")
 	id, n, size := created.UploadId, int32(1), int64(len(part))
 	out, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &id, PartNumber: &n, Body: bytes.NewReader(part), ContentLength: &size})
-	if err != nil {
-		t.Fatalf("UploadPart: %v", err)
-	}
+	require.NoError(t, err, "UploadPart")
 	parts := []types.CompletedPart{{ETag: out.ETag, PartNumber: &n}}
 
-	if _, err := mem.GetPark(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("a park was recorded beside the location (err=%v)", err)
-	}
+	_, err = mem.GetPark(ctx, mem.bk(), d)
+	require.ErrorIs(t, err, registry.ErrNotFound, "a park was recorded beside the location")
 	in, err := mem.GetIntent(ctx, mem.bk(), d)
-	if err != nil || in.State != registry.IntentAccepted {
-		t.Fatalf("the part's intent = %+v, %v; want accepted (reused)", in, err)
-	}
+	require.NoError(t, err, "the part's intent = %+v, %v", in, err)
+	require.Equal(t, registry.IntentAccepted, in.State, "the part's intent = %+v, %v", in, err)
 	su.mu.Lock()
 	aborted := len(su.aborted)
 	su.mu.Unlock()
-	if aborted != 1 {
-		t.Fatalf("streams aborted = %d, want 1 (the part's surplus allocation)", aborted)
-	}
+	require.Equal(t, 1, aborted, "streams aborted = %d, want 1 (the part's surplus allocation)", aborted)
 	completeIn(t, b, "bk", "k", id, parts)
-	if got := getFrom(t, b, "bk", "k"); !bytes.Equal(got, part) {
-		t.Fatalf("the completed object does not read back")
-	}
+	got := getFrom(t, b, "bk", "k")
+	require.Equal(t, part, got, "the completed object does not read back")
 }
 
 // gatedRemover holds each network remove until the test opens it, so a
@@ -893,17 +786,15 @@ func holdRelease(t *testing.T, b *Backend, gate *gatedRemover) (finish func()) {
 	select {
 	case <-gate.waiting:
 	case err := <-done:
-		t.Fatalf("the release finished (err %v) before it reached the network", err)
+		require.FailNow(t, "the release finished before it reached the network", "err: %v", err)
 	case <-time.After(10 * time.Second):
-		t.Fatal("no release reached the network")
+		require.FailNow(t, "no release reached the network")
 	}
 	var once sync.Once
 	finish = func() {
 		once.Do(func() {
 			close(gate.open)
-			if err := <-done; err != nil {
-				t.Errorf("held release: %v", err)
-			}
+			assert.NoError(t, <-done, "held release")
 		})
 	}
 	t.Cleanup(finish)
@@ -926,22 +817,17 @@ func TestPlaintextRelease_StalledRemoveTimesOut(t *testing.T) {
 	done := make(chan int, 1)
 	go func() {
 		n, err := b.SweepPendingReleases(ctx)
-		if err != nil {
-			t.Errorf("SweepPendingReleases: %v", err)
-		}
+		assert.NoError(t, err, "SweepPendingReleases")
 		done <- n
 	}()
 	select {
 	case n := <-done:
-		if n != 0 {
-			t.Fatalf("%d releases finished, want none: the remove never answered", n)
-		}
+		require.Zero(t, n, "%d releases finished, want none: the remove never answered", n)
 	case <-time.After(10 * time.Second):
-		t.Fatal("the release waited on the stalled remove")
+		require.FailNow(t, "the release waited on the stalled remove")
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 1 {
-		t.Fatalf("releases queued after the timed-out attempt = %d, want 1 to retry", len(pending))
-	}
+	pending, _ := mem.ListReleasesBySpace(ctx, mem.bk())
+	require.Len(t, pending, 1, "releases queued after the timed-out attempt")
 }
 
 // stallingParks stalls a release once, after the last of its checks and
@@ -973,13 +859,12 @@ func TestPlaintextRelease_LostLeaseSendsNoRemove(t *testing.T) {
 		tag, err := mem.pool.Exec(context.Background(), `UPDATE `+leases+`
 			SET owner = $2, expires = now() + $3 * interval '1 millisecond' WHERE subject = $1`,
 			spaceshardqueue.Subject(space, digest), uuid.New(), takenFor.Milliseconds())
-		if err != nil || tag.RowsAffected() != 1 {
-			t.Errorf("take the release's lease: %v, %d rows", err, tag.RowsAffected())
-		}
+		assert.NoError(t, err, "take the release's lease")
+		assert.Equal(t, int64(1), tag.RowsAffected(), "take the release's lease: rows")
 		select {
 		case <-ctx.Done():
 		case <-time.After(10 * time.Second):
-			t.Error("the release's context did not end after its lease was taken over")
+			assert.Fail(t, "the release's context did not end after its lease was taken over")
 		}
 	}
 	b, mem := newDeferredBackend(t, testfakes.NopUploader{},
@@ -998,28 +883,21 @@ func TestPlaintextRelease_LostLeaseSendsNoRemove(t *testing.T) {
 	select {
 	case <-stalled:
 	case <-time.After(20 * time.Second):
-		t.Fatal("the release never reached its last check")
+		require.FailNow(t, "the release never reached its last check")
 	}
 	// The other consumer holds the lease for a while yet, so only the
 	// stalled run could send a remove now.
 	time.Sleep(takenFor / 3)
-	if n := len(rm.removedDigests()); n != 0 {
-		t.Fatalf("the release removed %d blobs after losing its lease, want none", n)
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("SweepPendingReleases: %v", err)
-	}
+	n := len(rm.removedDigests())
+	require.Zero(t, n, "the release removed %d blobs after losing its lease", n)
+	require.NoError(t, <-done, "SweepPendingReleases")
 	deadline := time.Now().Add(20 * time.Second)
 	for len(rm.removedDigests()) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the release did not run once its lease was free")
-		}
+		require.False(t, time.Now().After(deadline), "the release did not run once its lease was free")
 		time.Sleep(50 * time.Millisecond)
 		drainReleases(t, b)
 	}
-	if n := len(rm.removed); n != 1 {
-		t.Fatalf("%d removes sent, want 1", n)
-	}
+	require.Len(t, rm.removed, 1, "removes sent")
 }
 
 // TestAbortReleasesAPublishedPartBlobItsObjectLeft: two uploads of the same
@@ -1041,21 +919,12 @@ func TestAbortReleasesAPublishedPartBlobItsObjectLeft(t *testing.T) {
 	completeIn(t, b, "bk", "done", doneID, parts)
 	d := blobDigestOf(t, b, "done", "")
 	deleteFrom(t, b, "bk", "done")
-	if err := b.blobs.DrainSpace(ctx, mem.bk()); err != nil {
-		t.Fatalf("run the deleted object's release: %v", err)
-	}
-	if n := rm.removedDigests()[string(d)]; n != 0 {
-		t.Fatalf("the blob an open upload names was removed %d times", n)
-	}
+	require.NoError(t, b.blobs.DrainSpace(ctx, mem.bk()), "run the deleted object's release")
+	n := rm.removedDigests()[string(d)]
+	require.Zero(t, n, "the blob an open upload names was removed %d times", n)
 
 	bucket, key := "bk", "open"
-	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &openID}); err != nil {
-		t.Fatalf("AbortMultipartUpload: %v", err)
-	}
-	if err := b.blobs.DrainSpace(ctx, mem.bk()); err != nil {
-		t.Fatalf("run the abort's releases: %v", err)
-	}
-	if n := rm.removedDigests()[string(d)]; n != 1 {
-		t.Fatalf("the blob nothing references was removed %d times, want once", n)
-	}
+	require.NoError(t, b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &openID}), "AbortMultipartUpload")
+	require.NoError(t, b.blobs.DrainSpace(ctx, mem.bk()), "run the abort's releases")
+	require.Equal(t, 1, rm.removedDigests()[string(d)], "removals of the blob nothing references")
 }

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/fil-forge/versitygw/s3err"
+	"github.com/stretchr/testify/require"
 )
 
 // Bucket-tagging tests over the refindex_test.go harness, covering
@@ -18,84 +19,53 @@ func TestBucketTagging_RoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	// No tag set yet: the 404 sentinel, not an empty map.
-	if _, err := b.GetBucketTagging(ctx, "bk"); err == nil {
-		t.Fatal("GetBucketTagging on an untagged bucket: want error")
-	} else {
-		wantAPIErr(t, err, s3err.ErrBucketTaggingNotFound)
-	}
+	_, err := b.GetBucketTagging(ctx, "bk")
+	require.Error(t, err, "GetBucketTagging on an untagged bucket")
+	wantAPIErr(t, err, s3err.ErrBucketTaggingNotFound)
 
 	tags := map[string]string{"env": "prod", "team": "storage"}
-	if err := b.PutBucketTagging(ctx, "bk", tags); err != nil {
-		t.Fatalf("PutBucketTagging: %v", err)
-	}
+	require.NoError(t, b.PutBucketTagging(ctx, "bk", tags), "PutBucketTagging")
 	got, err := b.GetBucketTagging(ctx, "bk")
-	if err != nil {
-		t.Fatalf("GetBucketTagging: %v", err)
-	}
-	if !maps.Equal(got, tags) {
-		t.Fatalf("tags = %v, want %v", got, tags)
-	}
+	require.NoError(t, err, "GetBucketTagging")
+	require.True(t, maps.Equal(got, tags), "tags = %v, want %v", got, tags)
 
 	// A second Put replaces the whole set rather than merging into it.
 	replacement := map[string]string{"env": "staging"}
-	if err := b.PutBucketTagging(ctx, "bk", replacement); err != nil {
-		t.Fatalf("PutBucketTagging (replace): %v", err)
-	}
-	if got, err = b.GetBucketTagging(ctx, "bk"); err != nil {
-		t.Fatalf("GetBucketTagging (after replace): %v", err)
-	}
-	if !maps.Equal(got, replacement) {
-		t.Fatalf("tags = %v, want %v", got, replacement)
-	}
+	require.NoError(t, b.PutBucketTagging(ctx, "bk", replacement), "PutBucketTagging (replace)")
+	got, err = b.GetBucketTagging(ctx, "bk")
+	require.NoError(t, err, "GetBucketTagging (after replace)")
+	require.True(t, maps.Equal(got, replacement), "tags = %v, want %v", got, replacement)
 
 	// Delete restores the unset state, and is idempotent from there.
-	if err := b.DeleteBucketTagging(ctx, "bk"); err != nil {
-		t.Fatalf("DeleteBucketTagging: %v", err)
-	}
-	if _, err := b.GetBucketTagging(ctx, "bk"); err == nil {
-		t.Fatal("GetBucketTagging after delete: want error")
-	} else {
-		wantAPIErr(t, err, s3err.ErrBucketTaggingNotFound)
-	}
-	if err := b.DeleteBucketTagging(ctx, "bk"); err != nil {
-		t.Fatalf("DeleteBucketTagging (second): %v", err)
-	}
+	require.NoError(t, b.DeleteBucketTagging(ctx, "bk"), "DeleteBucketTagging")
+	_, err = b.GetBucketTagging(ctx, "bk")
+	require.Error(t, err, "GetBucketTagging after delete")
+	wantAPIErr(t, err, s3err.ErrBucketTaggingNotFound)
+	require.NoError(t, b.DeleteBucketTagging(ctx, "bk"), "DeleteBucketTagging (second)")
 }
 
 func TestBucketTagging_EmptySetClears(t *testing.T) {
 	b, _, _ := newRefTestBackend(t)
 	ctx := context.Background()
 
-	if err := b.PutBucketTagging(ctx, "bk", map[string]string{"env": "prod"}); err != nil {
-		t.Fatalf("PutBucketTagging: %v", err)
-	}
-	if err := b.PutBucketTagging(ctx, "bk", map[string]string{}); err != nil {
-		t.Fatalf("PutBucketTagging (empty): %v", err)
-	}
-	if _, err := b.GetBucketTagging(ctx, "bk"); err == nil {
-		t.Fatal("GetBucketTagging after an empty Put: want error")
-	} else {
-		wantAPIErr(t, err, s3err.ErrBucketTaggingNotFound)
-	}
+	require.NoError(t, b.PutBucketTagging(ctx, "bk", map[string]string{"env": "prod"}), "PutBucketTagging")
+	require.NoError(t, b.PutBucketTagging(ctx, "bk", map[string]string{}), "PutBucketTagging (empty)")
+	_, err := b.GetBucketTagging(ctx, "bk")
+	require.Error(t, err, "GetBucketTagging after an empty Put")
+	wantAPIErr(t, err, s3err.ErrBucketTaggingNotFound)
 }
 
 func TestBucketTagging_MissingBucket(t *testing.T) {
 	b, _, _ := newRefTestBackend(t)
 	ctx := context.Background()
 
-	if _, err := b.GetBucketTagging(ctx, "nope"); err == nil {
-		t.Fatal("GetBucketTagging on a missing bucket: want error")
-	} else {
-		wantAPIErr(t, err, s3err.ErrNoSuchBucket)
-	}
-	if err := b.PutBucketTagging(ctx, "nope", map[string]string{"env": "prod"}); err == nil {
-		t.Fatal("PutBucketTagging on a missing bucket: want error")
-	} else {
-		wantAPIErr(t, err, s3err.ErrNoSuchBucket)
-	}
-	if err := b.DeleteBucketTagging(ctx, "nope"); err == nil {
-		t.Fatal("DeleteBucketTagging on a missing bucket: want error")
-	} else {
-		wantAPIErr(t, err, s3err.ErrNoSuchBucket)
-	}
+	_, err := b.GetBucketTagging(ctx, "nope")
+	require.Error(t, err, "GetBucketTagging on a missing bucket")
+	wantAPIErr(t, err, s3err.ErrNoSuchBucket)
+	err = b.PutBucketTagging(ctx, "nope", map[string]string{"env": "prod"})
+	require.Error(t, err, "PutBucketTagging on a missing bucket")
+	wantAPIErr(t, err, s3err.ErrNoSuchBucket)
+	err = b.DeleteBucketTagging(ctx, "nope")
+	require.Error(t, err, "DeleteBucketTagging on a missing bucket")
+	wantAPIErr(t, err, s3err.ErrNoSuchBucket)
 }

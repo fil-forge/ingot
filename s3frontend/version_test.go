@@ -13,6 +13,7 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/stretchr/testify/require"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/internal/reqscope"
@@ -25,9 +26,7 @@ import (
 
 func setVersioning(t *testing.T, b *Backend, status types.BucketVersioningStatus) {
 	t.Helper()
-	if err := b.PutBucketVersioning(context.Background(), "bk", status); err != nil {
-		t.Fatalf("PutBucketVersioning(%s): %v", status, err)
-	}
+	require.NoError(t, b.PutBucketVersioning(context.Background(), "bk", status), "PutBucketVersioning(%s)", status)
 }
 
 func putObjV(t *testing.T, b *Backend, key string, data []byte) s3response.PutObjectOutput {
@@ -38,9 +37,7 @@ func putObjV(t *testing.T, b *Backend, key string, data []byte) s3response.PutOb
 		Key:    &key,
 		Body:   bytes.NewReader(data), ContentLength: byteLen(data),
 	})
-	if err != nil {
-		t.Fatalf("PutObject %s: %v", key, err)
-	}
+	require.NoError(t, err, "PutObject %s", key)
 	return out
 }
 
@@ -57,9 +54,7 @@ func getObjV(t *testing.T, b *Backend, key, versionID string) (*s3.GetObjectOutp
 	}
 	defer out.Body.Close()
 	data, rerr := io.ReadAll(out.Body)
-	if rerr != nil {
-		t.Fatalf("read body: %v", rerr)
-	}
+	require.NoError(t, rerr, "read body")
 	return out, data, nil
 }
 
@@ -81,9 +76,7 @@ func listVersions(t *testing.T, b *Backend, in *s3.ListObjectVersionsInput) s3re
 	}
 	in.Bucket = &bucket
 	res, err := b.ListObjectVersions(context.Background(), in)
-	if err != nil {
-		t.Fatalf("ListObjectVersions: %v", err)
-	}
+	require.NoError(t, err, "ListObjectVersions")
 	return res
 }
 
@@ -102,9 +95,7 @@ func apiErrCode(t *testing.T, err error) string {
 		return ipErr.Code
 	}
 	var apiErr s3err.APIError
-	if !errors.As(err, &apiErr) {
-		t.Fatalf("not an API error: %v", err)
-	}
+	require.ErrorAs(t, err, &apiErr, "not an API error")
 	return apiErr.Code
 }
 
@@ -117,41 +108,33 @@ func TestVersioning_EnabledPutRetainsVersions(t *testing.T) {
 	out2 := putObjV(t, b, "k1", bb)
 	da := blobDigestOf(t, b, "k1", out1.VersionID)
 	db := blobDigestOf(t, b, "k1", out2.VersionID)
-	if out1.VersionID == "" || out2.VersionID == "" || out1.VersionID == out2.VersionID {
-		t.Fatalf("expected distinct non-empty version ids, got %q / %q", out1.VersionID, out2.VersionID)
-	}
+	require.NotEmpty(t, out1.VersionID, "expected distinct non-empty version ids, got %q / %q", out1.VersionID, out2.VersionID)
+	require.NotEmpty(t, out2.VersionID, "expected distinct non-empty version ids, got %q / %q", out1.VersionID, out2.VersionID)
+	require.NotEqual(t, out2.VersionID, out1.VersionID, "expected distinct non-empty version ids, got %q / %q", out1.VersionID, out2.VersionID)
 
 	// Current is B; version-scoped read returns A.
-	if _, data, err := getObjV(t, b, "k1", ""); err != nil || !bytes.Equal(data, bb) {
-		t.Fatalf("current GET = %q, %v; want %q", data, err, bb)
-	}
+	_, data, err := getObjV(t, b, "k1", "")
+	require.NoError(t, err, "current GET")
+	require.Equal(t, bb, data, "current GET")
 	got, data, err := getObjV(t, b, "k1", out1.VersionID)
-	if err != nil || !bytes.Equal(data, a) {
-		t.Fatalf("versioned GET = %q, %v; want %q", data, err, a)
-	}
-	if got.VersionId == nil || *got.VersionId != out1.VersionID {
-		t.Fatalf("versioned GET VersionId = %v, want %q", got.VersionId, out1.VersionID)
-	}
+	require.NoError(t, err, "versioned GET")
+	require.Equal(t, a, data, "versioned GET")
+	require.NotNil(t, got.VersionId, "versioned GET VersionId")
+	require.Equal(t, out1.VersionID, *got.VersionId, "versioned GET VersionId")
 
 	// Overwrite under Enabled releases nothing.
-	if claims(t, mem, da) != 1 || claims(t, mem, db) != 1 {
-		t.Fatalf("claims(A)=%d claims(B)=%d, want 1/1", claims(t, mem, da), claims(t, mem, db))
-	}
-	if len(rm.removed) != 0 {
-		t.Fatalf("removed %d blobs, want 0", len(rm.removed))
-	}
+	require.Equal(t, 1, claims(t, mem, da), "claims(A)")
+	require.Equal(t, 1, claims(t, mem, db), "claims(B)")
+	require.Empty(t, rm.removed, "removed %d blobs", len(rm.removed))
 
 	// ListObjectVersions: newest-first, IsLatest on the head.
 	res := listVersions(t, b, nil)
-	if len(res.Versions) != 2 || len(res.DeleteMarkers) != 0 {
-		t.Fatalf("versions=%d markers=%d, want 2/0", len(res.Versions), len(res.DeleteMarkers))
-	}
-	if *res.Versions[0].VersionId != out2.VersionID || !*res.Versions[0].IsLatest {
-		t.Fatalf("head version = %q latest=%v, want %q latest", *res.Versions[0].VersionId, *res.Versions[0].IsLatest, out2.VersionID)
-	}
-	if *res.Versions[1].VersionId != out1.VersionID || *res.Versions[1].IsLatest {
-		t.Fatalf("second version = %q latest=%v, want %q non-latest", *res.Versions[1].VersionId, *res.Versions[1].IsLatest, out1.VersionID)
-	}
+	require.Len(t, res.Versions, 2, "versions=%d markers", len(res.Versions))
+	require.Empty(t, res.DeleteMarkers, "versions=%d markers", len(res.Versions))
+	require.Equal(t, out2.VersionID, *res.Versions[0].VersionId, "head version")
+	require.True(t, *res.Versions[0].IsLatest, "head version latest")
+	require.Equal(t, out1.VersionID, *res.Versions[1].VersionId, "second version")
+	require.False(t, *res.Versions[1].IsLatest, "second version latest")
 }
 
 func TestVersioning_NullVersionRetainedOnEnable(t *testing.T) {
@@ -163,16 +146,13 @@ func TestVersioning_NullVersionRetainedOnEnable(t *testing.T) {
 	putObjV(t, b, "k1", bb)
 
 	// The null version survives beneath the numbered one.
-	if _, data, err := getObjV(t, b, "k1", "null"); err != nil || !bytes.Equal(data, a) {
-		t.Fatalf(`GET versionId=null = %q, %v; want %q`, data, err, a)
-	}
+	_, data, err := getObjV(t, b, "k1", "null")
+	require.NoError(t, err, "GET versionId=null = %q, %v", data, err)
+	require.Equal(t, a, data, "GET versionId=null = %q, %v", data, err)
 	res := listVersions(t, b, nil)
-	if len(res.Versions) != 2 {
-		t.Fatalf("versions = %d, want 2", len(res.Versions))
-	}
-	if *res.Versions[1].VersionId != "null" || *res.Versions[1].IsLatest {
-		t.Fatalf("bottom version = %q latest=%v, want null non-latest", *res.Versions[1].VersionId, *res.Versions[1].IsLatest)
-	}
+	require.Len(t, res.Versions, 2, "versions")
+	require.Equal(t, "null", *res.Versions[1].VersionId, "bottom version")
+	require.False(t, *res.Versions[1].IsLatest, "bottom version latest")
 }
 
 func TestVersioning_SuspendedReplacesNullInPlace(t *testing.T) {
@@ -188,36 +168,26 @@ func TestVersioning_SuspendedReplacesNullInPlace(t *testing.T) {
 	outB := putObjV(t, b, "k1", bb)
 	// A suspended PUT omits the version id from the response (§4.3); the write
 	// still lands as the "null" version, confirmed by resolving it below.
-	if outB.VersionID != "" {
-		t.Fatalf("suspended PUT VersionID = %q, want empty (omitted)", outB.VersionID)
-	}
+	require.Empty(t, outB.VersionID, "suspended PUT VersionID")
 	db := blobDigestOf(t, b, "k1", "null")
 	// The numbered version was retained; nothing released yet.
-	if claims(t, mem, da) != 1 || len(rm.removed) != 0 {
-		t.Fatalf("claims(A)=%d removed=%d, want 1/0", claims(t, mem, da), len(rm.removed))
-	}
+	require.Equal(t, 1, claims(t, mem, da), "claims(A)")
+	require.Empty(t, rm.removed, "removed")
 
 	// A second null write replaces the first in place.
 	putObjV(t, b, "k1", cc)
 	dc := blobDigestOf(t, b, "k1", "null")
 	drainReleases(t, b)
-	if claims(t, mem, db) != 0 || rm.removedDigests()[string(db)] != 1 {
-		t.Fatalf("claims(B)=%d removals(B)=%d, want 0/1", claims(t, mem, db), rm.removedDigests()[string(db)])
-	}
-	if claims(t, mem, dc) != 1 || claims(t, mem, da) != 1 {
-		t.Fatalf("claims(C)=%d claims(A)=%d, want 1/1", claims(t, mem, dc), claims(t, mem, da))
-	}
+	require.Zero(t, claims(t, mem, db), "claims(B)")
+	require.Equal(t, 1, rm.removedDigests()[string(db)], "removals(B)")
+	require.Equal(t, 1, claims(t, mem, dc), "claims(C)")
+	require.Equal(t, 1, claims(t, mem, da), "claims(A)")
 
 	res := listVersions(t, b, nil)
-	if len(res.Versions) != 2 {
-		t.Fatalf("versions = %d, want 2 (null + numbered)", len(res.Versions))
-	}
-	if *res.Versions[0].VersionId != "null" || !*res.Versions[0].IsLatest {
-		t.Fatalf("head = %q latest=%v, want null latest", *res.Versions[0].VersionId, *res.Versions[0].IsLatest)
-	}
-	if *res.Versions[1].VersionId != outA.VersionID {
-		t.Fatalf("bottom = %q, want %q", *res.Versions[1].VersionId, outA.VersionID)
-	}
+	require.Len(t, res.Versions, 2, "versions")
+	require.Equal(t, "null", *res.Versions[0].VersionId, "head")
+	require.True(t, *res.Versions[0].IsLatest, "head latest")
+	require.Equal(t, outA.VersionID, *res.Versions[1].VersionId, "bottom")
 }
 
 func TestVersioning_DeleteMarker(t *testing.T) {
@@ -228,55 +198,43 @@ func TestVersioning_DeleteMarker(t *testing.T) {
 	d := blobDigestOf(t, b, "k1", "")
 
 	out, err := deleteObjV(t, b, "k1", "")
-	if err != nil {
-		t.Fatalf("DeleteObject: %v", err)
-	}
-	if out.DeleteMarker == nil || !*out.DeleteMarker || out.VersionId == nil || *out.VersionId == "" {
-		t.Fatalf("marker response = %+v, want DeleteMarker + VersionId", out)
-	}
+	require.NoError(t, err, "DeleteObject")
+	require.NotNil(t, out.DeleteMarker, "marker response")
+	require.True(t, *out.DeleteMarker, "marker response = %+v, want DeleteMarker + VersionId", out)
+	require.NotNil(t, out.VersionId, "marker response")
+	require.NotEmpty(t, *out.VersionId, "marker response")
 	markerID := *out.VersionId
 
 	// Current-is-marker: GET/HEAD 404; scoped GET of the marker 405.
-	if _, _, err := getObjV(t, b, "k1", ""); apiErrCode(t, err) != "NoSuchKey" {
-		t.Fatalf("GET over marker = %v, want NoSuchKey", err)
-	}
-	if _, _, err := getObjV(t, b, "k1", markerID); apiErrCode(t, err) != "MethodNotAllowed" {
-		t.Fatalf("GET marker version = %v, want MethodNotAllowed", err)
-	}
+	_, _, err = getObjV(t, b, "k1", "")
+	require.Equal(t, "NoSuchKey", apiErrCode(t, err), "GET over marker")
+	_, _, err = getObjV(t, b, "k1", markerID)
+	require.Equal(t, "MethodNotAllowed", apiErrCode(t, err), "GET marker version")
 
 	// The marked version's data is retained.
-	if claims(t, mem, d) != 1 || len(rm.removed) != 0 {
-		t.Fatalf("claims=%d removed=%d, want 1/0", claims(t, mem, d), len(rm.removed))
-	}
+	require.Equal(t, 1, claims(t, mem, d), "claims")
+	require.Empty(t, rm.removed, "removed")
 
 	// ListObjects hides the key; ListObjectVersions shows marker + version.
 	bucket := "bk"
 	lres, err := b.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{Bucket: &bucket})
-	if err != nil {
-		t.Fatalf("ListObjectsV2: %v", err)
-	}
-	if len(lres.Contents) != 0 {
-		t.Fatalf("ListObjects shows %d keys over a marker, want 0", len(lres.Contents))
-	}
+	require.NoError(t, err, "ListObjectsV2")
+	require.Empty(t, lres.Contents, "ListObjects shows %d keys over a marker", len(lres.Contents))
 	vres := listVersions(t, b, nil)
-	if len(vres.DeleteMarkers) != 1 || len(vres.Versions) != 1 {
-		t.Fatalf("markers=%d versions=%d, want 1/1", len(vres.DeleteMarkers), len(vres.Versions))
-	}
-	if !*vres.DeleteMarkers[0].IsLatest || *vres.DeleteMarkers[0].VersionId != markerID {
-		t.Fatalf("marker entry = %+v, want latest %q", vres.DeleteMarkers[0], markerID)
-	}
+	require.Len(t, vres.DeleteMarkers, 1, "markers=%d versions", len(vres.DeleteMarkers))
+	require.Len(t, vres.Versions, 1, "markers=%d versions", len(vres.DeleteMarkers))
+	require.True(t, *vres.DeleteMarkers[0].IsLatest, "marker entry latest")
+	require.Equal(t, markerID, *vres.DeleteMarkers[0].VersionId, "marker entry")
 
 	// Deleting the marker by version id restores the object.
 	dout, err := deleteObjV(t, b, "k1", markerID)
-	if err != nil {
-		t.Fatalf("delete marker: %v", err)
-	}
-	if dout.DeleteMarker == nil || !*dout.DeleteMarker || *dout.VersionId != markerID {
-		t.Fatalf("delete-marker response = %+v, want DeleteMarker + id %q", dout, markerID)
-	}
-	if _, got, err := getObjV(t, b, "k1", ""); err != nil || !bytes.Equal(got, data) {
-		t.Fatalf("GET after marker removal = %q, %v; want %q", got, err, data)
-	}
+	require.NoError(t, err, "delete marker")
+	require.NotNil(t, dout.DeleteMarker, "delete-marker response")
+	require.True(t, *dout.DeleteMarker, "delete-marker response = %+v, want DeleteMarker + id %q", dout, markerID)
+	require.Equal(t, markerID, *dout.VersionId, "delete-marker response")
+	_, got, err := getObjV(t, b, "k1", "")
+	require.NoError(t, err, "GET after marker removal")
+	require.Equal(t, data, got, "GET after marker removal")
 }
 
 func TestVersioning_DeleteSpecificVersionPromotes(t *testing.T) {
@@ -289,34 +247,27 @@ func TestVersioning_DeleteSpecificVersionPromotes(t *testing.T) {
 	db := blobDigestOf(t, b, "k1", outB.VersionID)
 
 	// Delete the CURRENT version: the older one is promoted.
-	if _, err := deleteObjV(t, b, "k1", outB.VersionID); err != nil {
-		t.Fatalf("delete current version: %v", err)
-	}
-	if _, data, err := getObjV(t, b, "k1", ""); err != nil || !bytes.Equal(data, a) {
-		t.Fatalf("GET after promotion = %q, %v; want %q", data, err, a)
-	}
+	_, err := deleteObjV(t, b, "k1", outB.VersionID)
+	require.NoError(t, err, "delete current version")
+	_, data, err := getObjV(t, b, "k1", "")
+	require.NoError(t, err, "GET after promotion")
+	require.Equal(t, a, data, "GET after promotion")
 	drainReleases(t, b)
-	if claims(t, mem, db) != 0 || rm.removedDigests()[string(db)] != 1 {
-		t.Fatalf("claims(B)=%d removals(B)=%d, want 0/1", claims(t, mem, db), rm.removedDigests()[string(db)])
-	}
+	require.Zero(t, claims(t, mem, db), "claims(B)")
+	require.Equal(t, 1, rm.removedDigests()[string(db)], "removals(B)")
 	res := listVersions(t, b, nil)
-	if len(res.Versions) != 1 || *res.Versions[0].VersionId != outA.VersionID || !*res.Versions[0].IsLatest {
-		t.Fatalf("after promotion versions = %+v, want just %q latest", res.Versions, outA.VersionID)
-	}
+	require.Len(t, res.Versions, 1, "after promotion versions")
+	require.Equal(t, outA.VersionID, *res.Versions[0].VersionId, "after promotion versions")
+	require.True(t, *res.Versions[0].IsLatest, "after promotion versions = %+v, want just %q latest", res.Versions, outA.VersionID)
 
 	// Delete the last version: the key is gone entirely.
-	if _, err := deleteObjV(t, b, "k1", outA.VersionID); err != nil {
-		t.Fatalf("delete last version: %v", err)
-	}
-	if _, _, err := getObjV(t, b, "k1", ""); apiErrCode(t, err) != "NoSuchKey" {
-		t.Fatalf("GET after last delete = %v, want NoSuchKey", err)
-	}
-	if claims(t, mem, da) != 0 {
-		t.Fatalf("claims(A) = %d, want 0", claims(t, mem, da))
-	}
-	if n := len(listVersions(t, b, nil).Versions); n != 0 {
-		t.Fatalf("versions after full delete = %d, want 0", n)
-	}
+	_, err = deleteObjV(t, b, "k1", outA.VersionID)
+	require.NoError(t, err, "delete last version")
+	_, _, err = getObjV(t, b, "k1", "")
+	require.Equal(t, "NoSuchKey", apiErrCode(t, err), "GET after last delete")
+	require.Zero(t, claims(t, mem, da), "claims(A)")
+	n := len(listVersions(t, b, nil).Versions)
+	require.Zero(t, n, "versions after full delete")
 }
 
 func TestVersioning_SuspendedDeleteCreatesNullMarker(t *testing.T) {
@@ -328,28 +279,24 @@ func TestVersioning_SuspendedDeleteCreatesNullMarker(t *testing.T) {
 	// Repeated suspended deletes each replace the null marker in place.
 	for i := 0; i < 3; i++ {
 		out, err := deleteObjV(t, b, "k1", "")
-		if err != nil {
-			t.Fatalf("suspended delete #%d: %v", i, err)
-		}
-		if out.DeleteMarker == nil || !*out.DeleteMarker || *out.VersionId != "null" {
-			t.Fatalf("suspended delete #%d = %+v, want null marker", i, out)
-		}
+		require.NoError(t, err, "suspended delete #%d", i)
+		require.NotNil(t, out.DeleteMarker, "suspended delete #%d", i)
+		require.True(t, *out.DeleteMarker, "suspended delete #%d = %+v, want null marker", i, out)
+		require.Equal(t, "null", *out.VersionId, "suspended delete #%d", i)
 	}
 	res := listVersions(t, b, nil)
-	if len(res.DeleteMarkers) != 1 || *res.DeleteMarkers[0].VersionId != "null" || !*res.DeleteMarkers[0].IsLatest {
-		t.Fatalf("markers = %+v, want one latest null marker", res.DeleteMarkers)
-	}
-	if len(res.Versions) != 1 || *res.Versions[0].VersionId != outA.VersionID {
-		t.Fatalf("versions = %+v, want just %q", res.Versions, outA.VersionID)
-	}
+	require.Len(t, res.DeleteMarkers, 1, "markers = %+v, want one latest null marker", res.DeleteMarkers)
+	require.Equal(t, "null", *res.DeleteMarkers[0].VersionId, "markers = %+v, want one latest null marker", res.DeleteMarkers)
+	require.True(t, *res.DeleteMarkers[0].IsLatest, "markers = %+v, want one latest null marker", res.DeleteMarkers)
+	require.Len(t, res.Versions, 1, "versions")
+	require.Equal(t, outA.VersionID, *res.Versions[0].VersionId, "versions")
 
 	// Removing the null marker restores the numbered version.
-	if _, err := deleteObjV(t, b, "k1", "null"); err != nil {
-		t.Fatalf("delete null marker: %v", err)
-	}
-	if _, data, err := getObjV(t, b, "k1", ""); err != nil || !bytes.Equal(data, []byte("numbered")) {
-		t.Fatalf("GET after null-marker removal = %q, %v", data, err)
-	}
+	_, err := deleteObjV(t, b, "k1", "null")
+	require.NoError(t, err, "delete null marker")
+	_, data, err := getObjV(t, b, "k1", "")
+	require.NoError(t, err, "GET after null-marker removal")
+	require.Equal(t, []byte("numbered"), data, "GET after null-marker removal")
 }
 
 func TestVersioning_DeleteMarkerOnMissingKey(t *testing.T) {
@@ -358,16 +305,12 @@ func TestVersioning_DeleteMarkerOnMissingKey(t *testing.T) {
 
 	// S3 inserts a marker even when the key does not exist.
 	out, err := deleteObjV(t, b, "ghost", "")
-	if err != nil {
-		t.Fatalf("delete missing key: %v", err)
-	}
-	if out.DeleteMarker == nil || !*out.DeleteMarker {
-		t.Fatalf("response = %+v, want a delete marker", out)
-	}
+	require.NoError(t, err, "delete missing key")
+	require.NotNil(t, out.DeleteMarker, "response")
+	require.True(t, *out.DeleteMarker, "response = %+v, want a delete marker", out)
 	res := listVersions(t, b, nil)
-	if len(res.DeleteMarkers) != 1 || len(res.Versions) != 0 {
-		t.Fatalf("markers=%d versions=%d, want 1/0", len(res.DeleteMarkers), len(res.Versions))
-	}
+	require.Len(t, res.DeleteMarkers, 1, "markers=%d versions", len(res.DeleteMarkers))
+	require.Empty(t, res.Versions, "markers=%d versions", len(res.DeleteMarkers))
 }
 
 func TestVersioning_InvalidAndUnknownVersionIDs(t *testing.T) {
@@ -375,33 +318,26 @@ func TestVersioning_InvalidAndUnknownVersionIDs(t *testing.T) {
 	setVersioning(t, b, types.BucketVersioningStatusEnabled)
 	putObjV(t, b, "k1", []byte("x"))
 
-	if _, _, err := getObjV(t, b, "k1", "invalid_version_id"); apiErrCode(t, err) != "InvalidArgument" {
-		t.Fatalf("malformed versionId GET = %v, want InvalidArgument", err)
-	}
-	if _, _, err := getObjV(t, b, "k1", "01G65Z755AFWAKHE12NY0CQ9FH"); apiErrCode(t, err) != "NoSuchVersion" {
-		t.Fatalf("unknown versionId GET = %v, want NoSuchVersion", err)
-	}
-	if _, err := deleteObjV(t, b, "k1", "not-a-ulid!"); apiErrCode(t, err) != "InvalidArgument" {
-		t.Fatalf("malformed versionId DELETE = %v, want InvalidArgument", err)
-	}
+	_, _, err := getObjV(t, b, "k1", "invalid_version_id")
+	require.Equal(t, "InvalidArgument", apiErrCode(t, err), "malformed versionId GET")
+	_, _, err = getObjV(t, b, "k1", "01G65Z755AFWAKHE12NY0CQ9FH")
+	require.Equal(t, "NoSuchVersion", apiErrCode(t, err), "unknown versionId GET")
+	_, err = deleteObjV(t, b, "k1", "not-a-ulid!")
+	require.Equal(t, "InvalidArgument", apiErrCode(t, err), "malformed versionId DELETE")
 	// A well-formed but absent version deletes as a success no-op.
-	if _, err := deleteObjV(t, b, "k1", "01G65Z755AFWAKHE12NY0CQ9FH"); err != nil {
-		t.Fatalf("unknown versionId DELETE = %v, want no-op success", err)
-	}
-	if _, _, err := getObjV(t, b, "k1", ""); err != nil {
-		t.Fatalf("object must survive the no-op delete: %v", err)
-	}
+	_, err = deleteObjV(t, b, "k1", "01G65Z755AFWAKHE12NY0CQ9FH")
+	require.NoError(t, err, "unknown versionId DELETE")
+	_, _, err = getObjV(t, b, "k1", "")
+	require.NoError(t, err, "object must survive the no-op delete")
 }
 
 func TestVersioning_UnversionedScopedNullDelete(t *testing.T) {
 	b, _, _ := newRefTestBackend(t)
 	putObjV(t, b, "k1", []byte("plain"))
-	if _, err := deleteObjV(t, b, "k1", "null"); err != nil {
-		t.Fatalf("scoped null delete: %v", err)
-	}
-	if _, _, err := getObjV(t, b, "k1", ""); apiErrCode(t, err) != "NoSuchKey" {
-		t.Fatalf("GET after scoped null delete = %v, want NoSuchKey", err)
-	}
+	_, err := deleteObjV(t, b, "k1", "null")
+	require.NoError(t, err, "scoped null delete")
+	_, _, err = getObjV(t, b, "k1", "")
+	require.Equal(t, "NoSuchKey", apiErrCode(t, err), "GET after scoped null delete")
 }
 
 func TestVersioning_CopyFromVersion(t *testing.T) {
@@ -419,22 +355,16 @@ func TestVersioning_CopyFromVersion(t *testing.T) {
 		Key:        &dstKey,
 		CopySource: &src,
 	})
-	if err != nil {
-		t.Fatalf("CopyObject from version: %v", err)
-	}
-	if cout.CopySourceVersionId == nil || *cout.CopySourceVersionId != outA.VersionID {
-		t.Fatalf("CopySourceVersionId = %v, want %q", cout.CopySourceVersionId, outA.VersionID)
-	}
-	if cout.VersionId == nil || *cout.VersionId == "" {
-		t.Fatalf("dest VersionId missing: %+v", cout)
-	}
-	if _, data, err := getObjV(t, b, "k2", ""); err != nil || !bytes.Equal(data, a) {
-		t.Fatalf("copied GET = %q, %v; want %q", data, err, a)
-	}
+	require.NoError(t, err, "CopyObject from version")
+	require.NotNil(t, cout.CopySourceVersionId, "CopySourceVersionId")
+	require.Equal(t, outA.VersionID, *cout.CopySourceVersionId, "CopySourceVersionId")
+	require.NotNil(t, cout.VersionId, "dest VersionId missing: %+v", cout)
+	require.NotEmpty(t, *cout.VersionId, "dest VersionId missing: %+v", cout)
+	_, data, err := getObjV(t, b, "k2", "")
+	require.NoError(t, err, "copied GET")
+	require.Equal(t, a, data, "copied GET")
 	// The shared digest now has two claims: k1's old version and k2's new one.
-	if claims(t, mem, da) != 2 {
-		t.Fatalf("claims = %d, want 2", claims(t, mem, da))
-	}
+	require.Equal(t, 2, claims(t, mem, da), "claims(A)")
 }
 
 func TestVersioning_ListVersionsPagination(t *testing.T) {
@@ -471,22 +401,16 @@ func TestVersioning_ListVersionsPagination(t *testing.T) {
 		if res.IsTruncated == nil || !*res.IsTruncated {
 			break
 		}
-		if res.NextKeyMarker == nil {
-			t.Fatalf("truncated page missing NextKeyMarker")
-		}
+		require.NotNil(t, res.NextKeyMarker, "truncated page missing NextKeyMarker")
 		in = &s3.ListObjectVersionsInput{
 			MaxKeys:         &maxKeys,
 			KeyMarker:       res.NextKeyMarker,
 			VersionIdMarker: res.NextVersionIdMarker,
 		}
 	}
-	if len(got) != len(want) {
-		t.Fatalf("paged entries = %d, want %d\n got: %v\nwant: %v", len(got), len(want), got, want)
-	}
+	require.Len(t, got, len(want), "paged entries")
 	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("entry %d = %q, want %q\n got: %v\nwant: %v", i, got[i], want[i], got, want)
-		}
+		require.Equal(t, want[i], got[i], "entry %d", i)
 	}
 }
 
@@ -505,51 +429,35 @@ func TestVersioning_ListVersionsExactFit(t *testing.T) {
 
 	maxKeys := int32(3)
 	res := listVersions(t, b, &s3.ListObjectVersionsInput{MaxKeys: &maxKeys})
-	if len(res.Versions) != 3 || res.IsTruncated == nil || !*res.IsTruncated {
-		t.Fatalf("page1: versions=%d truncated=%v, want 3/true", len(res.Versions), res.IsTruncated)
-	}
-	if res.NextKeyMarker == nil {
-		t.Fatal("page1 missing NextKeyMarker")
-	}
+	require.Len(t, res.Versions, 3, "page1: versions=%d truncated", len(res.Versions))
+	require.NotNil(t, res.IsTruncated, "page1: versions=%d truncated", len(res.Versions))
+	require.True(t, *res.IsTruncated, "page1: versions=%d truncated=%v, want 3/true", len(res.Versions), res.IsTruncated)
+	require.NotNil(t, res.NextKeyMarker, "page1 missing NextKeyMarker")
 
 	res2 := listVersions(t, b, &s3.ListObjectVersionsInput{
 		MaxKeys:         &maxKeys,
 		KeyMarker:       res.NextKeyMarker,
 		VersionIdMarker: res.NextVersionIdMarker,
 	})
-	if len(res2.Versions) != 3 {
-		t.Fatalf("page2 versions = %d, want 3", len(res2.Versions))
-	}
-	if res2.IsTruncated == nil || *res2.IsTruncated {
-		t.Fatalf("page2 IsTruncated = %v, want false (exact fit, nothing follows)", res2.IsTruncated)
-	}
+	require.Len(t, res2.Versions, 3, "page2 versions")
+	require.NotNil(t, res2.IsTruncated, "page2 IsTruncated")
+	require.False(t, *res2.IsTruncated, "page2 IsTruncated (exact fit, nothing follows)")
 	for _, v := range res2.Versions {
-		if *v.Key != "o2" {
-			t.Fatalf("page2 key = %q, want o2", *v.Key)
-		}
+		require.Equal(t, "o2", *v.Key, "page2 key")
 	}
 }
 
 func TestVersioning_UnversionedResponsesOmitVersionIDs(t *testing.T) {
 	b, _, _ := newRefTestBackend(t)
 	out := putObjV(t, b, "k1", []byte("plain"))
-	if out.VersionID != "" {
-		t.Fatalf("unversioned PUT VersionID = %q, want empty", out.VersionID)
-	}
+	require.Empty(t, out.VersionID, "unversioned PUT VersionID")
 	gout, _, err := getObjV(t, b, "k1", "")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	if gout.VersionId != nil {
-		t.Fatalf("unversioned GET VersionId = %q, want nil", *gout.VersionId)
-	}
+	require.NoError(t, err, "GET")
+	require.Nil(t, gout.VersionId, "unversioned GET VersionId")
 	dout, err := deleteObjV(t, b, "k1", "")
-	if err != nil {
-		t.Fatalf("DELETE: %v", err)
-	}
-	if dout.VersionId != nil || dout.DeleteMarker != nil {
-		t.Fatalf("unversioned DELETE = %+v, want no version fields", dout)
-	}
+	require.NoError(t, err, "DELETE")
+	require.Nil(t, dout.VersionId, "unversioned DELETE")
+	require.Nil(t, dout.DeleteMarker, "unversioned DELETE")
 }
 
 func TestVersioning_GetBucketVersioningStates(t *testing.T) {
@@ -557,23 +465,18 @@ func TestVersioning_GetBucketVersioningStates(t *testing.T) {
 	ctx := context.Background()
 
 	out, err := b.GetBucketVersioning(ctx, "bk")
-	if err != nil {
-		t.Fatalf("GetBucketVersioning: %v", err)
-	}
-	if out.Status != nil {
-		t.Fatalf("never-configured Status = %v, want nil", *out.Status)
-	}
+	require.NoError(t, err, "GetBucketVersioning")
+	require.Nil(t, out.Status, "never-configured Status")
 	setVersioning(t, b, types.BucketVersioningStatusEnabled)
-	if out, _ = b.GetBucketVersioning(ctx, "bk"); out.Status == nil || *out.Status != types.BucketVersioningStatusEnabled {
-		t.Fatalf("Status = %v, want Enabled", out.Status)
-	}
+	out, _ = b.GetBucketVersioning(ctx, "bk")
+	require.NotNil(t, out.Status, "Status")
+	require.Equal(t, types.BucketVersioningStatusEnabled, *out.Status, "Status")
 	setVersioning(t, b, types.BucketVersioningStatusSuspended)
-	if out, _ = b.GetBucketVersioning(ctx, "bk"); out.Status == nil || *out.Status != types.BucketVersioningStatusSuspended {
-		t.Fatalf("Status = %v, want Suspended", out.Status)
-	}
-	if _, err := b.GetBucketVersioning(ctx, "nope"); apiErrCode(t, err) != "NoSuchBucket" {
-		t.Fatalf("missing bucket = %v, want NoSuchBucket", err)
-	}
+	out, _ = b.GetBucketVersioning(ctx, "bk")
+	require.NotNil(t, out.Status, "Status")
+	require.Equal(t, types.BucketVersioningStatusSuspended, *out.Status, "Status")
+	_, err = b.GetBucketVersioning(ctx, "nope")
+	require.Equal(t, "NoSuchBucket", apiErrCode(t, err), "missing bucket")
 }
 
 func TestVersioning_DeleteObjectsMixed(t *testing.T) {
@@ -591,36 +494,30 @@ func TestVersioning_DeleteObjectsMixed(t *testing.T) {
 			{Key: strPtr("b")}, // unscoped: marker
 		}},
 	})
-	if err != nil {
-		t.Fatalf("DeleteObjects: %v", err)
-	}
-	if len(res.Error) != 0 {
-		t.Fatalf("errors = %+v, want none", res.Error)
-	}
-	if len(res.Deleted) != 2 {
-		t.Fatalf("deleted = %d entries, want 2", len(res.Deleted))
-	}
+	require.NoError(t, err, "DeleteObjects")
+	require.Empty(t, res.Error, "errors")
+	require.Len(t, res.Deleted, 2, "deleted = %d entries", len(res.Deleted))
 	byKey := map[string]types.DeletedObject{}
 	for _, d := range res.Deleted {
 		byKey[*d.Key] = d
 	}
-	if e := byKey["a"]; e.VersionId == nil || *e.VersionId != outA.VersionID || e.DeleteMarker == nil || *e.DeleteMarker {
-		t.Fatalf(`entry "a" = %+v, want scoped VersionId + explicit DeleteMarker=false`, e)
-	}
-	if e := byKey["b"]; e.DeleteMarker == nil || !*e.DeleteMarker || e.DeleteMarkerVersionId == nil {
-		t.Fatalf(`entry "b" = %+v, want marker fields`, e)
-	}
+	ea := byKey["a"]
+	require.NotNil(t, ea.VersionId, "entry \"a\"")
+	require.Equal(t, outA.VersionID, *ea.VersionId, "entry \"a\" VersionId")
+	require.NotNil(t, ea.DeleteMarker, "entry \"a\"")
+	require.False(t, *ea.DeleteMarker, "entry \"a\" DeleteMarker")
+	e := byKey["b"]
+	require.NotNil(t, e.DeleteMarker, "entry \"b\"")
+	require.True(t, *e.DeleteMarker, "entry \"b\" = %+v, want marker fields", e)
+	require.NotNil(t, e.DeleteMarkerVersionId, "entry \"b\"")
 
 	// "a" is fully gone (its only version removed); "b" is marker-hidden.
-	if _, _, err := getObjV(t, b, "a", ""); apiErrCode(t, err) != "NoSuchKey" {
-		t.Fatalf(`GET "a" = %v, want NoSuchKey`, err)
-	}
-	if _, _, err := getObjV(t, b, "b", ""); apiErrCode(t, err) != "NoSuchKey" {
-		t.Fatalf(`GET "b" = %v, want NoSuchKey`, err)
-	}
-	if n := len(listVersions(t, b, nil).Versions); n != 1 {
-		t.Fatalf("remaining versions = %d, want 1 (b's data version)", n)
-	}
+	_, _, err = getObjV(t, b, "a", "")
+	require.Equal(t, "NoSuchKey", apiErrCode(t, err), "GET \"a\"")
+	_, _, err = getObjV(t, b, "b", "")
+	require.Equal(t, "NoSuchKey", apiErrCode(t, err), "GET \"b\"")
+	n := len(listVersions(t, b, nil).Versions)
+	require.Equal(t, 1, n, "remaining versions = %d, want 1 (b's data version)", n)
 }
 
 // TestVersioning_DeleteObjectsNeedsVersionPermission covers the per-entry
@@ -645,15 +542,13 @@ func TestVersioning_DeleteObjectsNeedsVersionPermission(t *testing.T) {
 					{Key: strPtr("a"), VersionId: &outA.VersionID},
 				}},
 			})
-			if err != nil {
-				t.Fatalf("DeleteObjects: %v", err)
-			}
-			if len(res.Deleted) != 0 || len(res.Error) != 1 || *res.Error[0].Code != "AccessDenied" || *res.Error[0].Key != "a" {
-				t.Fatalf("result = %+v, want one AccessDenied error for \"a\"", res)
-			}
-			if _, _, err := getObjV(t, b, "a", outA.VersionID); err != nil {
-				t.Fatalf("GET refused version of \"a\": %v", err)
-			}
+			require.NoError(t, err, "DeleteObjects")
+			require.Empty(t, res.Deleted, "result = %+v, want one AccessDenied error for \"a\"", res)
+			require.Len(t, res.Error, 1, "result = %+v, want one AccessDenied error for \"a\"", res)
+			require.Equal(t, "AccessDenied", *res.Error[0].Code, "result = %+v, want one AccessDenied error for \"a\"", res)
+			require.Equal(t, "a", *res.Error[0].Key, "result = %+v, want one AccessDenied error for \"a\"", res)
+			_, _, err = getObjV(t, b, "a", outA.VersionID)
+			require.NoError(t, err, "GET refused version of \"a\"")
 		})
 	}
 
@@ -664,12 +559,11 @@ func TestVersioning_DeleteObjectsNeedsVersionPermission(t *testing.T) {
 			{Key: strPtr("b")},
 		}},
 	})
-	if err != nil {
-		t.Fatalf("DeleteObjects: %v", err)
-	}
-	if len(res.Error) != 1 || *res.Error[0].Key != "a" || len(res.Deleted) != 1 || *res.Deleted[0].Key != "b" {
-		t.Fatalf("result = %+v, want \"a\" refused and \"b\" deleted", res)
-	}
+	require.NoError(t, err, "DeleteObjects")
+	require.Len(t, res.Error, 1, "result = %+v, want \"a\" refused and \"b\" deleted", res)
+	require.Equal(t, "a", *res.Error[0].Key, "result = %+v, want \"a\" refused and \"b\" deleted", res)
+	require.Len(t, res.Deleted, 1, "result = %+v, want \"a\" refused and \"b\" deleted", res)
+	require.Equal(t, "b", *res.Deleted[0].Key, "result = %+v, want \"a\" refused and \"b\" deleted", res)
 }
 
 // actionSet is a reqscope.ActionSet holding one bucket's actions.
@@ -690,9 +584,7 @@ func (a actionSet) Permits(bucket did.DID, action string) (allowed, known bool) 
 func withActions(t *testing.T, b *Backend, bucket string, actions ...string) context.Context {
 	t.Helper()
 	st, err := b.reg.Get(context.Background(), bucket)
-	if err != nil {
-		t.Fatalf("registry get %q: %v", bucket, err)
-	}
+	require.NoError(t, err, "registry get %q", bucket)
 	return context.WithValue(context.Background(), reqscope.ActionsKey(),
 		reqscope.ActionSet(actionSet{space: st.Space.String(), actions: actions}))
 }
@@ -723,27 +615,22 @@ func TestVersioning_NullEvictionFromPrev(t *testing.T) {
 
 	// A's claim is released and its blob removed; B and C stay claimed.
 	drainReleases(t, b)
-	if claims(t, mem, da) != 0 || rm.removedDigests()[string(da)] != 1 {
-		t.Fatalf("claims(A)=%d removals(A)=%d, want 0/1", claims(t, mem, da), rm.removedDigests()[string(da)])
-	}
-	if claims(t, mem, db) != 1 || claims(t, mem, dc) != 1 {
-		t.Fatalf("claims(B)=%d claims(C)=%d, want 1/1", claims(t, mem, db), claims(t, mem, dc))
-	}
+	require.Zero(t, claims(t, mem, da), "claims(A)")
+	require.Equal(t, 1, rm.removedDigests()[string(da)], "removals(A)")
+	require.Equal(t, 1, claims(t, mem, db), "claims(B)")
+	require.Equal(t, 1, claims(t, mem, dc), "claims(C)")
 
 	// The stack is [C null latest, B numbered]; the old null resolves to C.
 	res := listVersions(t, b, nil)
-	if len(res.Versions) != 2 || len(res.DeleteMarkers) != 0 {
-		t.Fatalf("versions=%d markers=%d, want 2/0", len(res.Versions), len(res.DeleteMarkers))
-	}
-	if *res.Versions[0].VersionId != "null" || !*res.Versions[0].IsLatest {
-		t.Fatalf("head = %q latest=%v, want null latest", *res.Versions[0].VersionId, *res.Versions[0].IsLatest)
-	}
-	if *res.Versions[1].VersionId != outB.VersionID || *res.Versions[1].IsLatest {
-		t.Fatalf("bottom = %q latest=%v, want %q non-latest", *res.Versions[1].VersionId, *res.Versions[1].IsLatest, outB.VersionID)
-	}
-	if _, data, err := getObjV(t, b, "k1", "null"); err != nil || !bytes.Equal(data, cc) {
-		t.Fatalf("GET null = %q, %v; want %q", data, err, cc)
-	}
+	require.Len(t, res.Versions, 2, "versions=%d markers", len(res.Versions))
+	require.Empty(t, res.DeleteMarkers, "versions=%d markers", len(res.Versions))
+	require.Equal(t, "null", *res.Versions[0].VersionId, "head")
+	require.True(t, *res.Versions[0].IsLatest, "head latest")
+	require.Equal(t, outB.VersionID, *res.Versions[1].VersionId, "bottom")
+	require.False(t, *res.Versions[1].IsLatest, "bottom latest")
+	_, data, err := getObjV(t, b, "k1", "null")
+	require.NoError(t, err, "GET null = %q, %v", data, err)
+	require.Equal(t, cc, data, "GET null = %q, %v", data, err)
 }
 
 // getValue decodes the top-MST value block for key: a bare manifest or an
@@ -752,17 +639,11 @@ func getValue(t *testing.T, b *Backend, key string) msbucket.ObjectValue {
 	t.Helper()
 	ctx := context.Background()
 	st, err := b.reg.Get(ctx, "bk")
-	if err != nil {
-		t.Fatalf("registry get: %v", err)
-	}
+	require.NoError(t, err, "registry get")
 	valCid, err := mst.LoadMST(b.read, st.Space, st.Root).Get(ctx, key)
-	if err != nil {
-		t.Fatalf("mst get %s: %v", key, err)
-	}
+	require.NoError(t, err, "mst get %s", key)
 	var val msbucket.ObjectValue
-	if err := b.read.Get(ctx, st.Space, valCid, &val); err != nil {
-		t.Fatalf("value get %s: %v", key, err)
-	}
+	require.NoError(t, b.read.Get(ctx, st.Space, valCid, &val), "value get %s", key)
 	return val
 }
 
@@ -777,17 +658,13 @@ func TestVersioning_UnversionedKeyStaysBare(t *testing.T) {
 
 	// Behaviorally: a single listed null version.
 	res := listVersions(t, b, nil)
-	if len(res.Versions) != 1 || *res.Versions[0].VersionId != "null" {
-		t.Fatalf("versions = %+v, want one null version", res.Versions)
-	}
+	require.Len(t, res.Versions, 1, "versions")
+	require.Equal(t, "null", *res.Versions[0].VersionId, "versions")
 	// Structurally: the value block is the manifest itself.
 	val := getValue(t, b, "k1")
-	if val.Manifest == nil || val.Leaf != nil {
-		t.Fatalf("value = {Manifest:%v Leaf:%v}, want bare manifest", val.Manifest, val.Leaf)
-	}
-	if val.Manifest.VersionID != "null" {
-		t.Fatalf("manifest VersionID = %q, want null", val.Manifest.VersionID)
-	}
+	require.NotNil(t, val.Manifest, "value = {Manifest:%v Leaf:%v}", val.Manifest, val.Leaf)
+	require.Nil(t, val.Leaf, "value = {Manifest:%v Leaf:%v}", val.Manifest, val.Leaf)
+	require.Equal(t, "null", val.Manifest.VersionID, "manifest VersionID")
 }
 
 // TestVersioning_FirstSupersessionCreatesLeaf pins the §5.2 upgrade rule on an
@@ -800,34 +677,24 @@ func TestVersioning_FirstSupersessionCreatesLeaf(t *testing.T) {
 	setVersioning(t, b, types.BucketVersioningStatusEnabled)
 
 	putObjV(t, b, "k1", []byte("one"))
-	if val := getValue(t, b, "k1"); val.Manifest == nil {
-		t.Fatalf("single-version Enabled key: value = {Leaf:%v}, want bare manifest", val.Leaf)
-	}
+	require.NotNil(t, getValue(t, b, "k1").Manifest, "single-version Enabled key")
 
 	out2 := putObjV(t, b, "k1", []byte("two"))
 	val := getValue(t, b, "k1")
-	if val.Leaf == nil {
-		t.Fatalf("superseded key: value is still a bare manifest, want leaf")
-	}
-	if val.Leaf.Current.VersionID != out2.VersionID || val.Leaf.Prev == nil {
-		t.Fatalf("leaf = {Current:%q Prev:%v}, want current %q with a prev tree", val.Leaf.Current.VersionID, val.Leaf.Prev, out2.VersionID)
-	}
+	require.NotNil(t, val.Leaf, "superseded key: value is still a bare manifest")
+	require.Equal(t, out2.VersionID, val.Leaf.Current.VersionID, "leaf = {Current:%q Prev:%v}, want current %q with a prev tree", val.Leaf.Current.VersionID, val.Leaf.Prev, out2.VersionID)
+	require.NotNil(t, val.Leaf.Prev, "leaf = {Current:%q Prev:%v}, want current %q with a prev tree", val.Leaf.Current.VersionID, val.Leaf.Prev, out2.VersionID)
 
 	// Delete the current version: the old one promotes, and the key keeps its
 	// leaf even though only one version remains.
-	if _, err := deleteObjV(t, b, "k1", out2.VersionID); err != nil {
-		t.Fatalf("delete version: %v", err)
-	}
+	_, err := deleteObjV(t, b, "k1", out2.VersionID)
+	require.NoError(t, err, "delete version")
 	val = getValue(t, b, "k1")
-	if val.Leaf == nil {
-		t.Fatalf("post-delete key: value downgraded to a bare manifest, want leaf (invariant 6)")
-	}
-	if val.Leaf.Prev != nil {
-		t.Fatalf("post-delete leaf.Prev = %v, want nil (single version)", val.Leaf.Prev)
-	}
-	if _, data, err := getObjV(t, b, "k1", ""); err != nil || !bytes.Equal(data, []byte("one")) {
-		t.Fatalf("GET after promotion = %q, %v; want \"one\"", data, err)
-	}
+	require.NotNil(t, val.Leaf, "post-delete key: value downgraded to a bare manifest")
+	require.Nil(t, val.Leaf.Prev, "post-delete leaf.Prev")
+	_, data, err := getObjV(t, b, "k1", "")
+	require.NoError(t, err, "GET after promotion")
+	require.Equal(t, []byte("one"), data, "GET after promotion")
 }
 
 // TestVersioning_ListVersionsDelimiter pins §9.2 grouping: every version of a
@@ -842,13 +709,10 @@ func TestVersioning_ListVersionsDelimiter(t *testing.T) {
 
 	delim := "/"
 	res := listVersions(t, b, &s3.ListObjectVersionsInput{Delimiter: &delim})
-	if len(res.CommonPrefixes) != 1 || *res.CommonPrefixes[0].Prefix != "a/" {
-		t.Fatalf("common prefixes = %+v, want [a/]", res.CommonPrefixes)
-	}
-	if len(res.Versions) != 1 || *res.Versions[0].Key != "b" || *res.Versions[0].VersionId != outB.VersionID {
-		t.Fatalf("versions = %+v, want just b@%s", res.Versions, outB.VersionID)
-	}
-	if len(res.DeleteMarkers) != 0 {
-		t.Fatalf("markers = %+v, want none", res.DeleteMarkers)
-	}
+	require.Len(t, res.CommonPrefixes, 1, "common prefixes")
+	require.Equal(t, "a/", *res.CommonPrefixes[0].Prefix, "common prefixes")
+	require.Len(t, res.Versions, 1, "versions")
+	require.Equal(t, "b", *res.Versions[0].Key, "versions")
+	require.Equal(t, outB.VersionID, *res.Versions[0].VersionId, "versions")
+	require.Empty(t, res.DeleteMarkers, "markers")
 }

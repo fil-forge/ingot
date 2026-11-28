@@ -2,7 +2,6 @@ package registry_test
 
 import (
 	"context"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -11,6 +10,7 @@ import (
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -25,33 +25,25 @@ func egressStore(t *testing.T) *registry.Postgres {
 
 func addEgress(t *testing.T, r *registry.Postgres, counts ...registry.EgressCount) {
 	t.Helper()
-	if err := r.AddEgress(context.Background(), counts); err != nil {
-		t.Fatalf("AddEgress: %v", err)
-	}
+	require.NoError(t, r.AddEgress(context.Background(), counts), "AddEgress")
 }
 
 func dueEgress(t *testing.T, r *registry.Postgres, limit int) []registry.EgressCount {
 	t.Helper()
 	due, err := r.DueEgress(context.Background(), limit)
-	if err != nil {
-		t.Fatalf("DueEgress: %v", err)
-	}
+	require.NoError(t, err, "DueEgress")
 	return due
 }
 
 func acknowledgeEgress(t *testing.T, r *registry.Postgres, counts ...registry.EgressCount) {
 	t.Helper()
-	if err := r.AcknowledgeEgress(context.Background(), counts); err != nil {
-		t.Fatalf("AcknowledgeEgress: %v", err)
-	}
+	require.NoError(t, r.AcknowledgeEgress(context.Background(), counts), "AcknowledgeEgress")
 }
 
 func egressBacklog(t *testing.T, r *registry.Postgres) registry.EgressBacklog {
 	t.Helper()
 	b, err := r.EgressBacklog(context.Background())
-	if err != nil {
-		t.Fatalf("EgressBacklog: %v", err)
-	}
+	require.NoError(t, err, "EgressBacklog")
 	return b
 }
 
@@ -60,9 +52,7 @@ func wantDue(t *testing.T, got []registry.EgressCount, want ...registry.EgressCo
 	if len(got) == 0 && len(want) == 0 {
 		return
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("due egress:\n got %v\nwant %v", got, want)
-	}
+	require.Equal(t, want, got, "due egress")
 }
 
 // Adds to one space and hour accumulate, from one call or several, as the
@@ -93,9 +83,7 @@ func TestAddEgressIgnoresNothingAndRefusesANegativeCount(t *testing.T) {
 	addEgress(t, r, registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 0})
 	wantDue(t, dueEgress(t, r, 10))
 
-	if err := r.AddEgress(context.Background(), []registry.EgressCount{{Space: space, Hour: egressHour0, Bytes: -1}}); err == nil {
-		t.Fatal("AddEgress accepted a negative count")
-	}
+	require.Error(t, r.AddEgress(context.Background(), []registry.EgressCount{{Space: space, Hour: egressHour0, Bytes: -1}}), "AddEgress accepted a negative count")
 }
 
 // Due counts come oldest hour first, within the limit, so a backlog is worked
@@ -126,9 +114,7 @@ func TestDueEgressIsOldestFirstAndLimited(t *testing.T) {
 func wantDueOldestFirst(t *testing.T, got []registry.EgressCount, want ...registry.EgressCount) {
 	t.Helper()
 	for i := 1; i < len(got); i++ {
-		if got[i].Hour.Before(got[i-1].Hour) {
-			t.Fatalf("due egress out of hour order:\n got %v", got)
-		}
+		require.False(t, got[i].Hour.Before(got[i-1].Hour), "due egress out of hour order:\n got %v", got)
 	}
 	byHourThenSpace := func(c []registry.EgressCount) []registry.EgressCount {
 		c = slices.Clone(c)
@@ -152,9 +138,9 @@ func TestAcknowledgedEgressIsDueAgainWhenItGrows(t *testing.T) {
 
 	acknowledgeEgress(t, r, dueEgress(t, r, 10)...)
 	wantDue(t, dueEgress(t, r, 10))
-	if b := egressBacklog(t, r); b.Counts != 0 || !b.Oldest.IsZero() {
-		t.Fatalf("backlog after acknowledging everything: %+v", b)
-	}
+	b := egressBacklog(t, r)
+	require.Zero(t, b.Counts, "backlog after acknowledging everything: %+v", b)
+	require.True(t, b.Oldest.IsZero(), "backlog after acknowledging everything: %+v", b)
 
 	addEgress(t, r, registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 5})
 	wantDue(t, dueEgress(t, r, 10), registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 15})
@@ -175,9 +161,8 @@ func TestAcknowledgeLeavesACountThatGrewDue(t *testing.T) {
 	wantDue(t, dueEgress(t, r, 10), registry.EgressCount{Space: space, Hour: egressHour0, Bytes: 15})
 	// It has been due since before the report went out, and its age says so.
 	after := egressBacklog(t, r)
-	if after.Counts != 1 || !after.Oldest.Equal(before.Oldest) {
-		t.Fatalf("backlog: got %+v, want one count due since %s", after, before.Oldest)
-	}
+	require.Equal(t, int64(1), after.Counts, "backlog: got %+v, want one count due since %s", after, before.Oldest)
+	require.True(t, after.Oldest.Equal(before.Oldest), "backlog: got %+v, want one count due since %s", after, before.Oldest)
 
 	// Acknowledging the total it reached settles it.
 	acknowledgeEgress(t, r, dueEgress(t, r, 10)...)
@@ -206,27 +191,22 @@ func TestAcknowledgeAtALowerTotalChangesNothing(t *testing.T) {
 func TestEgressBacklogCountsWhatIsDue(t *testing.T) {
 	r := egressStore(t)
 	a, b := testutil.RandomDID(t), testutil.RandomDID(t)
-	if got := egressBacklog(t, r); got.Counts != 0 || !got.Oldest.IsZero() {
-		t.Fatalf("empty backlog: %+v", got)
-	}
+	got := egressBacklog(t, r)
+	require.Zero(t, got.Counts, "empty backlog")
+	require.True(t, got.Oldest.IsZero(), "empty backlog: %+v", got)
 
 	start := time.Now().Add(-time.Minute)
 	addEgress(t, r,
 		registry.EgressCount{Space: a, Hour: egressHour0, Bytes: 1},
 		registry.EgressCount{Space: b, Hour: egressHour0, Bytes: 1},
 	)
-	got := egressBacklog(t, r)
-	if got.Counts != 2 {
-		t.Fatalf("backlog counts: got %d, want 2", got.Counts)
-	}
-	if got.Oldest.Before(start) || got.Oldest.After(time.Now().Add(time.Minute)) {
-		t.Fatalf("backlog oldest %s is not around now", got.Oldest)
-	}
+	got = egressBacklog(t, r)
+	require.Equal(t, int64(2), got.Counts, "backlog counts")
+	require.False(t, got.Oldest.Before(start), "backlog oldest %s is not around now", got.Oldest)
+	require.False(t, got.Oldest.After(time.Now().Add(time.Minute)), "backlog oldest %s is not around now", got.Oldest)
 
 	acknowledgeEgress(t, r, registry.EgressCount{Space: a, Hour: egressHour0, Bytes: 1})
-	if got := egressBacklog(t, r); got.Counts != 1 {
-		t.Fatalf("backlog counts after one acknowledgement: got %d, want 1", got.Counts)
-	}
+	require.Equal(t, int64(1), egressBacklog(t, r).Counts, "backlog counts after one acknowledgement")
 }
 
 // Pruning takes only counts that are up to date and were acknowledged long
@@ -243,17 +223,12 @@ func TestPruneEgress(t *testing.T) {
 	prune := func(before time.Time) int64 {
 		t.Helper()
 		n, err := r.PruneEgress(context.Background(), before)
-		if err != nil {
-			t.Fatalf("PruneEgress: %v", err)
-		}
+		require.NoError(t, err, "PruneEgress")
 		return n
 	}
-	if n := prune(time.Now().Add(-time.Hour)); n != 0 {
-		t.Fatalf("pruned %d counts acknowledged a moment ago", n)
-	}
-	if n := prune(time.Now().Add(time.Hour)); n != 1 {
-		t.Fatalf("pruned %d counts, want the 1 that is settled", n)
-	}
+	n := prune(time.Now().Add(-time.Hour))
+	require.Zero(t, n, "pruned counts acknowledged a moment ago")
+	require.Equal(t, int64(1), prune(time.Now().Add(time.Hour)), "pruned counts, want the 1 that is settled")
 	wantDue(t, dueEgress(t, r, 10), registry.EgressCount{Space: due, Hour: egressHour0, Bytes: 20})
 
 }

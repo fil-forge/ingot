@@ -8,6 +8,7 @@ import (
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	"github.com/stretchr/testify/require"
 	cbg "github.com/whyrusleeping/cbor-gen"
 	"go.uber.org/zap/zaptest"
 
@@ -21,19 +22,12 @@ func linkBlock(t *testing.T, name string, links ...cid.Cid) block.Block {
 	t.Helper()
 	var buf bytes.Buffer
 	cw := cbg.NewCborWriter(&buf)
-	if err := cw.WriteMajorTypeHeader(cbg.MajArray, uint64(1+len(links))); err != nil {
-		t.Fatalf("array header: %v", err)
-	}
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(name))); err != nil {
-		t.Fatalf("name header: %v", err)
-	}
-	if _, err := cw.WriteString(name); err != nil {
-		t.Fatalf("name: %v", err)
-	}
+	require.NoError(t, cw.WriteMajorTypeHeader(cbg.MajArray, uint64(1+len(links))), "array header")
+	require.NoError(t, cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(name))), "name header")
+	_, err := cw.WriteString(name)
+	require.NoError(t, err, "name")
 	for _, l := range links {
-		if err := cbg.WriteCid(cw, l); err != nil {
-			t.Fatalf("link: %v", err)
-		}
+		require.NoError(t, cbg.WriteCid(cw, l), "link")
 	}
 	return makeBlock(t, buf.Bytes())
 }
@@ -54,13 +48,10 @@ func shippedDeadBytes(t *testing.T, batches [][]block.Block, roots []cid.Cid) in
 	s, meta, _ := newTestStore(t, 64<<20, time.Hour, 6)
 	ctx := context.Background()
 	for i, blks := range batches {
-		if _, err := s.AppendBatch(ctx, blks, blockstore.OpRoot{Bucket: "bk", Root: roots[i]}); err != nil {
-			t.Fatalf("append %d: %v", i, err)
-		}
+		_, err := s.AppendBatch(ctx, blks, blockstore.OpRoot{Bucket: "bk", Root: roots[i]})
+		require.NoError(t, err, "append %d", i)
 	}
-	if err := s.catalog.sealOpenIfDue(ctx, true); err != nil {
-		t.Fatalf("seal: %v", err)
-	}
+	require.NoError(t, s.catalog.sealOpenIfDue(ctx, true), "seal")
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -72,15 +63,13 @@ func shippedDeadBytes(t *testing.T, batches [][]block.Block, roots []cid.Cid) in
 			}
 		}
 		meta.mu.Unlock()
-		if len(shipped) > 1 {
-			t.Fatalf("batches landed in %d segments, want 1", len(shipped))
-		}
+		require.LessOrEqual(t, len(shipped), 1, "batches landed in %d segments", len(shipped))
 		if len(shipped) == 1 {
 			return shipped[0].DeadBytes
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("segment never shipped")
+	require.FailNow(t, "segment never shipped")
 	return 0
 }
 
@@ -100,9 +89,8 @@ func TestShipRecordsDeadOnArrivalBytes(t *testing.T) {
 	got := shippedDeadBytes(t,
 		[][]block.Block{{a, r1}, {b, r2}, {c, r3}},
 		[]cid.Cid{r1.Cid(), r2.Cid(), r3.Cid()})
-	if want := frameSize(a, r1, r2); got != want {
-		t.Fatalf("dead bytes = %d, want %d (a, r1 and r2)", got, want)
-	}
+	want := frameSize(a, r1, r2)
+	require.Equal(t, want, got, "dead bytes = %d, want %d (a, r1 and r2)", got, want)
 }
 
 // TestShipRecordsDeadOnArrivalWhenRootIsOlder: a segment whose last root is
@@ -116,9 +104,8 @@ func TestShipRecordsDeadOnArrivalWhenRootIsOlder(t *testing.T) {
 	got := shippedDeadBytes(t,
 		[][]block.Block{{a, r1}, nil},
 		[]cid.Cid{r1.Cid(), older})
-	if want := frameSize(a, r1); got != want {
-		t.Fatalf("dead bytes = %d, want %d (every block)", got, want)
-	}
+	want := frameSize(a, r1)
+	require.Equal(t, want, got, "dead bytes")
 }
 
 // TestShipRecordsUnmeasurableSegment: a segment the walk cannot measure (its
@@ -127,9 +114,8 @@ func TestShipRecordsUnmeasurableSegment(t *testing.T) {
 	// An array header promising five items, and nothing after it.
 	bad := makeBlock(t, []byte{0x85})
 
-	if got := shippedDeadBytes(t, [][]block.Block{{bad}}, []cid.Cid{bad.Cid()}); got != -1 {
-		t.Fatalf("dead bytes = %d, want -1 (unmeasured)", got)
-	}
+	got := shippedDeadBytes(t, [][]block.Block{{bad}}, []cid.Cid{bad.Cid()})
+	require.Equal(t, int64(-1), got, "dead bytes")
 }
 
 // TestDeadOnArrivalWithoutOpRoots: a segment with no op-root has no root to
@@ -142,29 +128,16 @@ func TestDeadOnArrivalWithoutOpRoots(t *testing.T) {
 	dir := t.TempDir()
 
 	empty, err := createOpenSegment(ctx, dir, 1, blockstore.PlaneCatalog, "bk", meta, zaptest.NewLogger(t))
-	if err != nil {
-		t.Fatalf("create segment: %v", err)
-	}
-	if err := empty.seal(ctx, meta); err != nil {
-		t.Fatalf("seal: %v", err)
-	}
-	if got := empty.deadOnArrival(); got != 0 {
-		t.Fatalf("empty segment: dead bytes = %d, want 0", got)
-	}
+	require.NoError(t, err, "create segment")
+	require.NoError(t, empty.seal(ctx, meta), "seal")
+	got := empty.deadOnArrival()
+	require.Zero(t, got, "empty segment: dead bytes")
 
 	rootless, err := createOpenSegment(ctx, dir, 2, blockstore.PlaneCatalog, "bk", meta, zaptest.NewLogger(t))
-	if err != nil {
-		t.Fatalf("create segment: %v", err)
-	}
-	if err := rootless.append([]block.Block{linkBlock(t, "a"), linkBlock(t, "b")}, nil); err != nil {
-		t.Fatalf("append: %v", err)
-	}
-	if err := rootless.seal(ctx, meta); err != nil {
-		t.Fatalf("seal: %v", err)
-	}
-	if got := rootless.deadOnArrival(); got != -1 {
-		t.Fatalf("segment with blocks and no op-root: dead bytes = %d, want -1 (unmeasured)", got)
-	}
+	require.NoError(t, err, "create segment")
+	require.NoError(t, rootless.append([]block.Block{linkBlock(t, "a"), linkBlock(t, "b")}, nil), "append")
+	require.NoError(t, rootless.seal(ctx, meta), "seal")
+	require.Equal(t, int64(-1), rootless.deadOnArrival(), "segment with blocks and no op-root: dead bytes")
 }
 
 // TestDeadOnArrivalMeasuredOnce: a segment is measured at its first ship
@@ -176,26 +149,15 @@ func TestDeadOnArrivalMeasuredOnce(t *testing.T) {
 	ctx := context.Background()
 	meta := newFakeMeta()
 	seg, err := createOpenSegment(ctx, t.TempDir(), 1, blockstore.PlaneCatalog, "bk", meta, zaptest.NewLogger(t))
-	if err != nil {
-		t.Fatalf("create segment: %v", err)
-	}
+	require.NoError(t, err, "create segment")
 	a := linkBlock(t, "a")
 	r1 := linkBlock(t, "r1")
-	if err := seg.append([]block.Block{a, r1}, []blockstore.OpRoot{{Bucket: "bk", Root: r1.Cid()}}); err != nil {
-		t.Fatalf("append: %v", err)
-	}
-	if err := seg.seal(ctx, meta); err != nil {
-		t.Fatalf("seal: %v", err)
-	}
+	require.NoError(t, seg.append([]block.Block{a, r1}, []blockstore.OpRoot{{Bucket: "bk", Root: r1.Cid()}}), "append")
+	require.NoError(t, seg.seal(ctx, meta), "seal")
 
 	want := frameSize(a)
-	if got := seg.deadOnArrival(); got != want {
-		t.Fatalf("first measurement = %d, want %d (a)", got, want)
-	}
-	if err := seg.retire(); err != nil {
-		t.Fatalf("retire: %v", err)
-	}
-	if got := seg.deadOnArrival(); got != want {
-		t.Fatalf("second call = %d, want the first measurement %d", got, want)
-	}
+	got := seg.deadOnArrival()
+	require.Equal(t, want, got, "first measurement")
+	require.NoError(t, seg.retire(), "retire")
+	require.Equal(t, want, seg.deadOnArrival(), "second call must return the first measurement")
 }

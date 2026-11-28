@@ -1,11 +1,12 @@
 package cors
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3err"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // build renders origins, failing the test on error. Assertions run
@@ -15,20 +16,14 @@ import (
 func build(t *testing.T, origins []string) *auth.CORSConfiguration {
 	t.Helper()
 	cfg, err := Build(origins)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
+	require.NoError(t, err, "Build")
 	return cfg
 }
 
 func TestBuild_EmptyDisablesCORS(t *testing.T) {
 	cfg, err := Build(nil)
-	if err != nil {
-		t.Fatalf("Build(nil): %v", err)
-	}
-	if cfg != nil {
-		t.Errorf("Build(nil) = %+v, want nil (CORS disabled)", cfg)
-	}
+	require.NoError(t, err, "Build(nil)")
+	assert.Nil(t, cfg, "Build(nil)")
 }
 
 func TestBuild_RejectsBadOrigins(t *testing.T) {
@@ -50,9 +45,8 @@ func TestBuild_RejectsBadOrigins(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := Build([]string{tc.origin})
-			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("expected error containing %q, got: %v", tc.wantErr, err)
-			}
+			require.Error(t, err, "expected error containing %q, got: %v", tc.wantErr, err)
+			require.Contains(t, err.Error(), tc.wantErr)
 		})
 	}
 }
@@ -78,14 +72,12 @@ func TestBuild_OriginMatching(t *testing.T) {
 		"https://dev.example",      // the wildcard does not match the apex
 	}
 	for _, o := range allow {
-		if _, err := cfg.IsAllowed(o, "PUT", nil, s3err.ResourceType("")); err != nil {
-			t.Errorf("IsAllowed(%q) = %v, want allowed", o, err)
-		}
+		_, err := cfg.IsAllowed(o, "PUT", nil, s3err.ResourceType(""))
+		assert.NoError(t, err, "IsAllowed(%q)", o)
 	}
 	for _, o := range deny {
-		if _, err := cfg.IsAllowed(o, "PUT", nil, s3err.ResourceType("")); err == nil {
-			t.Errorf("IsAllowed(%q) = allowed, want denied", o)
-		}
+		_, err := cfg.IsAllowed(o, "PUT", nil, s3err.ResourceType(""))
+		assert.Error(t, err, "IsAllowed(%q) = allowed, want denied", o)
 	}
 }
 
@@ -95,29 +87,19 @@ func TestBuild_AllowanceHeaders(t *testing.T) {
 	// The header set a browser sends on an S3 preflight: SigV4 travels in
 	// authorization plus x-amz-*, so AllowedHeaders must cover them.
 	headers, err := auth.ParseCORSHeaders("authorization, content-type, x-amz-content-sha256, x-amz-date")
-	if err != nil {
-		t.Fatalf("ParseCORSHeaders: %v", err)
-	}
+	require.NoError(t, err, "ParseCORSHeaders")
 
 	allowance, err := cfg.IsAllowed("https://app.example", "PUT", headers, s3err.ResourceType(""))
-	if err != nil {
-		t.Fatalf("IsAllowed: %v", err)
-	}
-	if allowance.Origin != "https://app.example" {
-		t.Errorf("Origin = %q, want the request origin echoed", allowance.Origin)
-	}
+	require.NoError(t, err, "IsAllowed")
+	assert.Equal(t, "https://app.example", allowance.Origin, "Origin = %q, want the request origin echoed", allowance.Origin)
 	for _, m := range []string{"GET", "HEAD", "PUT", "POST", "DELETE"} {
-		if !strings.Contains(allowance.Methods, m) {
-			t.Errorf("Methods = %q, want it to include %s", allowance.Methods, m)
-		}
+		assert.Contains(t, allowance.Methods, m, "Methods")
 	}
 	for _, h := range []string{"ETag", "x-cid", "Accept-Ranges", "Content-Range"} {
-		if !strings.Contains(allowance.ExposedHeaders, h) {
-			t.Errorf("ExposedHeaders = %q, want it to include %s", allowance.ExposedHeaders, h)
-		}
+		assert.Contains(t, allowance.ExposedHeaders, h, "ExposedHeaders")
 	}
-	if allowance.MaxAge == nil || *allowance.MaxAge != maxAgeSeconds {
-		t.Errorf("MaxAge = %v, want %d", allowance.MaxAge, maxAgeSeconds)
+	if assert.NotNil(t, allowance.MaxAge, "MaxAge") {
+		assert.Equal(t, maxAgeSeconds, *allowance.MaxAge, "MaxAge")
 	}
 }
 
@@ -128,13 +110,7 @@ func TestBuild_WildcardOrigin(t *testing.T) {
 	cfg := build(t, []string{"*"})
 
 	allowance, err := cfg.IsAllowed("https://anything.example", "GET", nil, s3err.ResourceType(""))
-	if err != nil {
-		t.Fatalf("IsAllowed: %v", err)
-	}
-	if allowance.Origin != "*" {
-		t.Errorf("Origin = %q, want \"*\"", allowance.Origin)
-	}
-	if allowance.AllowCredentials != "false" {
-		t.Errorf("AllowCredentials = %q, want \"false\" for a wildcard origin", allowance.AllowCredentials)
-	}
+	require.NoError(t, err, "IsAllowed")
+	assert.Equal(t, "*", allowance.Origin, "Origin")
+	assert.Equal(t, "false", allowance.AllowCredentials, "AllowCredentials = %q, want \"false\" for a wildcard origin", allowance.AllowCredentials)
 }

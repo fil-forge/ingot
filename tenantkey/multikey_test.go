@@ -4,8 +4,9 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // The RFC 7748 §6.1 X25519 public key ("Alice") and its Multikey form: the
@@ -17,43 +18,29 @@ const (
 
 func TestDecodePublicKey_Vector(t *testing.T) {
 	pub, err := DecodePublicKey(rfc7748AliceKID)
-	if err != nil {
-		t.Fatalf("DecodePublicKey: %v", err)
-	}
-	if got := hex.EncodeToString(pub.Bytes()); got != rfc7748AlicePub {
-		t.Fatalf("decoded key = %s, want %s", got, rfc7748AlicePub)
-	}
-	if got := EncodePublicKey(pub); got != rfc7748AliceKID {
-		t.Fatalf("EncodePublicKey = %s, want %s", got, rfc7748AliceKID)
-	}
+	require.NoError(t, err, "DecodePublicKey")
+	got := hex.EncodeToString(pub.Bytes())
+	require.Equal(t, rfc7748AlicePub, got, "decoded key")
+	require.Equal(t, rfc7748AliceKID, EncodePublicKey(pub), "EncodePublicKey")
 }
 
 func TestEncodeDecodeRoundTrip(t *testing.T) {
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	kid := EncodePublicKey(priv.PublicKey())
 	back, err := DecodePublicKey(kid)
-	if err != nil {
-		t.Fatalf("DecodePublicKey(%s): %v", kid, err)
-	}
-	if !back.Equal(priv.PublicKey()) {
-		t.Fatal("round trip changed the key")
-	}
+	require.NoError(t, err, "DecodePublicKey(%s)", kid)
+	require.True(t, back.Equal(priv.PublicKey()), "round trip changed the key")
 }
 
 func TestDecodePublicKey_RejectsOtherKeyTypes(t *testing.T) {
 	// An ed25519 did:key identifier (multicodec ed25519-pub 0xed).
 	const ed25519 = "z6MkjFRxLLGdBqQSLkZbVnuwUFiomK8eGBkPtim9ETvP7vec"
-	if _, err := DecodePublicKey(ed25519); !errors.Is(err, ErrNotX25519) {
-		t.Fatalf("ed25519 key: err = %v, want ErrNotX25519", err)
-	}
-	if _, err := DecodePublicKey("not-multibase"); err == nil {
-		t.Fatal("garbage decoded without error")
-	}
+	_, err := DecodePublicKey(ed25519)
+	require.ErrorIs(t, err, ErrNotX25519, "ed25519 key")
+	_, err = DecodePublicKey("not-multibase")
+	require.Error(t, err, "garbage decoded without error")
 	// Right codec, wrong length.
-	if _, err := DecodePublicKey("z6LS"); !errors.Is(err, ErrNotX25519) && err == nil {
-		t.Fatal("truncated key decoded without error")
-	}
+	_, err = DecodePublicKey("z6LS")
+	require.Error(t, err, "truncated key decoded without error")
 }

@@ -7,6 +7,8 @@ import (
 	"io"
 	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestAsyncHash_MatchesInline pins that an asyncHash produces exactly the
@@ -30,13 +32,10 @@ func TestAsyncHash_MatchesInline(t *testing.T) {
 			a := newAsyncHash(md5.New())
 			tc.write(a, tc.input)
 			got := a.Sum()
-			if !bytes.Equal(got, want[:]) {
-				t.Fatalf("digest mismatch: got %x, want %x", got, want)
-			}
+			require.Equal(t, want[:], got, "digest mismatch")
 			// Sum is idempotent, so deferred cleanup after an explicit Sum is safe.
-			if again := a.Sum(); !bytes.Equal(again, got) {
-				t.Fatalf("second Sum differs: %x vs %x", again, got)
-			}
+			again := a.Sum()
+			require.Equal(t, got, again, "second Sum differs: %x vs %x", again, got)
 		})
 	}
 }
@@ -54,9 +53,8 @@ func TestAsyncHash_CallerReusesBuffer(t *testing.T) {
 		h.Write(buf)
 		a.Write(buf)
 	}
-	if got, want := a.Sum(), h.Sum(nil); !bytes.Equal(got, want) {
-		t.Fatalf("digest mismatch: got %x, want %x", got, want)
-	}
+	got, want := a.Sum(), h.Sum(nil)
+	require.Equal(t, want, got, "digest mismatch")
 }
 
 // gatedHash reports on taken when the asyncHash goroutine first hands it a
@@ -114,7 +112,5 @@ func TestAsyncHash_FixedBufferSet(t *testing.T) {
 		}
 		a.Write(big)
 	})
-	if buffers := got - base; buffers != asyncHashQueue+1 {
-		t.Fatalf("stream allocated %.1f buffers; want exactly %d", buffers, asyncHashQueue+1)
-	}
+	require.Equal(t, float64(asyncHashQueue+1), got-base, "buffers the stream allocated")
 }

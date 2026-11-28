@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/smelt/pkg/stack"
+	"github.com/stretchr/testify/require"
 )
 
 // TestForgeCompleteKeepalive: a CompleteMultipartUpload streams its response
@@ -34,30 +35,24 @@ func TestForgeCompleteKeepalive(t *testing.T) {
 	cl := recordingClient(t, endpoint, accessKey, secretKey, rec)
 
 	const bucket, key = "mp-keepalive", "obj"
-	if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		t.Fatalf("CreateBucket: %v", err)
-	}
-	if _, err := cl.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+	_, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+	require.NoError(t, err, "CreateBucket")
+	_, err = cl.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
 		Bucket:                  aws.String(bucket),
 		VersioningConfiguration: &types.VersioningConfiguration{Status: types.BucketVersioningStatusEnabled},
-	}); err != nil {
-		t.Fatalf("PutBucketVersioning: %v", err)
-	}
+	})
+	require.NoError(t, err, "PutBucketVersioning")
 	create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(bucket), Key: aws.String(key),
 	})
-	if err != nil {
-		t.Fatalf("CreateMultipartUpload: %v", err)
-	}
+	require.NoError(t, err, "CreateMultipartUpload")
 	var parts []types.CompletedPart
 	for n := int32(1); n <= 2; n++ {
 		part, err := cl.UploadPart(ctx, &s3.UploadPartInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 			PartNumber: aws.Int32(n), Body: bytes.NewReader(tagged(patternBytes(5<<20), byte(0x6a+n))),
 		})
-		if err != nil {
-			t.Fatalf("UploadPart %d: %v", n, err)
-		}
+		require.NoError(t, err, "UploadPart %d", n)
 		parts = append(parts, types.CompletedPart{PartNumber: aws.Int32(n), ETag: part.ETag})
 	}
 	complete := &s3.CompleteMultipartUploadInput{
@@ -68,28 +63,21 @@ func TestForgeCompleteKeepalive(t *testing.T) {
 	for _, attempt := range []string{"Complete", "re-Complete"} {
 		start := time.Now()
 		out, err := cl.CompleteMultipartUpload(ctx, complete)
-		if err != nil {
-			t.Fatalf("%s: %v", attempt, err)
-		}
+		require.NoError(t, err, "%s", attempt)
 		t.Logf("%s took %s", attempt, time.Since(start))
 		resp := rec.last(t)
-		if attempt == "Complete" && !resp.streamed() {
-			t.Fatalf("%s response was not streamed: body %q", attempt, resp.body)
+		if attempt == "Complete" {
+			require.True(t, resp.streamed(), "%s response was not streamed: body %q", attempt, resp.body)
 		}
-		if resp.versionID == "" || resp.versionID != aws.ToString(out.VersionId) {
-			t.Fatalf("%s: header x-amz-version-id %q, SDK VersionId %q; want the same non-empty id", attempt, resp.versionID, aws.ToString(out.VersionId))
-		}
+		require.NotEmpty(t, resp.versionID, "%s: header x-amz-version-id", attempt)
+		require.Equal(t, aws.ToString(out.VersionId), resp.versionID, "%s: header x-amz-version-id against the SDK's VersionId", attempt)
 		// The bucket encrypts by default, and the early headers say so.
-		if resp.encryption != string(types.ServerSideEncryptionAes256) || out.ServerSideEncryption != types.ServerSideEncryptionAes256 {
-			t.Fatalf("%s: header x-amz-server-side-encryption %q, SDK %q; want AES256", attempt, resp.encryption, out.ServerSideEncryption)
-		}
+		require.Equal(t, string(types.ServerSideEncryptionAes256), resp.encryption, "%s: header x-amz-server-side-encryption %q, SDK %q", attempt, resp.encryption, out.ServerSideEncryption)
+		require.Equal(t, types.ServerSideEncryptionAes256, out.ServerSideEncryption, "%s: header x-amz-server-side-encryption %q, SDK %q", attempt, resp.encryption, out.ServerSideEncryption)
 		versions, err := cl.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: aws.String(bucket)})
-		if err != nil {
-			t.Fatalf("ListObjectVersions: %v", err)
-		}
-		if len(versions.Versions) != 1 || aws.ToString(versions.Versions[0].VersionId) != resp.versionID {
-			t.Fatalf("after %s: versions %+v, want the one version %q", attempt, versions.Versions, resp.versionID)
-		}
+		require.NoError(t, err, "ListObjectVersions")
+		require.Len(t, versions.Versions, 1, "after %s: versions %+v", attempt, versions.Versions)
+		require.Equal(t, resp.versionID, aws.ToString(versions.Versions[0].VersionId), "after %s: versions %+v", attempt, versions.Versions)
 	}
 }
 
@@ -148,9 +136,7 @@ func (c *completeRecorder) last(t *testing.T) recordedComplete {
 	t.Helper()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.responses) == 0 {
-		t.Fatal("no CompleteMultipartUpload response recorded")
-	}
+	require.NotEmpty(t, c.responses, "no CompleteMultipartUpload response recorded")
 	return *c.responses[len(c.responses)-1]
 }
 
@@ -179,9 +165,7 @@ func recordingClient(t *testing.T, endpoint, accessKey, secretKey string, rec *c
 		awsconfig.WithHTTPClient(&http.Client{Transport: rec}),
 		awsconfig.WithRetryMaxAttempts(1),
 	)
-	if err != nil {
-		t.Fatalf("load aws config: %v", err)
-	}
+	require.NoError(t, err, "load aws config")
 	return s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(endpoint)
 		o.UsePathStyle = true

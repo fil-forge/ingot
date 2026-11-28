@@ -18,9 +18,7 @@ import (
 // (token from INGOT_TEST_BAO_TOKEN, default "root"); `make test` starts one.
 func TestOpenBaoProvider(t *testing.T) {
 	addr := os.Getenv("INGOT_TEST_BAO_ADDR")
-	if addr == "" {
-		t.Fatal("INGOT_TEST_BAO_ADDR is unset; run `make test`, which starts OpenBao, or set it to a dev-mode server")
-	}
+	require.NotEmpty(t, addr, "INGOT_TEST_BAO_ADDR is unset; run `make test`, which starts OpenBao, or set it to a dev-mode server")
 	token := os.Getenv("INGOT_TEST_BAO_TOKEN")
 	if token == "" {
 		token = "root"

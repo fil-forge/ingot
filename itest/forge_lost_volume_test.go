@@ -12,6 +12,7 @@ import (
 
 	ingottest "github.com/fil-forge/ingot/testing"
 	"github.com/fil-forge/smelt/pkg/stack"
+	"github.com/stretchr/testify/require"
 )
 
 // TestForgeRebuildAfterLostVolume loses Ingot's data volume mid-ingest and
@@ -35,31 +36,24 @@ func TestForgeRebuildAfterLostVolume(t *testing.T) {
 	cfg := forgeConfig(ingotEndpoint, accessKey, secretKey)
 
 	const bucket = "lost-volume-bucket"
-	if err := ingottest.CreateBucket(ctx, cfg, bucket); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, ingottest.CreateBucket(ctx, cfg, bucket), "create bucket")
 	objects := map[string][]byte{}
 	for i := range 5 {
 		key := fmt.Sprintf("obj-%d", i)
 		body := patternBytes(32<<10 + i)
-		if err := ingottest.PutBytes(ctx, cfg, bucket, key, body); err != nil {
-			t.Fatalf("put %s: %v", key, err)
-		}
+		require.NoError(t, ingottest.PutBytes(ctx, cfg, bucket, key, body), "put %s", key)
 		objects[key] = body
 	}
 
 	lost := ingotSQL(t, ctx, s, "SELECT string_agg(DISTINCT seq::text, ',') FROM ingot.catalog_journal WHERE bucket = '"+bucket+"'")
-	if lost == "" {
-		t.Fatal("no journaled catalog blocks before the wipe; the test proves nothing")
-	}
+	require.NotEmpty(t, lost, "no journaled catalog blocks before the wipe; the test proves nothing")
 	t.Logf("segments journaled before the wipe: %s", lost)
 
 	// Wipe the volume under the running process, then stop it. A SIGTERM is
 	// what PID 1 in the container honors; its shutdown can't save anything,
 	// since the files are already gone.
-	if _, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/*"); err != nil {
-		t.Fatalf("wipe /data: %v (stderr=%s)", err, errOut)
-	}
+	_, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/*")
+	require.NoError(t, err, "wipe /data (stderr=%s)", errOut)
 	_, _, _ = s.Exec(ctx, "ingot", "sh", "-c", "kill -TERM 1")
 	waitFor(t, 2*time.Minute, "ingot to go down and come back", func() bool {
 		time.Sleep(2 * time.Second)
@@ -74,33 +68,22 @@ func TestForgeRebuildAfterLostVolume(t *testing.T) {
 
 	for key, want := range objects {
 		got, err := ingottest.GetBytes(ctx, cfg, bucket, key)
-		if err != nil {
-			t.Fatalf("get %s after the rebuild: %v", key, err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Fatalf("get %s after the rebuild: %d bytes, want %d", key, len(got), len(want))
-		}
+		require.NoError(t, err, "get %s after the rebuild", key)
+		require.Equal(t, want, got, "get %s after the rebuild: %d bytes", key, len(got))
 	}
 	keys, err := ingottest.ListKeys(ctx, cfg, bucket)
-	if err != nil {
-		t.Fatalf("list after the rebuild: %v", err)
-	}
+	require.NoError(t, err, "list after the rebuild")
 	for key := range objects {
-		if !slices.Contains(keys, key) {
-			t.Fatalf("list after the rebuild = %v, missing %s", keys, key)
-		}
+		require.True(t, slices.Contains(keys, key), "list after the rebuild = %v, missing %s", keys, key)
 	}
 
 	lostSeqs := ingotSQL(t, ctx, s, "SELECT count(*) FROM ingot.catalog_journal WHERE seq IN ("+lost+")")
-	if n, _ := strconv.Atoi(lostSeqs); n != 0 {
-		t.Fatalf("%d journal rows still under the lost segments %s", n, lost)
-	}
+	n, _ := strconv.Atoi(lostSeqs)
+	require.Zero(t, n, "%d journal rows still under the lost segments %s", n, lost)
 
 	// A write after the restart captures ship authority for the space; the
 	// retry sweep then ships the rebuilt segments, and their journal rows go.
-	if err := ingottest.PutBytes(ctx, cfg, bucket, "after-restart", patternBytes(1<<10)); err != nil {
-		t.Fatalf("put after the restart: %v", err)
-	}
+	require.NoError(t, ingottest.PutBytes(ctx, cfg, bucket, "after-restart", patternBytes(1<<10)), "put after the restart")
 	waitFor(t, 4*time.Minute, "the rebuilt segments to ship", func() bool {
 		time.Sleep(5 * time.Second)
 		unshipped := ingotSQL(t, ctx, s,

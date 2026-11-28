@@ -2,11 +2,11 @@ package s3frontend
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
 	"github.com/fil-forge/versitygw/s3err"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -18,9 +18,7 @@ import (
 func collectMultipartMetrics(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("collect: %v", err)
-	}
+	require.NoError(t, reader.Collect(context.Background(), &rm), "collect")
 	got := map[string]int64{}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
@@ -55,14 +53,11 @@ func TestMultipartMetrics_AcceptPasses(t *testing.T) {
 	uploadDistinctParts(t, b, key, uploadID, 1)
 
 	for range 3 {
-		if err := runAccepts(t, b, uploadID); err != nil {
-			t.Fatalf("accept: %v", err)
-		}
+		require.NoError(t, runAccepts(t, b, uploadID), "accept")
 	}
 	got := collectMultipartMetrics(t, reader)
-	if got["ingot.multipart.accept_passes/failed"] != 1 || got["ingot.multipart.accept_passes/accepted"] != 1 {
-		t.Fatalf("accept passes = %v, want one failed and one accepted", got)
-	}
+	require.Equal(t, int64(1), got["ingot.multipart.accept_passes/failed"], "accept passes = %v, want one failed and one accepted", got)
+	require.Equal(t, int64(1), got["ingot.multipart.accept_passes/accepted"], "accept passes = %v, want one failed and one accepted", got)
 }
 
 // TestMultipartMetrics_CompleteDeferred: a Complete answered OperationAborted
@@ -84,12 +79,10 @@ func TestMultipartMetrics_CompleteDeferred(t *testing.T) {
 
 	_, err := mpComplete(t, b, key, uploadID, parts, nil)
 	var apiErr s3err.APIError
-	if !errors.As(err, &apiErr) || apiErr.Code != "OperationAborted" {
-		t.Fatalf("Complete: err = %v, want OperationAborted", err)
-	}
-	if got := collectMultipartMetrics(t, reader); got["ingot.multipart.complete_deferred"] != 1 {
-		t.Fatalf("complete_deferred = %d, want 1 (all: %v)", got["ingot.multipart.complete_deferred"], got)
-	}
+	require.ErrorAs(t, err, &apiErr, "Complete")
+	require.Equal(t, "OperationAborted", apiErr.Code, "Complete")
+	got := collectMultipartMetrics(t, reader)
+	require.Equal(t, int64(1), got["ingot.multipart.complete_deferred"], "complete_deferred (all: %v)", got)
 }
 
 // TestMultipartMetrics_ParkedAge: the gauge reports how long the oldest
@@ -104,14 +97,12 @@ func TestMultipartMetrics_ParkedAge(t *testing.T) {
 
 	// The part as recorded an hour ago, still parked.
 	mem.AgePart(uploadID, 1, time.Hour)
-	if age := collectMultipartMetrics(t, reader)["ingot.multipart.parked_age"]; age < 3590 || age > 3700 {
-		t.Fatalf("parked_age = %d, want about 3600", age)
-	}
+	age := collectMultipartMetrics(t, reader)["ingot.multipart.parked_age"]
+	require.GreaterOrEqual(t, age, int64(3590), "parked_age")
+	require.LessOrEqual(t, age, int64(3700), "parked_age")
 
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	if age, ok := collectMultipartMetrics(t, reader)["ingot.multipart.parked_age"]; !ok || age != 0 {
-		t.Fatalf("parked_age after acceptance = %d (reported %v), want 0", age, ok)
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
+	age, ok := collectMultipartMetrics(t, reader)["ingot.multipart.parked_age"]
+	require.True(t, ok, "parked_age after acceptance not reported")
+	require.Zero(t, age, "parked_age after acceptance")
 }

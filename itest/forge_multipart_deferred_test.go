@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/smelt/pkg/stack"
+	"github.com/stretchr/testify/require"
 )
 
 // TestForgeDeferredMultipart is the multipart acceptance gate (§7.2):
@@ -33,15 +34,12 @@ func TestForgeDeferredMultipart(t *testing.T) {
 	// Complete is called, and the object round-trips.
 	t.Run("RoundTrip", func(t *testing.T) {
 		const bucket, key = "mp-deferred", "obj"
-		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-			t.Fatalf("CreateBucket: %v", err)
-		}
+		_, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+		require.NoError(t, err, "CreateBucket")
 		create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key),
 		})
-		if err != nil {
-			t.Fatalf("CreateMultipartUpload: %v", err)
-		}
+		require.NoError(t, err, "CreateMultipartUpload")
 
 		// Unique per-part content (XOR-tagged so nothing dedups against other
 		// tests); each part is a single blob under the default max_blob_size.
@@ -55,9 +53,7 @@ func TestForgeDeferredMultipart(t *testing.T) {
 				Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 				PartNumber: aws.Int32(pn), Body: bytes.NewReader(data),
 			})
-			if err != nil {
-				t.Fatalf("UploadPart %d: %v", pn, err)
-			}
+			require.NoError(t, err, "UploadPart %d", pn)
 			completed = append(completed, types.CompletedPart{PartNumber: aws.Int32(pn), ETag: up.ETag})
 			whole = append(whole, data...)
 			// The stored digest names the encrypted envelope, minted at
@@ -66,13 +62,10 @@ func TestForgeDeferredMultipart(t *testing.T) {
 			partDigests = append(partDigests, partBlobDigests(t, ctx, s, aws.ToString(create.UploadId), pn)...)
 			// A parked part keeps no local copy: its bytes are on piri.
 			hexDigests := partBlobDigestsHex(t, ctx, s, aws.ToString(create.UploadId), pn)
-			if local := localDigests(t, ctx, s, hexDigests); len(local) != 0 {
-				t.Fatalf("part %d blobs have local copies after UploadPart: %v", pn, local)
-			}
+			local := localDigests(t, ctx, s, hexDigests)
+			require.Empty(t, local, "part %d blobs have local copies after UploadPart", pn)
 		}
-		if len(partDigests) != len(partData) {
-			t.Fatalf("parts stored %d blobs, want one per part (%d)", len(partDigests), len(partData))
-		}
+		require.Len(t, partDigests, len(partData), "parts stored %d blobs", len(partDigests))
 
 		// The parts are durable on piri and accepted while the upload is
 		// still open: Complete has nothing left to accept.
@@ -85,53 +78,42 @@ func TestForgeDeferredMultipart(t *testing.T) {
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 			MultipartUpload: &types.CompletedMultipartUpload{Parts: completed},
 		})
-		if err != nil {
-			t.Fatalf("CompleteMultipartUpload: %v", err)
-		}
-		if et := strings.Trim(aws.ToString(comp.ETag), `"`); !strings.HasSuffix(et, "-2") {
-			t.Fatalf("complete ETag = %q, want a multipart -2 suffix", et)
-		}
+		require.NoError(t, err, "CompleteMultipartUpload")
+		et := strings.Trim(aws.ToString(comp.ETag), `"`)
+		require.True(t, strings.HasSuffix(et, "-2"), "complete ETag = %q, want a multipart -2 suffix", et)
 
-		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, whole) {
-			t.Fatalf("GET mismatch: got %d bytes, want %d", len(got), len(whole))
-		}
+		got := getBody(t, ctx, cl, bucket, key, "")
+		require.Equal(t, whole, got, "GET mismatch")
 	})
 
 	// AbortRemoves: an upload aborted after its part was accepted removes the
 	// part's blob from piri as an accepted one.
 	t.Run("AbortRemoves", func(t *testing.T) {
 		const bucket, key = "mp-abort-unalloc", "obj"
-		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-			t.Fatalf("CreateBucket: %v", err)
-		}
+		_, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+		require.NoError(t, err, "CreateBucket")
 		create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key),
 		})
-		if err != nil {
-			t.Fatalf("CreateMultipartUpload: %v", err)
-		}
+		require.NoError(t, err, "CreateMultipartUpload")
 		data := tagged(patternBytes(512<<10), 0x33)
-		if _, err := cl.UploadPart(ctx, &s3.UploadPartInput{
+		_, err = cl.UploadPart(ctx, &s3.UploadPartInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 			PartNumber: aws.Int32(1), Body: bytes.NewReader(data),
-		}); err != nil {
-			t.Fatalf("UploadPart: %v", err)
-		}
+		})
+		require.NoError(t, err, "UploadPart")
 		digest := partBlobDigests(t, ctx, s, aws.ToString(create.UploadId), 1)[0]
 		waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/accept", digest)
 
-		if _, err := cl.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		_, err = cl.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
-		}); err != nil {
-			t.Fatalf("AbortMultipartUpload: %v", err)
-		}
+		})
+		require.NoError(t, err, "AbortMultipartUpload")
 
 		// The abort traversed ingot → sprue → piri as a removal of an
 		// accepted blob, and never as a reject of a parked one.
 		waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/release", digest)
-		if piriLogHasLine(t, ctx, s, "/blob/reject", digest) {
-			t.Fatalf("aborted part blob %s was rejected as parked after it was accepted", digest)
-		}
+		require.False(t, piriLogHasLine(t, ctx, s, "/blob/reject", digest), "aborted part blob %s was rejected as parked after it was accepted", digest)
 		t.Logf("abort removed accepted part blob %s via /blob/release", digest)
 	})
 }
@@ -163,9 +145,7 @@ func partBlobDigests(t *testing.T, ctx context.Context, s *stack.Stack, uploadID
 func piriLogHasLine(t *testing.T, ctx context.Context, s *stack.Stack, substrs ...string) bool {
 	t.Helper()
 	logs, err := s.Logs(ctx, "piri-0")
-	if err != nil {
-		t.Fatalf("piri-0 logs: %v", err)
-	}
+	require.NoError(t, err, "piri-0 logs")
 	for _, line := range strings.Split(logs, "\n") {
 		ok := true
 		for _, sub := range substrs {
@@ -195,11 +175,11 @@ func waitForPiriReceived(t *testing.T, ctx context.Context, s *stack.Stack, time
 		}
 		select {
 		case <-ctx.Done():
-			t.Fatalf("context done waiting for piri to receive %s: %v", digest, ctx.Err())
+			require.FailNow(t, "context done waiting for piri to receive the blob", "%s: %v", digest, ctx.Err())
 		case <-time.After(2 * time.Second):
 		}
 	}
-	t.Fatalf("piri-0 logs never showed blob %s received within %s", digest, timeout)
+	require.FailNow(t, "piri-0 logs never showed the blob received", "%s within %s", digest, timeout)
 }
 
 // waitForPiriLogLine polls until one piri-0 log line contains all substrings.
@@ -212,9 +192,9 @@ func waitForPiriLogLine(t *testing.T, ctx context.Context, s *stack.Stack, timeo
 		}
 		select {
 		case <-ctx.Done():
-			t.Fatalf("context done waiting for piri log %v: %v", substrs, ctx.Err())
+			require.FailNow(t, "context done waiting for piri log", "%v: %v", substrs, ctx.Err())
 		case <-time.After(2 * time.Second):
 		}
 	}
-	t.Fatalf("piri-0 logs never contained a line with all of %v within %s", substrs, timeout)
+	require.FailNow(t, "piri-0 logs never contained the line", "a line with all of %v within %s", substrs, timeout)
 }

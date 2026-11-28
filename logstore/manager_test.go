@@ -12,6 +12,7 @@ import (
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -61,9 +62,7 @@ func openTestManagerAndShipper(t *testing.T, dir string, meta Meta, flush *recor
 		FlushFor: flush.forBucket,
 		Logger:   zaptest.NewLogger(t),
 	})
-	if err != nil {
-		t.Fatalf("OpenManager: %v", err)
-	}
+	require.NoError(t, err, "OpenManager")
 	sh.start(t, m)
 	return m, sh
 }
@@ -128,9 +127,7 @@ func appendFor(t *testing.T, m *Manager, bucket, payload string) block.Block {
 		Bucket: bucket,
 		Root:   makeRoot(t, bucket+"/"+payload),
 	})
-	if err != nil {
-		t.Fatalf("AppendBatch(%s): %v", bucket, err)
-	}
+	require.NoError(t, err, "AppendBatch(%s)", bucket)
 	return blk
 }
 
@@ -149,46 +146,31 @@ func TestManager_SegregatesBuckets(t *testing.T) {
 
 	// Distinct per-bucket directories exist.
 	for _, b := range []string{"alpha", "beta"} {
-		if _, err := os.Stat(filepath.Join(dir, b, "catalog")); err != nil {
-			t.Fatalf("expected per-bucket dir for %q: %v", b, err)
-		}
+		_, err := os.Stat(filepath.Join(dir, b, "catalog"))
+		require.NoError(t, err, "expected per-bucket dir for %q", b)
 	}
 
 	// Cross-bucket Get serves both buckets' blocks through one handle.
 	for _, blk := range []block.Block{blkA, blkB} {
 		got, err := m.Get(context.Background(), blk.Cid())
-		if err != nil {
-			t.Fatalf("Get(%s): %v", blk.Cid(), err)
-		}
-		if string(got.RawData()) != string(blk.RawData()) {
-			t.Fatalf("Get returned wrong block for %s", blk.Cid())
-		}
+		require.NoError(t, err, "Get(%s)", blk.Cid())
+		require.Equal(t, blk.RawData(), got.RawData(), "Get returned wrong block for %s", blk.Cid())
 	}
 
 	// Each bucket's segments flush through its own closure.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if flush.count("alpha") > 0 && flush.count("beta") > 0 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if flush.count("alpha") == 0 || flush.count("beta") == 0 {
-		t.Fatalf("expected both buckets to flush; alpha=%d beta=%d",
-			flush.count("alpha"), flush.count("beta"))
-	}
+	require.Eventually(t, func() bool {
+		return flush.count("alpha") > 0 && flush.count("beta") > 0
+	}, 2*time.Second, 10*time.Millisecond, "expected both buckets to flush")
 
 	// Meta rows are stamped per bucket.
 	for _, b := range []string{"alpha", "beta"} {
 		rows, err := meta.ListSegments(context.Background(), blockstore.PlaneCatalog, b)
-		if err != nil || len(rows) == 0 {
-			t.Fatalf("ListSegments(%q) = %d rows, err %v", b, len(rows), err)
-		}
+		require.NoError(t, err, "ListSegments(%q) = %d rows, err %v", b, len(rows), err)
+		require.NotEmpty(t, rows, "ListSegments(%q) = %d rows, err %v", b, len(rows), err)
 	}
 	buckets, err := meta.ListSegmentBuckets(context.Background(), blockstore.PlaneCatalog)
-	if err != nil || len(buckets) != 2 {
-		t.Fatalf("ListSegmentBuckets = %v, err %v (want [alpha beta])", buckets, err)
-	}
+	require.NoError(t, err, "ListSegmentBuckets = %v, err %v", buckets, err)
+	require.Len(t, buckets, 2, "ListSegmentBuckets = %v, err %v", buckets, err)
 }
 
 // TestManager_RecoverySweep: a restarted Manager re-opens every bucket that
@@ -201,19 +183,13 @@ func TestManager_RecoverySweep(t *testing.T) {
 	m1 := openTestManager(t, dir, meta, flush)
 	blkA := appendFor(t, m1, "alpha", "survives-restart-a")
 	blkB := appendFor(t, m1, "beta", "survives-restart-b")
-	if err := m1.Close(context.Background()); err != nil {
-		t.Fatalf("close first manager: %v", err)
-	}
+	require.NoError(t, m1.Close(context.Background()), "close first manager")
 
 	m2 := openTestManager(t, dir, meta, flush)
 	for _, blk := range []block.Block{blkA, blkB} {
 		got, err := m2.Get(context.Background(), blk.Cid())
-		if err != nil {
-			t.Fatalf("Get after restart (%s): %v", blk.Cid(), err)
-		}
-		if string(got.RawData()) == "" {
-			t.Fatalf("empty block after restart")
-		}
+		require.NoError(t, err, "Get after restart (%s)", blk.Cid())
+		require.NotEmpty(t, string(got.RawData()), "empty block after restart")
 	}
 }
 
@@ -229,23 +205,17 @@ func TestManager_RemoveBucketLog(t *testing.T) {
 	blkB := appendFor(t, m, "beta", "kept")
 
 	shipper.stop()
-	if err := m.RemoveBucketLog(context.Background(), "alpha"); err != nil {
-		t.Fatalf("RemoveBucketLog: %v", err)
-	}
+	require.NoError(t, m.RemoveBucketLog(context.Background(), "alpha"), "RemoveBucketLog")
 
-	if _, err := os.Stat(filepath.Join(dir, "alpha")); !os.IsNotExist(err) {
-		t.Fatalf("expected alpha dir gone, stat err = %v", err)
-	}
+	_, err := os.Stat(filepath.Join(dir, "alpha"))
+	require.True(t, os.IsNotExist(err), "expected alpha dir gone, stat err = %v", err)
 	rows, err := meta.ListSegments(context.Background(), blockstore.PlaneCatalog, "alpha")
-	if err != nil || len(rows) != 0 {
-		t.Fatalf("expected no alpha segment rows, got %d (err %v)", len(rows), err)
-	}
-	if _, err := m.Get(context.Background(), blkA.Cid()); err == nil {
-		t.Fatalf("expected alpha block gone after removal")
-	}
-	if _, err := m.Get(context.Background(), blkB.Cid()); err != nil {
-		t.Fatalf("beta block must survive alpha's removal: %v", err)
-	}
+	require.NoError(t, err, "ListSegments")
+	require.Empty(t, rows, "expected no alpha segment rows")
+	_, err = m.Get(context.Background(), blkA.Cid())
+	require.Error(t, err, "expected alpha block gone after removal")
+	_, err = m.Get(context.Background(), blkB.Cid())
+	require.NoError(t, err, "beta block must survive alpha's removal")
 }
 
 // TestManager_QuiesceAndShippedSegmentDigests: quiescing joins the flush
@@ -265,14 +235,10 @@ func TestManager_QuiesceAndShippedSegmentDigests(t *testing.T) {
 	// Quiesce without waiting for the seal-age tick: it force-seals the open
 	// segment and joins the flush pipeline, so the rows are final on return
 	// regardless of whether the tail segment shipped or was dropped.
-	if err := m.QuiesceBucketLog(context.Background(), "alpha"); err != nil {
-		t.Fatalf("QuiesceBucketLog: %v", err)
-	}
+	require.NoError(t, m.QuiesceBucketLog(context.Background(), "alpha"), "QuiesceBucketLog")
 
 	rows, err := meta.ListSegments(context.Background(), blockstore.PlaneCatalog, "alpha")
-	if err != nil {
-		t.Fatalf("ListSegments: %v", err)
-	}
+	require.NoError(t, err, "ListSegments")
 	shipped := map[uint64]bool{}
 	sealed := 0
 	for _, r := range rows {
@@ -281,14 +247,10 @@ func TestManager_QuiesceAndShippedSegmentDigests(t *testing.T) {
 			shipped[r.Seq] = r.ShippedAt != 0
 		}
 	}
-	if sealed == 0 {
-		t.Fatalf("expected the quiesce to force-seal the open segment")
-	}
+	require.NotZero(t, sealed, "expected the quiesce to force-seal the open segment")
 
 	digests, err := m.ShippedSegmentDigests(context.Background(), "alpha")
-	if err != nil {
-		t.Fatalf("ShippedSegmentDigests: %v", err)
-	}
+	require.NoError(t, err, "ShippedSegmentDigests")
 	// Every sealed segment contributes a 34-byte sha2-256 CAR multihash;
 	// shipped ones additionally the flush's index digest.
 	wantLen := 0
@@ -298,20 +260,16 @@ func TestManager_QuiesceAndShippedSegmentDigests(t *testing.T) {
 			wantLen++
 		}
 	}
-	if len(digests) != wantLen {
-		t.Fatalf("got %d digests, want %d (sealed=%d shipped=%v)", len(digests), wantLen, sealed, shipped)
-	}
+	require.Len(t, digests, wantLen, "got %d digests, want %d (sealed=%d shipped=%v)", len(digests), wantLen, sealed, shipped)
 	for _, d := range digests {
-		if len(d) != 34 && string(d) != string(fakeIndexDigest) {
-			t.Fatalf("unexpected digest %q (len %d)", d, len(d))
-		}
+		require.True(t, len(d) == 34 || string(d) == string(fakeIndexDigest), "unexpected digest %q (len %d)", d, len(d))
 	}
 
 	// A bucket with no sealed segments reports none, and the quiesced
 	// bucket reopens lazily for new appends.
-	if got, err := m.ShippedSegmentDigests(context.Background(), "gamma"); err != nil || len(got) != 0 {
-		t.Fatalf("gamma: got %d digests, err %v", len(got), err)
-	}
+	got, err := m.ShippedSegmentDigests(context.Background(), "gamma")
+	require.NoError(t, err, "gamma")
+	require.Empty(t, got, "gamma digests")
 	appendFor(t, m, "alpha", "post-quiesce-write")
 }
 
@@ -330,42 +288,30 @@ func TestManager_ReleaseRetiredSegments(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	var retired []SegmentMeta
 	for i := 0; len(retired) < 2; i++ {
-		if time.Now().After(deadline) {
-			t.Fatalf("no segments retired in time (have %d)", len(retired))
-		}
+		require.False(t, time.Now().After(deadline), "no segments retired in time (have %d)", len(retired))
 		appendFor(t, m, "alpha", fmt.Sprintf("generation-%d", i))
 		time.Sleep(100 * time.Millisecond)
 		var err error
-		if retired, err = meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "alpha"); err != nil {
-			t.Fatalf("ListRetiredSegments: %v", err)
-		}
+		retired, err = meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "alpha")
+		require.NoError(t, err, "ListRetiredSegments")
 	}
 
-	if err := m.QuiesceBucketLog(ctx, "alpha"); err != nil {
-		t.Fatalf("QuiesceBucketLog: %v", err)
-	}
+	require.NoError(t, m.QuiesceBucketLog(ctx, "alpha"), "QuiesceBucketLog")
 	retired, err := meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "alpha")
-	if err != nil {
-		t.Fatalf("ListRetiredSegments: %v", err)
-	}
+	require.NoError(t, err, "ListRetiredSegments")
 	cars := map[string]uint64{}
 	for _, r := range retired {
 		car, err := multihash.Encode(r.SHA256, multihash.SHA2_256)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
+		require.NoError(t, err, "encode")
 		cars[string(car)] = r.Seq
 	}
 
 	// The unretired listing leaves retired segments to ReleaseRetiredSegments.
 	digests, err := m.ShippedSegmentDigests(ctx, "alpha")
-	if err != nil {
-		t.Fatalf("ShippedSegmentDigests: %v", err)
-	}
+	require.NoError(t, err, "ShippedSegmentDigests")
 	for _, d := range digests {
-		if seq, ok := cars[string(d)]; ok {
-			t.Fatalf("ShippedSegmentDigests lists retired segment %d", seq)
-		}
+		seq, ok := cars[string(d)]
+		require.False(t, ok, "ShippedSegmentDigests lists retired segment %d", seq)
 	}
 
 	released := map[string]int{}
@@ -380,34 +326,23 @@ func TestManager_ReleaseRetiredSegments(t *testing.T) {
 		released[string(d)]++
 		return nil
 	})
-	if !errors.Is(err, refused) {
-		t.Fatalf("ReleaseRetiredSegments with a refusing release = %v, want the refusal", err)
-	}
+	require.ErrorIs(t, err, refused, "ReleaseRetiredSegments with a refusing release")
 	left, err := meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "alpha")
-	if err != nil {
-		t.Fatalf("ListRetiredSegments: %v", err)
-	}
-	if len(left) != len(retired)-1 {
-		t.Fatalf("%d retired rows left after one segment's release, want %d", len(left), len(retired)-1)
-	}
+	require.NoError(t, err, "ListRetiredSegments")
+	require.Len(t, left, len(retired)-1, "retired rows left after one segment's release")
 
-	if err := m.ReleaseRetiredSegments(ctx, "alpha", func(d multihash.Multihash) error {
+	require.NoError(t, m.ReleaseRetiredSegments(ctx, "alpha", func(d multihash.Multihash) error {
 		released[string(d)]++
 		return nil
-	}); err != nil {
-		t.Fatalf("retried ReleaseRetiredSegments: %v", err)
-	}
+	}), "retried ReleaseRetiredSegments")
 	for car, seq := range cars {
-		if released[car] != 1 {
-			t.Fatalf("retired segment %d's CAR released %d times, want once", seq, released[car])
-		}
+		require.Equal(t, 1, released[car], "retired segment %d's CAR releases", seq)
 	}
-	if got := released[string(fakeIndexDigest)]; got != len(retired) {
-		t.Fatalf("released %d index blobs, want one per retired segment (%d)", got, len(retired))
-	}
-	if left, err := meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "alpha"); err != nil || len(left) != 0 {
-		t.Fatalf("retired rows after the release = %d (err %v), want none", len(left), err)
-	}
+	got := released[string(fakeIndexDigest)]
+	require.Equal(t, len(retired), got, "released index blobs, want one per retired segment")
+	left, err = meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "alpha")
+	require.NoError(t, err, "ListRetiredSegments")
+	require.Empty(t, left, "retired rows after the release")
 }
 
 // TestManager_RejectsUnsafeBucketNames: the bucket→directory mapping must
@@ -415,8 +350,7 @@ func TestManager_ReleaseRetiredSegments(t *testing.T) {
 func TestManager_RejectsUnsafeBucketNames(t *testing.T) {
 	m := openTestManager(t, t.TempDir(), newFakeMeta(), newRecordingFlush())
 	for _, name := range []string{"", ".", "..", "a/b", `a\b`} {
-		if _, err := m.logFor(context.Background(), name); err == nil {
-			t.Fatalf("logFor(%q) should fail", name)
-		}
+		_, err := m.logFor(context.Background(), name)
+		require.Error(t, err, "logFor(%q) should fail", name)
 	}
 }

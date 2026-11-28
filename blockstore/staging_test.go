@@ -3,9 +3,11 @@ package blockstore_test
 import (
 	"context"
 	"errors"
-	"github.com/fil-forge/ucantone/did"
 	"testing"
 	"time"
+
+	"github.com/fil-forge/ucantone/did"
+	"github.com/stretchr/testify/require"
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
@@ -126,23 +128,17 @@ func (noopBase) GetBlock(_ context.Context, _ did.DID, _ cid.Cid) (block.Block, 
 func makeBlock(t *testing.T, payload []byte) block.Block {
 	t.Helper()
 	mh, err := multihash.Sum(payload, multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("mh: %v", err)
-	}
+	require.NoError(t, err, "mh")
 	c := cid.NewCidV1(cid.Raw, mh)
 	blk, err := block.NewBlockWithCid(payload, c)
-	if err != nil {
-		t.Fatalf("blk: %v", err)
-	}
+	require.NoError(t, err, "blk")
 	return blk
 }
 
 func makeRoot(t *testing.T, name string) cid.Cid {
 	t.Helper()
 	mh, err := multihash.Sum([]byte("r:"+name), multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("mh: %v", err)
-	}
+	require.NoError(t, err, "mh")
 	return cid.NewCidV1(cid.DagCBOR, mh)
 }
 
@@ -157,9 +153,7 @@ func TestLayeredAndStagingHappyPath(t *testing.T) {
 		Catalog: logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
 		Logger:  logger,
 	})
-	if err != nil {
-		t.Fatalf("logstore Open: %v", err)
-	}
+	require.NoError(t, err, "logstore Open")
 	t.Cleanup(func() { _ = log.Close(context.Background()) })
 
 	bs := blockstore.NewLayered(nil, log, noopBase{})
@@ -170,30 +164,20 @@ func TestLayeredAndStagingHappyPath(t *testing.T) {
 	a := makeBlock(t, []byte("alpha-1"))
 	b := makeBlock(t, []byte("alpha-2"))
 	for _, blk := range []block.Block{a, b} {
-		if err := stage.Put(context.Background(), blk); err != nil {
-			t.Fatalf("stage.Put: %v", err)
-		}
+		require.NoError(t, stage.Put(context.Background(), blk), "stage.Put")
 	}
 	appended, err := stage.Commit(context.Background(), makeRoot(t, "alpha"))
-	if err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
+	require.NoError(t, err, "Commit")
 	// The commit journals what the log took, under the segment it went into.
-	if appended.Segment == 0 {
-		t.Fatal("Commit reported no segment")
-	}
-	if len(appended.Blocks) != 2 || !appended.Blocks[0].Cid().Equals(a.Cid()) || !appended.Blocks[1].Cid().Equals(b.Cid()) {
-		t.Fatalf("Commit reported blocks %v, want [%s %s] in put order", appended.Blocks, a.Cid(), b.Cid())
-	}
+	require.NotZero(t, appended.Segment, "Commit reported no segment")
+	require.Len(t, appended.Blocks, 2, "Commit reported blocks")
+	require.Equal(t, a.Cid(), appended.Blocks[0].Cid(), "Commit reported blocks out of put order")
+	require.Equal(t, b.Cid(), appended.Blocks[1].Cid(), "Commit reported blocks out of put order")
 
 	for _, blk := range []block.Block{a, b} {
 		got, err := bs.GetBlock(context.Background(), did.Undef, blk.Cid())
-		if err != nil {
-			t.Fatalf("layered.Get %s: %v", blk.Cid(), err)
-		}
-		if string(got.RawData()) != string(blk.RawData()) {
-			t.Fatalf("layered.Get %s mismatch: got %q want %q", blk.Cid(), got.RawData(), blk.RawData())
-		}
+		require.NoError(t, err, "layered.Get %s", blk.Cid())
+		require.Equal(t, blk.RawData(), got.RawData(), "layered.Get %s", blk.Cid())
 	}
 }
 
@@ -208,17 +192,13 @@ func TestLayeredFallsThroughToBaseOnMiss(t *testing.T) {
 		Catalog: logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
 		Logger:  logger,
 	})
-	if err != nil {
-		t.Fatalf("logstore Open: %v", err)
-	}
+	require.NoError(t, err, "logstore Open")
 	t.Cleanup(func() { _ = log.Close(context.Background()) })
 
 	bs := blockstore.NewLayered(nil, log, noopBase{})
 	missing := makeBlock(t, []byte("nope")).Cid()
 	_, err = bs.GetBlock(context.Background(), did.Undef, missing)
-	if !errors.Is(err, errUnknownBase) {
-		t.Fatalf("expected base sentinel, got %v", err)
-	}
+	require.ErrorIs(t, err, errUnknownBase)
 }
 
 func TestStagingDiscardLeavesLogUntouched(t *testing.T) {
@@ -232,20 +212,15 @@ func TestStagingDiscardLeavesLogUntouched(t *testing.T) {
 		Catalog: logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
 		Logger:  logger,
 	})
-	if err != nil {
-		t.Fatalf("logstore Open: %v", err)
-	}
+	require.NoError(t, err, "logstore Open")
 	t.Cleanup(func() { _ = log.Close(context.Background()) })
 
 	bs := blockstore.NewLayered(nil, log, noopBase{})
 	stage := blockstore.NewOpStaging(bs, log, "alpha", did.Undef)
 	blk := makeBlock(t, []byte("never-committed"))
-	if err := stage.Put(context.Background(), blk); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
+	require.NoError(t, stage.Put(context.Background(), blk), "Put")
 	stage.Discard()
 
-	if _, err := log.Get(context.Background(), blk.Cid()); !errors.Is(err, blockstore.ErrNotFound) {
-		t.Fatalf("Discard should leave log empty, got %v", err)
-	}
+	_, err = log.Get(context.Background(), blk.Cid())
+	require.ErrorIs(t, err, blockstore.ErrNotFound, "Discard should leave log empty")
 }

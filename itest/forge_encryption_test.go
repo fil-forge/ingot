@@ -21,6 +21,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/smelt/pkg/stack"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 )
@@ -57,19 +59,15 @@ func TestForgeEncryption(t *testing.T) {
 		tamperSize   = 4 * chunkSize
 	)
 	tamperData := patternBytes(tamperSize)
-	if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(tamperBucket)}); err != nil {
-		t.Fatalf("CreateBucket: %v", err)
-	}
+	_, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(tamperBucket)})
+	require.NoError(t, err, "CreateBucket")
 	localBefore := localBlobPaths(t, ctx, s)
-	if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
+	_, err = cl.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(tamperBucket), Key: aws.String(tamperKey), Body: bytes.NewReader(tamperData),
-	}); err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
+	})
+	require.NoError(t, err, "PutObject")
 	added := newLocalPaths(localBefore, localBlobPaths(t, ctx, s))
-	if len(added) != 1 {
-		t.Fatalf("PUT cached %d envelopes, want 1 (a 1 MiB object is a single blob under the default config)", len(added))
-	}
+	require.Len(t, added, 1, "PUT cached %d envelopes, want 1 (a 1 MiB object is a single blob under the default config)", len(added))
 	corruptLocalFileTail(t, ctx, s, added[0], 100)
 
 	// A tampered chunk must never reach the client as plaintext. Decryption
@@ -90,9 +88,7 @@ func TestForgeEncryption(t *testing.T) {
 		}
 		defer out.Body.Close()
 		got, readErr := io.ReadAll(out.Body)
-		if readErr == nil && len(got) == tamperSize {
-			t.Fatalf("whole GET of a tampered object returned all %d bytes with no error — corrupt plaintext served silently", len(got))
-		}
+		require.False(t, readErr == nil && len(got) == tamperSize, "whole GET of a tampered object returned all %d bytes with no error — corrupt plaintext served silently", len(got))
 		t.Logf("tampered whole GET failed mid-stream as required: read %d/%d bytes, err=%v", len(got), tamperSize, readErr)
 		if logs, lerr := s.Logs(ctx, "ingot"); lerr == nil && strings.Contains(logs, "failed authentication") {
 			t.Logf("ingot logged the aesstream authentication failure")
@@ -104,9 +100,7 @@ func TestForgeEncryption(t *testing.T) {
 	// and a range touching the tampered chunk fails.
 	t.Run("TamperedCiphertextRangeGET", func(t *testing.T) {
 		clean := getBody(t, ctx, cl, tamperBucket, tamperKey, "bytes=1000-2000")
-		if !bytes.Equal(clean, tamperData[1000:2001]) {
-			t.Fatalf("range in an untampered chunk mismatched after tampering elsewhere (%d bytes)", len(clean))
-		}
+		require.Equal(t, tamperData[1000:2001], clean, "range in an untampered chunk mismatched after tampering elsewhere (%d bytes)", len(clean))
 
 		hdr := fmt.Sprintf("bytes=%d-%d", tamperSize-50, tamperSize-1)
 		out, err := cl.GetObject(ctx, &s3.GetObjectInput{
@@ -118,9 +112,7 @@ func TestForgeEncryption(t *testing.T) {
 		}
 		defer out.Body.Close()
 		got, readErr := io.ReadAll(out.Body)
-		if readErr == nil && len(got) == 50 {
-			t.Fatalf("range over the tampered chunk returned all %d bytes with no error — corrupt plaintext served silently", len(got))
-		}
+		require.False(t, readErr == nil && len(got) == 50, "range over the tampered chunk returned all %d bytes with no error — corrupt plaintext served silently", len(got))
 		t.Logf("tampered ranged GET failed as required: read %d/50 bytes, err=%v", len(got), readErr)
 	})
 
@@ -130,15 +122,12 @@ func TestForgeEncryption(t *testing.T) {
 	// PUT; this pins it for an object assembled from parts.
 	t.Run("MultipartDeleteReleasesBlobs", func(t *testing.T) {
 		const bucket, key = "mp-delete", "obj"
-		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-			t.Fatalf("CreateBucket: %v", err)
-		}
+		_, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+		require.NoError(t, err, "CreateBucket")
 		create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key),
 		})
-		if err != nil {
-			t.Fatalf("CreateMultipartUpload: %v", err)
-		}
+		require.NoError(t, err, "CreateMultipartUpload")
 
 		partData := [][]byte{patternBytes(6 << 20), patternBytes(5 << 20), patternBytes(9 << 10)}
 		var completed []types.CompletedPart
@@ -149,40 +138,29 @@ func TestForgeEncryption(t *testing.T) {
 				Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 				PartNumber: aws.Int32(pn), Body: bytes.NewReader(data),
 			})
-			if err != nil {
-				t.Fatalf("UploadPart %d: %v", pn, err)
-			}
+			require.NoError(t, err, "UploadPart %d", pn)
 			completed = append(completed, types.CompletedPart{PartNumber: aws.Int32(pn), ETag: up.ETag})
 			whole = append(whole, data...)
 		}
-		if _, err := cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		_, err = cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 			MultipartUpload: &types.CompletedMultipartUpload{Parts: completed},
-		}); err != nil {
-			t.Fatalf("CompleteMultipartUpload: %v", err)
-		}
+		})
+		require.NoError(t, err, "CompleteMultipartUpload")
 		added := objectBlobDigestsHex(t, ctx, s, bucket, key)
-		if len(added) != 3 {
-			t.Fatalf("multipart object references %d blobs, want 3 (one per part under the default config)", len(added))
-		}
+		require.Len(t, added, 3, "multipart object references %d blobs, want 3 (one per part under the default config)", len(added))
 		// A part keeps no local copy, so the pre-delete read must
 		// come from piri — proving all three part blobs are durable on the
 		// network before we assert the release traverses it.
-		if local := localDigests(t, ctx, s, added); len(local) != 0 {
-			t.Fatalf("parked part blobs have local copies: %v", local)
-		}
-		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, whole) {
-			t.Fatalf("read-through from piri before delete mismatched: got %d bytes, want %d", len(got), len(whole))
-		}
+		local := localDigests(t, ctx, s, added)
+		require.Empty(t, local, "parked part blobs have local copies")
+		got := getBody(t, ctx, cl, bucket, key, "")
+		require.Equal(t, whole, got, "read-through from piri before delete mismatched")
 
-		if _, err := cl.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)}); err != nil {
-			t.Fatalf("DeleteObject: %v", err)
-		}
-		if _, err := cl.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)}); err == nil {
-			t.Fatalf("GET after delete succeeded, want NoSuchKey")
-		} else if !strings.Contains(err.Error(), "NoSuchKey") {
-			t.Fatalf("GET after delete failed with %v, want NoSuchKey", err)
-		}
+		_, err = cl.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+		require.NoError(t, err, "DeleteObject")
+		_, err = cl.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+		require.ErrorContains(t, err, "NoSuchKey", "GET after delete")
 
 		// The release reached piri and its sweep finalized the byte release
 		// (asynchronous end to end — poll the provider's logs through to the
@@ -207,31 +185,23 @@ func TestForgeEncryption(t *testing.T) {
 	// reports a broken pipe instead of EntityTooLarge.
 	t.Run("PartOverMaxSizeRejected", func(t *testing.T) {
 		const bucket, key = "big-reject", "obj"
-		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-			t.Fatalf("CreateBucket: %v", err)
-		}
+		_, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+		require.NoError(t, err, "CreateBucket")
 		create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key),
 		})
-		if err != nil {
-			t.Fatalf("CreateMultipartUpload: %v", err)
-		}
+		require.NoError(t, err, "CreateMultipartUpload")
 		const tooBig = int64(5)<<30 + 1
 		_, err = cl.UploadPart(ctx, &s3.UploadPartInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 			PartNumber: aws.Int32(1), Body: bytes.NewReader(nil), ContentLength: aws.Int64(tooBig),
 		}, func(o *s3.Options) { o.HTTPClient = &headersOnlyHTTPClient{} })
-		if err == nil {
-			t.Fatalf("UploadPart of 5 GiB + 1 succeeded, want EntityTooLarge")
-		}
-		if !strings.Contains(err.Error(), "EntityTooLarge") {
-			t.Fatalf("UploadPart of 5 GiB + 1 failed with %v, want EntityTooLarge", err)
-		}
-		if _, err := cl.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		require.Error(t, err, "UploadPart of 5 GiB + 1 succeeded, want EntityTooLarge")
+		require.Contains(t, err.Error(), "EntityTooLarge", "UploadPart of 5 GiB + 1 failed with %v", err)
+		_, err = cl.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
-		}); err != nil {
-			t.Fatalf("AbortMultipartUpload: %v", err)
-		}
+		})
+		require.NoError(t, err, "AbortMultipartUpload")
 	})
 
 	// ShredThenRead: DELETE cryptoshreds the object. The
@@ -245,16 +215,13 @@ func TestForgeEncryption(t *testing.T) {
 	// semantics); this covers the unversioned path.
 	t.Run("ShredThenRead", func(t *testing.T) {
 		const bucket, key = "shred", "obj"
-		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-			t.Fatalf("CreateBucket: %v", err)
-		}
+		_, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+		require.NoError(t, err, "CreateBucket")
 		// Two parts → two body blobs, so "every segment's row" is plural.
 		create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key),
 		})
-		if err != nil {
-			t.Fatalf("CreateMultipartUpload: %v", err)
-		}
+		require.NoError(t, err, "CreateMultipartUpload")
 		partData := [][]byte{tagged(patternBytes(5<<20), 0x3C), tagged(patternBytes(9<<10), 0x5A)}
 		var completed []types.CompletedPart
 		var whole []byte
@@ -264,65 +231,51 @@ func TestForgeEncryption(t *testing.T) {
 				Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 				PartNumber: aws.Int32(pn), Body: bytes.NewReader(data),
 			})
-			if err != nil {
-				t.Fatalf("UploadPart %d: %v", pn, err)
-			}
+			require.NoError(t, err, "UploadPart %d", pn)
 			completed = append(completed, types.CompletedPart{PartNumber: aws.Int32(pn), ETag: up.ETag})
 			whole = append(whole, data...)
 		}
-		if _, err := cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		_, err = cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 			MultipartUpload: &types.CompletedMultipartUpload{Parts: completed},
-		}); err != nil {
-			t.Fatalf("CompleteMultipartUpload: %v", err)
-		}
-		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, whole) {
-			t.Fatalf("round-trip before delete mismatched: %d bytes", len(got))
-		}
+		})
+		require.NoError(t, err, "CompleteMultipartUpload")
+		got := getBody(t, ctx, cl, bucket, key, "")
+		require.Equal(t, whole, got, "round-trip before delete mismatched: %d bytes", len(got))
 
 		digests := objectBlobDigestsHex(t, ctx, s, bucket, key)
-		if len(digests) != len(partData) {
-			t.Fatalf("blob_refs records %d digests, want %d (one per part)", len(digests), len(partData))
-		}
+		require.Len(t, digests, len(partData), "blob_refs records %d digests", len(digests))
 
 		const putKey = "single"
-		if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
+		_, err = cl.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(bucket), Key: aws.String(putKey), Body: bytes.NewReader(tagged(patternBytes(64<<10), 0x6B)),
-		}); err != nil {
-			t.Fatalf("PutObject: %v", err)
-		}
+		})
+		require.NoError(t, err, "PutObject")
 		putDigests := objectBlobDigestsHex(t, ctx, s, bucket, putKey)
-		if local := localDigests(t, ctx, s, putDigests); len(local) != len(putDigests) {
-			t.Fatalf("pre-delete: %d of the single-PUT object's %d envelopes cached, want all", len(local), len(putDigests))
-		}
-		if _, err := cl.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(putKey)}); err != nil {
-			t.Fatalf("DeleteObject %s: %v", putKey, err)
-		}
+		local := localDigests(t, ctx, s, putDigests)
+		require.Len(t, local, len(putDigests), "pre-delete: %d of the single-PUT object's %d envelopes cached", len(local), len(putDigests))
+		_, err = cl.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(putKey)})
+		require.NoError(t, err, "DeleteObject %s", putKey)
 		digests = append(digests, putDigests...)
 		// Pre-delete sanity: without this, the zero-rows assertion below
 		// would pass vacuously against an unencrypted write.
-		if n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", digests); n != len(digests) {
-			t.Fatalf("pre-delete: %d enc-params rows for %d blobs", n, len(digests))
-		}
+		n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", digests)
+		require.Equal(t, len(digests), n, "pre-delete: %d enc-params rows for %d blobs", n, len(digests))
 
-		if _, err := cl.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)}); err != nil {
-			t.Fatalf("DeleteObject: %v", err)
-		}
-		if _, err := cl.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)}); err == nil || !strings.Contains(err.Error(), "NoSuchKey") {
-			t.Fatalf("GET after delete: want NoSuchKey, got %v", err)
-		}
-		if _, err := cl.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)}); err == nil {
-			t.Fatalf("HEAD after delete succeeded, want NotFound")
-		}
+		_, err = cl.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+		require.NoError(t, err, "DeleteObject")
+		_, err = cl.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+		require.ErrorContains(t, err, "NoSuchKey", "GET after delete")
+		_, err = cl.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+		require.Error(t, err, "HEAD after delete succeeded, want NotFound")
 
 		// The claims drop synchronously with the delete; the shred (enc-params
 		// + location rows) and the cache cleanup are deferred behind the
 		// release grace (60s default) and executed by the release task —
 		// poll them through.
 		refsQ := fmt.Sprintf(`SELECT count(*) FROM ingot.blob_refs WHERE bucket = '%s' AND object_key = '%s'`, bucket, key)
-		if out := ingotSQL(t, ctx, s, refsQ); out != "0" {
-			t.Fatalf("%s blob_refs rows survived the delete", out)
-		}
+		out := ingotSQL(t, ctx, s, refsQ)
+		require.Equal(t, "0", out, "%s blob_refs rows survived the delete", out)
 		shredDeadline := time.Now().Add(3 * time.Minute)
 		for {
 			enc := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", digests)
@@ -331,9 +284,7 @@ func TestForgeEncryption(t *testing.T) {
 			if enc == 0 && loc == 0 && len(local) == 0 {
 				break
 			}
-			if time.Now().After(shredDeadline) {
-				t.Fatalf("deferred shred never executed: %d enc-params + %d location rows survive, cache still holds %v", enc, loc, local)
-			}
+			require.False(t, time.Now().After(shredDeadline), "deferred shred never executed: %d enc-params + %d location rows survive, cache still holds %v", enc, loc, local)
 			time.Sleep(5 * time.Second)
 		}
 		t.Logf("shred OK: %d region-wrap rows destroyed, the single-PUT envelope freed from the cache", len(digests))
@@ -347,38 +298,31 @@ func TestForgeEncryption(t *testing.T) {
 	// stack).
 	t.Run("AbortShredsKeyRows", func(t *testing.T) {
 		const bucket, key = "mp-shred-abort", "obj"
-		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-			t.Fatalf("CreateBucket: %v", err)
-		}
+		_, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+		require.NoError(t, err, "CreateBucket")
 		create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key),
 		})
-		if err != nil {
-			t.Fatalf("CreateMultipartUpload: %v", err)
-		}
-		if _, err := cl.UploadPart(ctx, &s3.UploadPartInput{
+		require.NoError(t, err, "CreateMultipartUpload")
+		_, err = cl.UploadPart(ctx, &s3.UploadPartInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 			PartNumber: aws.Int32(1), Body: bytes.NewReader(tagged(patternBytes(5<<20), 0x3D)),
-		}); err != nil {
-			t.Fatalf("UploadPart: %v", err)
-		}
+		})
+		require.NoError(t, err, "UploadPart")
 		// Capture before the abort: the session cascade destroys the part
 		// rows, and with them the only index to these digests.
 		digests := partBlobDigestsHex(t, ctx, s, aws.ToString(create.UploadId), 1)
-		if n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", digests); n != len(digests) {
-			t.Fatalf("pre-abort: %d enc-params rows for %d part blobs", n, len(digests))
-		}
+		n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", digests)
+		require.Equal(t, len(digests), n, "pre-abort: %d enc-params rows for %d part blobs", n, len(digests))
 
-		if _, err := cl.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		_, err = cl.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
-		}); err != nil {
-			t.Fatalf("AbortMultipartUpload: %v", err)
-		}
+		})
+		require.NoError(t, err, "AbortMultipartUpload")
 
 		for _, tbl := range []string{"ingot.blob_encryption_params", "ingot.upload_intents", "ingot.blob_parks"} {
-			if n := countRowsForDigests(t, ctx, s, tbl, "digest", digests); n != 0 {
-				t.Fatalf("%d %s rows survived the abort", n, tbl)
-			}
+			n := countRowsForDigests(t, ctx, s, tbl, "digest", digests)
+			require.Zero(t, n, "%d %s rows survived the abort", n, tbl)
 		}
 		t.Logf("abort shredded %d part-blob key rows (enc-params, intents, parks)", len(digests))
 	})
@@ -388,54 +332,42 @@ func TestForgeEncryption(t *testing.T) {
 	// run inline at UploadPart), and Complete serves the winner.
 	t.Run("SupersededPartShredsKeyRow", func(t *testing.T) {
 		const bucket, key = "mp-shred-supersede", "obj"
-		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-			t.Fatalf("CreateBucket: %v", err)
-		}
+		_, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+		require.NoError(t, err, "CreateBucket")
 		create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key),
 		})
-		if err != nil {
-			t.Fatalf("CreateMultipartUpload: %v", err)
-		}
+		require.NoError(t, err, "CreateMultipartUpload")
 		uploadPart := func(data []byte) *s3.UploadPartOutput {
 			up, err := cl.UploadPart(ctx, &s3.UploadPartInput{
 				Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 				PartNumber: aws.Int32(1), Body: bytes.NewReader(data),
 			})
-			if err != nil {
-				t.Fatalf("UploadPart: %v", err)
-			}
+			require.NoError(t, err, "UploadPart")
 			return up
 		}
 
 		uploadPart(tagged(patternBytes(5<<20), 0x4E))
 		oldDigests := partBlobDigestsHex(t, ctx, s, aws.ToString(create.UploadId), 1)
-		if n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", oldDigests); n != len(oldDigests) {
-			t.Fatalf("pre-supersede: %d enc-params rows for %d part blobs", n, len(oldDigests))
-		}
+		n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", oldDigests)
+		require.Equal(t, len(oldDigests), n, "pre-supersede: %d enc-params rows for %d part blobs", n, len(oldDigests))
 
 		winner := tagged(patternBytes(5<<20), 0x77)
 		up2 := uploadPart(winner)
 		newDigests := partBlobDigestsHex(t, ctx, s, aws.ToString(create.UploadId), 1)
 
-		if n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", oldDigests); n != 0 {
-			t.Fatalf("%d enc-params rows of the superseded part survived", n)
-		}
-		if n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", newDigests); n != len(newDigests) {
-			t.Fatalf("the winning part has %d enc-params rows, want %d", n, len(newDigests))
-		}
+		require.Zero(t, countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", oldDigests), "enc-params rows of the superseded part survived")
+		require.Equal(t, len(newDigests), countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", newDigests), "the winning part's enc-params rows")
 
-		if _, err := cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		_, err = cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 			MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{
 				{PartNumber: aws.Int32(1), ETag: up2.ETag},
 			}},
-		}); err != nil {
-			t.Fatalf("CompleteMultipartUpload: %v", err)
-		}
-		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, winner) {
-			t.Fatalf("object is not the winning part's bytes (%d bytes)", len(got))
-		}
+		})
+		require.NoError(t, err, "CompleteMultipartUpload")
+		got := getBody(t, ctx, cl, bucket, key, "")
+		require.Equal(t, winner, got, "object is not the winning part's bytes (%d bytes)", len(got))
 		t.Logf("supersede shredded %d key rows; winner round-trips", len(oldDigests))
 	})
 
@@ -444,51 +376,41 @@ func TestForgeEncryption(t *testing.T) {
 	// row gone — while the winner commits and round-trips.
 	t.Run("CompleteShredsOrphanParts", func(t *testing.T) {
 		const bucket, key = "mp-shred-orphan", "obj"
-		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-			t.Fatalf("CreateBucket: %v", err)
-		}
+		_, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+		require.NoError(t, err, "CreateBucket")
 		create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key),
 		})
-		if err != nil {
-			t.Fatalf("CreateMultipartUpload: %v", err)
-		}
+		require.NoError(t, err, "CreateMultipartUpload")
 		winner := tagged(patternBytes(5<<20), 0x2B)
 		up1, err := cl.UploadPart(ctx, &s3.UploadPartInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 			PartNumber: aws.Int32(1), Body: bytes.NewReader(winner),
 		})
-		if err != nil {
-			t.Fatalf("UploadPart 1: %v", err)
-		}
-		if _, err := cl.UploadPart(ctx, &s3.UploadPartInput{
+		require.NoError(t, err, "UploadPart 1")
+		_, err = cl.UploadPart(ctx, &s3.UploadPartInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 			PartNumber: aws.Int32(2), Body: bytes.NewReader(tagged(patternBytes(5<<20), 0x9C)),
-		}); err != nil {
-			t.Fatalf("UploadPart 2: %v", err)
-		}
+		})
+		require.NoError(t, err, "UploadPart 2")
 		orphan := partBlobDigestsHex(t, ctx, s, aws.ToString(create.UploadId), 2)
-		if n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", orphan); n != len(orphan) {
-			t.Fatalf("pre-complete: %d enc-params rows for %d orphan blobs", n, len(orphan))
-		}
+		n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", orphan)
+		require.Equal(t, len(orphan), n, "pre-complete: %d enc-params rows for %d orphan blobs", n, len(orphan))
 
-		if _, err := cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		_, err = cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 			MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{
 				{PartNumber: aws.Int32(1), ETag: up1.ETag},
 			}},
-		}); err != nil {
-			t.Fatalf("CompleteMultipartUpload: %v", err)
-		}
+		})
+		require.NoError(t, err, "CompleteMultipartUpload")
 
 		for _, tbl := range []string{"ingot.blob_encryption_params", "ingot.upload_intents", "ingot.blob_parks"} {
-			if n := countRowsForDigests(t, ctx, s, tbl, "digest", orphan); n != 0 {
-				t.Fatalf("%d %s rows survived for the orphaned part", n, tbl)
-			}
+			n := countRowsForDigests(t, ctx, s, tbl, "digest", orphan)
+			require.Zero(t, n, "%d %s rows survived for the orphaned part", n, tbl)
 		}
-		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, winner) {
-			t.Fatalf("winner mismatch after orphan reap (%d bytes)", len(got))
-		}
+		got := getBody(t, ctx, cl, bucket, key, "")
+		require.Equal(t, winner, got, "winner mismatch after orphan reap (%d bytes)", len(got))
 		t.Logf("Complete reaped %d orphan part blobs; winner round-trips", len(orphan))
 	})
 
@@ -501,19 +423,17 @@ func TestForgeEncryption(t *testing.T) {
 	// prior root finish first.
 	t.Run("OverwriteRace", func(t *testing.T) {
 		const bucket, key = "overwrite-race", "obj"
-		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-			t.Fatalf("CreateBucket: %v", err)
-		}
+		_, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+		require.NoError(t, err, "CreateBucket")
 		oldData := tagged(patternBytes(1<<20), 0x51)
 		newData := tagged(patternBytes(1<<20+64<<10), 0x62) // different length amplifies mix detection
 		oldETag, newETag := quotedMD5(oldData), quotedMD5(newData)
 		oldSum, newSum := sha256.Sum256(oldData), sha256.Sum256(newData)
 
-		if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
+		_, err = cl.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(oldData),
-		}); err != nil {
-			t.Fatalf("PutObject (old): %v", err)
-		}
+		})
+		require.NoError(t, err, "PutObject (old)")
 		oldDigests := objectBlobDigestsHex(t, ctx, s, bucket, key)
 
 		start := make(chan struct{})
@@ -554,25 +474,23 @@ func TestForgeEncryption(t *testing.T) {
 			}()
 		}
 		close(start)
-		if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
+		_, err = cl.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(newData),
-		}); err != nil {
-			t.Fatalf("PutObject (overwrite): %v", err)
-		}
+		})
+		require.NoError(t, err, "PutObject (overwrite)")
 		time.Sleep(500 * time.Millisecond) // a few post-swap reads
 		close(stop)
 		wg.Wait()
 		close(violations)
 		for v := range violations {
-			t.Errorf("%s", v)
+			assert.Fail(t, v)
 		}
 		if t.Failed() {
 			t.FailNow()
 		}
 
-		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, newData) {
-			t.Fatalf("final GET is not the new object (%d bytes)", len(got))
-		}
+		got := getBody(t, ctx, cl, bucket, key, "")
+		require.Equal(t, newData, got, "final GET is not the new object (%d bytes)", len(got))
 		// The superseded generation's rows shred after the release grace.
 		shredDeadline := time.Now().Add(3 * time.Minute)
 		for {
@@ -581,9 +499,7 @@ func TestForgeEncryption(t *testing.T) {
 			if enc == 0 && loc == 0 {
 				break
 			}
-			if time.Now().After(shredDeadline) {
-				t.Fatalf("superseded generation never shredded: %d enc-params + %d location rows survive", enc, loc)
-			}
+			require.False(t, time.Now().After(shredDeadline), "superseded generation never shredded: %d enc-params + %d location rows survive", enc, loc)
 			time.Sleep(5 * time.Second)
 		}
 		t.Logf("overwrite race clean: every concurrent read was exactly old or new; superseded generation shredded")
@@ -622,41 +538,32 @@ func TestForgeMaxSizePart(t *testing.T) {
 		chunkSize = int64(256) << 10
 		blobSize  = msbucket.DefaultMaxBlobSize // the default config's max_blob_size
 	)
-	if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		t.Fatalf("CreateBucket: %v", err)
-	}
+	_, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+	require.NoError(t, err, "CreateBucket")
 	create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(bucket), Key: aws.String(key),
 	})
-	if err != nil {
-		t.Fatalf("CreateMultipartUpload: %v", err)
-	}
+	require.NoError(t, err, "CreateMultipartUpload")
 
 	start := time.Now()
 	up, err := cl.UploadPart(ctx, &s3.UploadPartInput{
 		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 		PartNumber: aws.Int32(1), Body: newPatternReader(size), ContentLength: aws.Int64(size),
 	})
-	if err != nil {
-		t.Fatalf("UploadPart (5 GiB): %v", err)
-	}
-	if _, err := cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+	require.NoError(t, err, "UploadPart (5 GiB)")
+	_, err = cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{
 			{PartNumber: aws.Int32(1), ETag: up.ETag},
 		}},
-	}); err != nil {
-		t.Fatalf("CompleteMultipartUpload: %v", err)
-	}
+	})
+	require.NoError(t, err, "CompleteMultipartUpload")
 	t.Logf("5 GiB part uploaded and completed in %s", time.Since(start))
 
 	head, err := cl.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
-	if err != nil {
-		t.Fatalf("HeadObject: %v", err)
-	}
-	if got := aws.ToInt64(head.ContentLength); got != size {
-		t.Fatalf("HEAD ContentLength = %d, want %d", got, size)
-	}
+	require.NoError(t, err, "HeadObject")
+	got := aws.ToInt64(head.ContentLength)
+	require.Equal(t, size, got, "HEAD ContentLength")
 
 	for _, rc := range []struct {
 		name       string
@@ -668,16 +575,13 @@ func TestForgeMaxSizePart(t *testing.T) {
 		{"tail", size - 1024, size - 1},
 	} {
 		hdr := fmt.Sprintf("bytes=%d-%d", rc.start, rc.end)
-		if got := getBody(t, ctx, cl, bucket, key, hdr); !bytes.Equal(got, patternRange(rc.start, rc.end)) {
-			t.Fatalf("%s range %s mismatch (%d bytes)", rc.name, hdr, len(got))
-		}
+		got := getBody(t, ctx, cl, bucket, key, hdr)
+		require.Equal(t, patternRange(rc.start, rc.end), got, "%s range %s mismatch (%d bytes)", rc.name, hdr, len(got))
 	}
 
 	start = time.Now()
 	out, err := cl.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
-	if err != nil {
-		t.Fatalf("GetObject (5 GiB): %v", err)
-	}
+	require.NoError(t, err, "GetObject (5 GiB)")
 	defer out.Body.Close()
 	buf := make([]byte, 4<<20)
 	want := make([]byte, 4<<20)
@@ -689,21 +593,15 @@ func TestForgeMaxSizePart(t *testing.T) {
 			for i := range expected {
 				expected[i] = patternByteAt(pos + int64(i))
 			}
-			if !bytes.Equal(buf[:n], expected) {
-				t.Fatalf("read-back mismatch in the block at offset %d", pos)
-			}
+			require.Equal(t, expected, buf[:n], "read-back mismatch in the block at offset %d", pos)
 			pos += int64(n)
 		}
 		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
 			break
 		}
-		if rerr != nil {
-			t.Fatalf("read at offset %d: %v", pos, rerr)
-		}
+		require.NoError(t, rerr, "read at offset %d", pos)
 	}
-	if pos != size {
-		t.Fatalf("full GET returned %d bytes, want %d", pos, size)
-	}
+	require.Equal(t, size, pos, "full GET returned %d bytes", pos)
 	t.Logf("5 GiB read back byte-exact in %s", time.Since(start))
 }
 
@@ -720,25 +618,20 @@ func TestForgeMultipartExpiryShred(t *testing.T) {
 	cl := sdkClient(forgeS3Conf(endpoint, accessKey, secretKey))
 
 	const bucket, key = "mp-expiry", "obj"
-	if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		t.Fatalf("CreateBucket: %v", err)
-	}
+	_, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+	require.NoError(t, err, "CreateBucket")
 	create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(bucket), Key: aws.String(key),
 	})
-	if err != nil {
-		t.Fatalf("CreateMultipartUpload: %v", err)
-	}
-	if _, err := cl.UploadPart(ctx, &s3.UploadPartInput{
+	require.NoError(t, err, "CreateMultipartUpload")
+	_, err = cl.UploadPart(ctx, &s3.UploadPartInput{
 		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 		PartNumber: aws.Int32(1), Body: bytes.NewReader(tagged(patternBytes(5<<20), 0x66)),
-	}); err != nil {
-		t.Fatalf("UploadPart: %v", err)
-	}
+	})
+	require.NoError(t, err, "UploadPart")
 	digests := partBlobDigestsHex(t, ctx, s, aws.ToString(create.UploadId), 1)
-	if n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", digests); n != len(digests) {
-		t.Fatalf("pre-expiry: %d enc-params rows for %d part blobs", n, len(digests))
-	}
+	n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", digests)
+	require.Equal(t, len(digests), n, "pre-expiry: %d enc-params rows for %d part blobs", n, len(digests))
 
 	// Abandon the upload. The sweeper ticks at ttl/2 (15s here); give it a
 	// few cycles of headroom.
@@ -749,15 +642,12 @@ func TestForgeMultipartExpiryShred(t *testing.T) {
 			countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", digests) == 0 {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("session or enc-params rows survived %s past the 30s TTL — the sweeper did not shred", time.Since(deadline.Add(-3*time.Minute)))
-		}
+		require.False(t, time.Now().After(deadline), "session or enc-params rows survived %s past the 30s TTL — the sweeper did not shred", time.Since(deadline.Add(-3*time.Minute)))
 		time.Sleep(5 * time.Second)
 	}
 	for _, tbl := range []string{"ingot.upload_intents", "ingot.blob_parks"} {
-		if n := countRowsForDigests(t, ctx, s, tbl, "digest", digests); n != 0 {
-			t.Fatalf("%d %s rows survived the expiry sweep", n, tbl)
-		}
+		n := countRowsForDigests(t, ctx, s, tbl, "digest", digests)
+		require.Zero(t, n, "%d %s rows survived the expiry sweep", n, tbl)
 	}
 	t.Logf("expiry sweep shredded %d part-blob key rows and the session", len(digests))
 }
@@ -770,9 +660,7 @@ func localDigests(t *testing.T, ctx context.Context, s *stack.Stack, digests []s
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
 		fmt.Sprintf(`for d in %s; do if [ -e "/data/cache/$d" ]; then echo "$d"; fi; done`, strings.Join(digests, " ")))
-	if err != nil {
-		t.Fatalf("list cached blobs: %v (stderr=%s)", err, errOut)
-	}
+	require.NoError(t, err, "list cached blobs: %v (stderr=%s)", err, errOut)
 	return strings.Fields(out)
 }
 

@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -49,36 +50,25 @@ func (s *spanTree) one(name string) sdktrace.ReadOnlySpan {
 			found = append(found, sp)
 		}
 	}
-	if len(found) != 1 {
-		s.t.Fatalf("expected one %q span, got %d", name, len(found))
-	}
+	require.Len(s.t, found, 1, "%q spans", name)
 	return found[0]
 }
 
 // requireChild fails unless child's parent is parent.
 func (s *spanTree) requireChild(parent, child sdktrace.ReadOnlySpan) {
 	s.t.Helper()
-	if child.Parent().SpanID() != parent.SpanContext().SpanID() {
-		s.t.Fatalf("expected %q under %q", child.Name(), parent.Name())
-	}
+	require.Equal(s.t, parent.SpanContext().SpanID(), child.Parent().SpanID())
 }
 
 // requireInTrace fails unless sp belongs to the root span's trace.
 func (s *spanTree) requireInTrace(sp sdktrace.ReadOnlySpan) {
 	s.t.Helper()
-	if sp.SpanContext().TraceID() != s.root.TraceID() {
-		s.t.Fatalf("expected %q in the request's trace", sp.Name())
-	}
+	require.Equal(s.t, s.root.TraceID(), sp.SpanContext().TraceID(), "expected %q in the request's trace", sp.Name())
 }
 
 func requireAttr(t *testing.T, sp sdktrace.ReadOnlySpan, want attribute.KeyValue) {
 	t.Helper()
-	for _, kv := range sp.Attributes() {
-		if kv == want {
-			return
-		}
-	}
-	t.Fatalf("expected %q to carry %v, got %v", sp.Name(), want, sp.Attributes())
+	require.Contains(t, sp.Attributes(), want, "%q attributes", sp.Name())
 }
 
 func TestPutObjectSpans(t *testing.T) {
@@ -87,22 +77,19 @@ func TestPutObjectSpans(t *testing.T) {
 	bucket, key := "bk", "k1"
 
 	tree := traceOp(t, func(ctx context.Context) {
-		if _, err := b.PutObject(ctx, s3response.PutObjectInput{
+		_, err := b.PutObject(ctx, s3response.PutObjectInput{
 			Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data),
-		}); err != nil {
-			t.Fatalf("PutObject: %v", err)
-		}
+		})
+		require.NoError(t, err, "PutObject")
 	})
 
 	write := tree.one("body.write")
-	if write.Parent().SpanID() != tree.root.SpanID() {
-		t.Fatalf("expected body.write under the request span")
-	}
+	require.Equal(t, tree.root.SpanID(), write.Parent().SpanID(), "expected body.write under the request span")
 	requireAttr(t, write, attribute.Int64("ingot.body.bytes", int64(len(data))))
 	requireAttr(t, write, attribute.Int("ingot.body.blobs", 1))
-	if ev := write.Events(); len(ev) != 1 || ev[0].Name != "body.received" {
-		t.Fatalf("expected a body.received event on body.write, got %v", ev)
-	}
+	ev := write.Events()
+	require.Len(t, ev, 1, "expected a body.received event on body.write")
+	require.Equal(t, "body.received", ev[0].Name, "expected a body.received event on body.write")
 
 	requireAttr(t, tree.one("blob.upload"), attribute.String("ingot.blob.result", "streamed"))
 
@@ -121,9 +108,7 @@ func TestReadSpans(t *testing.T) {
 
 	get := traceOp(t, func(ctx context.Context) {
 		out, err := b.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &key})
-		if err != nil {
-			t.Fatalf("GetObject: %v", err)
-		}
+		require.NoError(t, err, "GetObject")
 		_, _ = io.Copy(io.Discard, out.Body)
 		_ = out.Body.Close()
 	})
@@ -131,19 +116,16 @@ func TestReadSpans(t *testing.T) {
 
 	missing := "nope"
 	miss := traceOp(t, func(ctx context.Context) {
-		if _, err := b.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &missing}); err == nil {
-			t.Fatal("expected NoSuchKey")
-		}
+		_, err := b.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &missing})
+		require.Error(t, err, "expected NoSuchKey")
 	})
-	if code := miss.one("tree.lookup").Status().Code.String(); code != "Unset" {
-		t.Fatalf("expected NoSuchKey to leave tree.lookup unmarked, got %s", code)
-	}
+	code := miss.one("tree.lookup").Status().Code.String()
+	require.Equal(t, "Unset", code, "expected NoSuchKey to leave tree.lookup unmarked")
 
 	list := traceOp(t, func(ctx context.Context) {
 		maxKeys := int32(2)
-		if _, err := b.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bucket, MaxKeys: &maxKeys}); err != nil {
-			t.Fatalf("ListObjectsV2: %v", err)
-		}
+		_, err := b.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bucket, MaxKeys: &maxKeys})
+		require.NoError(t, err, "ListObjectsV2")
 	})
 	walk := list.one("tree.list")
 	requireAttr(t, walk, attribute.Int("ingot.tree.keys_returned", 2))
@@ -155,9 +137,8 @@ func TestReadSpans(t *testing.T) {
 	putObj(t, b, "d/2", testBody(1<<10))
 	versions := traceOp(t, func(ctx context.Context) {
 		delim := "/"
-		if _, err := b.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: &bucket, Delimiter: &delim}); err != nil {
-			t.Fatalf("ListObjectVersions: %v", err)
-		}
+		_, err := b.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: &bucket, Delimiter: &delim})
+		require.NoError(t, err, "ListObjectVersions")
 	})
 	requireAttr(t, versions.one("tree.list_versions"), attribute.Int("ingot.tree.versions_returned", 3))
 }
@@ -176,9 +157,7 @@ func TestMultipartSpans(t *testing.T) {
 			out, err := b.UploadPart(ctx, &s3.UploadPartInput{
 				Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &n, Body: bytes.NewReader(body), ContentLength: byteLen(body),
 			})
-			if err != nil {
-				t.Fatalf("UploadPart %d: %v", n, err)
-			}
+			require.NoError(t, err, "UploadPart %d", n)
 			completed = append(completed, types.CompletedPart{PartNumber: &n, ETag: out.ETag})
 		}
 	})
@@ -190,17 +169,14 @@ func TestMultipartSpans(t *testing.T) {
 			parked++
 		}
 	}
-	if parked != 2 {
-		t.Fatalf("expected a blob.park span per part, got %d", parked)
-	}
+	require.Equal(t, 2, parked, "expected a blob.park span per part")
 
 	complete := traceOp(t, func(ctx context.Context) {
-		if _, _, err := b.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		_, _, err := b.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 			Bucket: &bucket, Key: &key, UploadId: &uploadID,
 			MultipartUpload: &types.CompletedMultipartUpload{Parts: completed},
-		}); err != nil {
-			t.Fatalf("CompleteMultipartUpload: %v", err)
-		}
+		})
+		require.NoError(t, err, "CompleteMultipartUpload")
 	})
 	// Each part's blob is concluded by its own accept, on the queue's
 	// workers rather than under the request.
@@ -212,9 +188,7 @@ func TestMultipartSpans(t *testing.T) {
 			concludes++
 		}
 	}
-	if concludes != 2 {
-		t.Fatalf("expected a blobs.conclude span per part blob, got %d", concludes)
-	}
+	require.Equal(t, 2, concludes, "expected a blobs.conclude span per part blob")
 }
 
 // TestSweepLocalBlobsSpans: each pass of a local blob sweep records a span
@@ -226,9 +200,8 @@ func TestSweepLocalBlobsSpans(t *testing.T) {
 	budgetToEvict(b, 2, size)
 
 	tree := traceOp(t, func(ctx context.Context) {
-		if _, err := b.SweepLocalBlobs(ctx); err != nil {
-			t.Fatalf("SweepLocalBlobs: %v", err)
-		}
+		_, err := b.SweepLocalBlobs(ctx)
+		require.NoError(t, err, "SweepLocalBlobs")
 	})
 
 	budget := tree.one("local_blobs.budget_pass")
@@ -253,9 +226,7 @@ func TestSweepLocalBlobsSpansOnCancel(t *testing.T) {
 	})
 
 	for _, sp := range tree.spans {
-		if sp.Status().Code == codes.Error {
-			t.Fatalf("span %q marked failed on cancellation: %s", sp.Name(), sp.Status().Description)
-		}
+		require.NotEqual(t, codes.Error, sp.Status().Code, "span %q marked failed on cancellation: %s", sp.Name(), sp.Status().Description)
 	}
 	tree.one("local_blobs.orphan_pass")
 }

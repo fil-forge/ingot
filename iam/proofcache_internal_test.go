@@ -54,7 +54,7 @@ func TestIndexTracksAddAndLookup(t *testing.T) {
 	// A different key yields nothing (and never scans).
 	other := mintDelegation(t, delegation.WithNoExpiration())
 	for range d.listDelegations(context.Background(), other.Audience(), other.Command(), other.Subject()) {
-		t.Fatal("unexpected yield for unindexed key")
+		require.FailNow(t, "unexpected yield for unindexed key")
 	}
 }
 
@@ -70,7 +70,7 @@ func TestExpiredEntryIsLiveCheckedBeforeJanitor(t *testing.T) {
 
 	require.Equal(t, 1, d.indexSize(), "janitor has not swept; index still holds the entry")
 	for range d.listDelegations(context.Background(), dlg.Audience(), dlg.Command(), dlg.Subject()) {
-		t.Fatal("expired delegation must not yield")
+		require.FailNow(t, "expired delegation must not yield")
 	}
 
 	// The janitor's sweep (run directly here) prunes the index via OnEvicted.

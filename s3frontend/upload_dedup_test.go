@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -49,18 +50,14 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 	dir := t.TempDir()
 	mem := newTestStore(t)
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
-	if err != nil {
-		t.Fatalf("cache: %v", err)
-	}
+	require.NoError(t, err, "cache")
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(dir, "segments"),
 		Meta:    mem,
 		Catalog: logstore.PlaneConfig{Ship: false},
 		Logger:  zaptest.NewLogger(t),
 	})
-	if err != nil {
-		t.Fatalf("logstore: %v", err)
-	}
+	require.NoError(t, err, "logstore")
 	t.Cleanup(func() { _ = log.Close(ctx) })
 
 	up := &countingUploader{calls: map[string]int{}}
@@ -82,9 +79,7 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 	}
 	withStreaming(t, &deps, dir)
 	b := mem.newBackend(t, deps)
-	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{}); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{}), "create bucket")
 
 	data := []byte("identical bytes across puts and keys")
 
@@ -94,15 +89,10 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 
 	up.mu.Lock()
 	defer up.mu.Unlock()
-	if len(up.calls) != 3 {
-		t.Fatalf("uploaded %d distinct digests, want 3 (fresh CEK per write ends content dedup)", len(up.calls))
-	}
+	require.Len(t, up.calls, 3, "uploaded %d distinct digests, want 3 (fresh CEK per write ends content dedup)", len(up.calls))
 	for d, n := range up.calls {
-		if n != 1 {
-			t.Fatalf("UploadBlob called %d times for blob %x, want 1", n, []byte(d))
-		}
+		require.Equal(t, 1, n, "UploadBlob called %d times for blob %x", n, []byte(d))
 	}
-	if n := up.calls[string(digestOf(t, data))]; n != 0 {
-		t.Fatalf("a stored digest equals hash(plaintext); blobs were not encrypted")
-	}
+	n := up.calls[string(digestOf(t, data))]
+	require.Zero(t, n, "a stored digest equals hash(plaintext); blobs were not encrypted")
 }

@@ -19,6 +19,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // isolateAWSConfig points the SDK at no shared config and placeholder
@@ -63,8 +65,7 @@ func (s *packServerShape) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		s.t.Errorf("read body: %v", err)
+	if !assert.NoError(s.t, err, "read body") {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -80,18 +81,13 @@ func (s *packServerShape) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.created = true
 	case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, bucketPath+"/"):
 		key := strings.TrimPrefix(r.URL.Path, bucketPath+"/")
-		if got := r.Header.Get("If-None-Match"); got != "*" {
-			s.t.Errorf("PUT %s: If-None-Match %q, want *", key, got)
-		}
+		assert.Equal(s.t, "*", r.Header.Get("If-None-Match"), "PUT %s: If-None-Match", key)
 		sum := sha256.Sum256(body)
-		if got, want := r.Header.Get("X-Amz-Checksum-Sha256"), base64.StdEncoding.EncodeToString(sum[:]); got != want {
-			s.t.Errorf("PUT %s: x-amz-checksum-sha256 %q, want %q", key, got, want)
-		}
+		assert.Equal(s.t, base64.StdEncoding.EncodeToString(sum[:]), r.Header.Get("X-Amz-Checksum-Sha256"), "PUT %s: x-amz-checksum-sha256", key)
 		for name := range r.Header {
 			lower := strings.ToLower(name)
-			if (strings.HasPrefix(lower, "x-amz-checksum-") && lower != "x-amz-checksum-sha256") || lower == "x-amz-trailer" {
-				s.t.Errorf("PUT %s: unexpected header %s", key, name)
-			}
+			assert.False(s.t, (strings.HasPrefix(lower, "x-amz-checksum-") && lower != "x-amz-checksum-sha256") || lower == "x-amz-trailer",
+				"PUT %s: unexpected header %s", key, name)
 		}
 		if s.objects[key] {
 			writeS3Error(w, http.StatusPreconditionFailed, "PreconditionFailed")
@@ -109,7 +105,7 @@ func (s *packServerShape) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveObject(w, r, strings.TrimPrefix(r.URL.Path, bucketPath+"/"))
 		return
 	default:
-		s.t.Errorf("unexpected request %s %s", r.Method, r.URL)
+		assert.Failf(s.t, "unexpected request", "%s %s", r.Method, r.URL)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -139,8 +135,8 @@ func (s *packServerShape) serveObject(w http.ResponseWriter, r *http.Request, ke
 		return
 	}
 	var lo, hi int
-	if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &lo, &hi); err != nil || lo > hi || hi >= len(body) {
-		s.t.Errorf("GET %s: range %q of %d bytes", key, r.Header.Get("Range"), len(body))
+	if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &lo, &hi); !assert.True(s.t, err == nil && lo <= hi && hi < len(body),
+		"GET %s: range %q of %d bytes", key, r.Header.Get("Range"), len(body)) {
 		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 		return
 	}
@@ -208,30 +204,21 @@ func TestClientSendsThePackServersRequests(t *testing.T) {
 	defer hs.Close()
 
 	client, err := NewClient(t.Context(), ClientConfig{Endpoint: hs.URL, Region: "us-east-1", Conns: 4})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	r, err := Load(t.Context(), client, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	// Five bulk and two real objects, one bulk key already taken.
-	if r.Total.Written != 6 || r.Total.Existed != 1 || r.Total.Real != 2 {
-		t.Fatalf("totals %+v", r.Total)
-	}
-	if !strings.Contains(srv.encryption, "<SSEAlgorithm>none</SSEAlgorithm>") {
-		t.Fatalf("encryption request %q does not set none", srv.encryption)
-	}
+	require.Equal(t, uint64(6), r.Total.Written, "totals %+v", r.Total)
+	require.Equal(t, uint64(1), r.Total.Existed, "totals %+v", r.Total)
+	require.Equal(t, uint64(2), r.Total.Real, "totals %+v", r.Total)
+	require.Contains(t, srv.encryption, "<SSEAlgorithm>none</SSEAlgorithm>", "encryption request %q does not set none", srv.encryption)
 
 	// A load from a fresh state finds the bucket its own and every key taken.
 	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
 	r, err = Load(t.Context(), client, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Total.Written != 0 || r.Total.Existed != 7 {
-		t.Fatalf("second load totals %+v", r.Total)
-	}
+	require.NoError(t, err)
+	require.Zero(t, r.Total.Written, "second load totals %+v", r.Total)
+	require.Equal(t, uint64(7), r.Total.Existed, "second load totals %+v", r.Total)
 }
 
 // testAttemptTimeout bounds each PUT attempt in the tests that cut one off.
@@ -276,16 +263,11 @@ func TestClientRetriesWhenNoResponseComes(t *testing.T) {
 			hs := httptest.NewServer(srv)
 			defer hs.Close()
 			client, err := NewClient(t.Context(), ClientConfig{Endpoint: hs.URL, Region: "us-east-1", Conns: 4})
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 			r, err := Load(t.Context(), client, cfg)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if r.Total.Errors != 1 || r.Total.Written != 5 {
-				t.Fatalf("totals %+v, want the PUT with no response retried once", r.Total)
-			}
+			require.NoError(t, err)
+			require.Equal(t, uint64(1), r.Total.Errors, "totals %+v, want the PUT with no response retried once", r.Total)
+			require.Equal(t, uint64(5), r.Total.Written, "totals %+v, want the PUT with no response retried once", r.Total)
 		})
 	}
 }
@@ -339,16 +321,12 @@ func TestClientResendsACutOffRealBody(t *testing.T) {
 			// included: Close waits for the held handler to return.
 			defer close(release)
 			client, err := NewClient(t.Context(), ClientConfig{Endpoint: hs.URL, Region: "us-east-1", Conns: 4})
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 			r, err := Load(t.Context(), client, cfg)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if r.Total.Errors != 1 || r.Total.Real != 1 || r.Total.Written != 6 {
-				t.Fatalf("totals %+v, want the cut-off real PUT sent again once", r.Total)
-			}
+			require.NoError(t, err)
+			require.Equal(t, uint64(1), r.Total.Errors, "totals %+v, want the cut-off real PUT sent again once", r.Total)
+			require.Equal(t, uint64(1), r.Total.Real, "totals %+v, want the cut-off real PUT sent again once", r.Total)
+			require.Equal(t, uint64(6), r.Total.Written, "totals %+v, want the cut-off real PUT sent again once", r.Total)
 		})
 	}
 }
@@ -364,30 +342,20 @@ func TestClientValidatesThroughTheSDK(t *testing.T) {
 	hs := httptest.NewServer(srv)
 	defer hs.Close()
 	client, err := NewClient(t.Context(), ClientConfig{Endpoint: hs.URL, Region: "us-east-1", Conns: 4})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Load(t.Context(), client, load); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+	_, err = Load(t.Context(), client, load)
+	require.NoError(t, err)
 	cfg := validateConfig(load)
 	cfg.RangeSize = 300 << 10
 	r, err := Validate(t.Context(), client, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Failures != 0 {
-		t.Fatalf("%d failures: %v", r.Failures, r.FailureSample)
-	}
+	require.NoError(t, err)
+	require.Zero(t, r.Failures, "%d failures: %v", r.Failures, r.FailureSample)
 	// Twelve objects at four a page is three pages.
 	for op, want := range map[string]uint64{OpGetRange: 3, OpHead: 5, OpListPage: 3, OpPut: 5, OpDelete: 5, OpPutReal: 4, OpDeleteReal: 4} {
-		if got := r.Latency[op].Count; got != want {
-			t.Errorf("%s: %d timed, want %d", op, got, want)
-		}
+		got := r.Latency[op].Count
+		assert.Equal(t, want, got, "%s: %d timed", op, got)
 	}
-	if len(srv.objects) != 12 {
-		t.Fatalf("%d objects left, want the load's 12", len(srv.objects))
-	}
+	require.Len(t, srv.objects, 12, "%d objects left", len(srv.objects))
 }
 
 func TestClientLogsNothingForARangedGetWithoutChecksum(t *testing.T) {
@@ -395,9 +363,7 @@ func TestClientLogsNothingForARangedGetWithoutChecksum(t *testing.T) {
 	// The SDK's default logger writes to the os.Stderr of the moment the
 	// config loads, so swap it before NewClient.
 	stderr, err := os.CreateTemp(t.TempDir(), "stderr")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	orig := os.Stderr
 	os.Stderr = stderr
 	t.Cleanup(func() { os.Stderr = orig })
@@ -406,31 +372,21 @@ func TestClientLogsNothingForARangedGetWithoutChecksum(t *testing.T) {
 	hs := httptest.NewServer(srv)
 	defer hs.Close()
 	client, err := NewClient(t.Context(), ClientConfig{Endpoint: hs.URL, Region: "us-east-1", Conns: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	// A ranged answer carries no whole-object checksum, as ingot's doesn't.
 	out, err := client.GetObject(t.Context(), &s3.GetObjectInput{Bucket: aws.String("any-bucket"), Key: aws.String("any-key"), Range: aws.String("bytes=0-15")})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	io.Copy(io.Discard, out.Body)
 	out.Body.Close()
 	logged, err := os.ReadFile(stderr.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(logged) != 0 {
-		t.Fatalf("the SDK logged:\n%s", logged)
-	}
+	require.NoError(t, err)
+	require.Empty(t, logged, "the SDK logged")
 }
 
 func TestNewClientNeedsRegionAndEndpoint(t *testing.T) {
 	isolateAWSConfig(t)
-	if _, err := NewClient(t.Context(), ClientConfig{Endpoint: "http://127.0.0.1:1"}); err == nil || !strings.Contains(err.Error(), "region") {
-		t.Fatalf("no region: %v", err)
-	}
-	if _, err := NewClient(t.Context(), ClientConfig{Region: "us-east-1"}); err == nil || !strings.Contains(err.Error(), "endpoint") {
-		t.Fatalf("no endpoint: %v", err)
-	}
+	_, err := NewClient(t.Context(), ClientConfig{Endpoint: "http://127.0.0.1:1"})
+	require.ErrorContains(t, err, "region", "no region")
+	_, err = NewClient(t.Context(), ClientConfig{Region: "us-east-1"})
+	require.ErrorContains(t, err, "endpoint", "no endpoint")
 }

@@ -2,13 +2,13 @@ package registry_test
 
 import (
 	"context"
-	"reflect"
 	"testing"
 	"time"
 
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/registry"
@@ -27,9 +27,7 @@ func newObjectFixture(t *testing.T) *objectFixture {
 	t.Helper()
 	pool := pgtest.New(t)
 	f := &objectFixture{pool: pool, r: registry.NewPostgres(pool), name: "objects-bucket", space: testutil.RandomDID(t)}
-	if err := f.r.Create(context.Background(), f.name, f.space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, f.r.Create(context.Background(), f.name, f.space, registry.CreateState{Tenant: testutil.RandomDID(t)}), "create bucket")
 	return f
 }
 
@@ -39,44 +37,34 @@ func (f *objectFixture) count(t *testing.T, added, removed int64) {
 	t.Helper()
 	ctx := context.Background()
 	tx, err := f.pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin: %v", err)
-	}
+	require.NoError(t, err, "begin")
 	defer func() { _ = tx.Rollback(ctx) }()
 	for _, st := range registry.ObjectCountWrites(f.name, added, removed) {
-		if _, err := tx.Exec(ctx, st.SQL, st.Args...); err != nil {
-			t.Fatalf("object count write: %v", err)
-		}
+		_, err = tx.Exec(ctx, st.SQL, st.Args...)
+		require.NoError(t, err, "object count write")
 	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
+	require.NoError(t, tx.Commit(ctx), "commit")
 }
 
 // age moves the space's counts back by d, as if they had been written then.
 func (f *objectFixture) age(t *testing.T, d time.Duration) {
 	t.Helper()
-	if _, err := f.pool.Exec(context.Background(),
+	_, err := f.pool.Exec(context.Background(),
 		`UPDATE ingot.object_usage SET hour = hour - $2::interval WHERE space = $1`,
-		f.space.String(), d.String()); err != nil {
-		t.Fatalf("age counts: %v", err)
-	}
+		f.space.String(), d.String())
+	require.NoError(t, err, "age counts")
 }
 
 func (f *objectFixture) due(t *testing.T) []registry.ObjectCount {
 	t.Helper()
 	due, err := f.r.DueObjects(context.Background(), 100)
-	if err != nil {
-		t.Fatalf("DueObjects: %v", err)
-	}
+	require.NoError(t, err, "DueObjects")
 	return due
 }
 
 func (f *objectFixture) acknowledge(t *testing.T, counts ...registry.ObjectCount) {
 	t.Helper()
-	if err := f.r.AcknowledgeObjects(context.Background(), counts); err != nil {
-		t.Fatalf("AcknowledgeObjects: %v", err)
-	}
+	require.NoError(t, f.r.AcknowledgeObjects(context.Background(), counts), "AcknowledgeObjects")
 }
 
 // totals strips the hours from counts, which are the database's own.
@@ -93,9 +81,7 @@ func wantTotals(t *testing.T, got []registry.ObjectCount, want ...[2]int64) {
 	if want == nil {
 		want = [][2]int64{}
 	}
-	if !reflect.DeepEqual(totals(got), want) {
-		t.Fatalf("object counts:\n got %v\nwant %v", totals(got), want)
-	}
+	require.Equal(t, want, totals(got), "object counts")
 }
 
 // A change adds to the bucket's totals, and the hour's count holds the totals
@@ -107,12 +93,9 @@ func TestObjectCountWritesKeepTheBucketsTotalsByHour(t *testing.T) {
 	f.count(t, 2, 1)
 	due := f.due(t)
 	wantTotals(t, due, [2]int64{5, 1})
-	if due[0].Space != f.space {
-		t.Fatalf("counted for space %s, want %s", due[0].Space, f.space)
-	}
-	if !due[0].Hour.Equal(due[0].Hour.Truncate(time.Hour)) || time.Since(due[0].Hour) > 2*time.Hour {
-		t.Fatalf("counted in hour %s, want the current whole hour", due[0].Hour)
-	}
+	require.Equal(t, f.space, due[0].Space, "counted for space")
+	require.True(t, due[0].Hour.Equal(due[0].Hour.Truncate(time.Hour)), "counted in hour %s, want the current whole hour", due[0].Hour)
+	require.LessOrEqual(t, time.Since(due[0].Hour), 2*time.Hour, "counted in hour %s, want the current whole hour", due[0].Hour)
 
 	// A change in a later hour starts that hour's count from the totals so
 	// far, and leaves the earlier hour's as it was.
@@ -121,9 +104,8 @@ func TestObjectCountWritesKeepTheBucketsTotalsByHour(t *testing.T) {
 	wantTotals(t, f.due(t), [2]int64{5, 1}, [2]int64{5, 5})
 
 	// A change that counts nothing writes nothing.
-	if w := registry.ObjectCountWrites(f.name, 0, 0); len(w) != 0 {
-		t.Fatalf("a change of no objects has %d writes", len(w))
-	}
+	w := registry.ObjectCountWrites(f.name, 0, 0)
+	require.Empty(t, w, "a change of no objects has %d writes", len(w))
 }
 
 // A bucket that is gone is counted nowhere, and what its space has counted
@@ -131,9 +113,7 @@ func TestObjectCountWritesKeepTheBucketsTotalsByHour(t *testing.T) {
 func TestObjectCountWritesForAMissingBucketWriteNothing(t *testing.T) {
 	f := newObjectFixture(t)
 	f.count(t, 2, 2)
-	if err := f.r.Delete(context.Background(), f.name, f.space); err != nil {
-		t.Fatalf("delete bucket: %v", err)
-	}
+	require.NoError(t, f.r.Delete(context.Background(), f.name, f.space), "delete bucket")
 	f.count(t, 1, 0)
 	wantTotals(t, f.due(t), [2]int64{2, 2})
 }
@@ -166,12 +146,9 @@ func TestAcknowledgeObjectsKeepsTheLargestReported(t *testing.T) {
 	f.acknowledge(t, older...)
 	wantTotals(t, f.due(t))
 	b, err := f.r.ObjectBacklog(context.Background())
-	if err != nil {
-		t.Fatalf("ObjectBacklog: %v", err)
-	}
-	if b.Counts != 0 || !b.Oldest.IsZero() {
-		t.Fatalf("backlog %+v, want none", b)
-	}
+	require.NoError(t, err, "ObjectBacklog")
+	require.Zero(t, b.Counts, "backlog %+v", b)
+	require.True(t, b.Oldest.IsZero(), "backlog %+v, want none", b)
 }
 
 func TestObjectBacklogCountsWhatIsDue(t *testing.T) {
@@ -182,12 +159,10 @@ func TestObjectBacklogCountsWhatIsDue(t *testing.T) {
 	f.count(t, 1, 0)
 
 	b, err := f.r.ObjectBacklog(context.Background())
-	if err != nil {
-		t.Fatalf("ObjectBacklog: %v", err)
-	}
-	if b.Counts != 2 || b.Oldest.Before(before) || b.Oldest.After(time.Now().Add(time.Minute)) {
-		t.Fatalf("backlog %+v, want 2 counts due since about now", b)
-	}
+	require.NoError(t, err, "ObjectBacklog")
+	require.Equal(t, int64(2), b.Counts, "backlog %+v, want 2 counts due since about now", b)
+	require.False(t, b.Oldest.Before(before), "backlog %+v, want 2 counts due since about now", b)
+	require.False(t, b.Oldest.After(time.Now().Add(time.Minute)), "backlog %+v, want 2 counts due since about now", b)
 }
 
 // Only counts that are up to date and were acknowledged before the cutoff are
@@ -200,19 +175,19 @@ func TestPruneObjects(t *testing.T) {
 	f.age(t, time.Hour)
 	f.count(t, 1, 0)
 
-	if n, err := f.r.PruneObjects(ctx, time.Now().Add(-time.Hour)); err != nil || n != 0 {
-		t.Fatalf("pruned %d (%v) before the cutoff, want 0", n, err)
-	}
+	n, err := f.r.PruneObjects(ctx, time.Now().Add(-time.Hour))
+	require.NoError(t, err, "prune before the cutoff")
+	require.Zero(t, n, "pruned before the cutoff")
 	// The acknowledged count goes; the one still due stays.
-	if n, err := f.r.PruneObjects(ctx, time.Now().Add(time.Hour)); err != nil || n != 1 {
-		t.Fatalf("pruned %d (%v), want 1", n, err)
-	}
+	n, err = f.r.PruneObjects(ctx, time.Now().Add(time.Hour))
+	require.NoError(t, err, "prune")
+	require.Equal(t, int64(1), n, "pruned")
 	wantTotals(t, f.due(t), [2]int64{5, 1})
 
 	f.acknowledge(t, f.due(t)...)
-	if n, err := f.r.PruneObjects(ctx, time.Now().Add(time.Hour)); err != nil || n != 1 {
-		t.Fatalf("pruned %d (%v), want 1", n, err)
-	}
+	n, err = f.r.PruneObjects(ctx, time.Now().Add(time.Hour))
+	require.NoError(t, err, "prune")
+	require.Equal(t, int64(1), n, "pruned")
 	f.count(t, 0, 2)
 	wantTotals(t, f.due(t), [2]int64{5, 3})
 }
@@ -226,21 +201,15 @@ func TestBucketTotalsSumTheBucketsObjects(t *testing.T) {
 	wantBucketTotals := func(want registry.BucketTotals, msg string) {
 		t.Helper()
 		got, err := r.BucketTotals(ctx)
-		if err != nil {
-			t.Fatalf("BucketTotals: %v", err)
-		}
-		if got != want {
-			t.Fatalf("totals = %+v, want %+v: %s", got, want, msg)
-		}
+		require.NoError(t, err, "BucketTotals")
+		require.Equal(t, want, got, "totals: %s", msg)
 	}
 	wantBucketTotals(registry.BucketTotals{}, "no buckets")
 
 	first := &objectFixture{pool: pool, r: r, name: "first", space: testutil.RandomDID(t)}
 	second := &objectFixture{pool: pool, r: r, name: "second", space: testutil.RandomDID(t)}
 	for _, f := range []*objectFixture{first, second} {
-		if err := r.Create(ctx, f.name, f.space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-			t.Fatalf("create bucket %s: %v", f.name, err)
-		}
+		require.NoError(t, r.Create(ctx, f.name, f.space, registry.CreateState{Tenant: testutil.RandomDID(t)}), "create bucket %s", f.name)
 	}
 	wantBucketTotals(registry.BucketTotals{Buckets: 2}, "two empty buckets")
 
@@ -248,8 +217,6 @@ func TestBucketTotalsSumTheBucketsObjects(t *testing.T) {
 	second.count(t, 4, 0)
 	wantBucketTotals(registry.BucketTotals{Buckets: 2, Objects: 7}, "3 in one bucket and 4 in the other")
 
-	if err := r.Delete(ctx, second.name, second.space); err != nil {
-		t.Fatalf("delete bucket: %v", err)
-	}
+	require.NoError(t, r.Delete(ctx, second.name, second.space), "delete bucket")
 	wantBucketTotals(registry.BucketTotals{Buckets: 1, Objects: 3}, "the deleted bucket's objects have gone with it")
 }

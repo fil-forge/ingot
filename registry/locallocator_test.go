@@ -7,6 +7,8 @@ import (
 
 	"github.com/fil-forge/ucantone/did"
 	mh "github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/blockstore/locator"
 )
@@ -37,9 +39,7 @@ const testProviderDID = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2do
 func mustDigest(t *testing.T, data string) mh.Multihash {
 	t.Helper()
 	digest, err := mh.Sum([]byte(data), mh.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash: %v", err)
-	}
+	require.NoError(t, err, "multihash")
 	return digest
 }
 
@@ -47,9 +47,7 @@ func TestLocalLocator_Locate(t *testing.T) {
 	ctx := context.Background()
 	digest := mustDigest(t, "blob bytes")
 	space, err := did.Parse(testProviderDID)
-	if err != nil {
-		t.Fatalf("parse space: %v", err)
-	}
+	require.NoError(t, err, "parse space")
 	const url = "http://piri:80/blob/z6abc"
 
 	ll := NewLocalLocator(fakeLocStore{locs: map[string]*BlobLocation{
@@ -57,26 +55,15 @@ func TestLocalLocator_Locate(t *testing.T) {
 	}}, fakeLocStore{})
 
 	locs, err := ll.Locate(ctx, []did.DID{space}, digest)
-	if err != nil {
-		t.Fatalf("Locate: %v", err)
-	}
-	if len(locs) != 1 {
-		t.Fatalf("got %d locations, want 1", len(locs))
-	}
+	require.NoError(t, err, "Locate")
+	require.Len(t, locs, 1)
 	cm := locs[0].Commitment
-	if cm.Node.String() != testProviderDID {
-		t.Errorf("Node = %s, want %s", cm.Node, testProviderDID)
-	}
-	if string(cm.Content) != string(digest) {
-		t.Errorf("Content digest mismatch")
-	}
-	if len(cm.Location) != 1 || cm.Location[0].URL().String() != url {
-		t.Errorf("Location = %v, want [%s]", cm.Location, url)
-	}
+	assert.Equal(t, testProviderDID, cm.Node.String(), "Node")
+	assert.Equal(t, string(digest), string(cm.Content), "Content digest mismatch")
+	assert.True(t, len(cm.Location) == 1 && cm.Location[0].URL().String() == url, "Location = %v, want [%s]", cm.Location, url)
 	// Whole blob, End inclusive: [0, size-1] so Forge computes End-Start+1 = size.
-	if locs[0].Range.Start != 0 || locs[0].Range.End != 1233 {
-		t.Errorf("Range = {%d,%d}, want {0,1233}", locs[0].Range.Start, locs[0].Range.End)
-	}
+	assert.Equal(t, int64(0), locs[0].Range.Start, "Range.Start")
+	assert.Equal(t, int64(1233), locs[0].Range.End, "Range.End")
 }
 
 // TestLocalLocator_InclusionFallthrough is the retired-catalog-block case: the
@@ -88,9 +75,7 @@ func TestLocalLocator_InclusionFallthrough(t *testing.T) {
 	blockDigest := mustDigest(t, "manifest block")
 	shardDigest := mustDigest(t, "segment car bytes")
 	space, err := did.Parse(testProviderDID)
-	if err != nil {
-		t.Fatalf("parse space: %v", err)
-	}
+	require.NoError(t, err, "parse space")
 	const url = "http://piri:80/blob/zshard"
 
 	store := fakeLocStore{
@@ -104,22 +89,13 @@ func TestLocalLocator_InclusionFallthrough(t *testing.T) {
 	ll := NewLocalLocator(store, store)
 
 	locs, err := ll.Locate(ctx, []did.DID{space}, blockDigest)
-	if err != nil {
-		t.Fatalf("Locate: %v", err)
-	}
-	if len(locs) != 1 {
-		t.Fatalf("got %d locations, want 1", len(locs))
-	}
+	require.NoError(t, err, "Locate")
+	require.Len(t, locs, 1)
 	cm := locs[0].Commitment
-	if string(cm.Content) != string(shardDigest) {
-		t.Errorf("Content = %x, want shard digest %x (retrieve reads the shard, ranged)", cm.Content, shardDigest)
-	}
-	if len(cm.Location) != 1 || cm.Location[0].URL().String() != url {
-		t.Errorf("Location = %v, want [%s]", cm.Location, url)
-	}
-	if locs[0].Range.Start != 52114 || locs[0].Range.End != 52420 {
-		t.Errorf("Range = {%d,%d}, want {52114,52420}", locs[0].Range.Start, locs[0].Range.End)
-	}
+	assert.Equal(t, string(shardDigest), string(cm.Content), "Content = %x, want shard digest %x (retrieve reads the shard, ranged)", cm.Content, shardDigest)
+	assert.True(t, len(cm.Location) == 1 && cm.Location[0].URL().String() == url, "Location = %v, want [%s]", cm.Location, url)
+	assert.Equal(t, int64(52114), locs[0].Range.Start, "Range.Start")
+	assert.Equal(t, int64(52420), locs[0].Range.End, "Range.End")
 }
 
 // An inclusion whose shard has no location row is a broken write-path
@@ -138,13 +114,9 @@ func TestLocalLocator_InclusionWithoutShardLocation(t *testing.T) {
 	ll := NewLocalLocator(store, store)
 
 	_, err := ll.Locate(context.Background(), []did.DID{space}, blockDigest)
-	if err == nil {
-		t.Fatal("Locate succeeded, want invariant-violation error")
-	}
+	require.Error(t, err, "Locate succeeded, want invariant-violation error")
 	var nf locator.NotFoundError
-	if errors.As(err, &nf) {
-		t.Fatalf("err = %v, want a non-NotFound error", err)
-	}
+	require.False(t, errors.As(err, &nf), "err = %v, want a non-NotFound error", err)
 }
 
 func TestLocalLocator_NotFound(t *testing.T) {
@@ -154,7 +126,5 @@ func TestLocalLocator_NotFound(t *testing.T) {
 
 	_, err := ll.Locate(context.Background(), []did.DID{space}, digest)
 	var nf locator.NotFoundError
-	if !errors.As(err, &nf) {
-		t.Fatalf("err = %v, want locator.NotFoundError", err)
-	}
+	require.ErrorAs(t, err, &nf, "err = %v, want locator.NotFoundError", err)
 }

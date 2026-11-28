@@ -1,7 +1,6 @@
 package s3frontend
 
 import (
-	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -13,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/versitygw/backend"
+	"github.com/stretchr/testify/require"
 )
 
 // storedEnvelopeSizes returns the on-disk size of every blob an object
@@ -36,40 +36,29 @@ func assertPlaintextSize(t *testing.T, what string, got int64, want int64, envel
 		return
 	}
 	for _, e := range envelopes {
-		if got == e {
-			t.Fatalf("%s = %d: a stored envelope's size, want the plaintext %d", what, got, want)
-		}
+		require.NotEqual(t, e, got, "%s = %d: a stored envelope's size", what, got)
 	}
-	if got == envelopeTotal {
-		t.Fatalf("%s = %d: the stored envelopes' total, want the plaintext %d", what, got, want)
-	}
-	t.Fatalf("%s = %d, want the plaintext %d", what, got, want)
+	require.NotEqual(t, envelopeTotal, got, "%s = %d: the stored envelopes' total", what, got)
+	require.FailNow(t, fmt.Sprintf("%s = %d, want the plaintext %d", what, got, want))
 }
 
 // assertPartHeaders checks a ?partNumber response's Content-Length,
 // Content-Range and PartsCount against the part's plaintext coordinates.
 func assertPartHeaders(t *testing.T, what string, length *int64, contentRange *string, partsCount *int32, wantLen int64, wantCR string, wantParts int32, envelopes []int64, envelopeTotal int64) {
 	t.Helper()
-	if length == nil {
-		t.Fatalf("%s: no Content-Length", what)
-	}
+	require.NotNil(t, length, "%s: no Content-Length", what)
 	assertPlaintextSize(t, what+" Content-Length", *length, wantLen, envelopes, envelopeTotal)
-	if contentRange == nil || *contentRange != wantCR {
-		t.Fatalf("%s Content-Range = %v, want %q", what, contentRange, wantCR)
-	}
-	if partsCount == nil || *partsCount != wantParts {
-		t.Fatalf("%s PartsCount = %v, want %d", what, partsCount, wantParts)
-	}
+	require.NotNil(t, contentRange, "%s Content-Range", what)
+	require.Equal(t, wantCR, *contentRange, "%s Content-Range", what)
+	require.NotNil(t, partsCount, "%s PartsCount", what)
+	require.Equal(t, wantParts, *partsCount, "%s PartsCount", what)
 }
 
 func assertETag(t *testing.T, what string, got *string, want string) {
 	t.Helper()
-	if got == nil {
-		t.Fatalf("%s: no ETag", what)
-	}
-	if g := strings.Trim(*got, `"`); g != want {
-		t.Fatalf("%s ETag = %q, want the plaintext-derived %q", what, g, want)
-	}
+	require.NotNil(t, got, "%s: no ETag", what)
+	g := strings.Trim(*got, `"`)
+	require.Equal(t, want, g, "%s ETag", what)
 }
 
 // TestHeadListReportPlaintextSizes: every size and ETag ingot reports comes
@@ -103,17 +92,14 @@ func TestHeadListReportPlaintextSizes(t *testing.T) {
 		pn := int32(i + 1)
 		sum := crc32cB64(data)
 		out, err := mpUploadPart(t, b, mpKey, uploadID, pn, data, func(in *s3.UploadPartInput) { in.ChecksumCRC32C = &sum })
-		if err != nil {
-			t.Fatalf("UploadPart %d: %v", pn, err)
-		}
+		require.NoError(t, err, "UploadPart %d", pn)
 		completed = append(completed, types.CompletedPart{PartNumber: &pn, ETag: out.ETag, ChecksumCRC32C: out.ChecksumCRC32C})
 		mpWhole = append(mpWhole, data...)
 		md := md5.Sum(data)
 		etagCat.Write(md[:])
 	}
-	if _, err := mpComplete(t, b, mpKey, uploadID, completed, nil); err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
+	_, err := mpComplete(t, b, mpKey, uploadID, completed, nil)
+	require.NoError(t, err, "Complete")
 	mpETag := hex.EncodeToString(etagCat.Sum(nil)) + "-2"
 
 	type object struct {
@@ -129,12 +115,8 @@ func TestHeadListReportPlaintextSizes(t *testing.T) {
 	envelopeTotal := map[string]int64{}
 	for _, o := range objects {
 		sizes, total := storedEnvelopeSizes(t, b, o.key)
-		if len(sizes) < 2 {
-			t.Fatalf("%s stored %d blobs, want several (small blob ceiling)", o.key, len(sizes))
-		}
-		if total <= int64(len(o.plaintext)) {
-			t.Fatalf("%s stored %d bytes for %d plaintext; envelopes must be larger", o.key, total, len(o.plaintext))
-		}
+		require.GreaterOrEqual(t, len(sizes), 2, "%s stored %d blobs, want several (small blob ceiling)", o.key, len(sizes))
+		require.Greater(t, total, int64(len(o.plaintext)), "%s stored %d bytes for %d plaintext; envelopes must be larger", o.key, total, len(o.plaintext))
 		envelopes[o.key], envelopeTotal[o.key] = sizes, total
 	}
 
@@ -143,16 +125,12 @@ func TestHeadListReportPlaintextSizes(t *testing.T) {
 		env, envTotal := envelopes[o.key], envelopeTotal[o.key]
 
 		head, err := b.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &bucket, Key: &o.key})
-		if err != nil {
-			t.Fatalf("HeadObject %s: %v", o.key, err)
-		}
+		require.NoError(t, err, "HeadObject %s", o.key)
 		assertPlaintextSize(t, "HEAD "+o.key+" Content-Length", *head.ContentLength, want, env, envTotal)
 		assertETag(t, "HEAD "+o.key, head.ETag, o.etag)
 
 		get, err := b.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &o.key})
-		if err != nil {
-			t.Fatalf("GetObject %s: %v", o.key, err)
-		}
+		require.NoError(t, err, "GetObject %s", o.key)
 		get.Body.Close()
 		assertPlaintextSize(t, "GET "+o.key+" Content-Length", *get.ContentLength, want, env, envTotal)
 		assertETag(t, "GET "+o.key, get.ETag, o.etag)
@@ -161,22 +139,18 @@ func TestHeadListReportPlaintextSizes(t *testing.T) {
 		// plaintext total in Content-Range.
 		rng := "bytes=10-2009"
 		rget, err := b.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &o.key, Range: &rng})
-		if err != nil {
-			t.Fatalf("GetObject %s range: %v", o.key, err)
-		}
+		require.NoError(t, err, "GetObject %s range", o.key)
 		rget.Body.Close()
 		assertPlaintextSize(t, "ranged GET "+o.key+" Content-Length", *rget.ContentLength, 2000, env, envTotal)
-		if wantCR := fmt.Sprintf("bytes 10-2009/%d", want); rget.ContentRange == nil || *rget.ContentRange != wantCR {
-			t.Fatalf("ranged GET %s Content-Range = %v, want %q", o.key, rget.ContentRange, wantCR)
-		}
+		wantCR := fmt.Sprintf("bytes 10-2009/%d", want)
+		require.NotNil(t, rget.ContentRange, "ranged GET %s Content-Range", o.key)
+		require.Equal(t, wantCR, *rget.ContentRange, "ranged GET %s Content-Range", o.key)
 
 		attrs, err := b.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
 			Bucket: &bucket, Key: &o.key,
 			ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesObjectSize, types.ObjectAttributesEtag, types.ObjectAttributesObjectParts},
 		})
-		if err != nil {
-			t.Fatalf("GetObjectAttributes %s: %v", o.key, err)
-		}
+		require.NoError(t, err, "GetObjectAttributes %s", o.key)
 		assertPlaintextSize(t, "GetObjectAttributes "+o.key+" ObjectSize", *attrs.ObjectSize, want, env, envTotal)
 		assertETag(t, "GetObjectAttributes "+o.key, attrs.ETag, o.etag)
 	}
@@ -191,35 +165,24 @@ func TestHeadListReportPlaintextSizes(t *testing.T) {
 		pn := int32(i + 1)
 		wantCR := fmt.Sprintf("bytes %d-%d/%d", offset, offset+int64(len(data))-1, len(mpWhole))
 		head, err := b.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &bucket, Key: &mpKey, PartNumber: &pn})
-		if err != nil {
-			t.Fatalf("HeadObject partNumber=%d: %v", pn, err)
-		}
+		require.NoError(t, err, "HeadObject partNumber=%d", pn)
 		assertPartHeaders(t, fmt.Sprintf("HEAD partNumber=%d", pn), head.ContentLength, head.ContentRange, head.PartsCount, int64(len(data)), wantCR, int32(len(parts)), env, envTotal)
 
 		get, err := b.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &mpKey, PartNumber: &pn})
-		if err != nil {
-			t.Fatalf("GetObject partNumber=%d: %v", pn, err)
-		}
+		require.NoError(t, err, "GetObject partNumber=%d", pn)
 		body, err := io.ReadAll(get.Body)
 		get.Body.Close()
-		if err != nil {
-			t.Fatalf("read GET partNumber=%d: %v", pn, err)
-		}
+		require.NoError(t, err, "read GET partNumber=%d", pn)
 		assertPartHeaders(t, fmt.Sprintf("GET partNumber=%d", pn), get.ContentLength, get.ContentRange, get.PartsCount, int64(len(data)), wantCR, int32(len(parts)), env, envTotal)
-		if !bytes.Equal(body, data) {
-			t.Fatalf("GET partNumber=%d returned %d bytes that are not part %d", pn, len(body), pn)
-		}
+		require.Equal(t, data, body, "GET partNumber=%d returned %d bytes that are not part %d", pn, len(body), pn)
 		offset += int64(len(data))
 	}
 	attrs, err := b.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
 		Bucket: &bucket, Key: &mpKey, ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesObjectParts},
 	})
-	if err != nil {
-		t.Fatalf("GetObjectAttributes parts: %v", err)
-	}
-	if attrs.ObjectParts == nil || len(attrs.ObjectParts.Parts) != len(parts) {
-		t.Fatalf("GetObjectAttributes ObjectParts = %+v, want %d parts", attrs.ObjectParts, len(parts))
-	}
+	require.NoError(t, err, "GetObjectAttributes parts")
+	require.NotNil(t, attrs.ObjectParts, "GetObjectAttributes ObjectParts")
+	require.Len(t, attrs.ObjectParts.Parts, len(parts), "GetObjectAttributes ObjectParts")
 	for i, p := range attrs.ObjectParts.Parts {
 		assertPlaintextSize(t, fmt.Sprintf("GetObjectAttributes part %d Size", i+1), *p.Size, int64(len(parts[i])), env, envTotal)
 	}
@@ -232,45 +195,29 @@ func TestHeadListReportPlaintextSizes(t *testing.T) {
 	check := func(what, key string, size *int64, etag *string) {
 		t.Helper()
 		o, ok := wantByKey[key]
-		if !ok {
-			t.Fatalf("%s listed unexpected key %q", what, key)
-		}
-		if size == nil {
-			t.Fatalf("%s %s: no Size", what, key)
-		}
+		require.True(t, ok, "%s listed unexpected key %q", what, key)
+		require.NotNil(t, size, "%s %s: no Size", what, key)
 		assertPlaintextSize(t, what+" "+key+" Size", *size, int64(len(o.plaintext)), envelopes[key], envelopeTotal[key])
 		assertETag(t, what+" "+key, etag, o.etag)
 	}
 
 	v1, err := b.ListObjects(ctx, &s3.ListObjectsInput{Bucket: &bucket})
-	if err != nil {
-		t.Fatalf("ListObjects: %v", err)
-	}
-	if len(v1.Contents) != len(objects) {
-		t.Fatalf("ListObjects returned %d keys, want %d", len(v1.Contents), len(objects))
-	}
+	require.NoError(t, err, "ListObjects")
+	require.Len(t, v1.Contents, len(objects), "ListObjects returned %d keys", len(v1.Contents))
 	for _, c := range v1.Contents {
 		check("ListObjects", *c.Key, c.Size, c.ETag)
 	}
 
 	v2, err := b.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bucket})
-	if err != nil {
-		t.Fatalf("ListObjectsV2: %v", err)
-	}
-	if len(v2.Contents) != len(objects) {
-		t.Fatalf("ListObjectsV2 returned %d keys, want %d", len(v2.Contents), len(objects))
-	}
+	require.NoError(t, err, "ListObjectsV2")
+	require.Len(t, v2.Contents, len(objects), "ListObjectsV2 returned %d keys", len(v2.Contents))
 	for _, c := range v2.Contents {
 		check("ListObjectsV2", *c.Key, c.Size, c.ETag)
 	}
 
 	lv, err := b.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: &bucket})
-	if err != nil {
-		t.Fatalf("ListObjectVersions: %v", err)
-	}
-	if len(lv.Versions) != len(objects) {
-		t.Fatalf("ListObjectVersions returned %d versions, want %d", len(lv.Versions), len(objects))
-	}
+	require.NoError(t, err, "ListObjectVersions")
+	require.Len(t, lv.Versions, len(objects), "ListObjectVersions returned %d versions", len(lv.Versions))
 	for _, v := range lv.Versions {
 		check("ListObjectVersions", *v.Key, v.Size, v.ETag)
 	}

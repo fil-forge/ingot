@@ -5,12 +5,12 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"strings"
 	"testing"
 
 	"github.com/fil-forge/ucantone/did"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 	cbg "github.com/whyrusleeping/cbor-gen"
 )
 
@@ -49,9 +49,7 @@ func (m *memBlocks) Get(_ context.Context, _ did.DID, c cid.Cid, out any) error 
 func blobDigest(t testing.TB, i int) mh.Multihash {
 	t.Helper()
 	d, err := mh.Sum([]byte(fmt.Sprintf("blob %d", i)), mh.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash: %v", err)
-	}
+	require.NoError(t, err, "multihash")
 	return d
 }
 
@@ -83,18 +81,12 @@ func roundTrip(t *testing.T, refs BlobRefs, sizes BlobListSizes) (Body, *memBloc
 	ctx := context.Background()
 	store := newMemBlocks()
 	list, err := BuildBlobList(ctx, store, refs, sizes)
-	if err != nil {
-		t.Fatalf("BuildBlobList: %v", err)
-	}
+	require.NoError(t, err, "BuildBlobList")
 	mf := &ObjectManifest{Key: "k", Body: Body{Size: refs.Size(), Blobs: list}}
 	var buf bytes.Buffer
-	if err := ManifestValue(mf).MarshalCBOR(&buf); err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
+	require.NoError(t, ManifestValue(mf).MarshalCBOR(&buf), "marshal")
 	var em EnvelopedManifest
-	if err := em.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
+	require.NoError(t, em.UnmarshalCBOR(bytes.NewReader(buf.Bytes())), "unmarshal")
 	return em.Manifest.Body, store, buf.Len()
 }
 
@@ -103,31 +95,21 @@ func roundTrip(t *testing.T, refs BlobRefs, sizes BlobListSizes) (Body, *memBloc
 func assertSameBlobs(t *testing.T, idx BlobIndex, want BlobRefs) {
 	t.Helper()
 	ctx := context.Background()
-	if idx.Size() != want.Size() {
-		t.Fatalf("Size = %d, want %d", idx.Size(), want.Size())
-	}
+	require.Equal(t, want.Size(), idx.Size(), "Size")
 	for _, w := range want {
 		for _, off := range []int64{w.Start, w.End} {
 			got, err := idx.Locate(ctx, off)
-			if err != nil {
-				t.Fatalf("Locate(%d): %v", off, err)
-			}
-			if got.Start != w.Start || got.End != w.End || !bytes.Equal(got.Digest, w.Digest) {
-				t.Fatalf("Locate(%d) = [%d,%d], want [%d,%d]", off, got.Start, got.End, w.Start, w.End)
-			}
+			require.NoError(t, err, "Locate(%d)", off)
+			require.Equal(t, w.Start, got.Start, "Locate(%d) = [%d,%d]", off, got.Start, got.End)
+			require.Equal(t, w.End, got.End, "Locate(%d) = [%d,%d]", off, got.Start, got.End)
+			require.True(t, bytes.Equal(got.Digest, w.Digest), "Locate(%d) = [%d,%d], want [%d,%d]", off, got.Start, got.End, w.Start, w.End)
 		}
 	}
 	digests, err := idx.Digests(ctx)
-	if err != nil {
-		t.Fatalf("Digests: %v", err)
-	}
-	if len(digests) != len(want) {
-		t.Fatalf("Digests returned %d, want %d", len(digests), len(want))
-	}
+	require.NoError(t, err, "Digests")
+	require.Len(t, digests, len(want), "Digests")
 	for i, d := range digests {
-		if !bytes.Equal(d, want[i].Digest) {
-			t.Fatalf("digest %d differs", i)
-		}
+		require.True(t, bytes.Equal(d, want[i].Digest), "digest %d differs", i)
 	}
 }
 
@@ -143,9 +125,8 @@ func TestBlobList_RoundTrip(t *testing.T) {
 			if n > 1024 {
 				wantExtents = (n - 1024 + 1023) / 1024
 			}
-			if len(body.Blobs.Head) != min(n, 1024) || len(body.Blobs.Extents) != wantExtents {
-				t.Fatalf("head %d, extents %d; want %d, %d", len(body.Blobs.Head), len(body.Blobs.Extents), min(n, 1024), wantExtents)
-			}
+			require.Len(t, body.Blobs.Head, min(n, 1024), "head")
+			require.Len(t, body.Blobs.Extents, wantExtents, "extents")
 			assertSameBlobs(t, body.Index(store, did.Undef), refs)
 		})
 	}
@@ -174,36 +155,24 @@ func TestBlobList_LargestUpload(t *testing.T) {
 	ctx := context.Background()
 	store := newMemBlocks()
 	list, err := BuildBlobList(ctx, store, refs, BlobListSizes{})
-	if err != nil {
-		t.Fatalf("BuildBlobList: %v", err)
-	}
+	require.NoError(t, err, "BuildBlobList")
 	mf := &ObjectManifest{Key: "k", Body: Body{
 		Size: refs.Size(), Blobs: list, PartSizes: partSizes, PartChecksums: partChecksums,
 		TreeBlocks: make([]byte, 32768*32),
 	}}
 	var buf bytes.Buffer
-	if err := ManifestValue(mf).MarshalCBOR(&buf); err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
+	require.NoError(t, ManifestValue(mf).MarshalCBOR(&buf), "marshal")
 	var em EnvelopedManifest
-	if err := em.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if got := len(em.Manifest.Body.PartSizes); got != parts {
-		t.Fatalf("PartSizes = %d, want %d", got, parts)
-	}
-	if got := len(em.Manifest.Body.PartChecksums); got != parts {
-		t.Fatalf("PartChecksums = %d, want %d", got, parts)
-	}
+	require.NoError(t, em.UnmarshalCBOR(bytes.NewReader(buf.Bytes())), "unmarshal")
+	require.Len(t, em.Manifest.Body.PartSizes, parts, "PartSizes")
+	require.Len(t, em.Manifest.Body.PartChecksums, parts, "PartChecksums")
 	largest := 0
 	for _, raw := range store.blocks {
 		largest = max(largest, len(raw))
 	}
 	t.Logf("manifest %d bytes (TreeBlocks 1 MiB of it), %d extents, largest extent %d bytes",
 		buf.Len(), len(list.Extents), largest)
-	if largest > 64<<10 {
-		t.Fatalf("largest extent %d bytes, want under 64 KiB", largest)
-	}
+	require.LessOrEqual(t, largest, 64<<10, "largest extent %d bytes", largest)
 	assertSameBlobs(t, em.Manifest.Body.Index(store, did.Undef), refs)
 }
 
@@ -225,15 +194,11 @@ func TestBlobIndex_LocateLoadsAtMostOneExtent(t *testing.T) {
 			want, _ := refs.Locate(ctx, off)
 			store.gets = 0
 			got, err := body.Index(store, did.Undef).Locate(ctx, off)
-			if err != nil {
-				t.Fatalf("trial %d: Locate(%d): %v", trial, off, err)
-			}
-			if got.Start != want.Start || got.End != want.End || !bytes.Equal(got.Digest, want.Digest) {
-				t.Fatalf("trial %d: Locate(%d) = [%d,%d], want [%d,%d]", trial, off, got.Start, got.End, want.Start, want.End)
-			}
-			if store.gets > 1 {
-				t.Fatalf("trial %d: Locate(%d) loaded %d blocks", trial, off, store.gets)
-			}
+			require.NoError(t, err, "trial %d: Locate(%d)", trial, off)
+			require.Equal(t, want.Start, got.Start, "trial %d: Locate(%d) = [%d,%d]", trial, off, got.Start, got.End)
+			require.Equal(t, want.End, got.End, "trial %d: Locate(%d) = [%d,%d]", trial, off, got.Start, got.End)
+			require.True(t, bytes.Equal(got.Digest, want.Digest), "trial %d: Locate(%d) = [%d,%d], want [%d,%d]", trial, off, got.Start, got.End, want.Start, want.End)
+			require.LessOrEqual(t, store.gets, 1, "trial %d: Locate(%d) loaded %d blocks", trial, off, store.gets)
 		}
 		assertSameBlobs(t, body.Index(store, did.Undef), refs)
 	}
@@ -247,13 +212,10 @@ func TestBlobIndex_SequentialReadLoadsEachExtentOnce(t *testing.T) {
 	idx := body.Index(store, did.Undef)
 	ctx := context.Background()
 	for off := int64(0); off < refs.Size(); off += 5 {
-		if _, err := idx.Locate(ctx, off); err != nil {
-			t.Fatalf("Locate(%d): %v", off, err)
-		}
+		_, err := idx.Locate(ctx, off)
+		require.NoError(t, err, "Locate(%d)", off)
 	}
-	if store.gets != 3 {
-		t.Fatalf("loaded %d extent blocks, want 3", store.gets)
-	}
+	require.Equal(t, 3, store.gets, "loaded %d extent blocks", store.gets)
 }
 
 // TestBlobIndex_Extent returns the blobs stored with the one at an offset.
@@ -263,16 +225,12 @@ func TestBlobIndex_Extent(t *testing.T) {
 	idx := body.Index(store, did.Undef)
 	for off, want := range map[int64][2]int{0: {0, 2}, 19: {0, 2}, 20: {2, 5}, 49: {2, 5}, 50: {5, 7}, 69: {5, 7}} {
 		got, err := idx.Extent(context.Background(), off)
-		if err != nil {
-			t.Fatalf("Extent(%d): %v", off, err)
-		}
-		if len(got) != want[1]-want[0] || got[0].Start != refs[want[0]].Start {
-			t.Fatalf("Extent(%d) = %d blobs from %d, want blobs %d..%d", off, len(got), got[0].Start, want[0], want[1])
-		}
+		require.NoError(t, err, "Extent(%d)", off)
+		require.Len(t, got, want[1]-want[0], "Extent(%d)", off)
+		require.Equal(t, refs[want[0]].Start, got[0].Start, "Extent(%d)", off)
 	}
-	if _, err := idx.Extent(context.Background(), 70); err == nil {
-		t.Fatal("Extent past the end: want an error")
-	}
+	_, err := idx.Extent(context.Background(), 70)
+	require.Error(t, err, "Extent past the end: want an error")
 }
 
 // TestBuildBlobList_Deterministic: the same refs give the same list and CIDs.
@@ -281,21 +239,11 @@ func TestBuildBlobList_Deterministic(t *testing.T) {
 	sizes := BlobListSizes{Head: 2, Extent: 2}
 	ctx := context.Background()
 	a, err := BuildBlobList(ctx, newMemBlocks(), refs, sizes)
-	if err != nil {
-		t.Fatalf("BuildBlobList: %v", err)
-	}
+	require.NoError(t, err, "BuildBlobList")
 	b, err := BuildBlobList(ctx, newMemBlocks(), refs, sizes)
-	if err != nil {
-		t.Fatalf("BuildBlobList: %v", err)
-	}
-	if len(a.Extents) != 4 || len(a.Extents) != len(b.Extents) {
-		t.Fatalf("extents %d and %d, want 4", len(a.Extents), len(b.Extents))
-	}
-	for i := range a.Extents {
-		if a.Extents[i] != b.Extents[i] {
-			t.Fatalf("extent %d differs: %v vs %v", i, a.Extents[i], b.Extents[i])
-		}
-	}
+	require.NoError(t, err, "BuildBlobList")
+	require.Len(t, a.Extents, 4, "extents")
+	require.Equal(t, a.Extents, b.Extents, "extents")
 }
 
 // TestBuildBlobList_Rejects a list over capacity, sizes a list cannot
@@ -305,12 +253,9 @@ func TestBuildBlobList_Rejects(t *testing.T) {
 	t.Run("over capacity", func(t *testing.T) {
 		sizes := BlobListSizes{Head: 1, Extent: 1}
 		_, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, sizes.MaxBlobs()+1, 1), sizes)
-		if err == nil || !strings.Contains(err.Error(), "at most") {
-			t.Fatalf("err = %v, want the capacity refusal", err)
-		}
-		if _, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, sizes.MaxBlobs(), 1), sizes); err != nil {
-			t.Fatalf("at capacity: %v", err)
-		}
+		require.ErrorContains(t, err, "at most")
+		_, err = BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, sizes.MaxBlobs(), 1), sizes)
+		require.NoError(t, err, "at capacity")
 	})
 	for name, sizes := range map[string]BlobListSizes{
 		"negative head":   {Head: -1},
@@ -319,16 +264,14 @@ func TestBuildBlobList_Rejects(t *testing.T) {
 		"extent too long": {Extent: 8193},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, 1, 1), sizes); err == nil {
-				t.Fatal("want an error")
-			}
+			_, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, 1, 1), sizes)
+			require.Error(t, err, "want an error")
 		})
 	}
 	t.Run("longest lists", func(t *testing.T) {
 		sizes := BlobListSizes{Head: 8192, Extent: 8192}
-		if _, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, 8192+8192, 1), sizes); err != nil {
-			t.Fatalf("lists of 8,192: %v", err)
-		}
+		_, err := BuildBlobList(ctx, newMemBlocks(), uniformRefs(t, 8192+8192, 1), sizes)
+		require.NoError(t, err, "lists of 8,192")
 	})
 	for name, refs := range map[string]BlobRefs{
 		"gap":           {{Digest: blobDigest(t, 0), Start: 0, End: 9}, {Digest: blobDigest(t, 1), Start: 11, End: 20}},
@@ -337,18 +280,16 @@ func TestBuildBlobList_Rejects(t *testing.T) {
 		"no digest":     {{Start: 0, End: 9}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := BuildBlobList(ctx, newMemBlocks(), refs, BlobListSizes{}); err == nil {
-				t.Fatal("want an error")
-			}
+			_, err := BuildBlobList(ctx, newMemBlocks(), refs, BlobListSizes{})
+			require.Error(t, err, "want an error")
 		})
 	}
 }
 
 // TestMaxBodyBlobs is the capacity at the default sizes.
 func TestMaxBodyBlobs(t *testing.T) {
-	if got := (BlobListSizes{}).MaxBlobs(); MaxBodyBlobs != got {
-		t.Fatalf("MaxBodyBlobs = %d, capacity at the default sizes %d", MaxBodyBlobs, got)
-	}
+	got := (BlobListSizes{}).MaxBlobs()
+	require.Equal(t, MaxBodyBlobs, got, "MaxBodyBlobs = %d, capacity at the default sizes %d", MaxBodyBlobs, got)
 }
 
 // TestBlobIndex_RejectsMalformedLists: every shape the writer never
@@ -359,9 +300,7 @@ func TestBlobIndex_RejectsMalformedLists(t *testing.T) {
 	d := func(i int) mh.Multihash { return blobDigest(t, i) }
 	extent := func(entries ...BlobEntry) cid.Cid {
 		c, err := store.Put(ctx, &EnvelopedBlobExtent{Extent: &BlobExtent{Entries: entries}})
-		if err != nil {
-			t.Fatalf("put extent: %v", err)
-		}
+		require.NoError(t, err, "put extent")
 		return c
 	}
 	good := extent(BlobEntry{d(2), 20}, BlobEntry{d(3), 30})
@@ -386,9 +325,8 @@ func TestBlobIndex_RejectsMalformedLists(t *testing.T) {
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
 			body := Body{Size: c.size, Blobs: c.list}
-			if _, err := body.Index(store, did.Undef).Locate(ctx, c.off); err == nil {
-				t.Fatalf("Locate(%d): want an error", c.off)
-			}
+			_, err := body.Index(store, did.Undef).Locate(ctx, c.off)
+			require.Error(t, err, "Locate(%d): want an error", c.off)
 		})
 	}
 }
@@ -408,68 +346,50 @@ func TestManifestV0_DecodesAsCurrent(t *testing.T) {
 		},
 	}
 	var buf bytes.Buffer
-	if err := (&ValueUnion{ManifestV0: v0}).MarshalCBOR(&buf); err != nil {
-		t.Fatalf("marshal /0: %v", err)
-	}
-	if !bytes.Contains(buf.Bytes(), []byte("/objectmanifest/0")) {
-		t.Fatal("block does not carry the /0 key")
-	}
+	require.NoError(t, (&ValueUnion{ManifestV0: v0}).MarshalCBOR(&buf), "marshal /0")
+	require.True(t, bytes.Contains(buf.Bytes(), []byte("/objectmanifest/0")), "block does not carry the /0 key")
 	var val ObjectValue
-	if err := val.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if val.ManifestV0 != nil || val.Manifest == nil {
-		t.Fatalf("decoded arms: v0 %v, manifest %v; want only the manifest", val.ManifestV0 != nil, val.Manifest != nil)
-	}
+	require.NoError(t, val.UnmarshalCBOR(bytes.NewReader(buf.Bytes())), "unmarshal")
+	require.Nil(t, val.ManifestV0, "decoded arms")
+	require.NotNil(t, val.Manifest, "decoded arms")
 	mf := val.Manifest
-	if mf.Key != "k" || mf.ETag != "abc-3" || mf.Seq != 4 || mf.ChecksumType != "COMPOSITE" ||
-		mf.CacheControl != "no-cache" || mf.Metadata["a"] != "b" || !mf.Plaintext ||
-		mf.Body.TreeChunkLog != 4 || len(mf.Body.PartChecksums) != 2 || mf.Body.PartSizes[1] != 50 {
-		t.Fatalf("decoded manifest = %+v", mf)
-	}
-	if len(mf.Body.Blobs.Extents) != 0 {
-		t.Fatalf("a /0 list has %d extents, want none", len(mf.Body.Blobs.Extents))
-	}
+	require.Equal(t, "k", mf.Key, "decoded manifest = %+v", mf)
+	require.Equal(t, "abc-3", mf.ETag, "decoded manifest = %+v", mf)
+	require.Equal(t, uint64(4), mf.Seq, "decoded manifest = %+v", mf)
+	require.Equal(t, "COMPOSITE", mf.ChecksumType, "decoded manifest = %+v", mf)
+	require.Equal(t, "no-cache", mf.CacheControl, "decoded manifest = %+v", mf)
+	require.Equal(t, "b", mf.Metadata["a"], "decoded manifest = %+v", mf)
+	require.True(t, mf.Plaintext, "decoded manifest = %+v", mf)
+	require.Equal(t, uint8(4), mf.Body.TreeChunkLog, "decoded manifest = %+v", mf)
+	require.Len(t, mf.Body.PartChecksums, 2, "decoded manifest = %+v", mf)
+	require.Equal(t, int64(50), mf.Body.PartSizes[1], "decoded manifest = %+v", mf)
+	require.Empty(t, mf.Body.Blobs.Extents, "a /0 list has %d extents", len(mf.Body.Blobs.Extents))
 	assertSameBlobs(t, mf.Body.Index(newMemBlocks(), did.Undef), refs)
 
 	var em EnvelopedManifest
-	if err := em.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err != nil || em.Manifest.Key != "k" {
-		t.Fatalf("EnvelopedManifest over /0: %v", err)
-	}
+	err := em.UnmarshalCBOR(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err, "EnvelopedManifest over /0")
+	require.Equal(t, "k", em.Manifest.Key, "EnvelopedManifest over /0")
 }
 
 // TestManifestV0_NotWritten: the /0 arm is decode-only.
 func TestManifestV0_NotWritten(t *testing.T) {
 	val := &ObjectValue{ValueUnion{ManifestV0: &ObjectManifestV0{Key: "k"}}}
-	if err := val.MarshalCBOR(&bytes.Buffer{}); err == nil {
-		t.Fatal("marshal of a /0 value: want an error")
-	}
+	require.Error(t, val.MarshalCBOR(&bytes.Buffer{}), "marshal of a /0 value: want an error")
 }
 
 // TestBlobExtent_UnionKeys: an extent block carries its own key and decodes
 // only as an extent.
 func TestBlobExtent_UnionKeys(t *testing.T) {
 	var ext bytes.Buffer
-	if err := (&EnvelopedBlobExtent{Extent: &BlobExtent{Entries: []BlobEntry{{blobDigest(t, 0), 0}}}}).MarshalCBOR(&ext); err != nil {
-		t.Fatalf("marshal extent: %v", err)
-	}
-	if !bytes.Contains(ext.Bytes(), []byte("/blobextent/0")) {
-		t.Fatal("extent block does not carry its union key")
-	}
+	require.NoError(t, (&EnvelopedBlobExtent{Extent: &BlobExtent{Entries: []BlobEntry{{blobDigest(t, 0), 0}}}}).MarshalCBOR(&ext), "marshal extent")
+	require.True(t, bytes.Contains(ext.Bytes(), []byte("/blobextent/0")), "extent block does not carry its union key")
 	var val ObjectValue
-	if err := val.UnmarshalCBOR(bytes.NewReader(ext.Bytes())); err == nil {
-		t.Fatal("extent decoded as a value block")
-	}
+	require.Error(t, val.UnmarshalCBOR(bytes.NewReader(ext.Bytes())), "extent decoded as a value block")
 
 	var mf bytes.Buffer
-	if err := ManifestValue(&ObjectManifest{Key: "k"}).MarshalCBOR(&mf); err != nil {
-		t.Fatalf("marshal manifest: %v", err)
-	}
+	require.NoError(t, ManifestValue(&ObjectManifest{Key: "k"}).MarshalCBOR(&mf), "marshal manifest")
 	var env EnvelopedBlobExtent
-	if err := env.UnmarshalCBOR(bytes.NewReader(mf.Bytes())); err == nil {
-		t.Fatal("manifest decoded as an extent")
-	}
-	if err := (&EnvelopedBlobExtent{}).MarshalCBOR(&bytes.Buffer{}); err == nil {
-		t.Fatal("marshal of an empty extent envelope: want an error")
-	}
+	require.Error(t, env.UnmarshalCBOR(bytes.NewReader(mf.Bytes())), "manifest decoded as an extent")
+	require.Error(t, (&EnvelopedBlobExtent{}).MarshalCBOR(&bytes.Buffer{}), "marshal of an empty extent envelope: want an error")
 }

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -19,6 +18,8 @@ import (
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/taskrunner"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestFootprintDisk: each entry at the top of the data directory reports its
@@ -32,24 +33,14 @@ func TestFootprintDisk(t *testing.T) {
 		"tokens.cbor":             3,
 	} {
 		path := filepath.Join(dir, name)
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, make([]byte, size), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, make([]byte, size), 0o644))
 	}
-	if err := os.Mkdir(filepath.Join(dir, "spool"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("tokens.cbor", filepath.Join(dir, "link")); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "spool"), 0o755))
+	require.NoError(t, os.Symlink("tokens.cbor", filepath.Join(dir, "link")))
 
 	got, err := diskUsage(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	want := diskFootprint{
 		Entries: []diskEntry{
 			{Name: "cache", diskFigures: diskFigures{Files: 1, Bytes: 20}},
@@ -60,13 +51,10 @@ func TestFootprintDisk(t *testing.T) {
 		},
 		Total: diskFigures{Files: 4, Bytes: 38},
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("diskUsage = %+v, want %+v", got, want)
-	}
+	require.Equal(t, want, got, "diskUsage")
 
-	if _, err := diskUsage(filepath.Join(dir, "missing")); err == nil {
-		t.Fatal("diskUsage of a missing data directory succeeded")
-	}
+	_, err = diskUsage(filepath.Join(dir, "missing"))
+	require.Error(t, err, "diskUsage of a missing data directory succeeded")
 }
 
 // TestFootprintPostgres: the report lists the ingot schema's tables, the
@@ -81,21 +69,13 @@ func TestFootprintPostgres(t *testing.T) {
 		PollInterval: 10 * time.Millisecond,
 		Logger:       zaptest.NewLogger(t),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Migrate(ctx); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+	require.NoError(t, r.Migrate(ctx))
 
 	// Before any release: no timings.
 	before, err := footprint(ctx, pool, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if before.Releases != (releaseFootprint{}) {
-		t.Fatalf("releases before any ran = %+v, want none", before.Releases)
-	}
+	require.NoError(t, err)
+	require.Zero(t, before.Releases, "releases before any ran")
 
 	err = r.Handle(spaceshardqueue.Name, spaceshardqueue.ReleaseAction,
 		func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
@@ -107,24 +87,17 @@ func TestFootprintPostgres(t *testing.T) {
 			}
 			return []byte(spaceshardqueue.ReleasedResult), nil
 		})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	// A release due at once, as a commit with no grace queues it, waits
 	// before the runner starts, so it runs that long behind.
 	const wait = 200 * time.Millisecond
 	dueNow := registry.DueNow()
 	late, err := r.Submit(ctx, taskrunner.Spec{Queue: spaceshardqueue.Name, Subject: "released-late", Action: spaceshardqueue.ReleaseAction, NotBefore: &dueNow})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	time.Sleep(wait)
-	if err := r.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Wait(ctx, spaceshardqueue.Name, late); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, r.Start(ctx))
+	_, err = r.Wait(ctx, spaceshardqueue.Name, late)
+	require.NoError(t, err)
 	// Two more wait out a grace, so their time from queued to finished is at
 	// least that, and they run hardly behind.
 	const grace = 300 * time.Millisecond
@@ -135,56 +108,48 @@ func TestFootprintPostgres(t *testing.T) {
 			spec.NotBefore = &due
 		}
 		id, err := r.Submit(ctx, spec)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := r.Wait(ctx, spaceshardqueue.Name, id); err != nil && subject != "broken" {
-			t.Fatalf("release %s: %v", subject, err)
+		require.NoError(t, err)
+		_, err = r.Wait(ctx, spaceshardqueue.Name, id)
+		if subject != "broken" {
+			require.NoError(t, err, "release %s", subject)
 		}
 	}
-	if err := r.Stop(ctx); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, r.Stop(ctx))
 	// With the runner stopped, one release due at once has been due for the
 	// wait, and one waits out its grace.
 	later, dueAgain := time.Now().Add(time.Hour), registry.DueNow()
 	for subject, notBefore := range map[string]*time.Time{"due": &dueAgain, "waiting": &later} {
-		if _, err := r.Submit(ctx, taskrunner.Spec{Queue: spaceshardqueue.Name, Subject: subject, Action: spaceshardqueue.ReleaseAction, NotBefore: notBefore}); err != nil {
-			t.Fatal(err)
-		}
+		_, err = r.Submit(ctx, taskrunner.Spec{Queue: spaceshardqueue.Name, Subject: subject, Action: spaceshardqueue.ReleaseAction, NotBefore: notBefore})
+		require.NoError(t, err)
 	}
 	time.Sleep(wait)
 
 	report, err := footprint(ctx, pool, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	rel := report.Releases
-	if rel.Released != 3 || rel.Pending != 2 || rel.Due != 1 || rel.Failed != 1 {
-		t.Errorf("releases = %+v, want 3 released, 2 pending, 1 due, 1 failed", rel)
-	}
+	assert.Equal(t, int64(3), rel.Released, "released")
+	assert.Equal(t, int64(2), rel.Pending, "pending")
+	assert.Equal(t, int64(1), rel.Due, "due")
+	assert.Equal(t, int64(1), rel.Failed, "failed")
 	ordered := func(s *releaseSeconds) bool {
 		return s != nil && s.P50 >= 0 && s.P50 <= s.P90 && s.P90 <= s.P99 && s.P99 <= s.Max
 	}
 	// Allow for the database's clock and the test's to differ a little.
 	const slack = 50 * time.Millisecond
 	took, lag := rel.Seconds, rel.LagSeconds
-	if !ordered(took) || took.P50 < (grace-slack).Seconds() {
-		t.Errorf("release seconds = %+v, want ordered quantiles of at least the %v grace", took, grace)
-	}
+	assert.True(t, ordered(took) && took.P50 >= (grace-slack).Seconds(),
+		"release seconds = %+v, want ordered quantiles of at least the %v grace", took, grace)
 	// The late release ran the wait behind, and no lag outruns the time
 	// from queued to finished. The others ran hardly behind.
-	if !ordered(lag) || took == nil || lag.Max < (wait-slack).Seconds() || lag.Max > took.Max+slack.Seconds() || lag.P50 > (grace-slack).Seconds() {
-		t.Errorf("release lag = %+v, want ordered quantiles up to the %v wait, none above %+v", lag, wait, took)
-	}
+	assert.True(t, ordered(lag) && took != nil && lag.Max >= (wait-slack).Seconds() && lag.Max <= took.Max+slack.Seconds() && lag.P50 <= (grace-slack).Seconds(),
+		"release lag = %+v, want ordered quantiles up to the %v wait, none above %+v", lag, wait, took)
 	// The report's own queries take some of the headroom. It must stay under
 	// the second registry.DueNow sets a release back, or measuring from that
 	// time instead of from when it was queued would pass too.
 	const headroom = 500 * time.Millisecond
-	if rel.OldestDueSeconds < (wait-slack).Seconds() || rel.OldestDueSeconds > (wait+headroom).Seconds() {
-		t.Errorf("oldest due = %v seconds, want about the %v wait", rel.OldestDueSeconds, wait)
-	}
+	assert.GreaterOrEqual(t, rel.OldestDueSeconds, (wait - slack).Seconds(), "oldest due seconds")
+	assert.LessOrEqual(t, rel.OldestDueSeconds, (wait + headroom).Seconds(), "oldest due seconds")
 
 	pg := report.Postgres
 	var names []string
@@ -192,24 +157,15 @@ func TestFootprintPostgres(t *testing.T) {
 	for _, tb := range pg.Tables {
 		names = append(names, tb.Name)
 		sum += tb.TotalBytes
-		if tb.TotalBytes != tb.TableBytes+tb.IndexBytes {
-			t.Errorf("table %s: total %d bytes, want table %d + indexes %d", tb.Name, tb.TotalBytes, tb.TableBytes, tb.IndexBytes)
-		}
+		assert.Equal(t, tb.TableBytes+tb.IndexBytes, tb.TotalBytes, "table %s: total %d bytes", tb.Name, tb.TotalBytes)
 	}
 	for _, name := range []string{"buckets", "queue_space_shard_tasks", "queue_space_shard_leases"} {
-		if !slices.Contains(names, name) {
-			t.Errorf("tables %v lack %s", names, name)
-		}
+		assert.True(t, slices.Contains(names, name), "tables %v lack %s", names, name)
 	}
-	if pg.SchemaBytes != sum || pg.SchemaBytes <= 0 {
-		t.Errorf("schema bytes = %d, want the tables' %d", pg.SchemaBytes, sum)
-	}
-	if pg.DatabaseBytes < pg.SchemaBytes {
-		t.Errorf("database bytes = %d, want at least the schema's %d", pg.DatabaseBytes, pg.SchemaBytes)
-	}
-	if pg.WALBytes <= before.Postgres.WALBytes {
-		t.Errorf("WAL position %d did not move on from %d", pg.WALBytes, before.Postgres.WALBytes)
-	}
+	assert.Equal(t, sum, pg.SchemaBytes, "schema bytes")
+	assert.Positive(t, pg.SchemaBytes, "schema bytes")
+	assert.GreaterOrEqual(t, pg.DatabaseBytes, pg.SchemaBytes, "database bytes = %d, want at least the schema's %d", pg.DatabaseBytes, pg.SchemaBytes)
+	assert.Greater(t, pg.WALBytes, before.Postgres.WALBytes, "WAL position %d did not move on from %d", pg.WALBytes, before.Postgres.WALBytes)
 }
 
 // TestFootprintJSON: the report carries the field names the command's help
@@ -220,13 +176,9 @@ func TestFootprintJSON(t *testing.T) {
 		Disk:     diskFootprint{Entries: []diskEntry{{}}},
 		Releases: releaseFootprint{Seconds: &releaseSeconds{}, LagSeconds: &releaseSeconds{}},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	var got map[string]any
-	if err := json.Unmarshal(b, &got); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, json.Unmarshal(b, &got))
 	want := map[string][]string{
 		"":                     {"time", "postgres", "disk", "releases"},
 		"postgres":             {"database_bytes", "wal_bytes", "schema_bytes", "tables"},
@@ -241,13 +193,10 @@ func TestFootprintJSON(t *testing.T) {
 	for path, keys := range want {
 		obj := lookup(t, got, path)
 		for _, k := range keys {
-			if _, ok := obj[k]; !ok {
-				t.Errorf("%s has no %q: %v", path, k, obj)
-			}
+			_, ok := obj[k]
+			assert.True(t, ok, "%s has no %q: %v", path, k, obj)
 		}
-		if len(obj) != len(keys) {
-			t.Errorf("%s has %d fields, want %v", path, len(obj), keys)
-		}
+		assert.Len(t, obj, len(keys), "%s has %d fields", path, len(obj))
 	}
 }
 
@@ -261,18 +210,14 @@ func lookup(t *testing.T, v map[string]any, path string) map[string]any {
 	cur := any(v)
 	for _, k := range strings.Split(path, ".") {
 		m, ok := cur.(map[string]any)
-		if !ok {
-			t.Fatalf("%s: %v is not an object", path, cur)
-		}
+		require.True(t, ok, "%s: %v is not an object", path, cur)
 		cur = m[k]
 		if a, ok := cur.([]any); ok && len(a) > 0 {
 			cur = a[0]
 		}
 	}
 	m, ok := cur.(map[string]any)
-	if !ok {
-		t.Fatalf("%s: %v is not an object", path, cur)
-	}
+	require.True(t, ok, "%s: %v is not an object", path, cur)
 	return m
 }
 
@@ -285,22 +230,14 @@ func TestFootprintCommand(t *testing.T) {
 		Queues: []taskrunner.QueueOptions{{Name: spaceshardqueue.Name}},
 		Logger: zaptest.NewLogger(t),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Migrate(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+	require.NoError(t, r.Migrate(context.Background()))
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "data")
-	if err := os.MkdirAll(filepath.Join(dataDir, "segments"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.MkdirAll(filepath.Join(dataDir, "segments"), 0o755))
 	execute := func(config string) (string, error) {
 		path := filepath.Join(dir, "config.yaml")
-		if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.WriteFile(path, []byte(config), 0o600))
 		root := newRootCmd()
 		var out bytes.Buffer
 		root.SetOut(&out)
@@ -311,20 +248,16 @@ func TestFootprintCommand(t *testing.T) {
 	}
 
 	out, err := execute("data_dir: " + dataDir + "\npostgres_dsn: " + dsn + "\n")
-	if err != nil {
-		t.Fatalf("footprint: %v\n%s", err, out)
-	}
+	require.NoError(t, err, "footprint: %v\n%s", err, out)
 	var report footprintReport
-	if err := json.Unmarshal([]byte(out), &report); err != nil {
-		t.Fatalf("footprint printed %q: %v", out, err)
-	}
-	if len(report.Postgres.Tables) == 0 || len(report.Disk.Entries) != 1 || report.Disk.Entries[0].Name != "segments" {
-		t.Errorf("footprint = %+v, want the schema's tables and the segments directory", report)
+	require.NoError(t, json.Unmarshal([]byte(out), &report), "footprint printed %q", out)
+	assert.NotEmpty(t, report.Postgres.Tables, "footprint")
+	if assert.Len(t, report.Disk.Entries, 1, "footprint") {
+		assert.Equal(t, "segments", report.Disk.Entries[0].Name, "footprint")
 	}
 
-	if _, err := execute("postgres_dsn: " + dsn + "\n"); err == nil || !strings.Contains(err.Error(), "needs data_dir") {
-		t.Errorf("footprint without data_dir: %v, want a refusal", err)
-	}
+	_, err = execute("postgres_dsn: " + dsn + "\n")
+	assert.ErrorContains(t, err, "needs data_dir", "footprint without data_dir")
 }
 
 // TestDevCommandsListed: the measurement commands are left out of the help
@@ -336,9 +269,7 @@ func TestDevCommandsListed(t *testing.T) {
 		var out bytes.Buffer
 		root.SetOut(&out)
 		root.SetArgs([]string{"--help"})
-		if err := root.Execute(); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, root.Execute())
 		return out.String()
 	}
 	listed := func(out, name string) bool {
@@ -354,21 +285,15 @@ func TestDevCommandsListed(t *testing.T) {
 		t.Setenv(devCommandsEnv, value)
 		out := help()
 		for _, name := range []string{"catalog", "footprint"} {
-			if listed(out, name) {
-				t.Errorf("%s=%q: help lists %s:\n%s", devCommandsEnv, value, name, out)
-			}
+			assert.False(t, listed(out, name), "%s=%q: help lists %s:\n%s", devCommandsEnv, value, name, out)
 		}
-		if !listed(out, "serve") {
-			t.Errorf("%s=%q: help lacks serve:\n%s", devCommandsEnv, value, out)
-		}
+		assert.True(t, listed(out, "serve"), "%s=%q: help lacks serve:\n%s", devCommandsEnv, value, out)
 	}
 
 	t.Setenv(devCommandsEnv, "1")
 	out := help()
 	for _, name := range []string{"catalog", "footprint"} {
-		if !listed(out, name) {
-			t.Errorf("%s=1: help lacks %s:\n%s", devCommandsEnv, name, out)
-		}
+		assert.True(t, listed(out, name), "%s=1: help lacks %s:\n%s", devCommandsEnv, name, out)
 	}
 
 	t.Setenv(devCommandsEnv, "")
@@ -377,8 +302,7 @@ func TestDevCommandsListed(t *testing.T) {
 		var out bytes.Buffer
 		root.SetOut(&out)
 		root.SetArgs(args)
-		if err := root.Execute(); err != nil || !strings.Contains(out.String(), "as JSON") {
-			t.Errorf("ingot %v while unlisted: %v\n%s", args, err, out.String())
-		}
+		assert.NoError(t, root.Execute(), "ingot %v while unlisted", args)
+		assert.Contains(t, out.String(), "as JSON", "ingot %v while unlisted", args)
 	}
 }

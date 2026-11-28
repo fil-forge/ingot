@@ -17,6 +17,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // loadForValidation loads buckets of 50 bulk and 2 real objects each and
@@ -25,9 +27,8 @@ func loadForValidation(t *testing.T, f *fakeS3, buckets int) Config {
 	t.Helper()
 	cfg := testConfig(t, buckets, 50)
 	cfg.RealEvery = 20
-	if _, err := Load(t.Context(), f, cfg); err != nil {
-		t.Fatal(err)
-	}
+	_, err := Load(t.Context(), f, cfg)
+	require.NoError(t, err)
 	return cfg
 }
 
@@ -57,32 +58,31 @@ func TestValidateChecksALoadedCatalog(t *testing.T) {
 	cfg := validateConfig(load)
 	cfg.Progress = &progress
 	r, err := Validate(t.Context(), f, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Failures != 0 {
-		t.Fatalf("%d failures: %v", r.Failures, r.FailureSample)
-	}
+	require.NoError(t, err)
+	require.Zero(t, r.Failures, "%d failures: %v", r.Failures, r.FailureSample)
 	// 52 objects a bucket at seven a page is eight pages.
 	for op, want := range map[string]uint64{OpGetRange: 6, OpHead: 15, OpListPage: 16, OpPut: 15, OpDelete: 15, OpPutReal: 4, OpDeleteReal: 4} {
-		if got := r.Latency[op].Count; got != want {
-			t.Errorf("%s: %d timed, want %d", op, got, want)
-		}
+		got := r.Latency[op].Count
+		assert.Equal(t, want, got, "%s: %d timed", op, got)
 	}
-	if len(r.Lists) != 2 || r.Lists[0].Bucket != load.Buckets[0] || r.Lists[0].Objects != 52 || r.Lists[1].Pages != 8 ||
-		r.Lists[0].Missing != 0 || r.Lists[0].Extra != 0 || !r.Lists[0].Complete {
-		t.Fatalf("lists %+v", r.Lists)
-	}
-	if p := r.Point; p.Buckets != 3 || p.MinBulk != 50 || p.MaxBulk != 50 || p.Real != 6 {
-		t.Fatalf("test point %+v", p)
-	}
-	if !slices.Equal(r.Steps, ValidateSteps) || r.Interrupted || len(r.WriteRun) != 16 {
-		t.Fatalf("steps %v, interrupted %v, write run %q", r.Steps, r.Interrupted, r.WriteRun)
-	}
+	require.Len(t, r.Lists, 2, "lists %+v", r.Lists)
+	require.Equal(t, load.Buckets[0], r.Lists[0].Bucket, "lists %+v", r.Lists)
+	require.Equal(t, uint64(52), r.Lists[0].Objects, "lists %+v", r.Lists)
+	require.Equal(t, 8, r.Lists[1].Pages, "lists %+v", r.Lists)
+	require.Zero(t, r.Lists[0].Missing, "lists %+v", r.Lists)
+	require.Zero(t, r.Lists[0].Extra, "lists %+v", r.Lists)
+	require.True(t, r.Lists[0].Complete, "lists %+v", r.Lists)
+	p := r.Point
+	require.Equal(t, 3, p.Buckets, "test point %+v", p)
+	require.Equal(t, uint64(50), p.MinBulk, "test point %+v", p)
+	require.Equal(t, uint64(50), p.MaxBulk, "test point %+v", p)
+	require.Equal(t, uint64(6), p.Real, "test point %+v", p)
+	require.True(t, slices.Equal(r.Steps, ValidateSteps), "steps %v, interrupted %v, write run %q", r.Steps, r.Interrupted, r.WriteRun)
+	require.False(t, r.Interrupted, "steps %v, interrupted %v, write run %q", r.Steps, r.Interrupted, r.WriteRun)
+	require.Len(t, r.WriteRun, 16, "steps %v, interrupted %v, write run %q", r.Steps, r.Interrupted, r.WriteRun)
 	// A line per step, and one as the write step starts.
-	if lines := strings.Count(progress.String(), "\n"); lines != len(ValidateSteps)+1 || !strings.Contains(progress.String(), "run "+r.WriteRun) {
-		t.Fatalf("progress %q", progress.String())
-	}
+	require.Equal(t, len(ValidateSteps)+1, strings.Count(progress.String(), "\n"), "progress lines: %q", progress.String())
+	require.Contains(t, progress.String(), "run "+r.WriteRun, "progress")
 	// The objects the validation wrote are gone, and nothing else changed.
 	st := readTestState(t, load)
 	for _, b := range load.Buckets {
@@ -128,35 +128,29 @@ func TestValidateWritesRealObjects(t *testing.T) {
 	for range 2 {
 		rec := &realPuts{fakeS3: f}
 		r, err := Validate(t.Context(), rec, cfg)
-		if err != nil || r.Failures != 0 {
-			t.Fatalf("validate: %v, failures %v", err, r.FailureSample)
-		}
+		require.NoError(t, err, "validate: %v, failures %v", err, r.FailureSample)
+		require.Zero(t, r.Failures, "validate: %v, failures %v", err, r.FailureSample)
 		slices.SortFunc(rec.puts, func(a, b realPut) int { return strings.Compare(a.bucket, b.bucket) })
 		var buckets []string
 		for _, p := range rec.puts {
 			buckets = append(buckets, p.bucket)
 			// The fake checks the body against its checksum, so a key that
 			// ends in the checksum names the body's digest.
-			if !keyRE.MatchString(p.key) || !strings.HasSuffix(p.key, p.sum) || p.size < load.RealMinSize || p.size > load.RealMaxSize {
-				t.Errorf("real object %s/%s of %d bytes", p.bucket, p.key, p.size)
-			}
+			assert.Regexp(t, keyRE, p.key, "real object %s/%s", p.bucket, p.key)
+			assert.True(t, strings.HasSuffix(p.key, p.sum), "real object %s/%s does not end in its checksum %s", p.bucket, p.key, p.sum)
+			assert.GreaterOrEqual(t, p.size, load.RealMinSize, "real object %s/%s size", p.bucket, p.key)
+			assert.LessOrEqual(t, p.size, load.RealMaxSize, "real object %s/%s size", p.bucket, p.key)
 			for _, o := range st.Buckets[p.bucket].Real {
-				if o.Key == p.key {
-					t.Errorf("wrote the load's object %s/%s", p.bucket, p.key)
-				}
+				assert.NotEqual(t, p.key, o.Key, "wrote the load's object %s/%s", p.bucket, p.key)
 			}
-			if runs[p.key] {
-				t.Errorf("wrote %s/%s on an earlier run too", p.bucket, p.key)
-			}
+			assert.False(t, runs[p.key], "wrote %s/%s on an earlier run too", p.bucket, p.key)
 			runs[p.key] = true
 		}
 		b := load.Buckets
-		if want := []string{b[0], b[0], b[1], b[2]}; !slices.Equal(buckets, want) {
-			t.Errorf("real objects went to %v, want %v", buckets, want)
-		}
-		if !strings.Contains(progress.String(), OpPutReal+" 4") || !strings.Contains(progress.String(), OpDeleteReal+" 4") {
-			t.Errorf("progress %q", progress.String())
-		}
+		want := []string{b[0], b[0], b[1], b[2]}
+		assert.True(t, slices.Equal(buckets, want), "real objects went to %v, want %v", buckets, want)
+		assert.Contains(t, progress.String(), OpPutReal+" 4", "progress")
+		assert.Contains(t, progress.String(), OpDeleteReal+" 4", "progress")
 	}
 	for _, b := range load.Buckets {
 		checkBucket(t, f, load, b, 50, st.Buckets[b])
@@ -195,18 +189,14 @@ func TestValidateReadsTheSameSampleAgain(t *testing.T) {
 		cfg.Sample = sample
 		cfg.Steps = []string{StepGet, StepHead}
 		r, err := Validate(t.Context(), rec, cfg)
-		if err != nil || r.Failures != 0 {
-			t.Fatalf("validate: %v, report %+v", err, r)
-		}
+		require.NoError(t, err, "validate: %v, report %+v", err, r)
+		require.Zero(t, r.Failures, "validate: %v, report %+v", err, r)
 		return rec.reads
 	}
 	cold, warm := reads("a"), reads("a")
-	if len(cold) != 14 || !maps.Equal(cold, warm) {
-		t.Fatalf("two runs with one sample read %d and %d requests, the same: %v", len(cold), len(warm), maps.Equal(cold, warm))
-	}
-	if maps.Equal(cold, reads("b")) {
-		t.Fatal("another sample read the same objects and ranges")
-	}
+	require.Len(t, cold, 14, "requests one sample read")
+	require.True(t, maps.Equal(cold, warm), "two runs with one sample read different requests")
+	require.False(t, maps.Equal(cold, reads("b")), "another sample read the same objects and ranges")
 }
 
 // keepingDeletes acknowledges deletes without applying them.
@@ -231,9 +221,7 @@ func TestValidateFindsWrongAnswers(t *testing.T) {
 	cfg.Samples = 50 // every bulk object
 	cfg.RangeSize = 1 << 30
 	r, err := Validate(t.Context(), keepingDeletes{f}, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	all := strings.Join(r.FailureSample, "\n")
 	for _, want := range []string{
 		"not the ones written",
@@ -242,14 +230,11 @@ func TestValidateFindsWrongAnswers(t *testing.T) {
 		fmt.Sprintf("list %s: %s is missing", b, BulkKey(load.KeyPrefix, load.Seed, b, 7)),
 		"after its delete: still there",
 	} {
-		if !strings.Contains(all, want) {
-			t.Errorf("no failure says %q in:\n%s", want, all)
-		}
+		assert.Contains(t, all, want, "no failure says %q in:\n%s", want, all)
 	}
 	// One read, two heads, one listing, and every written object kept.
-	if want := uint64(4 + cfg.Samples + cfg.WriteReal); r.Failures != want {
-		t.Fatalf("%d failures, want %d:\n%s", r.Failures, want, all)
-	}
+	want := uint64(4 + cfg.Samples + cfg.WriteReal)
+	require.Equal(t, want, r.Failures, "%d failures", r.Failures)
 }
 
 func TestValidateDeletesWhatItWroteWhenPutsFail(t *testing.T) {
@@ -271,18 +256,15 @@ func TestValidateDeletesWhatItWroteWhenPutsFail(t *testing.T) {
 	cfg := validateConfig(load)
 	cfg.Steps = []string{StepWrite}
 	r, err := Validate(t.Context(), f, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	// Half of the 14 PUTs fail, and all 14 objects get a delete.
 	timed := r.Latency[OpPut].Count + r.Latency[OpPutReal].Count
-	if r.Failures != 7 || timed != 7 || r.Latency[OpDelete].Count != 10 || r.Latency[OpDeleteReal].Count != 4 {
-		t.Fatalf("failures %d, puts %d, deletes %d and %d", r.Failures, timed, r.Latency[OpDelete].Count, r.Latency[OpDeleteReal].Count)
-	}
+	require.Equal(t, uint64(7), r.Failures, "failures")
+	require.Equal(t, uint64(7), timed, "timed puts")
+	require.Equal(t, uint64(10), r.Latency[OpDelete].Count, "bulk deletes")
+	require.Equal(t, uint64(4), r.Latency[OpDeleteReal].Count, "real deletes")
 	for _, b := range load.Buckets {
-		if !maps.Equal(f.objects(b), before[b]) {
-			t.Fatalf("%s changed", b)
-		}
+		require.True(t, maps.Equal(f.objects(b), before[b]), "%s changed", b)
 	}
 }
 
@@ -347,28 +329,25 @@ func TestValidateInterruptedWriteLeavesNothing(t *testing.T) {
 			cfg.Progress = &progress
 			client := newCtxS3(f)
 			r, err := Validate(ctx, client, cfg)
-			if err == nil || !r.Interrupted || !slices.Equal(r.Steps, []string{StepHead}) || r.WriteRun == "" || r.Failures != 0 {
-				t.Fatalf("interrupted write: %v, report %+v", err, r)
-			}
+			require.Error(t, err, "interrupted write: %v, report %+v", err, r)
+			require.True(t, r.Interrupted, "interrupted write: %v, report %+v", err, r)
+			require.True(t, slices.Equal(r.Steps, []string{StepHead}), "interrupted write: %v, report %+v", err, r)
+			require.NotEmpty(t, r.WriteRun, "interrupted write: %v, report %+v", err, r)
+			require.Zero(t, r.Failures, "interrupted write: %v, report %+v", err, r)
 			// No PUT goes out after the interrupt, and each one sent gets a
 			// delete.
 			want := int64(tc.cancelAt)
-			if puts, deletes := client.puts.Load(), client.deletes.Load(); puts != want || deletes != want {
-				t.Fatalf("%d PUTs and %d deletes, want %d of each", puts, deletes, want)
-			}
-			if got := r.Latency[OpDeleteReal].Count; got != tc.real {
-				t.Fatalf("%d real objects deleted, want %d", got, tc.real)
-			}
+			puts, deletes := client.puts.Load(), client.deletes.Load()
+			require.Equal(t, want, puts, "%d PUTs and %d deletes", puts, deletes)
+			require.Equal(t, want, deletes, "%d PUTs and %d deletes", puts, deletes)
+			got := r.Latency[OpDeleteReal].Count
+			require.Equal(t, tc.real, got, "%d real objects deleted", got)
 			out := progress.String()
 			for _, want := range []string{"run " + r.WriteRun, "interrupt again to stop at once", fmt.Sprintf("deleting the %d objects whose PUT was sent", tc.cancelAt)} {
-				if !strings.Contains(out, want) {
-					t.Fatalf("progress %q lacks %q", out, want)
-				}
+				require.Contains(t, out, want, "progress %q lacks %q", out, want)
 			}
 			for _, b := range load.Buckets {
-				if !maps.Equal(f.objects(b), before[b]) {
-					t.Fatalf("%s: %d objects left, want %d", b, len(f.objects(b)), len(before[b]))
-				}
+				require.True(t, maps.Equal(f.objects(b), before[b]), "%s: objects left differ from those before", b)
 			}
 		})
 	}
@@ -399,9 +378,9 @@ func TestValidateCountsAnInterruptDuringTheLastRequests(t *testing.T) {
 	cfg.Samples = 1
 	cfg.Workers = 1
 	r, err := Validate(ctx, cancelingHead{f, cancel}, cfg)
-	if err == nil || !r.Interrupted || len(r.Steps) != 0 {
-		t.Fatalf("validate: %v, report %+v", err, r)
-	}
+	require.Error(t, err, "validate: %v, report %+v", err, r)
+	require.True(t, r.Interrupted, "validate: %v, report %+v", err, r)
+	require.Empty(t, r.Steps, "validate: %v, report %+v", err, r)
 }
 
 func TestValidateListNeedsEveryRecordedObject(t *testing.T) {
@@ -415,12 +394,12 @@ func TestValidateListNeedsEveryRecordedObject(t *testing.T) {
 	cfg := validateConfig(load)
 	cfg.Steps = []string{StepList}
 	r, err := Validate(t.Context(), f, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(r.Lists) != 1 || r.Lists[0].Objects != 52 || r.Lists[0].Missing != 3 || r.Lists[0].Extra != 3 || r.Failures != 3 {
-		t.Fatalf("lists %+v, failures %v", r.Lists, r.FailureSample)
-	}
+	require.NoError(t, err)
+	require.Len(t, r.Lists, 1, "lists %+v, failures %v", r.Lists, r.FailureSample)
+	require.Equal(t, uint64(52), r.Lists[0].Objects, "lists %+v, failures %v", r.Lists, r.FailureSample)
+	require.Equal(t, uint64(3), r.Lists[0].Missing, "lists %+v, failures %v", r.Lists, r.FailureSample)
+	require.Equal(t, uint64(3), r.Lists[0].Extra, "lists %+v, failures %v", r.Lists, r.FailureSample)
+	require.Equal(t, uint64(3), r.Failures, "lists %+v, failures %v", r.Lists, r.FailureSample)
 }
 
 // stuckListing ignores the continuation token, so every page is the first.
@@ -438,12 +417,10 @@ func TestValidateStopsOnAListingThatDoesNotMoveOn(t *testing.T) {
 	cfg := validateConfig(load)
 	cfg.Steps = []string{StepList}
 	r, err := Validate(t.Context(), stuckListing{f}, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Failures != 1 || !strings.Contains(r.FailureSample[0], "out of order") || r.Latency[OpListPage].Count != 2 {
-		t.Fatalf("failures %v, pages %d", r.FailureSample, r.Latency[OpListPage].Count)
-	}
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), r.Failures, "failures %v", r.FailureSample)
+	require.Contains(t, r.FailureSample[0], "out of order")
+	require.Equal(t, uint64(2), r.Latency[OpListPage].Count, "list pages")
 }
 
 // misplacedKey moves the first page's first key to its end, and continues
@@ -476,16 +453,14 @@ func TestValidateStopsAtAKeyOutOfOrder(t *testing.T) {
 	cfg := validateConfig(load)
 	cfg.Steps = []string{StepList}
 	r, err := Validate(t.Context(), misplacedKey{f, new(atomic.Int64)}, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Failures != 1 || !strings.Contains(r.FailureSample[0], "out of order") || r.Latency[OpListPage].Count != 1 {
-		t.Fatalf("failures %v, pages %d", r.FailureSample, r.Latency[OpListPage].Count)
-	}
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), r.Failures, "failures %v", r.FailureSample)
+	require.Contains(t, r.FailureSample[0], "out of order")
+	require.Equal(t, uint64(1), r.Latency[OpListPage].Count, "list pages")
 	// The key that came late isn't reported missing.
-	if len(r.Lists) != 1 || r.Lists[0].Complete || r.Lists[0].Missing != 0 {
-		t.Fatalf("lists %+v", r.Lists)
-	}
+	require.Len(t, r.Lists, 1, "lists %+v", r.Lists)
+	require.False(t, r.Lists[0].Complete, "lists %+v", r.Lists)
+	require.Zero(t, r.Lists[0].Missing, "lists %+v", r.Lists)
 }
 
 // failingLaterPages fails every listing page after the first.
@@ -509,16 +484,14 @@ func TestValidateReportsMissingKeysBeforeAFailedPage(t *testing.T) {
 	cfg := validateConfig(load)
 	cfg.Steps = []string{StepList}
 	r, err := Validate(t.Context(), failingLaterPages{f}, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	all := strings.Join(r.FailureSample, "\n")
-	if r.Failures != 2 || !strings.Contains(all, keys[0]+" is missing") || !strings.Contains(all, "status 503") {
-		t.Fatalf("failures %d:\n%s", r.Failures, all)
-	}
-	if len(r.Lists) != 1 || r.Lists[0].Complete || r.Lists[0].Missing != 1 {
-		t.Fatalf("lists %+v", r.Lists)
-	}
+	require.Equal(t, uint64(2), r.Failures, "failures %d:\n%s", r.Failures, all)
+	require.Contains(t, all, keys[0]+" is missing", "failures %d:\n%s", r.Failures, all)
+	require.Contains(t, all, "status 503", "failures %d:\n%s", r.Failures, all)
+	require.Len(t, r.Lists, 1, "lists %+v", r.Lists)
+	require.False(t, r.Lists[0].Complete, "lists %+v", r.Lists)
+	require.Equal(t, uint64(1), r.Lists[0].Missing, "lists %+v", r.Lists)
 }
 
 // lateCommit is a gateway that commits a PUT even when the client has given
@@ -562,13 +535,11 @@ func TestValidateFinishesAPutInFlightBeforeItsDelete(t *testing.T) {
 	cfg := validateConfig(load)
 	cfg.Steps = []string{StepWrite}
 	cfg.Workers = 1
-	if _, err := Validate(ctx, client, cfg); err == nil {
-		t.Fatal("validate was not interrupted")
-	}
+	_, err := Validate(ctx, client, cfg)
+	require.Error(t, err, "validate was not interrupted")
 	client.late.Wait()
-	if after := f.objects(load.Buckets[0]); !maps.Equal(after, before) {
-		t.Fatalf("%d objects, want %d", len(after), len(before))
-	}
+	after := f.objects(load.Buckets[0])
+	require.True(t, maps.Equal(after, before), "%d objects, want %d", len(after), len(before))
 }
 
 // noLength answers a HEAD without a Content-Length.
@@ -584,12 +555,9 @@ func TestValidateNeedsAContentLength(t *testing.T) {
 	cfg := validateConfig(load)
 	cfg.Steps = []string{StepHead}
 	r, err := Validate(t.Context(), noLength{f}, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Failures != uint64(cfg.Samples) || !strings.Contains(r.FailureSample[0], "no Content-Length") {
-		t.Fatalf("failures %v", r.FailureSample)
-	}
+	require.NoError(t, err)
+	require.Equal(t, uint64(cfg.Samples), r.Failures, "failures %v", r.FailureSample)
+	require.Contains(t, r.FailureSample[0], "no Content-Length", "failures %v", r.FailureSample)
 }
 
 func TestValidateStopsWhenCanceled(t *testing.T) {
@@ -598,9 +566,9 @@ func TestValidateStopsWhenCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	r, err := Validate(ctx, f, validateConfig(load))
-	if err == nil || r == nil || r.Failures != 0 {
-		t.Fatalf("validate under a canceled context: %v, report %+v", err, r)
-	}
+	require.Error(t, err, "validate under a canceled context: %v, report %+v", err, r)
+	require.NotNil(t, r, "validate under a canceled context: %v, report %+v", err, r)
+	require.Zero(t, r.Failures, "validate under a canceled context: %v, report %+v", err, r)
 }
 
 func TestValidateRefuses(t *testing.T) {
@@ -615,9 +583,8 @@ func TestValidateRefuses(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cfg := validateConfig(load)
 			change(&cfg)
-			if _, err := Validate(t.Context(), f, cfg); err == nil {
-				t.Fatal("validate ran")
-			}
+			_, err := Validate(t.Context(), f, cfg)
+			require.Error(t, err, "validate ran")
 		})
 	}
 }

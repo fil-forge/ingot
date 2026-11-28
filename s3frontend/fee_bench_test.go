@@ -19,6 +19,7 @@ import (
 	"github.com/filecoin-project/go-fee"
 	"github.com/filecoin-project/go-fee/aesstream"
 	mh "github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/blockstore"
 	msbucket "github.com/fil-forge/ingot/bucket"
@@ -74,25 +75,16 @@ type benchEnc struct {
 func newBenchEnc(tb testing.TB) *benchEnc {
 	tb.Helper()
 	cache, err := blockstore.NewBlobCache(filepath.Join(tb.TempDir(), "cache"))
-	if err != nil {
-		tb.Fatal(err)
-	}
+	require.NoError(tb, err)
 	kek := make([]byte, regionkey.KEKLen)
-	if _, err := rand.Read(kek); err != nil {
-		tb.Fatal(err)
-	}
+	_, err = rand.Read(kek)
+	require.NoError(tb, err)
 	keys, err := regionkey.NewInProcessProvider("v1", kek)
-	if err != nil {
-		tb.Fatal(err)
-	}
+	require.NoError(tb, err)
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		tb.Fatal(err)
-	}
+	require.NoError(tb, err)
 	space, err := did.Parse("did:web:bench.example")
-	if err != nil {
-		tb.Fatal(err)
-	}
+	require.NoError(tb, err)
 	return &benchEnc{
 		cache:     cache,
 		keys:      keys,
@@ -114,9 +106,7 @@ func (benchProvider) PutBlob(_ context.Context, _ uploader.StreamedBlob, body io
 func benchSplit(tb testing.TB, enc *bodyWriter, data []byte) msbucket.BlobRefs {
 	tb.Helper()
 	_, blobs, err := msbucket.SplitSizedBody(context.Background(), enc, bytes.NewReader(data), int64(len(data)), 0)
-	if err != nil {
-		tb.Fatal(err)
-	}
+	require.NoError(tb, err)
 	return blobs
 }
 
@@ -143,9 +133,8 @@ func BenchmarkIngest_Full(b *testing.B) {
 				// the measurement, and fail rather than let them pile up.
 				b.StopTimer()
 				enc.drop()
-				if n := env.cache.InFlight(); n != 0 {
-					b.Fatalf("%d bytes left in the cache", n)
-				}
+				n := env.cache.InFlight()
+				require.Zero(b, n, "%d bytes left in the cache", n)
 				b.StartTimer()
 			}
 		})
@@ -183,12 +172,9 @@ func BenchmarkFEE_EncryptWithCEK(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				rc, _, err := fee.EncryptWithCEK(bytes.NewReader(data), cek, []fee.Recipient{env.recipient})
-				if err != nil {
-					b.Fatal(err)
-				}
-				if _, err := io.Copy(sink{}, rc); err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, err)
+				_, err = io.Copy(sink{}, rc)
+				require.NoError(b, err)
 				rc.Close()
 			}
 		})
@@ -207,12 +193,9 @@ func BenchmarkFEE_EncryptWithCEK_NoRecipient(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				rc, _, err := fee.EncryptWithCEK(bytes.NewReader(data), cek, nil)
-				if err != nil {
-					b.Fatal(err)
-				}
-				if _, err := io.Copy(sink{}, rc); err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, err)
+				_, err = io.Copy(sink{}, rc)
+				require.NoError(b, err)
 				rc.Close()
 			}
 		})
@@ -231,15 +214,10 @@ func BenchmarkAESStream_Writer(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				w, err := aesstream.NewWriter(sink{}, cfg)
-				if err != nil {
-					b.Fatal(err)
-				}
-				if _, err := io.CopyBuffer(w, struct{ io.Reader }{bytes.NewReader(data)}, buf); err != nil {
-					b.Fatal(err)
-				}
-				if err := w.Close(); err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, err)
+				_, err = io.CopyBuffer(w, struct{ io.Reader }{bytes.NewReader(data)}, buf)
+				require.NoError(b, err)
+				require.NoError(b, w.Close())
 			}
 		})
 	}
@@ -290,23 +268,15 @@ func BenchmarkFileWrite(b *testing.B) {
 			b.SetBytes(size)
 			for b.Loop() {
 				f, err := os.CreateTemp(dir, ".tmp-*")
-				if err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, err)
 				_, err = io.CopyBuffer(struct{ io.Writer }{f}, struct{ io.Reader }{bytes.NewReader(data)}, buf)
 				if closeErr := f.Close(); err == nil {
 					err = closeErr
 				}
-				if err != nil {
-					b.Fatal(err)
-				}
-				if err := os.Rename(f.Name(), dst); err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, err)
+				require.NoError(b, os.Rename(f.Name(), dst))
 				b.StopTimer()
-				if err := os.Remove(dst); err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, os.Remove(dst))
 				b.StartTimer()
 			}
 		})
@@ -322,20 +292,15 @@ func benchStored(b *testing.B, env *benchEnc, data []byte) (msbucket.BlobRefs, *
 	enc.cache = env.cache
 	body := benchSplit(b, enc, data)
 	for digest, local := range enc.locals() {
-		if _, err := env.cache.Adopt(local, mh.Multihash(digest)); err != nil {
-			b.Fatal(err)
-		}
+		_, err := env.cache.Adopt(local, mh.Multihash(digest))
+		require.NoError(b, err)
 	}
 	encMap := make(map[string]encBlob)
 	for _, ref := range body {
 		params, err := enc.params(env.space, ref.Digest)
-		if err != nil {
-			b.Fatal(err)
-		}
+		require.NoError(b, err)
 		stored, err := enc.storedSize(ref.Digest)
-		if err != nil {
-			b.Fatal(err)
-		}
+		require.NoError(b, err)
 		encMap[string(ref.Digest)] = encBlob{params: params, storedSize: stored}
 	}
 	return body, &decryptingOpener{read: env.cache, keys: env.keys, enc: encMap}
@@ -357,12 +322,8 @@ func BenchmarkRead_Full(b *testing.B) {
 				rc := msbucket.OpenBody(context.Background(), opener, env.space, body)
 				n, err := io.CopyBuffer(sink{}, rc, buf)
 				rc.Close()
-				if err != nil {
-					b.Fatal(err)
-				}
-				if n != size {
-					b.Fatalf("read %d bytes, want %d", n, size)
-				}
+				require.NoError(b, err)
+				require.Equal(b, size, n, "read %d bytes", n)
 			}
 		})
 	}
@@ -383,9 +344,7 @@ func BenchmarkRead_Full4K(b *testing.B) {
 				rc := msbucket.OpenBody(context.Background(), opener, env.space, body)
 				_, err := io.CopyBuffer(sink{}, struct{ io.Reader }{rc}, buf)
 				rc.Close()
-				if err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, err)
 			}
 		})
 	}
@@ -399,20 +358,15 @@ func BenchmarkSpanReader_Memory(b *testing.B) {
 			data := benchData(size)
 			cfg := aesstream.Config{Key: make([]byte, 32), BaseNonce: make([]byte, 7), AAD: []byte("aad")}
 			ct, err := aesstream.Seal(cfg, data)
-			if err != nil {
-				b.Fatal(err)
-			}
+			require.NoError(b, err)
 			buf := make([]byte, 32<<10)
 			b.SetBytes(size)
 			b.ReportAllocs()
 			for b.Loop() {
 				sr, err := aesstream.NewSpanReader(bytes.NewReader(ct), cfg, int64(len(ct)), 0, size-1)
-				if err != nil {
-					b.Fatal(err)
-				}
-				if _, err := io.CopyBuffer(sink{}, sr, buf); err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, err)
+				_, err = io.CopyBuffer(sink{}, sr, buf)
+				require.NoError(b, err)
 				sr.Close()
 			}
 		})
@@ -436,12 +390,8 @@ func BenchmarkRead_Range(b *testing.B) {
 		rc := msbucket.OpenBodyRange(context.Background(), opener, env.space, body, start, start+rangeLen-1)
 		n, err := io.CopyBuffer(sink{}, rc, buf)
 		rc.Close()
-		if err != nil {
-			b.Fatal(err)
-		}
-		if n != rangeLen {
-			b.Fatalf("read %d bytes, want %d", n, rangeLen)
-		}
+		require.NoError(b, err)
+		require.Equal(b, int64(rangeLen), n, "read %d bytes", n)
 	}
 }
 
@@ -476,12 +426,9 @@ func BenchmarkFEE_EncryptWithCEKParallel(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			rc, _, err := fee.EncryptWithCEK(bytes.NewReader(data), cek, []fee.Recipient{env.recipient})
-			if err != nil {
-				b.Fatal(err)
-			}
-			if _, err := io.Copy(sink{}, rc); err != nil {
-				b.Fatal(err)
-			}
+			require.NoError(b, err)
+			_, err = io.Copy(sink{}, rc)
+			require.NoError(b, err)
 			rc.Close()
 		}
 	})

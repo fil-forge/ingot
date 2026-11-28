@@ -8,11 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"github.com/aws/smithy-go"
-	"github.com/aws/smithy-go/middleware"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"io"
 	"net/http"
 	"net/url"
@@ -21,6 +17,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/stretchr/testify/require"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -48,9 +49,8 @@ func TestForgeBucketEncryption(t *testing.T) {
 	cl := sdkClient(forgeS3Conf(endpoint, accessKey, secretKey))
 
 	const bucket = "plain"
-	if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		t.Fatalf("CreateBucket: %v", err)
-	}
+	_, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+	require.NoError(t, err, "CreateBucket")
 	sseConfig := func(algo types.ServerSideEncryption) *types.ServerSideEncryptionConfiguration {
 		return &types.ServerSideEncryptionConfiguration{Rules: []types.ServerSideEncryptionRule{{
 			ApplyServerSideEncryptionByDefault: &types.ServerSideEncryptionByDefault{SSEAlgorithm: algo},
@@ -59,29 +59,23 @@ func TestForgeBucketEncryption(t *testing.T) {
 	wantNotFound := func(t *testing.T) {
 		t.Helper()
 		_, err := cl.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{Bucket: aws.String(bucket)})
-		if code, status := apiErrorOf(t, err); code != "ServerSideEncryptionConfigurationNotFoundError" || status != http.StatusNotFound {
-			t.Fatalf("GetBucketEncryption = %s/%d, want ServerSideEncryptionConfigurationNotFoundError/404", code, status)
-		}
+		code, status := apiErrorOf(t, err)
+		require.Equal(t, "ServerSideEncryptionConfigurationNotFoundError", code, "GetBucketEncryption = %s/%d", code, status)
+		require.Equal(t, http.StatusNotFound, status, "GetBucketEncryption = %s/%d", code, status)
 	}
 	head := func(t *testing.T, key string) types.ServerSideEncryption {
 		t.Helper()
 		out, err := cl.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
-		if err != nil {
-			t.Fatalf("HeadObject %s: %v", key, err)
-		}
+		require.NoError(t, err, "HeadObject %s", key)
 		return out.ServerSideEncryption
 	}
 	get := func(t *testing.T, key string) (types.ServerSideEncryption, []byte) {
 		t.Helper()
 		out, err := cl.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
-		if err != nil {
-			t.Fatalf("GetObject %s: %v", key, err)
-		}
+		require.NoError(t, err, "GetObject %s", key)
 		defer out.Body.Close()
 		body, err := io.ReadAll(out.Body)
-		if err != nil {
-			t.Fatalf("read %s: %v", key, err)
-		}
+		require.NoError(t, err, "read %s", key)
 		return out.ServerSideEncryption, body
 	}
 	// keyRows counts the blob_encryption_params rows of key's body blobs.
@@ -94,9 +88,7 @@ func TestForgeBucketEncryption(t *testing.T) {
 	localSHA256 := func(t *testing.T, path string) string {
 		t.Helper()
 		out, errOut, err := s.Exec(ctx, "ingot", "sha256sum", path)
-		if err != nil {
-			t.Fatalf("sha256sum %s: %v (stderr=%s)", path, err, errOut)
-		}
+		require.NoError(t, err, "sha256sum %s: %v (stderr=%s)", path, err, errOut)
 		return strings.Fields(out)[0]
 	}
 	putOne := func(t *testing.T, key string, data []byte, sse types.ServerSideEncryption) (types.ServerSideEncryption, string) {
@@ -105,13 +97,9 @@ func TestForgeBucketEncryption(t *testing.T) {
 		out, err := cl.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(data), ServerSideEncryption: sse,
 		})
-		if err != nil {
-			t.Fatalf("PutObject %s: %v", key, err)
-		}
+		require.NoError(t, err, "PutObject %s", key)
 		added := newLocalPaths(before, localBlobPaths(t, ctx, s))
-		if len(added) != 1 {
-			t.Fatalf("PutObject %s cached %d files, want 1", key, len(added))
-		}
+		require.Len(t, added, 1, "PutObject %s cached %d files", key, len(added))
 		return out.ServerSideEncryption, added[0]
 	}
 
@@ -120,55 +108,40 @@ func TestForgeBucketEncryption(t *testing.T) {
 	data := patternBytes(1 << 20)
 	sum := sha256.Sum256(data)
 	plainHex := hex.EncodeToString(sum[:])
-	if sse, path := putOne(t, "default", data, ""); sse != types.ServerSideEncryptionAes256 || localSHA256(t, path) == plainHex {
-		t.Fatalf("unconfigured bucket: PUT reports %q and the stored file %s the plaintext, want AES256 and an envelope", sse, map[bool]string{true: "is", false: "is not"}[localSHA256(t, path) == plainHex])
-	}
-	if blobs, rows := keyRows(t, "default"); rows != blobs {
-		t.Fatalf("unconfigured bucket: %d key rows for %d blobs", rows, blobs)
-	}
+	sse, path := putOne(t, "default", data, "")
+	require.Equal(t, types.ServerSideEncryptionAes256, sse, "unconfigured bucket: PUT")
+	require.NotEqual(t, plainHex, localSHA256(t, path), "unconfigured bucket: the stored file is the plaintext")
+	blobs, rows := keyRows(t, "default")
+	require.Equal(t, blobs, rows, "unconfigured bucket: %d key rows for %d blobs", rows, blobs)
 	// The control for the piri-side check below: an encrypted PUT of these
 	// bytes leaves piri holding an envelope, so once that envelope is on
 	// piri, no blob of the plaintext's digest is. (Checked before the "none"
 	// PUT of the same bytes, which creates exactly that blob.)
 	waitForPiriBlob(t, ctx, s, hexDigest(t, objectBlobDigestsHex(t, ctx, s, bucket, "default")[0]), 30*time.Second)
-	if piriHoldsBlob(t, ctx, s, sha256Digest(t, sum)) {
-		t.Fatalf("unconfigured bucket: piri holds a blob of the plaintext's digest after an encrypted PUT")
-	}
+	require.False(t, piriHoldsBlob(t, ctx, s, sha256Digest(t, sum)), "unconfigured bucket: piri holds a blob of the plaintext's digest after an encrypted PUT")
 
 	// "none": stored as received.
-	if _, err := cl.PutBucketEncryption(ctx, &s3.PutBucketEncryptionInput{Bucket: aws.String(bucket), ServerSideEncryptionConfiguration: sseConfig("none")}); err != nil {
-		t.Fatalf("PutBucketEncryption none: %v", err)
-	}
+	_, err = cl.PutBucketEncryption(ctx, &s3.PutBucketEncryptionInput{Bucket: aws.String(bucket), ServerSideEncryptionConfiguration: sseConfig("none")})
+	require.NoError(t, err, "PutBucketEncryption none")
 	got, err := cl.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{Bucket: aws.String(bucket)})
-	if err != nil {
-		t.Fatalf("GetBucketEncryption: %v", err)
-	}
-	if rules := got.ServerSideEncryptionConfiguration.Rules; len(rules) != 1 || rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm != "none" {
-		t.Fatalf("GetBucketEncryption = %+v, want one rule naming none", rules)
-	}
+	require.NoError(t, err, "GetBucketEncryption")
+	rules := got.ServerSideEncryptionConfiguration.Rules
+	require.Len(t, rules, 1, "GetBucketEncryption = %+v, want one rule naming none", rules)
+	require.Equal(t, types.ServerSideEncryption("none"), rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm, "GetBucketEncryption = %+v, want one rule naming none", rules)
 	t.Run("StoredAsReceived", func(t *testing.T) {
 		sse, path := putOne(t, "plain", data, "")
-		if sse != "" {
-			t.Fatalf("PUT reports %q, want no encryption", sse)
-		}
-		if got := localSHA256(t, path); got != plainHex {
-			t.Fatalf("cached file sha256 = %s, want the plaintext's %s", got, plainHex)
-		}
-		if blobs, rows := keyRows(t, "plain"); blobs != 1 || rows != 0 {
-			t.Fatalf("%d blobs with %d key rows, want 1 and 0", blobs, rows)
-		}
-		if sse := head(t, "plain"); sse != "" {
-			t.Fatalf("HEAD reports %q, want no encryption", sse)
-		}
+		require.Empty(t, sse, "PUT")
+		require.Equal(t, plainHex, localSHA256(t, path), "cached file sha256 against the plaintext's")
+		blobs, rows := keyRows(t, "plain")
+		require.Equal(t, 1, blobs, "%d blobs with %d key rows", blobs, rows)
+		require.Zero(t, rows, "%d blobs with %d key rows", blobs, rows)
+		require.Empty(t, head(t, "plain"), "HEAD reports encryption")
 		sse, body := get(t, "plain")
-		if sse != "" || !bytes.Equal(body, data) {
-			t.Fatalf("GET reports %q and %d bytes, want no encryption and the %d-byte plaintext", sse, len(body), len(data))
-		}
+		require.Empty(t, sse, "GET reports %q and %d bytes, want no encryption and the %d-byte plaintext", sse, len(body), len(data))
+		require.Equal(t, data, body, "GET reports %q and %d bytes, want no encryption and the %d-byte plaintext", sse, len(body), len(data))
 		// The digest of the stored blob is the plaintext's own: the sha256
 		// multihash of the bytes.
-		if digests := objectBlobDigestsHex(t, ctx, s, bucket, "plain"); digests[0] != "1220"+plainHex {
-			t.Fatalf("stored digest %s is not the plaintext's multihash 1220%s", digests[0], plainHex)
-		}
+		require.Equal(t, "1220"+plainHex, objectBlobDigestsHex(t, ctx, s, bucket, "plain")[0], "stored digest against the plaintext's multihash")
 		// And piri holds it under that digest: the blob on the network is
 		// the uploaded bytes.
 		waitForPiriBlob(t, ctx, s, sha256Digest(t, sum), 30*time.Second)
@@ -178,43 +151,32 @@ func TestForgeBucketEncryption(t *testing.T) {
 		// by its sha256. Under max_blob_size, so it is one blob.
 		const size = 128 << 20
 		h := sha256.New()
-		if _, err := io.Copy(h, newPatternReader(size)); err != nil {
-			t.Fatalf("hash pattern: %v", err)
-		}
+		_, err := io.Copy(h, newPatternReader(size))
+		require.NoError(t, err, "hash pattern")
 		var want [32]byte
 		copy(want[:], h.Sum(nil))
 		big := bigObjectClient(t, endpoint, accessKey, secretKey)
 		out, err := big.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(bucket), Key: aws.String("pack"), Body: newPatternReader(size), ContentLength: aws.Int64(size),
 		})
-		if err != nil {
-			t.Fatalf("PutObject pack: %v", err)
-		}
-		if out.ServerSideEncryption != "" {
-			t.Fatalf("PUT reports %q, want no encryption", out.ServerSideEncryption)
-		}
-		if blobs, rows := keyRows(t, "pack"); blobs != 1 || rows != 0 {
-			t.Fatalf("%d blobs with %d key rows, want 1 and 0", blobs, rows)
-		}
+		require.NoError(t, err, "PutObject pack")
+		require.Empty(t, out.ServerSideEncryption, "PUT")
+		blobs, rows := keyRows(t, "pack")
+		require.Equal(t, 1, blobs, "%d blobs with %d key rows", blobs, rows)
+		require.Zero(t, rows, "%d blobs with %d key rows", blobs, rows)
 		waitForPiriBlob(t, ctx, s, sha256Digest(t, want), 60*time.Second)
 	})
 	t.Run("ExplicitAES256EncryptsOneObject", func(t *testing.T) {
 		sse, path := putOne(t, "asked", data, types.ServerSideEncryptionAes256)
-		if sse != types.ServerSideEncryptionAes256 {
-			t.Fatalf("PUT with AES256 reports %q, want AES256", sse)
-		}
-		if localSHA256(t, path) == plainHex {
-			t.Fatalf("cached file is the plaintext; the object was not encrypted")
-		}
-		if blobs, rows := keyRows(t, "asked"); blobs != 1 || rows != 1 {
-			t.Fatalf("%d blobs with %d key rows, want 1 and 1", blobs, rows)
-		}
-		if sse := head(t, "asked"); sse != types.ServerSideEncryptionAes256 {
-			t.Fatalf("HEAD reports %q, want AES256", sse)
-		}
-		if sse, body := get(t, "asked"); sse != types.ServerSideEncryptionAes256 || !bytes.Equal(body, data) {
-			t.Fatalf("GET reports %q, want AES256 and the plaintext back", sse)
-		}
+		require.Equal(t, types.ServerSideEncryptionAes256, sse, "PUT with AES256")
+		require.NotEqual(t, plainHex, localSHA256(t, path), "cached file is the plaintext; the object was not encrypted")
+		blobs, rows := keyRows(t, "asked")
+		require.Equal(t, 1, blobs, "%d blobs with %d key rows", blobs, rows)
+		require.Equal(t, 1, rows, "%d blobs with %d key rows", blobs, rows)
+		require.Equal(t, types.ServerSideEncryptionAes256, head(t, "asked"), "HEAD")
+		sse, body := get(t, "asked")
+		require.Equal(t, types.ServerSideEncryptionAes256, sse, "GET")
+		require.Equal(t, data, body, "GET: the plaintext back")
 	})
 	t.Run("MultipartFollowsTheCreate", func(t *testing.T) {
 		p1, p2 := patternBytes(5<<20), []byte("tail of the multipart object")
@@ -224,37 +186,25 @@ func TestForgeBucketEncryption(t *testing.T) {
 			rows int
 		}{{"mp-plain", "", 0}, {"mp-enc", types.ServerSideEncryptionAes256, 2}} {
 			mpu, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String(bucket), Key: aws.String(tc.key), ServerSideEncryption: tc.sse})
-			if err != nil {
-				t.Fatalf("CreateMultipartUpload %s: %v", tc.key, err)
-			}
-			if mpu.ServerSideEncryption != tc.sse {
-				t.Fatalf("%s: create reports %q, want %q", tc.key, mpu.ServerSideEncryption, tc.sse)
-			}
+			require.NoError(t, err, "CreateMultipartUpload %s", tc.key)
+			require.Equal(t, tc.sse, mpu.ServerSideEncryption, "%s: create", tc.key)
 			var parts []types.CompletedPart
 			for i, p := range [][]byte{p1, p2} {
 				n := int32(i + 1)
 				up, err := cl.UploadPart(ctx, &s3.UploadPartInput{Bucket: aws.String(bucket), Key: aws.String(tc.key), UploadId: mpu.UploadId, PartNumber: &n, Body: bytes.NewReader(p)})
-				if err != nil {
-					t.Fatalf("UploadPart %s/%d: %v", tc.key, n, err)
-				}
-				if up.ServerSideEncryption != tc.sse {
-					t.Fatalf("%s: part %d reports %q, want %q", tc.key, n, up.ServerSideEncryption, tc.sse)
-				}
+				require.NoError(t, err, "UploadPart %s/%d", tc.key, n)
+				require.Equal(t, tc.sse, up.ServerSideEncryption, "%s: part %d", tc.key, n)
 				parts = append(parts, types.CompletedPart{ETag: up.ETag, PartNumber: &n})
 			}
 			done, err := cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: aws.String(bucket), Key: aws.String(tc.key), UploadId: mpu.UploadId, MultipartUpload: &types.CompletedMultipartUpload{Parts: parts}})
-			if err != nil {
-				t.Fatalf("CompleteMultipartUpload %s: %v", tc.key, err)
-			}
-			if done.ServerSideEncryption != tc.sse {
-				t.Fatalf("%s: complete reports %q, want %q", tc.key, done.ServerSideEncryption, tc.sse)
-			}
-			if blobs, rows := keyRows(t, tc.key); blobs != 2 || rows != tc.rows {
-				t.Fatalf("%s: %d blobs with %d key rows, want 2 and %d", tc.key, blobs, rows, tc.rows)
-			}
-			if sse, body := get(t, tc.key); sse != tc.sse || !bytes.Equal(body, append(append([]byte{}, p1...), p2...)) {
-				t.Fatalf("%s: GET reports %q (want %q) or the body differs", tc.key, sse, tc.sse)
-			}
+			require.NoError(t, err, "CompleteMultipartUpload %s", tc.key)
+			require.Equal(t, tc.sse, done.ServerSideEncryption, "%s: complete", tc.key)
+			blobs, rows := keyRows(t, tc.key)
+			require.Equal(t, 2, blobs, "%s: %d blobs with %d key rows", tc.key, blobs, rows)
+			require.Equal(t, tc.rows, rows, "%s: %d blobs with %d key rows", tc.key, blobs, rows)
+			sse, body := get(t, tc.key)
+			require.Equal(t, tc.sse, sse, "%s: GET reports %q (want %q) or the body differs", tc.key, sse, tc.sse)
+			require.Equal(t, append(append([]byte{}, p1...), p2...), body, "%s: GET reports %q (want %q) or the body differs", tc.key, sse, tc.sse)
 		}
 	})
 	t.Run("CopyFollowsTheDestination", func(t *testing.T) {
@@ -266,39 +216,30 @@ func TestForgeBucketEncryption(t *testing.T) {
 			rows     int
 		}{{"asked", "asked-to-plain", "", 0}, {"plain", "plain-to-enc", types.ServerSideEncryptionAes256, 1}} {
 			out, err := cl.CopyObject(ctx, &s3.CopyObjectInput{Bucket: aws.String(bucket), Key: aws.String(tc.dst), CopySource: aws.String(bucket + "/" + tc.src), ServerSideEncryption: tc.sse})
-			if err != nil {
-				t.Fatalf("CopyObject %s → %s: %v", tc.src, tc.dst, err)
-			}
-			if out.ServerSideEncryption != tc.sse {
-				t.Fatalf("%s: copy reports %q, want %q", tc.dst, out.ServerSideEncryption, tc.sse)
-			}
-			if blobs, rows := keyRows(t, tc.dst); blobs != 1 || rows != tc.rows {
-				t.Fatalf("%s: %d blobs with %d key rows, want 1 and %d", tc.dst, blobs, rows, tc.rows)
-			}
-			if sse, body := get(t, tc.dst); sse != tc.sse || !bytes.Equal(body, data) {
-				t.Fatalf("%s: GET reports %q (want %q) or the body differs", tc.dst, sse, tc.sse)
-			}
+			require.NoError(t, err, "CopyObject %s → %s", tc.src, tc.dst)
+			require.Equal(t, tc.sse, out.ServerSideEncryption, "%s: copy", tc.dst)
+			blobs, rows := keyRows(t, tc.dst)
+			require.Equal(t, 1, blobs, "%s: %d blobs with %d key rows", tc.dst, blobs, rows)
+			require.Equal(t, tc.rows, rows, "%s: %d blobs with %d key rows", tc.dst, blobs, rows)
+			sse, body := get(t, tc.dst)
+			require.Equal(t, tc.sse, sse, "%s: GET reports %q (want %q) or the body differs", tc.dst, sse, tc.sse)
+			require.Equal(t, data, body, "%s: GET reports %q (want %q) or the body differs", tc.dst, sse, tc.sse)
 		}
 	})
 	t.Run("DeleteRestoresEncryption", func(t *testing.T) {
-		if _, err := cl.DeleteBucketEncryption(ctx, &s3.DeleteBucketEncryptionInput{Bucket: aws.String(bucket)}); err != nil {
-			t.Fatalf("DeleteBucketEncryption: %v", err)
-		}
+		_, err := cl.DeleteBucketEncryption(ctx, &s3.DeleteBucketEncryptionInput{Bucket: aws.String(bucket)})
+		require.NoError(t, err, "DeleteBucketEncryption")
 		wantNotFound(t)
-		if sse, path := putOne(t, "after-delete", data, ""); sse != types.ServerSideEncryptionAes256 || localSHA256(t, path) == plainHex {
-			t.Fatalf("after delete: PUT reports %q, want AES256 and an envelope on disk", sse)
-		}
+		sse, path := putOne(t, "after-delete", data, "")
+		require.Equal(t, types.ServerSideEncryptionAes256, sse, "after delete: PUT reports %q, want AES256 and an envelope on disk", sse)
+		require.NotEqual(t, plainHex, localSHA256(t, path), "after delete: PUT reports %q, want AES256 and an envelope on disk", sse)
 		// Configuring AES256 explicitly is accepted and round-trips.
-		if _, err := cl.PutBucketEncryption(ctx, &s3.PutBucketEncryptionInput{Bucket: aws.String(bucket), ServerSideEncryptionConfiguration: sseConfig(types.ServerSideEncryptionAes256)}); err != nil {
-			t.Fatalf("PutBucketEncryption AES256: %v", err)
-		}
+		_, err = cl.PutBucketEncryption(ctx, &s3.PutBucketEncryptionInput{Bucket: aws.String(bucket), ServerSideEncryptionConfiguration: sseConfig(types.ServerSideEncryptionAes256)})
+		require.NoError(t, err, "PutBucketEncryption AES256")
 		got, err := cl.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{Bucket: aws.String(bucket)})
-		if err != nil {
-			t.Fatalf("GetBucketEncryption: %v", err)
-		}
-		if algo := got.ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm; algo != types.ServerSideEncryptionAes256 {
-			t.Fatalf("GetBucketEncryption = %q, want AES256", algo)
-		}
+		require.NoError(t, err, "GetBucketEncryption")
+		algo := got.ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm
+		require.Equal(t, types.ServerSideEncryptionAes256, algo, "GetBucketEncryption")
 	})
 	t.Run("ConflictingSubresources", func(t *testing.T) {
 		// A query naming two subresources is refused as S3 refuses it, before
@@ -318,13 +259,12 @@ func TestForgeBucketEncryption(t *testing.T) {
 			})
 		}
 		_, err := cl.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{Bucket: aws.String(bucket)}, withUploads)
-		if code, status := apiErrorOf(t, err); code != "InvalidArgument" || status != http.StatusBadRequest {
-			t.Fatalf("GetBucketEncryption with ?uploads = %s/%d, want InvalidArgument/400", code, status)
-		}
+		code, status := apiErrorOf(t, err)
+		require.Equal(t, "InvalidArgument", code, "GetBucketEncryption with ?uploads = %s/%d", code, status)
+		require.Equal(t, http.StatusBadRequest, status, "GetBucketEncryption with ?uploads = %s/%d", code, status)
 		var apiErr smithy.APIError
-		if !errors.As(err, &apiErr) || !strings.Contains(apiErr.ErrorMessage(), "Conflicting query string parameters: encryption, uploads") {
-			t.Fatalf("error message = %q, want the conflicting parameters named, sorted", err)
-		}
+		require.ErrorAs(t, err, &apiErr, "error message = %q, want the conflicting parameters named, sorted", err)
+		require.Contains(t, apiErr.ErrorMessage(), "Conflicting query string parameters: encryption, uploads", "error message = %q, want the conflicting parameters named, sorted", err)
 	})
 
 	t.Run("AWSCLI", func(t *testing.T) {
@@ -334,16 +274,12 @@ func TestForgeBucketEncryption(t *testing.T) {
 		// and make a put-object store as received, with no SSE header on
 		// head-object.
 		ep, err := url.Parse(endpoint)
-		if err != nil {
-			t.Fatalf("parse ingot endpoint %q: %v", endpoint, err)
-		}
+		require.NoError(t, err, "parse ingot endpoint %q", endpoint)
 		containerEndpoint := "http://host.docker.internal:" + ep.Port()
 		const cliBucket = "plain-cli"
 		work := t.TempDir()
 		inPath := filepath.Join(work, "in.bin")
-		if err := os.WriteFile(inPath, data, 0o644); err != nil {
-			t.Fatalf("write input: %v", err)
-		}
+		require.NoError(t, os.WriteFile(inPath, data, 0o644), "write input")
 		awsAPI := fmt.Sprintf("aws --endpoint-url %q s3api", containerEndpoint)
 		noneConfig := `'{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"none"}}]}'`
 		script := strings.Join([]string{
@@ -383,17 +319,11 @@ func TestForgeBucketEncryption(t *testing.T) {
 		if cli != nil {
 			t.Cleanup(func() { _ = cli.Terminate(context.Background()) })
 		}
-		if err != nil {
-			t.Fatalf("run aws-cli container: %v", err)
-		}
+		require.NoError(t, err, "run aws-cli container")
 		state, err := cli.State(ctx)
-		if err != nil {
-			t.Fatalf("aws-cli container state: %v", err)
-		}
+		require.NoError(t, err, "aws-cli container state")
 		logs := string(fileFromContainer(t, ctx, cli, "/work/run.log"))
-		if state.ExitCode != 0 {
-			t.Fatalf("aws-cli script exited %d:\n%s", state.ExitCode, logs)
-		}
+		require.Zero(t, state.ExitCode, "aws-cli script exited %d:\n%s", state.ExitCode, logs)
 		t.Logf("aws-cli output:\n%s", logs)
 
 		var enc struct {
@@ -405,21 +335,15 @@ func TestForgeBucketEncryption(t *testing.T) {
 				} `json:"Rules"`
 			} `json:"ServerSideEncryptionConfiguration"`
 		}
-		if err := json.Unmarshal(fileFromContainer(t, ctx, cli, "/work/enc.json"), &enc); err != nil {
-			t.Fatalf("parse get-bucket-encryption output: %v", err)
-		}
-		if rules := enc.ServerSideEncryptionConfiguration.Rules; len(rules) != 1 || rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm != "none" {
-			t.Fatalf("get-bucket-encryption = %+v, want one rule with SSEAlgorithm none", enc)
-		}
+		require.NoError(t, json.Unmarshal(fileFromContainer(t, ctx, cli, "/work/enc.json"), &enc), "parse get-bucket-encryption output")
+		rules := enc.ServerSideEncryptionConfiguration.Rules
+		require.Len(t, rules, 1, "get-bucket-encryption = %+v, want one rule with SSEAlgorithm none", enc)
+		require.Equal(t, "none", rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm, "get-bucket-encryption = %+v, want one rule with SSEAlgorithm none", enc)
 		var head map[string]any
-		if err := json.Unmarshal(fileFromContainer(t, ctx, cli, "/work/head.json"), &head); err != nil {
-			t.Fatalf("parse head-object output: %v", err)
-		}
-		if sse, ok := head["ServerSideEncryption"]; ok {
-			t.Fatalf("head-object reports ServerSideEncryption %v on a none bucket, want none", sse)
-		}
-		if n, _ := head["ContentLength"].(float64); int(n) != len(data) {
-			t.Fatalf("head-object ContentLength = %v, want %d", head["ContentLength"], len(data))
-		}
+		require.NoError(t, json.Unmarshal(fileFromContainer(t, ctx, cli, "/work/head.json"), &head), "parse head-object output")
+		sse, ok := head["ServerSideEncryption"]
+		require.False(t, ok, "head-object reports ServerSideEncryption %v on a none bucket, want none", sse)
+		n, _ := head["ContentLength"].(float64)
+		require.Equal(t, len(data), int(n), "head-object ContentLength")
 	})
 }

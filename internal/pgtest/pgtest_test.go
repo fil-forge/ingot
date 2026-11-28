@@ -4,16 +4,15 @@ import (
 	"testing"
 
 	"github.com/fil-forge/ingot/internal/pgtest"
+	"github.com/stretchr/testify/require"
 )
 
 // Each test's database is migrated and its own.
 func TestNewGivesEachTestAMigratedDatabase(t *testing.T) {
 	a, b := pgtest.New(t), pgtest.New(t)
-	if _, err := a.Exec(t.Context(), `INSERT INTO ingot.revocation_cursor (token) VALUES ('1')`); err != nil {
-		t.Fatalf("migrated tables: %v", err)
-	}
+	_, err := a.Exec(t.Context(), `INSERT INTO ingot.revocation_cursor (token) VALUES ('1')`)
+	require.NoError(t, err, "migrated tables")
 	var n int
-	if err := b.QueryRow(t.Context(), `SELECT count(*) FROM ingot.revocation_cursor`).Scan(&n); err != nil || n != 0 {
-		t.Fatalf("the second database saw %d rows (%v), want none", n, err)
-	}
+	require.NoError(t, b.QueryRow(t.Context(), `SELECT count(*) FROM ingot.revocation_cursor`).Scan(&n))
+	require.Zero(t, n, "rows the second database saw")
 }

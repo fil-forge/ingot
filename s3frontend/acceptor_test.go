@@ -18,6 +18,8 @@ import (
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/queue/multipartqueue"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
@@ -33,18 +35,14 @@ func cancelQueuedAccepts(t *testing.T, b *Backend, uploadID string) {
 	t.Helper()
 	ctx := context.Background()
 	tasks, err := storeFor(b).queued(ctx, multipartqueue.Name)
-	if err != nil {
-		t.Fatalf("queued accepts: %v", err)
-	}
+	require.NoError(t, err, "queued accepts")
 	var ids []taskrunner.TaskID
 	for _, task := range tasks {
 		if task.Subject == uploadID && task.Action == multipartqueue.AcceptAction && task.State == "pending" {
 			ids = append(ids, task.ID)
 		}
 	}
-	if err := storeFor(b).tasks.Cancel(ctx, multipartqueue.Name, ids...); err != nil {
-		t.Fatalf("cancel queued accepts: %v", err)
-	}
+	require.NoError(t, storeFor(b).tasks.Cancel(ctx, multipartqueue.Name, ids...), "cancel queued accepts")
 }
 
 // runAccepts runs one accept of uploadID's parked parts, as the queue's
@@ -138,9 +136,7 @@ func uploadDistinctParts(t *testing.T, b *Backend, key, uploadID string, n int) 
 		body := testBody(int(backend.MinPartSize))
 		body[0] = byte(i)
 		out, err := mpUploadPart(t, b, key, uploadID, i, body, nil)
-		if err != nil {
-			t.Fatalf("UploadPart %d: %v", i, err)
-		}
+		require.NoError(t, err, "UploadPart %d", i)
 		num := i
 		parts = append(parts, types.CompletedPart{PartNumber: &num, ETag: out.ETag})
 	}
@@ -151,9 +147,7 @@ func uploadDistinctParts(t *testing.T, b *Backend, key, uploadID string, n int) 
 func partStates(t *testing.T, mem *testStore, uploadID string) map[int]string {
 	t.Helper()
 	parts, err := mem.ListParts(context.Background(), uploadID)
-	if err != nil {
-		t.Fatalf("ListParts: %v", err)
-	}
+	require.NoError(t, err, "ListParts")
 	out := map[int]string{}
 	for _, p := range parts {
 		out[p.PartNumber] = p.State
@@ -181,12 +175,9 @@ func TestAcceptAcceptsPartsWhileUploading(t *testing.T) {
 
 	uploadID := mpCreate(t, b, key, "", "")
 	parts := uploadDistinctParts(t, b, key, uploadID, 3)
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartAccepted) {
-		t.Fatalf("part states = %v, want all accepted", states)
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
+	states := partStates(t, mem, uploadID)
+	require.True(t, allIn(states, registry.PartAccepted), "part states = %v, want all accepted", states)
 	for n := 1; n <= 3; n++ {
 		for _, d := range hygienePartDigests(t, mem, uploadID, n) {
 			assertAcceptedAndUnparked(t, mem, d)
@@ -194,12 +185,10 @@ func TestAcceptAcceptsPartsWhileUploading(t *testing.T) {
 	}
 	concludedBefore := cc.concluded()
 
-	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
-	if got := cc.concluded(); len(got) != len(concludedBefore) {
-		t.Fatalf("conclude calls after Complete = %v, want none beyond the accept's %v", got, concludedBefore)
-	}
+	_, err := mpComplete(t, b, key, uploadID, parts, nil)
+	require.NoError(t, err, "Complete")
+	got := cc.concluded()
+	require.Len(t, got, len(concludedBefore), "conclude calls after Complete = %v, want none beyond the accept's %v", got, concludedBefore)
 }
 
 // TestUploadedPartsAreAcceptedInTheBackground: with no delay, the accept an
@@ -219,9 +208,7 @@ func TestUploadedPartsAreAcceptedInTheBackground(t *testing.T) {
 		if allIn(states, registry.PartAccepted) {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("part states = %v, want all accepted by the background accept", states)
-		}
+		require.False(t, time.Now().After(deadline), "part states = %v, want all accepted by the background accept", states)
 		time.Sleep(20 * time.Millisecond)
 	}
 }
@@ -235,22 +222,17 @@ func TestUploadPartQueuesOneAccept(t *testing.T) {
 	uploadID := mpCreate(t, b, key, "", "")
 	uploadDistinctParts(t, b, key, uploadID, 2)
 
-	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartParked) {
-		t.Fatalf("part states = %v, want all parked", states)
-	}
+	states := partStates(t, mem, uploadID)
+	require.True(t, allIn(states, registry.PartParked), "part states = %v, want all parked", states)
 	tasks, err := mem.queued(context.Background(), multipartqueue.Name)
-	if err != nil {
-		t.Fatalf("queued: %v", err)
-	}
+	require.NoError(t, err, "queued")
 	pending := 0
 	for _, task := range tasks {
 		if task.Subject == uploadID && task.Action == multipartqueue.AcceptAction && task.State == "pending" {
 			pending++
 		}
 	}
-	if pending != 1 {
-		t.Fatalf("pending accepts for the upload = %d, want 1 (all: %+v)", pending, tasks)
-	}
+	require.Equal(t, 1, pending, "pending accepts for the upload")
 }
 
 // TestAcceptConcludesEachBlobOnItsOwn: the upload's accept queues an accept
@@ -262,15 +244,11 @@ func TestAcceptConcludesEachBlobOnItsOwn(t *testing.T) {
 	uploadID := mpCreate(t, b, key, "", "")
 	uploadDistinctParts(t, b, key, uploadID, 3)
 
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	if got := cc.concluded(); !slices.Equal(got, []int{1, 1, 1}) {
-		t.Fatalf("conclude calls = %v, want one per blob", got)
-	}
-	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartAccepted) {
-		t.Fatalf("part states = %v, want all accepted", states)
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
+	got := cc.concluded()
+	require.True(t, slices.Equal(got, []int{1, 1, 1}), "conclude calls = %v, want one per blob", got)
+	states := partStates(t, mem, uploadID)
+	require.True(t, allIn(states, registry.PartAccepted), "part states = %v, want all accepted", states)
 }
 
 // TestAcceptLeavesASessionNoLongerOpen: a completed session's parts are
@@ -282,15 +260,11 @@ func TestAcceptLeavesASessionNoLongerOpen(t *testing.T) {
 	uploadDistinctParts(t, b, "completed", uploadID, 1)
 	mem.setSessionState(t, uploadID, registry.SessionCompleted)
 
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartParked) {
-		t.Fatalf("part states = %v, want parked", states)
-	}
-	if got := cc.concluded(); len(got) != 0 {
-		t.Fatalf("conclude calls = %v, want none", got)
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
+	states := partStates(t, mem, uploadID)
+	require.True(t, allIn(states, registry.PartParked), "part states = %v, want parked", states)
+	got := cc.concluded()
+	require.Empty(t, got, "conclude calls")
 }
 
 // selectiveConcluder concludes like the parking uploader, except that a
@@ -346,25 +320,19 @@ func TestAFailedBlobAcceptLeavesItsPart(t *testing.T) {
 	sc.failing = map[string]bool{string(second): true}
 	sc.mu.Unlock()
 
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	if got := partStates(t, mem, uploadID); got[1] != registry.PartAccepted || got[2] != registry.PartParked {
-		t.Fatalf("part states = %v, want part 1 accepted and part 2 parked", got)
-	}
-	if _, err := mem.GetLocation(ctx, mem.bk(), second); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("the refused blob is located (err=%v)", err)
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
+	got := partStates(t, mem, uploadID)
+	require.Equal(t, registry.PartAccepted, got[1], "part states = %v, want part 1 accepted and part 2 parked", got)
+	require.Equal(t, registry.PartParked, got[2], "part states = %v, want part 1 accepted and part 2 parked", got)
+	_, err := mem.GetLocation(ctx, mem.bk(), second)
+	require.ErrorIs(t, err, registry.ErrNotFound, "the refused blob is located (err=%v)", err)
 
 	sc.mu.Lock()
 	sc.failing = nil
 	sc.mu.Unlock()
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("retried accept: %v", err)
-	}
-	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartAccepted) {
-		t.Fatalf("part states after the retry = %v, want accepted", states)
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "retried accept")
+	states := partStates(t, mem, uploadID)
+	require.True(t, allIn(states, registry.PartAccepted), "part states after the retry = %v, want accepted", states)
 }
 
 // TestAcceptLeavesAPartWhoseBlobIsGone: a parked part whose blob has neither
@@ -376,21 +344,16 @@ func TestAcceptLeavesAPartWhoseBlobIsGone(t *testing.T) {
 	key := "accept-no-park"
 	uploadID := mpCreate(t, b, key, "", "")
 	parts := uploadDistinctParts(t, b, key, uploadID, 2)
-	if err := mem.DeletePark(ctx, mem.bk(), hygienePartDigests(t, mem, uploadID, 2)[0]); err != nil {
-		t.Fatalf("DeletePark: %v", err)
-	}
+	require.NoError(t, mem.DeletePark(ctx, mem.bk(), hygienePartDigests(t, mem, uploadID, 2)[0]), "DeletePark")
 
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	if got := partStates(t, mem, uploadID); got[1] != registry.PartAccepted || got[2] != registry.PartParked {
-		t.Fatalf("part states = %v, want part 1 accepted and part 2 parked", got)
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
+	got := partStates(t, mem, uploadID)
+	require.Equal(t, registry.PartAccepted, got[1], "part states = %v, want part 1 accepted and part 2 parked", got)
+	require.Equal(t, registry.PartParked, got[2], "part states = %v, want part 1 accepted and part 2 parked", got)
 	_, err := mpComplete(t, b, key, uploadID, parts, nil)
 	var apiErr s3err.APIError
-	if !errors.As(err, &apiErr) || apiErr.Code != "InvalidPart" {
-		t.Fatalf("Complete: err = %v, want InvalidPart", err)
-	}
+	require.ErrorAs(t, err, &apiErr, "Complete: err = %v, want InvalidPart", err)
+	require.Equal(t, "InvalidPart", apiErr.Code, "Complete: err")
 }
 
 // gatedConcluder holds every conclude until open is closed, and signals
@@ -449,22 +412,16 @@ func TestCompleteWaitsForARunningAccept(t *testing.T) {
 	}()
 	select {
 	case err := <-done:
-		t.Fatalf("Complete returned before the accept finished: %v", err)
+		require.FailNow(t, "Complete returned before the accept finished", "err: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 	close(g.open)
-	if err := <-background; err != nil {
-		t.Fatalf("background accept: %v", err)
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
-	if n := g.concludes(); n != 1 {
-		t.Fatalf("concludes = %d, want the background accept's one", n)
-	}
-	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartAccepted) {
-		t.Fatalf("part states = %v, want all accepted", states)
-	}
+	require.NoError(t, <-background, "background accept")
+	require.NoError(t, <-done, "Complete")
+	n := g.concludes()
+	require.Equal(t, 1, n, "concludes = %d, want the background accept's one", n)
+	states := partStates(t, mem, uploadID)
+	require.True(t, allIn(states, registry.PartAccepted), "part states = %v, want all accepted", states)
 }
 
 // TestCompleteOverTheWaitBudgetLeavesTheUploadOpen: an accept still running
@@ -486,23 +443,19 @@ func TestCompleteOverTheWaitBudgetLeavesTheUploadOpen(t *testing.T) {
 
 	_, err := mpComplete(t, b, key, uploadID, parts, nil)
 	var apiErr s3err.APIError
-	if !errors.As(err, &apiErr) || apiErr.Code != "OperationAborted" {
-		t.Fatalf("Complete over the wait budget: err = %v, want OperationAborted", err)
-	}
-	if sess, err := mem.GetSession(ctx, uploadID); err != nil || sess.State != registry.SessionOpen {
-		t.Fatalf("session after the refused Complete = %+v, %v; want open", sess, err)
-	}
+	require.ErrorAs(t, err, &apiErr, "Complete over the wait budget")
+	require.Equal(t, "OperationAborted", apiErr.Code, "Complete over the wait budget")
+	sess, err := mem.GetSession(ctx, uploadID)
+	require.NoError(t, err, "session after the refused Complete")
+	require.Equal(t, registry.SessionOpen, sess.State, "session after the refused Complete")
 
 	close(g.open)
-	if err := <-background; err != nil {
-		t.Fatalf("background accept: %v", err)
-	}
+	require.NoError(t, <-background, "background accept")
 	// The retry's accept starts once the background one's lease is free,
 	// which a loaded machine can take longer than the shrunk budget to see.
 	limits.AcceptWait = saved
-	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
-		t.Fatalf("retry Complete: %v", err)
-	}
+	_, err = mpComplete(t, b, key, uploadID, parts, nil)
+	require.NoError(t, err, "retry Complete")
 }
 
 // TestCompleteWaitsThroughAFailedConclude: a part whose blob's accept fails
@@ -523,23 +476,19 @@ func TestCompleteWaitsThroughAFailedConclude(t *testing.T) {
 
 	_, err := mpComplete(t, b, key, uploadID, parts, nil)
 	var apiErr s3err.APIError
-	if !errors.As(err, &apiErr) || apiErr.Code != "OperationAborted" {
-		t.Fatalf("Complete against a failing conclude: err = %v, want OperationAborted", err)
-	}
+	require.ErrorAs(t, err, &apiErr, "Complete against a failing conclude: err = %v, want OperationAborted", err)
+	require.Equal(t, "OperationAborted", apiErr.Code, "Complete against a failing conclude: err")
 	cc.mu.Lock()
 	concludes := len(cc.calls)
 	cc.mu.Unlock()
-	if concludes != 1 {
-		t.Fatalf("concludes while Complete waited = %d, want the one that failed", concludes)
-	}
-	if sess, err := mem.GetSession(ctx, uploadID); err != nil || sess.State != registry.SessionOpen {
-		t.Fatalf("session after the refused Complete = %+v, %v; want open", sess, err)
-	}
+	require.Equal(t, 1, concludes, "concludes while Complete waited = %d, want the one that failed", concludes)
+	sess, err := mem.GetSession(ctx, uploadID)
+	require.NoError(t, err, "session after the refused Complete")
+	require.Equal(t, registry.SessionOpen, sess.State, "session after the refused Complete")
 
 	limits.AcceptWait = saved
-	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
-		t.Fatalf("retry Complete: %v", err)
-	}
+	_, err = mpComplete(t, b, key, uploadID, parts, nil)
+	require.NoError(t, err, "retry Complete")
 }
 
 // TestCompleteBringsARetryingAcceptForward: a blob's accept has failed and
@@ -554,24 +503,18 @@ func TestCompleteBringsARetryingAcceptForward(t *testing.T) {
 	parts := uploadDistinctParts(t, b, key, uploadID, 1)
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
 	// The blob's accept fails once and waits to retry.
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
 
 	start := time.Now()
-	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
-	if took := time.Since(start); took > 4*time.Second {
-		t.Errorf("Complete took %v: it waited out the accept's backoff", took)
-	}
+	_, err := mpComplete(t, b, key, uploadID, parts, nil)
+	require.NoError(t, err, "Complete")
+	took := time.Since(start)
+	assert.LessOrEqual(t, took, 4*time.Second, "Complete took %v: it waited out the accept's backoff", took)
 	blobAccept(t, mem, d) // fails the test unless the blob has exactly one accept
 	cc.mu.Lock()
 	concludes := len(cc.calls)
 	cc.mu.Unlock()
-	if concludes != 2 {
-		t.Fatalf("concludes = %d, want 2: the one that failed and its retry", concludes)
-	}
+	require.Equal(t, 2, concludes, "concludes = %d, want 2: the one that failed and its retry", concludes)
 }
 
 // stallingConcluder never answers a conclude while stalled: it waits for its
@@ -601,19 +544,13 @@ func TestAcceptConcludeTimesOut(t *testing.T) {
 	uploadID := mpCreate(t, b, key, "", "")
 	uploadDistinctParts(t, b, key, uploadID, 1)
 
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartParked) {
-		t.Fatalf("part states after a timed-out conclude = %v, want parked", states)
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
+	states := partStates(t, mem, uploadID)
+	require.True(t, allIn(states, registry.PartParked), "part states after a timed-out conclude = %v, want parked", states)
 	sc.stalled.Store(false)
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("retried accept: %v", err)
-	}
-	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartAccepted) {
-		t.Fatalf("part states after the retry = %v, want accepted", states)
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "retried accept")
+	states = partStates(t, mem, uploadID)
+	require.True(t, allIn(states, registry.PartAccepted), "part states after the retry = %v, want accepted", states)
 }
 
 // TestCompleteAcceptsOnlyItsParts: Complete names part 1 and omits part 2,
@@ -630,16 +567,11 @@ func TestCompleteAcceptsOnlyItsParts(t *testing.T) {
 	sc.mu.Unlock()
 	// The accept UploadPart queued fails on part 2, before Complete runs
 	// its own.
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	if got := partStates(t, mem, uploadID); got[2] != registry.PartParked {
-		t.Fatalf("part 2 = %q, want parked", got[2])
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
+	require.Equal(t, registry.PartParked, partStates(t, mem, uploadID)[2], "part 2")
 
-	if _, err := mpComplete(t, b, key, uploadID, parts[:1], nil); err != nil {
-		t.Fatalf("Complete of part 1: %v", err)
-	}
+	_, err := mpComplete(t, b, key, uploadID, parts[:1], nil)
+	require.NoError(t, err, "Complete of part 1")
 }
 
 // TestAcceptTakesABlobWithAReleasePending: a part's blob has a release
@@ -654,24 +586,16 @@ func TestAcceptTakesABlobWithAReleasePending(t *testing.T) {
 	uploadID := mpCreate(t, b, key, "", "")
 	parts := uploadDistinctParts(t, b, key, uploadID, 1)
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
-	if err := mem.EnqueueRelease(ctx, mem.bk(), d, registry.DueNow()); err != nil {
-		t.Fatalf("EnqueueRelease: %v", err)
-	}
+	require.NoError(t, mem.EnqueueRelease(ctx, mem.bk(), d, registry.DueNow()), "EnqueueRelease")
 
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	if states := partStates(t, mem, uploadID); states[1] != registry.PartAccepted {
-		t.Fatalf("part state = %q, want accepted", states[1])
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
+	require.Equal(t, registry.PartAccepted, partStates(t, mem, uploadID)[1], "part state")
 	drainReleases(t, b)
 	assertAcceptedAndUnparked(t, mem, d)
-	if n := rm.removedDigests()[string(d)]; n != 0 {
-		t.Fatalf("referenced blob removed %d times, want never", n)
-	}
-	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
+	n := rm.removedDigests()[string(d)]
+	require.Zero(t, n, "referenced blob removed %d times", n)
+	_, err := mpComplete(t, b, key, uploadID, parts, nil)
+	require.NoError(t, err, "Complete")
 }
 
 // providerConcluder concludes as the upload service and provider do: a blob
@@ -753,7 +677,7 @@ func (c *providerConcluder) assertNoneLeft(t *testing.T) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for d := range c.registered {
-		t.Fatalf("blob %x left registered with nothing to remove it", []byte(d))
+		require.FailNow(t, "blob left registered with nothing to remove it", "blob %x", []byte(d))
 	}
 }
 
@@ -773,15 +697,12 @@ func (c *providerConcluder) runOnce(hook *func()) {
 func assertGone(t *testing.T, mem *testStore, d multihash.Multihash) {
 	t.Helper()
 	ctx := context.Background()
-	if loc, err := mem.GetLocation(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("blob %s has a location after its release: %+v (err=%v)", d, loc, err)
-	}
-	if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("park row for released blob %s survived (err=%v)", d, err)
-	}
-	if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("intent for released blob %s survived (err=%v)", d, err)
-	}
+	loc, err := mem.GetLocation(ctx, mem.bk(), d)
+	require.ErrorIs(t, err, registry.ErrNotFound, "blob %s has a location after its release: %+v (err=%v)", d, loc, err)
+	_, err = mem.ParkByDigest(ctx, d)
+	require.ErrorIs(t, err, registry.ErrNotFound, "park row for released blob %s survived", d)
+	_, err = mem.IntentByDigest(ctx, d)
+	require.ErrorIs(t, err, registry.ErrNotFound, "intent for released blob %s survived", d)
 }
 
 // TestAcceptRacesATeardown: an abort or a session expiry arrives while a
@@ -793,14 +714,12 @@ func TestAcceptRacesATeardown(t *testing.T) {
 	teardowns := map[string]func(t *testing.T, b *Backend, key, uploadID string){
 		"abort": func(t *testing.T, b *Backend, key, uploadID string) {
 			bucket := "bk"
-			if err := b.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
-				t.Errorf("Abort: %v", err)
-			}
+			assert.NoError(t, b.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}), "Abort")
 		},
 		"expiry": func(t *testing.T, b *Backend, _, _ string) {
-			if n, err := sweepUploads(context.Background(), b); err != nil || n != 1 {
-				t.Errorf("sweep: cleaned=%d err=%v, want the open session", n, err)
-			}
+			n, err := sweepUploads(context.Background(), b)
+			assert.NoError(t, err, "sweep")
+			assert.Equal(t, 1, n, "sweep: cleaned")
 		},
 	}
 	for name, teardown := range teardowns {
@@ -824,9 +743,7 @@ func TestAcceptRacesATeardown(t *testing.T) {
 					time.Sleep(100 * time.Millisecond)
 					pc.mu.Lock()
 					defer pc.mu.Unlock()
-					if pc.removed > 0 || slices.Contains(pc.aborted, string(d)) {
-						t.Error("the teardown's release ran while the blob was being concluded")
-					}
+					assert.False(t, pc.removed > 0 || slices.Contains(pc.aborted, string(d)), "the teardown's release ran while the blob was being concluded")
 				}
 				if when == "before accept" {
 					pc.before = hook
@@ -839,9 +756,7 @@ func TestAcceptRacesATeardown(t *testing.T) {
 
 				assertGone(t, mem, d)
 				pc.assertNoneLeft(t)
-				if pc.removed != 1 {
-					t.Fatalf("blob %s removed %d times, want once", d, pc.removed)
-				}
+				require.Equal(t, 1, pc.removed, "blob %s removed %d times", d, pc.removed)
 			})
 		}
 	}
@@ -871,8 +786,7 @@ func TestAcceptRacesASupersede(t *testing.T) {
 		go func() {
 			defer close(superseded)
 			out, err := mpUploadPart(t, b, key, uploadID, 1, replacement, nil)
-			if err != nil {
-				t.Errorf("superseding UploadPart: %v", err)
+			if !assert.NoError(t, err, "superseding UploadPart") {
 				return
 			}
 			etag = out.ETag
@@ -880,13 +794,9 @@ func TestAcceptRacesASupersede(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 		pc.mu.Lock()
 		defer pc.mu.Unlock()
-		if pc.removed > 0 || slices.Contains(pc.aborted, string(first)) {
-			t.Error("the superseded blob's release ran while it was being concluded")
-		}
+		assert.False(t, pc.removed > 0 || slices.Contains(pc.aborted, string(first)), "the superseded blob's release ran while it was being concluded")
 	}
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
 	<-superseded
 	drainReleases(t, b)
 
@@ -894,22 +804,15 @@ func TestAcceptRacesASupersede(t *testing.T) {
 	pc.mu.Lock()
 	stillRegistered := pc.registered[string(first)]
 	pc.mu.Unlock()
-	if stillRegistered {
-		t.Fatalf("superseded blob %s left registered with nothing to remove it", first)
-	}
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept of the replacement: %v", err)
-	}
+	require.False(t, stillRegistered, "superseded blob %s left registered with nothing to remove it", first)
+	require.NoError(t, runAccepts(t, b, uploadID), "accept of the replacement")
 	second := hygienePartDigests(t, mem, uploadID, 1)[0]
-	if states := partStates(t, mem, uploadID); states[1] != registry.PartAccepted {
-		t.Fatalf("replacement part state = %q, want accepted", states[1])
-	}
+	require.Equal(t, registry.PartAccepted, partStates(t, mem, uploadID)[1], "replacement part state")
 	assertAcceptedAndUnparked(t, mem, second)
 
 	one := int32(1)
-	if _, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: etag}}, nil); err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
+	_, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: etag}}, nil)
+	require.NoError(t, err, "Complete")
 }
 
 // TestAcceptRacesASupersedesRelease: a part is uploaded again, and the
@@ -933,30 +836,22 @@ func TestAcceptRacesASupersedesRelease(t *testing.T) {
 	old := hygienePartDigests(t, mem, uploadID, 1)[0]
 
 	store.hook = func() {
-		if err := runAccepts(t, b, uploadID); err != nil {
-			t.Errorf("accept: %v", err)
-		}
+		assert.NoError(t, runAccepts(t, b, uploadID), "accept")
 	}
 	replacement := testBody(int(backend.MinPartSize))
 	replacement[0] = 0xee
-	if _, err := mpUploadPart(t, b, key, uploadID, 1, replacement, nil); err != nil {
-		t.Fatalf("superseding UploadPart: %v", err)
-	}
-	if store.hook != nil {
-		t.Fatal("the hook never ran")
-	}
+	_, err := mpUploadPart(t, b, key, uploadID, 1, replacement, nil)
+	require.NoError(t, err, "superseding UploadPart")
+	require.Nil(t, store.hook, "the hook never ran")
 	drainReleases(t, b)
 
 	assertGone(t, mem, old)
 	pc.mu.Lock()
 	stillRegistered := pc.registered[string(old)]
 	pc.mu.Unlock()
-	if stillRegistered {
-		t.Fatalf("superseded blob %s left registered with nothing to remove it", old)
-	}
-	if got, _ := mem.ReleasingDigests(ctx, mem.bk(), []multihash.Multihash{old}); got[string(old)] {
-		t.Fatalf("release of %s left pending", old)
-	}
+	require.False(t, stillRegistered, "superseded blob %s left registered with nothing to remove it", old)
+	got, _ := mem.ReleasingDigests(ctx, mem.bk(), []multihash.Multihash{old})
+	require.False(t, got[string(old)], "release of %s left pending", old)
 }
 
 // TestAcceptsShareABlob: two open uploads of the space hold the same bytes,
@@ -973,30 +868,21 @@ func TestAcceptsShareABlob(t *testing.T) {
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
 
 	const other = "other-sharing"
-	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: "bk", Space: mem.bk(), ObjectKey: "other"}); err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, SpanLengths: []int64{1}}, nil); err != nil {
-		t.Fatalf("PutPart: %v", err)
-	}
+	require.NoError(t, mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: "bk", Space: mem.bk(), ObjectKey: "other"}), "CreateSession")
+	_, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, SpanLengths: []int64{1}}, nil)
+	require.NoError(t, err, "PutPart")
 
 	for _, id := range []string{uploadID, other} {
-		if err := runAccepts(t, b, id); err != nil {
-			t.Fatalf("accept of %s: %v", id, err)
-		}
+		require.NoError(t, runAccepts(t, b, id), "accept of %s", id)
 	}
 	for _, id := range []string{uploadID, other} {
-		if states := partStates(t, mem, id); states[1] != registry.PartAccepted {
-			t.Fatalf("upload %s part state = %q, want accepted", id, states[1])
-		}
+		require.Equal(t, registry.PartAccepted, partStates(t, mem, id)[1], "upload %s part state", id)
 	}
-	if got := cc.concluded(); !slices.Equal(got, []int{1}) {
-		t.Fatalf("conclude calls = %v, want the shared blob concluded once", got)
-	}
+	got := cc.concluded()
+	require.True(t, slices.Equal(got, []int{1}), "conclude calls = %v, want the shared blob concluded once", got)
 	assertAcceptedAndUnparked(t, mem, d)
-	if n := rm.removedDigests()[string(d)]; n != 0 {
-		t.Fatalf("shared blob %s removed %d times, want never", d, n)
-	}
+	n := rm.removedDigests()[string(d)]
+	require.Zero(t, n, "shared blob %s removed %d times", d, n)
 }
 
 // TestAcceptLeavesAReplacementPark: the provider accepts a part's blob, the
@@ -1016,37 +902,25 @@ func TestAcceptLeavesAReplacementPark(t *testing.T) {
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
 
 	h, err := multihash.Sum([]byte("replacement allocation"), multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash: %v", err)
-	}
+	require.NoError(t, err, "multihash")
 	replacement := cid.NewCidV1(cid.Raw, h)
 	pc.after = func() {
-		if err := mem.DeletePark(ctx, mem.bk(), d); err != nil {
-			t.Errorf("DeletePark: %v", err)
-		}
-		if ok, err := mem.PutPark(ctx, registry.BlobPark{Space: mem.bk(), Digest: d, AddTask: replacement.Bytes(), AcceptTask: replacement.Bytes(), PutInvocation: []byte{1}, Size: 1}); err != nil || !ok {
-			t.Errorf("PutPark (replacement) = %v, %v", ok, err)
-		}
+		assert.NoError(t, mem.DeletePark(ctx, mem.bk(), d), "DeletePark")
+		ok, err := mem.PutPark(ctx, registry.BlobPark{Space: mem.bk(), Digest: d, AddTask: replacement.Bytes(), AcceptTask: replacement.Bytes(), PutInvocation: []byte{1}, Size: 1})
+		assert.NoError(t, err, "PutPark (replacement)")
+		assert.True(t, ok, "PutPark (replacement)")
 	}
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	if park, err := mem.GetPark(ctx, mem.bk(), d); err != nil || !bytes.Equal(park.AddTask, replacement.Bytes()) {
-		t.Fatalf("replacement park after the first accept = %+v, %v; want it kept", park, err)
-	}
-	if states := partStates(t, mem, uploadID); states[1] != registry.PartParked {
-		t.Fatalf("part state = %q, want parked", states[1])
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
+	park, err := mem.GetPark(ctx, mem.bk(), d)
+	require.NoError(t, err, "replacement park after the first accept")
+	require.Equal(t, replacement.Bytes(), park.AddTask, "replacement park after the first accept")
+	require.Equal(t, registry.PartParked, partStates(t, mem, uploadID)[1], "part state")
 
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("second accept: %v", err)
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "second accept")
 	pc.mu.Lock()
 	concluded := slices.Clone(pc.concluded)
 	pc.mu.Unlock()
-	if !slices.Contains(concluded, replacement) {
-		t.Fatalf("concluded add tasks = %v; the replacement park was never concluded on its own allocation", concluded)
-	}
+	require.True(t, slices.Contains(concluded, replacement), "concluded add tasks = %v; the replacement park was never concluded on its own allocation", concluded)
 	assertAcceptedAndUnparked(t, mem, d)
 }
 
@@ -1092,38 +966,26 @@ func TestAcceptKeepsAParkThatReplacesALocation(t *testing.T) {
 	uploadDistinctParts(t, b, key, uploadID, 1)
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
 	// Another conclude recorded the blob, its park left beside the location.
-	if err := mem.PutLocation(ctx, registry.BlobLocation{Space: mem.bk(), Digest: d, Provider: "did:key:zNode", URL: "https://node.example/blob", Size: 1}); err != nil {
-		t.Fatalf("PutLocation: %v", err)
-	}
+	require.NoError(t, mem.PutLocation(ctx, registry.BlobLocation{Space: mem.bk(), Digest: d, Provider: "did:key:zNode", URL: "https://node.example/blob", Size: 1}), "PutLocation")
 	h, err := multihash.Sum([]byte("replacing allocation"), multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash: %v", err)
-	}
+	require.NoError(t, err, "multihash")
 	replacement := cid.NewCidV1(cid.Raw, h)
 	locs.mu.Lock()
 	locs.digest = d
 	locs.hook = func() {
 		_ = mem.DeleteLocation(ctx, mem.bk(), d)
 		_ = mem.DeletePark(ctx, mem.bk(), d)
-		if ok, err := mem.PutPark(ctx, registry.BlobPark{Space: mem.bk(), Digest: d, AddTask: replacement.Bytes(), AcceptTask: replacement.Bytes(), PutInvocation: []byte{1}, Size: 1}); err != nil || !ok {
-			t.Errorf("PutPark (replacement) = %v, %v", ok, err)
-		}
+		ok, err := mem.PutPark(ctx, registry.BlobPark{Space: mem.bk(), Digest: d, AddTask: replacement.Bytes(), AcceptTask: replacement.Bytes(), PutInvocation: []byte{1}, Size: 1})
+		assert.NoError(t, err, "PutPark (replacement)")
+		assert.True(t, ok, "PutPark (replacement)")
 	}
 	locs.mu.Unlock()
 
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
 	park, err := mem.GetPark(ctx, mem.bk(), d)
-	if err != nil {
-		t.Fatalf("replacement park dropped by a stale located path: %v", err)
-	}
-	if !bytes.Equal(park.AddTask, replacement.Bytes()) {
-		t.Fatalf("park add task = %x, want the replacement's", park.AddTask)
-	}
-	if states := partStates(t, mem, uploadID); states[1] != registry.PartParked {
-		t.Fatalf("part state = %q, want parked", states[1])
-	}
+	require.NoError(t, err, "replacement park dropped by a stale located path")
+	require.Equal(t, replacement.Bytes(), park.AddTask, "park add task")
+	require.Equal(t, registry.PartParked, partStates(t, mem, uploadID)[1], "part state")
 }
 
 // blobAccept returns the one queue-space-shard.accept queued for d in the
@@ -1131,9 +993,7 @@ func TestAcceptKeepsAParkThatReplacesALocation(t *testing.T) {
 func blobAccept(t *testing.T, mem *testStore, d multihash.Multihash) taskrunnertest.QueuedTask {
 	t.Helper()
 	tasks, err := mem.queued(context.Background(), spaceshardqueue.Name)
-	if err != nil {
-		t.Fatalf("queued blob accepts: %v", err)
-	}
+	require.NoError(t, err, "queued blob accepts")
 	subject := spaceshardqueue.Subject(mem.bk(), d)
 	var found []taskrunnertest.QueuedTask
 	for _, task := range tasks {
@@ -1141,9 +1001,7 @@ func blobAccept(t *testing.T, mem *testStore, d multihash.Multihash) taskrunnert
 			found = append(found, task)
 		}
 	}
-	if len(found) != 1 {
-		t.Fatalf("accepts queued for the blob = %d, want 1", len(found))
-	}
+	require.Len(t, found, 1, "accepts queued for the blob")
 	return found[0]
 }
 
@@ -1161,32 +1019,25 @@ func TestAcceptRetriesUntilTheConcludeSucceeds(t *testing.T) {
 	uploadDistinctParts(t, b, key, uploadID, 1)
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
 	// The blob's accept fails once and waits to retry.
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
 
 	// Each retry is brought forward in place of waiting out its backoff. A
 	// task's attempts count its failures.
 	bringForward := func() {
 		t.Helper()
-		if _, err := b.blobs.ExpediteAccepts(ctx, mem.bk()); err != nil {
-			t.Fatalf("bring the accept forward: %v", err)
-		}
+		_, err := b.blobs.ExpediteAccepts(ctx, mem.bk())
+		require.NoError(t, err, "bring the accept forward")
 	}
 	for failed := 2; failed <= failures; failed++ {
 		bringForward()
 		deadline := time.Now().Add(10 * time.Second)
 		for {
 			task := blobAccept(t, mem, d)
-			if task.State != "pending" {
-				t.Fatalf("the accept is %s after %d failures, want it waiting to retry", task.State, task.Attempts)
-			}
+			require.Equal(t, "pending", task.State, "the accept is %s after %d failures, want it waiting to retry", task.State, task.Attempts)
 			if task.Attempts >= failed {
 				break
 			}
-			if time.Now().After(deadline) {
-				t.Fatalf("failure %d did not happen: %+v", failed, task)
-			}
+			require.False(t, time.Now().After(deadline), "failure %d did not happen: %+v", failed, task)
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
@@ -1194,7 +1045,7 @@ func TestAcceptRetriesUntilTheConcludeSucceeds(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	for !allIn(partStates(t, mem, uploadID), registry.PartAccepted) {
 		if time.Now().After(deadline) {
-			t.Fatalf("part states = %v after the conclude succeeded, want accepted; accept = %+v",
+			require.FailNow(t, "parts not accepted after the conclude succeeded", "part states = %v, want accepted; accept = %+v",
 				partStates(t, mem, uploadID), blobAccept(t, mem, d))
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -1251,39 +1102,27 @@ func TestAcceptFailsForGoodWhenTheAllocationIsGone(t *testing.T) {
 	uploadID, parts := uploadOnePart(t, b, "bk", key, part)
 	gc.setGone(d)
 
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	if task := blobAccept(t, mem, d); task.State != "failed" {
-		t.Fatalf("the blob's accept is %s, want failed with no retry", task.State)
-	}
-	if _, err := mem.GetPark(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("park of the lost blob: err = %v, want it gone", err)
-	}
-	if states := partStates(t, mem, uploadID); states[1] != registry.PartParked {
-		t.Fatalf("part state = %q, want parked", states[1])
-	}
-	_, err := mpComplete(t, b, key, uploadID, parts, nil)
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
+	task := blobAccept(t, mem, d)
+	require.Equal(t, "failed", task.State, "the blob's accept is %s, want failed with no retry", task.State)
+	_, err := mem.GetPark(ctx, mem.bk(), d)
+	require.ErrorIs(t, err, registry.ErrNotFound, "park of the lost blob")
+	require.Equal(t, registry.PartParked, partStates(t, mem, uploadID)[1], "part state")
+	_, err = mpComplete(t, b, key, uploadID, parts, nil)
 	var apiErr s3err.APIError
-	if !errors.As(err, &apiErr) || apiErr.Code != "InvalidPart" {
-		t.Fatalf("Complete of the lost part: err = %v, want InvalidPart", err)
-	}
+	require.ErrorAs(t, err, &apiErr, "Complete of the lost part")
+	require.Equal(t, "InvalidPart", apiErr.Code, "Complete of the lost part")
 
 	gc.setGone()
 	out, err := mpUploadPart(t, b, key, uploadID, 1, part, nil)
-	if err != nil {
-		t.Fatalf("UploadPart again: %v", err)
-	}
-	if got := hygienePartDigests(t, mem, uploadID, 1)[0]; !bytes.Equal(got, d) {
-		t.Fatalf("the part uploaded again is stored under %x, want %x", got, d)
-	}
-	if _, err := mem.GetPark(ctx, mem.bk(), d); err != nil {
-		t.Fatalf("park of the part uploaded again: %v", err)
-	}
+	require.NoError(t, err, "UploadPart again")
+	got := hygienePartDigests(t, mem, uploadID, 1)[0]
+	require.True(t, bytes.Equal(got, d), "the part uploaded again is stored under %x, want %x", got, d)
+	_, err = mem.GetPark(ctx, mem.bk(), d)
+	require.NoError(t, err, "park of the part uploaded again")
 	n := int32(1)
-	if _, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{ETag: out.ETag, PartNumber: &n}}, nil); err != nil {
-		t.Fatalf("Complete after the part was uploaded again: %v", err)
-	}
+	_, err = mpComplete(t, b, key, uploadID, []types.CompletedPart{{ETag: out.ETag, PartNumber: &n}}, nil)
+	require.NoError(t, err, "Complete after the part was uploaded again")
 }
 
 // TestALostAllocationsAcceptLeavesAReplacementPark: while the provider
@@ -1301,28 +1140,21 @@ func TestALostAllocationsAcceptLeavesAReplacementPark(t *testing.T) {
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
 
 	h, err := multihash.Sum([]byte("replacement allocation"), multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash: %v", err)
-	}
+	require.NoError(t, err, "multihash")
 	replacement := cid.NewCidV1(cid.Raw, h)
 	gc.setGone(d)
 	gc.refusing = func() {
-		if err := mem.DeletePark(ctx, mem.bk(), d); err != nil {
-			t.Errorf("DeletePark: %v", err)
-		}
-		if ok, err := mem.PutPark(ctx, registry.BlobPark{Space: mem.bk(), Digest: d, AddTask: replacement.Bytes(), AcceptTask: replacement.Bytes(), PutInvocation: []byte{1}, Size: 1}); err != nil || !ok {
-			t.Errorf("PutPark (replacement) = %v, %v", ok, err)
-		}
+		assert.NoError(t, mem.DeletePark(ctx, mem.bk(), d), "DeletePark")
+		ok, err := mem.PutPark(ctx, registry.BlobPark{Space: mem.bk(), Digest: d, AddTask: replacement.Bytes(), AcceptTask: replacement.Bytes(), PutInvocation: []byte{1}, Size: 1})
+		assert.NoError(t, err, "PutPark (replacement)")
+		assert.True(t, ok, "PutPark (replacement)")
 	}
-	if err := runAccepts(t, b, uploadID); err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	if task := blobAccept(t, mem, d); task.State != "failed" {
-		t.Fatalf("the blob's accept is %s, want failed", task.State)
-	}
-	if park, err := mem.GetPark(ctx, mem.bk(), d); err != nil || !bytes.Equal(park.AddTask, replacement.Bytes()) {
-		t.Fatalf("replacement park after the failed accept = %+v, %v; want it kept", park, err)
-	}
+	require.NoError(t, runAccepts(t, b, uploadID), "accept")
+	task := blobAccept(t, mem, d)
+	require.Equal(t, "failed", task.State, "the blob's accept")
+	park, err := mem.GetPark(ctx, mem.bk(), d)
+	require.NoError(t, err, "replacement park after the failed accept")
+	require.Equal(t, replacement.Bytes(), park.AddTask, "replacement park after the failed accept")
 }
 
 // TestAFailingAcceptIsNotQueuedAgain: while a blob's accept keeps failing
@@ -1340,21 +1172,16 @@ func TestAFailingAcceptIsNotQueuedAgain(t *testing.T) {
 		body := testBody(int(backend.MinPartSize))
 		body[0] = byte(i)
 		out, err := mpUploadPart(t, b, key, uploadID, i, body, nil)
-		if err != nil {
-			t.Fatalf("UploadPart %d: %v", i, err)
-		}
+		require.NoError(t, err, "UploadPart %d", i)
 		num := i
 		parts = append(parts, types.CompletedPart{PartNumber: &num, ETag: out.ETag})
-		if err := runAccepts(t, b, uploadID); err != nil {
-			t.Fatalf("accept after part %d: %v", i, err)
-		}
+		require.NoError(t, runAccepts(t, b, uploadID), "accept after part %d", i)
 	}
 	for range 2 {
 		_, err := mpComplete(t, b, key, uploadID, parts, nil)
 		var apiErr s3err.APIError
-		if !errors.As(err, &apiErr) || apiErr.Code != "OperationAborted" {
-			t.Fatalf("Complete against a failing upload service: err = %v, want OperationAborted", err)
-		}
+		require.ErrorAs(t, err, &apiErr, "Complete against a failing upload service: err = %v, want OperationAborted", err)
+		require.Equal(t, "OperationAborted", apiErr.Code, "Complete against a failing upload service: err")
 	}
 	for n := 1; n <= 3; n++ {
 		blobAccept(t, mem, hygienePartDigests(t, mem, uploadID, n)[0]) // exactly one accept each

@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/fil-forge/versitygw/tests/integration"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // forgeCase pairs an upstream versitygw integration case with its subtest
@@ -119,9 +121,8 @@ func TestForgeVersity(t *testing.T) {
 							t.Skip(reason)
 						}
 					}
-					if err := tt.fn(catConf); err != nil {
-						t.Fatalf("%v", err)
-					}
+					err := tt.fn(catConf)
+					require.NoError(t, err)
 				})
 			}
 		})
@@ -132,8 +133,7 @@ func TestForgeVersity(t *testing.T) {
 			for _, tt := range cat.xfail {
 				t.Run(tt.name, func(t *testing.T) {
 					err := tt.fn(catConf)
-					if err == nil {
-						t.Errorf("case unexpectedly passed; promote it from the %s xfail table to the pass table", cat.name)
+					if !assert.Error(t, err, "case unexpectedly passed; promote it from the %s xfail table to the pass table", cat.name) {
 						return
 					}
 					t.Skipf("known-failing: %v", err)

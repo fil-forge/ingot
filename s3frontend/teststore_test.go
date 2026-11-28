@@ -14,6 +14,7 @@ import (
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
@@ -94,12 +95,8 @@ func newTestStoreWithLease(t testing.TB, ttl time.Duration) *testStore {
 		Node:         testNode,
 		Logger:       zaptest.NewLogger(t),
 	})
-	if err != nil {
-		t.Fatalf("task runner: %v", err)
-	}
-	if err := r.Migrate(context.Background()); err != nil {
-		t.Fatalf("migrate task queues: %v", err)
-	}
+	require.NoError(t, err, "task runner")
+	require.NoError(t, r.Migrate(context.Background()), "migrate task queues")
 	return &testStore{Postgres: registry.NewPostgres(pool), pool: pool, tasks: r}
 }
 
@@ -135,17 +132,11 @@ func (s *testStore) newBackend(t testing.TB, deps Deps) *Backend {
 		}
 	}
 	b, err := New(deps)
-	if err != nil {
-		t.Fatalf("backend: %v", err)
-	}
-	if err := s.tasks.Handle(shardqueue.Name, shardFlush, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+	require.NoError(t, err, "backend")
+	require.NoError(t, s.tasks.Handle(shardqueue.Name, shardFlush, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
 		return nil, nil
-	}); err != nil {
-		t.Fatalf("register shard flush: %v", err)
-	}
-	if err := s.tasks.Start(context.Background()); err != nil {
-		t.Fatalf("start task queues: %v", err)
-	}
+	}), "register shard flush")
+	require.NoError(t, s.tasks.Start(context.Background()), "start task queues")
 	stores.Store(b, s)
 	t.Cleanup(func() { _ = s.tasks.Stop(context.Background()) })
 	return b
@@ -162,9 +153,8 @@ const shardFlush = "flush"
 func settleCache(t testing.TB, b *Backend, digests ...multihash.Multihash) {
 	t.Helper()
 	for _, d := range digests {
-		if _, err := storeFor(b).tasks.Run(t.Context(), taskrunner.Spec{Queue: shardqueue.Name, Subject: hex.EncodeToString(d), Action: shardFlush}); err != nil {
-			t.Fatalf("settle the cache tasks of %x: %v", d, err)
-		}
+		_, err := storeFor(b).tasks.Run(t.Context(), taskrunner.Spec{Queue: shardqueue.Name, Subject: hex.EncodeToString(d), Action: shardFlush})
+		require.NoError(t, err, "settle the cache tasks of %x", d)
 	}
 }
 
@@ -202,11 +192,9 @@ func randomDID() did.DID {
 // life, as its commits counted them.
 func (s *testStore) objectTotals(t testing.TB, bucket string) (added, removed int64) {
 	t.Helper()
-	if err := s.pool.QueryRow(context.Background(),
+	require.NoError(t, s.pool.QueryRow(context.Background(),
 		`SELECT objects_added, objects_removed FROM ingot.buckets WHERE name = $1`, bucket,
-	).Scan(&added, &removed); err != nil {
-		t.Fatalf("read object totals: %v", err)
-	}
+	).Scan(&added, &removed), "read object totals")
 	return added, removed
 }
 
@@ -485,10 +473,9 @@ func (s *testStore) PutPart(ctx context.Context, p registry.MultipartPart, tree 
 // what a change does to an upload in that state.
 func (s *testStore) setSessionState(t testing.TB, uploadID, state string) {
 	t.Helper()
-	if _, err := s.pool.Exec(context.Background(),
-		`UPDATE ingot.multipart_sessions SET state = $2 WHERE upload_id = $1`, uploadID, state); err != nil {
-		t.Fatalf("set session state: %v", err)
-	}
+	_, err := s.pool.Exec(context.Background(),
+		`UPDATE ingot.multipart_sessions SET state = $2 WHERE upload_id = $1`, uploadID, state)
+	require.NoError(t, err, "set session state")
 }
 
 // sweepUploads runs, at once, what each upload's scheduled tasks do once its
@@ -539,18 +526,14 @@ func sweepUploads(ctx context.Context, b *Backend) (int, error) {
 func releaseSpaces(t *testing.T, mem *testStore) []did.DID {
 	t.Helper()
 	tasks, err := mem.queued(context.Background(), spaceshardqueue.Name)
-	if err != nil {
-		t.Fatalf("queued releases: %v", err)
-	}
+	require.NoError(t, err, "queued releases")
 	var out []did.DID
 	for _, task := range tasks {
 		if task.Action != spaceshardqueue.ReleaseAction {
 			continue
 		}
 		space, _, err := spaceshardqueue.ParseSubject(task.Subject)
-		if err != nil {
-			t.Fatalf("space-shard subject: %v", err)
-		}
+		require.NoError(t, err, "space-shard subject")
 		if !slices.Contains(out, space) {
 			out = append(out, space)
 		}
