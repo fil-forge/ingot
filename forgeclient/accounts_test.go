@@ -13,22 +13,17 @@ import (
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/command"
 	"github.com/fil-forge/ucantone/ucan/delegation"
+	"github.com/stretchr/testify/require"
 )
 
 func newAccountsTestClient(t *testing.T, agent ucan.Issuer, store tokenstore.Store) *Client {
 	t.Helper()
 	svc, err := ed25519.GenerateIssuer()
-	if err != nil {
-		t.Fatalf("generate service issuer: %v", err)
-	}
+	require.NoError(t, err, "generate service issuer")
 	u, err := url.Parse("http://127.0.0.1:1")
-	if err != nil {
-		t.Fatalf("parse url: %v", err)
-	}
+	require.NoError(t, err, "parse url")
 	c, err := New(agent, svc.DID(), *u, WithTokenStore(store))
-	if err != nil {
-		t.Fatalf("new client: %v", err)
-	}
+	require.NoError(t, err, "new client")
 	return c
 }
 
@@ -38,88 +33,58 @@ func newAccountsTestClient(t *testing.T, agent ucan.Issuer, store tokenstore.Sto
 func accountGrant(t *testing.T, account did.DID, agent ucan.Issuer) ucan.Delegation {
 	t.Helper()
 	dlg, err := delegation.Delegate(absentee.From(account), agent.DID(), did.Undef, command.Top(), delegation.WithNoExpiration())
-	if err != nil {
-		t.Fatalf("delegate account→agent: %v", err)
-	}
+	require.NoError(t, err, "delegate account→agent")
 	return dlg
 }
 
 func TestAccounts(t *testing.T) {
 	ctx := context.Background()
 	agent, err := ed25519.GenerateIssuer()
-	if err != nil {
-		t.Fatalf("generate agent: %v", err)
-	}
+	require.NoError(t, err, "generate agent")
 
 	alice, err := didmailto.New("alice@example.com")
-	if err != nil {
-		t.Fatalf("didmailto alice: %v", err)
-	}
+	require.NoError(t, err, "didmailto alice")
 	bob, err := didmailto.New("bob@example.com")
-	if err != nil {
-		t.Fatalf("didmailto bob: %v", err)
-	}
+	require.NoError(t, err, "didmailto bob")
 
 	t.Run("empty store returns no accounts", func(t *testing.T) {
 		c := newAccountsTestClient(t, agent, tokenstore.NewMemStore())
 		got, err := c.Accounts(ctx)
-		if err != nil {
-			t.Fatalf("Accounts: %v", err)
-		}
-		if len(got) != 0 {
-			t.Fatalf("want 0 accounts, got %v", got)
-		}
+		require.NoError(t, err, "Accounts")
+		require.Empty(t, got)
 	})
 
 	t.Run("non-mailto issuer is filtered out", func(t *testing.T) {
 		other, err := ed25519.GenerateIssuer()
-		if err != nil {
-			t.Fatalf("generate other: %v", err)
-		}
+		require.NoError(t, err, "generate other")
 		keyGrant, err := delegation.Delegate(other, agent.DID(), did.Undef, command.Top(), delegation.WithNoExpiration())
-		if err != nil {
-			t.Fatalf("delegate key→agent: %v", err)
-		}
+		require.NoError(t, err, "delegate key→agent")
 		store := tokenstore.NewMemStore()
-		if err := store.AddDelegations(ctx, keyGrant); err != nil {
-			t.Fatalf("add: %v", err)
-		}
+		require.NoError(t, store.AddDelegations(ctx, keyGrant), "add")
 		c := newAccountsTestClient(t, agent, store)
 		got, err := c.Accounts(ctx)
-		if err != nil {
-			t.Fatalf("Accounts: %v", err)
-		}
-		if len(got) != 0 {
-			t.Fatalf("did:key issuer should be filtered out, got %v", got)
-		}
+		require.NoError(t, err, "Accounts")
+		require.Empty(t, got, "did:key issuer should be filtered out")
 	})
 
 	t.Run("returns distinct mailto accounts, sorted", func(t *testing.T) {
 		store := tokenstore.NewMemStore()
 		// bob then alice (out of order); alice twice (dedup).
-		if err := store.AddDelegations(ctx,
+		require.NoError(t, store.AddDelegations(ctx,
 			accountGrant(t, bob, agent),
 			accountGrant(t, alice, agent),
 			accountGrant(t, alice, agent),
-		); err != nil {
-			t.Fatalf("add: %v", err)
-		}
+		), "add")
 		c := newAccountsTestClient(t, agent, store)
 		got, err := c.Accounts(ctx)
-		if err != nil {
-			t.Fatalf("Accounts: %v", err)
-		}
+		require.NoError(t, err, "Accounts")
 		want := []did.DID{alice, bob}
 		if alice.String() > bob.String() {
 			want = []did.DID{bob, alice}
 		}
-		if len(got) != len(want) {
-			t.Fatalf("want %d accounts %v, got %d %v", len(want), want, len(got), got)
-		}
+		require.Len(t, got, len(want))
 		for i := range want {
-			if got[i] != want[i] {
-				t.Fatalf("account[%d]: want %s, got %s", i, want[i], got[i])
-			}
+			require.Equal(t, want[i], got[i], "account[%d]", i)
 		}
 	})
 }

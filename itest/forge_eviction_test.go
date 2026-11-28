@@ -3,12 +3,12 @@
 package itest
 
 import (
-	"bytes"
 	"fmt"
 	"testing"
 	"time"
 
 	ingottest "github.com/fil-forge/ingot/testing"
+	"github.com/stretchr/testify/require"
 )
 
 // TestForgeReadAfterEviction proves the appliance read tier: after the local
@@ -38,26 +38,17 @@ func TestForgeReadAfterEviction(t *testing.T) {
 		data[i] = byte(i*7 + 3)
 	}
 
-	if err := ingottest.CreateBucket(ctx, cfg, bucket); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
-	if err := ingottest.PutBytes(ctx, cfg, bucket, key, data); err != nil {
-		t.Fatalf("put object: %v", err)
-	}
+	require.NoError(t, ingottest.CreateBucket(ctx, cfg, bucket), "create bucket")
+	require.NoError(t, ingottest.PutBytes(ctx, cfg, bucket, key, data), "put object")
 
 	// Wipe the local blob copies (the cache) so the next GET cannot
 	// read-after-write — its body blobs must be re-fetched from piri.
-	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/cache"); err != nil {
-		t.Fatalf("wipe local blob copies: %v (stdout=%s stderr=%s)", err, out, errOut)
-	}
+	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/cache")
+	require.NoError(t, err, "wipe local blob copies (stdout=%s stderr=%s)", out, errOut)
 
 	got, err := ingottest.GetBytes(ctx, cfg, bucket, key)
-	if err != nil {
-		t.Fatalf("get after eviction (forge read tier): %v", err)
-	}
-	if !bytes.Equal(got, data) {
-		t.Fatalf("read-after-eviction mismatch: got %d bytes, want %d", len(got), len(data))
-	}
+	require.NoError(t, err, "get after eviction (forge read tier)")
+	require.Equal(t, data, got, "read-after-eviction mismatch")
 	t.Logf("read-after-eviction OK: %d bytes re-fetched from piri via the local locator", len(got))
 }
 
@@ -77,9 +68,7 @@ func TestForgeLocalBlobBudget(t *testing.T) {
 	const bucket = "budget-bucket"
 	const budget = 4 << 20
 
-	if err := ingottest.CreateBucket(ctx, cfg, bucket); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, ingottest.CreateBucket(ctx, cfg, bucket), "create bucket")
 	objects := make(map[string][]byte)
 	for i := range 16 {
 		key := fmt.Sprintf("obj-%02d", i)
@@ -87,9 +76,7 @@ func TestForgeLocalBlobBudget(t *testing.T) {
 		for j := range data {
 			data[j] = byte(i*31 + j*7)
 		}
-		if err := ingottest.PutBytes(ctx, cfg, bucket, key, data); err != nil {
-			t.Fatalf("put %s: %v", key, err)
-		}
+		require.NoError(t, ingottest.PutBytes(ctx, cfg, bucket, key, data), "put %s", key)
 		objects[key] = data
 	}
 
@@ -100,25 +87,18 @@ func TestForgeLocalBlobBudget(t *testing.T) {
 			t.Logf("local blob usage %d bytes, within the %d-byte budget", used, budget)
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("local blob usage %d bytes still over the %d-byte budget after 2 minutes", used, budget)
-		}
+		require.False(t, time.Now().After(deadline), "local blob usage %d bytes still over the %d-byte budget after 2 minutes", used, budget)
 		time.Sleep(5 * time.Second)
 	}
 	// 16 MiB down to at most 4 MiB leaves room for at most four of the
 	// 1 MiB blobs; the rest are read back from piri below.
-	if n := localBlobCount(t, ctx, s); n > 4 {
-		t.Fatalf("local blobs after eviction = %d, want at most 4", n)
-	}
+	n := localBlobCount(t, ctx, s)
+	require.LessOrEqual(t, n, 4, "local blobs after eviction")
 
 	for key, want := range objects {
 		got, err := ingottest.GetBytes(ctx, cfg, bucket, key)
-		if err != nil {
-			t.Fatalf("get %s after eviction: %v", key, err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Fatalf("get %s after eviction: got %d bytes, want %d matching bytes", key, len(got), len(want))
-		}
+		require.NoError(t, err, "get %s after eviction", key)
+		require.Equal(t, want, got, "get %s after eviction: got %d bytes, want %d matching bytes", key, len(got), len(want))
 	}
 }
 
@@ -135,25 +115,15 @@ func TestForgeUncachedWrites(t *testing.T) {
 	cfg := forgeConfig(ingotEndpoint, accessKey, secretKey)
 	const bucket, key = "uncached-bucket", "obj"
 
-	if err := ingottest.CreateBucket(ctx, cfg, bucket); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, ingottest.CreateBucket(ctx, cfg, bucket), "create bucket")
 	data := make([]byte, 3<<20)
 	for i := range data {
 		data[i] = byte(i*13 + 5)
 	}
 	before := localBlobCount(t, ctx, s)
-	if err := ingottest.PutBytes(ctx, cfg, bucket, key, data); err != nil {
-		t.Fatalf("put: %v", err)
-	}
-	if got := localBlobCount(t, ctx, s) - before; got != 0 {
-		t.Fatalf("PUT left %d local blobs, want 0 with cache_writes off", got)
-	}
+	require.NoError(t, ingottest.PutBytes(ctx, cfg, bucket, key, data), "put")
+	require.Zero(t, localBlobCount(t, ctx, s)-before, "local blobs a PUT left with cache_writes off")
 	got, err := ingottest.GetBytes(ctx, cfg, bucket, key)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if !bytes.Equal(got, data) {
-		t.Fatalf("get: got %d bytes, want %d matching bytes", len(got), len(data))
-	}
+	require.NoError(t, err, "get")
+	require.Equal(t, data, got, "get: got %d bytes, want %d matching bytes", len(got), len(data))
 }

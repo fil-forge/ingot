@@ -12,6 +12,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/smelt/pkg/stack"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestForgeWriteLockedTenantIsReadOnly checks the tenant states through the S3
@@ -38,16 +40,14 @@ func TestForgeWriteLockedTenantIsReadOnly(t *testing.T) {
 	svcAK, svcSK := hiltProvisionTenant(t, ctx, s, tenant)
 	owner := bigObjectClient(t, endpoint, svcAK, svcSK)
 	for _, b := range []string{bucket, spare} {
-		if _, err := owner.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(b)}); err != nil {
-			t.Fatalf("create %s: %v", b, err)
-		}
+		_, err := owner.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(b)})
+		require.NoError(t, err, "create %s", b)
 	}
 	for _, key := range []string{"kept", "deleted"} {
-		if _, err := owner.PutObject(ctx, &s3.PutObjectInput{
+		_, err := owner.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(patternBytes(512)),
-		}); err != nil {
-			t.Fatalf("put %s: %v", key, err)
-		}
+		})
+		require.NoError(t, err, "put %s", key)
 	}
 
 	newClient := func(t *testing.T, name string) *s3.Client {
@@ -59,20 +59,17 @@ func TestForgeWriteLockedTenantIsReadOnly(t *testing.T) {
 
 	requireAccessDenied := func(t *testing.T, err error, what string) {
 		t.Helper()
-		if err == nil {
-			t.Fatalf("%s succeeded, want a refusal", what)
-		}
+		require.Error(t, err, "%s succeeded, want a refusal", what)
 		code, status := apiErrorOf(t, err)
-		if status != http.StatusForbidden || code != "AccessDenied" {
-			t.Errorf("%s: got HTTP %d %s, want 403 AccessDenied (err=%v)", what, status, code, err)
+		if !assert.Equal(t, http.StatusForbidden, status, "%s (err=%v)", what, err) ||
+			!assert.Equal(t, "AccessDenied", code, "%s (err=%v)", what, err) {
 			return
 		}
 		t.Logf("%s refused: HTTP %d %s", what, status, code)
 	}
 	requireOK := func(t *testing.T, err error, what string) {
 		t.Helper()
-		if err != nil {
-			t.Errorf("%s: %v", what, err)
+		if !assert.NoError(t, err, what) {
 			return
 		}
 		t.Logf("%s succeeded", what)
@@ -131,11 +128,10 @@ func TestForgeWriteLockedTenantIsReadOnly(t *testing.T) {
 // hiltSetTenantStatus moves a tenant to one of active, write-locked, disabled.
 func hiltSetTenantStatus(t *testing.T, ctx context.Context, s *stack.Stack, tenantID, status string) {
 	t.Helper()
-	if out, errOut, err := s.Exec(ctx, "hilt", "curl", "-sS", "-f", "-X", "POST",
+	out, errOut, err := s.Exec(ctx, "hilt", "curl", "-sS", "-f", "-X", "POST",
 		"http://localhost:80/tenants/"+tenantID+"/status",
 		"-H", "Authorization: Bearer dev-partner-key", "-H", "Content-Type: application/json",
-		"-d", fmt.Sprintf(`{"status":%q}`, status)); err != nil {
-		t.Fatalf("hilt set tenant %q status %q: %v (stdout=%s stderr=%s)", tenantID, status, err, out, errOut)
-	}
+		"-d", fmt.Sprintf(`{"status":%q}`, status))
+	require.NoError(t, err, "hilt set tenant %q status %q: %v (stdout=%s stderr=%s)", tenantID, status, err, out, errOut)
 	t.Logf("tenant %q status set to %q", tenantID, status)
 }

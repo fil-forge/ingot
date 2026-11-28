@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/stretchr/testify/require"
 )
 
 // Multipart checksum tests (FIL-620): per-part checksums at UploadPart, the
@@ -41,9 +42,7 @@ func mpCreate(t *testing.T, b *Backend, key string, algo types.ChecksumAlgorithm
 		ChecksumAlgorithm: algo,
 		ChecksumType:      ctype,
 	})
-	if err != nil {
-		t.Fatalf("CreateMultipartUpload: %v", err)
-	}
+	require.NoError(t, err, "CreateMultipartUpload")
 	return res.UploadId
 }
 
@@ -87,9 +86,7 @@ func headChecksum(t *testing.T, b *Backend, key string) (crc32c, crc64, sha256v 
 		Key:          &key,
 		ChecksumMode: types.ChecksumModeEnabled,
 	})
-	if err != nil {
-		t.Fatalf("HeadObject %s: %v", key, err)
-	}
+	require.NoError(t, err, "HeadObject %s", key)
 	return out.ChecksumCRC32C, out.ChecksumCRC64NVME, out.ChecksumSHA256, out.ChecksumType
 }
 
@@ -108,12 +105,9 @@ func TestMultipartChecksum_FullObjectCRC32C(t *testing.T) {
 	var etags, sums [2]string
 	for i, data := range [][]byte{part1, part2} {
 		out, err := mpUploadPart(t, b, key, uploadID, int32(i+1), data, nil)
-		if err != nil {
-			t.Fatalf("UploadPart %d: %v", i+1, err)
-		}
-		if got := out.ChecksumCRC32C; got == nil || *got != crc32cB64(data) {
-			t.Fatalf("part %d echo = %v, want %s", i+1, got, crc32cB64(data))
-		}
+		require.NoError(t, err, "UploadPart %d", i+1)
+		require.NotNil(t, out.ChecksumCRC32C, "part %d echo", i+1)
+		require.Equal(t, crc32cB64(data), *out.ChecksumCRC32C, "part %d echo", i+1)
 		etags[i], sums[i] = *out.ETag, *out.ChecksumCRC32C
 	}
 
@@ -122,20 +116,16 @@ func TestMultipartChecksum_FullObjectCRC32C(t *testing.T) {
 		{PartNumber: &one, ETag: &etags[0], ChecksumCRC32C: &sums[0]},
 		{PartNumber: &two, ETag: &etags[1], ChecksumCRC32C: &sums[1]},
 	}, nil)
-	if err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
+	require.NoError(t, err, "Complete")
 	want := crc32cB64(append(append([]byte(nil), part1...), part2...))
-	if res.ChecksumCRC32C == nil || *res.ChecksumCRC32C != want {
-		t.Fatalf("final = %v, want %s", res.ChecksumCRC32C, want)
-	}
-	if res.ChecksumType == nil || *res.ChecksumType != types.ChecksumTypeFullObject {
-		t.Fatalf("type = %v, want FULL_OBJECT", res.ChecksumType)
-	}
+	require.NotNil(t, res.ChecksumCRC32C, "final")
+	require.Equal(t, want, *res.ChecksumCRC32C, "final")
+	require.NotNil(t, res.ChecksumType, "type")
+	require.Equal(t, types.ChecksumTypeFullObject, *res.ChecksumType, "type")
 	hCrc32c, _, _, hType := headChecksum(t, b, key)
-	if hCrc32c == nil || *hCrc32c != want || hType != types.ChecksumTypeFullObject {
-		t.Fatalf("HEAD echo = %v/%v, want %s/FULL_OBJECT", hCrc32c, hType, want)
-	}
+	require.NotNil(t, hCrc32c, "HEAD echo = %v/%v", hCrc32c, hType)
+	require.Equal(t, want, *hCrc32c, "HEAD echo = %v/%v", hCrc32c, hType)
+	require.Equal(t, types.ChecksumTypeFullObject, hType, "HEAD echo = %v/%v", hCrc32c, hType)
 }
 
 // TestMultipartChecksum_CompositeSHA256 drives a COMPOSITE SHA256 session:
@@ -158,9 +148,7 @@ func TestMultipartChecksum_CompositeSHA256(t *testing.T) {
 		out, err := mpUploadPart(t, b, key, uploadID, int32(i+1), tc.data, func(in *s3.UploadPartInput) {
 			in.ChecksumSHA256 = &tc.sum
 		})
-		if err != nil {
-			t.Fatalf("UploadPart %d: %v", i+1, err)
-		}
+		require.NoError(t, err, "UploadPart %d", i+1)
 		etags[i] = *out.ETag
 	}
 
@@ -177,20 +165,16 @@ func TestMultipartChecksum_CompositeSHA256(t *testing.T) {
 		in.ChecksumType = types.ChecksumTypeComposite
 		in.ChecksumSHA256 = &want
 	})
-	if err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
-	if res.ChecksumSHA256 == nil || *res.ChecksumSHA256 != want {
-		t.Fatalf("final = %v, want %s", res.ChecksumSHA256, want)
-	}
-	if res.ChecksumType == nil || *res.ChecksumType != types.ChecksumTypeComposite {
-		t.Fatalf("type = %v, want COMPOSITE", res.ChecksumType)
-	}
+	require.NoError(t, err, "Complete")
+	require.NotNil(t, res.ChecksumSHA256, "final")
+	require.Equal(t, want, *res.ChecksumSHA256, "final")
+	require.NotNil(t, res.ChecksumType, "type")
+	require.Equal(t, types.ChecksumTypeComposite, *res.ChecksumType, "type")
 	// The composite value persists on the manifest with its type.
 	_, _, hSha, hType := headChecksum(t, b, key)
-	if hSha == nil || *hSha != want || hType != types.ChecksumTypeComposite {
-		t.Fatalf("HEAD echo = %v/%v, want %s/COMPOSITE", hSha, hType, want)
-	}
+	require.NotNil(t, hSha, "HEAD echo = %v/%v", hSha, hType)
+	require.Equal(t, want, *hSha, "HEAD echo = %v/%v", hSha, hType)
+	require.Equal(t, types.ChecksumTypeComposite, hType, "HEAD echo = %v/%v", hSha, hType)
 
 	// A wrong final checksum on a fresh session of the same shape fails.
 	key2 := key + "-bad-final"
@@ -198,18 +182,15 @@ func TestMultipartChecksum_CompositeSHA256(t *testing.T) {
 	out, err := mpUploadPart(t, b, key2, uploadID2, 1, part2, func(in *s3.UploadPartInput) {
 		in.ChecksumSHA256 = &sum2
 	})
-	if err != nil {
-		t.Fatalf("UploadPart: %v", err)
-	}
+	require.NoError(t, err, "UploadPart")
 	bogus := sha256B64([]byte("not the composite")) + "-1"
 	_, err = mpComplete(t, b, key2, uploadID2, []types.CompletedPart{
 		{PartNumber: &one, ETag: out.ETag, ChecksumSHA256: &sum2},
 	}, func(in *s3.CompleteMultipartUploadInput) {
 		in.ChecksumSHA256 = &bogus
 	})
-	if code := apiErrCode(t, err); code != "BadDigest" {
-		t.Fatalf("wrong final → %s, want BadDigest", code)
-	}
+	code := apiErrCode(t, err)
+	require.Equal(t, "BadDigest", code, "wrong final → %s", code)
 }
 
 // TestMultipartChecksum_DefaultCRC64NVME: a session that declares no checksum
@@ -226,12 +207,8 @@ func TestMultipartChecksum_DefaultCRC64NVME(t *testing.T) {
 	var etags [2]string
 	for i, data := range [][]byte{part1, part2} {
 		out, err := mpUploadPart(t, b, key, uploadID, int32(i+1), data, nil)
-		if err != nil {
-			t.Fatalf("UploadPart %d: %v", i+1, err)
-		}
-		if out.ChecksumCRC64NVME != nil {
-			t.Fatalf("undeclared session echoed a checksum: %s", *out.ChecksumCRC64NVME)
-		}
+		require.NoError(t, err, "UploadPart %d", i+1)
+		require.Nil(t, out.ChecksumCRC64NVME, "undeclared session echoed a checksum")
 		etags[i] = *out.ETag
 	}
 
@@ -245,24 +222,20 @@ func TestMultipartChecksum_DefaultCRC64NVME(t *testing.T) {
 		// authoritative.
 		in.ChecksumCRC64NVME = &bogus
 	})
-	if err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
-	if res.ChecksumCRC64NVME == nil || *res.ChecksumCRC64NVME == bogus {
-		t.Fatalf("final = %v, want a derived (non-bogus) CRC64NVME", res.ChecksumCRC64NVME)
-	}
-	if res.ChecksumType == nil || *res.ChecksumType != types.ChecksumTypeFullObject {
-		t.Fatalf("type = %v, want FULL_OBJECT", res.ChecksumType)
-	}
+	require.NoError(t, err, "Complete")
+	require.NotNil(t, res.ChecksumCRC64NVME, "final = %v, want a derived (non-bogus) CRC64NVME", res.ChecksumCRC64NVME)
+	require.NotEqual(t, bogus, *res.ChecksumCRC64NVME, "final = %v, want a derived (non-bogus) CRC64NVME", res.ChecksumCRC64NVME)
+	require.NotNil(t, res.ChecksumType, "type")
+	require.Equal(t, types.ChecksumTypeFullObject, *res.ChecksumType, "type")
 
 	// Cross-check the combine: a single PUT of the same bytes stores the same
 	// default CRC64NVME.
 	putObj(t, b, "single-shot", append(append([]byte(nil), part1...), part2...))
 	_, mpCrc, _, _ := headChecksum(t, b, key)
 	_, singleCrc, _, _ := headChecksum(t, b, "single-shot")
-	if mpCrc == nil || singleCrc == nil || *mpCrc != *singleCrc {
-		t.Fatalf("multipart CRC64NVME %v != single-PUT %v", mpCrc, singleCrc)
-	}
+	require.NotNil(t, mpCrc, "multipart CRC64NVME %v != single-PUT %v", mpCrc, singleCrc)
+	require.NotNil(t, singleCrc, "multipart CRC64NVME %v != single-PUT %v", mpCrc, singleCrc)
+	require.Equal(t, *singleCrc, *mpCrc, "multipart CRC64NVME %v != single-PUT %v", mpCrc, singleCrc)
 }
 
 // TestUploadPart_ChecksumNegotiation covers the UploadPart-time rejections:
@@ -278,16 +251,13 @@ func TestUploadPart_ChecksumNegotiation(t *testing.T) {
 	_, err := mpUploadPart(t, b, "neg-a", uploadID, 1, data, func(in *s3.UploadPartInput) {
 		in.ChecksumSHA1 = &sha1sum
 	})
-	if code := apiErrCode(t, err); code != "InvalidRequest" {
-		t.Fatalf("algo mismatch → %s, want InvalidRequest", code)
-	}
+	code := apiErrCode(t, err)
+	require.Equal(t, "InvalidRequest", code, "algo mismatch → %s", code)
 
 	// COMPOSITE session, no part checksum.
 	uploadID = mpCreate(t, b, "neg-b", types.ChecksumAlgorithmSha256, types.ChecksumTypeComposite)
 	_, err = mpUploadPart(t, b, "neg-b", uploadID, 1, data, nil)
-	if code := apiErrCode(t, err); code != "InvalidRequest" {
-		t.Fatalf("composite without checksum → %s, want InvalidRequest", code)
-	}
+	require.Equal(t, "InvalidRequest", apiErrCode(t, err), "composite without checksum")
 
 	// Supplied value doesn't match the bytes.
 	uploadID = mpCreate(t, b, "neg-c", types.ChecksumAlgorithmCrc32c, types.ChecksumTypeFullObject)
@@ -295,9 +265,7 @@ func TestUploadPart_ChecksumNegotiation(t *testing.T) {
 	_, err = mpUploadPart(t, b, "neg-c", uploadID, 1, data, func(in *s3.UploadPartInput) {
 		in.ChecksumCRC32C = &wrong
 	})
-	if code := apiErrCode(t, err); code != "BadDigest" {
-		t.Fatalf("wrong value → %s, want BadDigest", code)
-	}
+	require.Equal(t, "BadDigest", apiErrCode(t, err), "wrong value")
 }
 
 // TestComplete_PartChecksumValidation covers the Complete-time per-part and
@@ -310,9 +278,7 @@ func TestComplete_PartChecksumValidation(t *testing.T) {
 
 	uploadID := mpCreate(t, b, key, types.ChecksumAlgorithmCrc32c, types.ChecksumTypeFullObject)
 	out, err := mpUploadPart(t, b, key, uploadID, 1, data, nil)
-	if err != nil {
-		t.Fatalf("UploadPart: %v", err)
-	}
+	require.NoError(t, err, "UploadPart")
 	one := int32(1)
 
 	// Complete's checksum type must match the session's.
@@ -321,43 +287,34 @@ func TestComplete_PartChecksumValidation(t *testing.T) {
 	}, func(in *s3.CompleteMultipartUploadInput) {
 		in.ChecksumType = types.ChecksumTypeComposite
 	})
-	if code := apiErrCode(t, err); code != "InvalidRequest" {
-		t.Fatalf("type mismatch → %s, want InvalidRequest", code)
-	}
+	code := apiErrCode(t, err)
+	require.Equal(t, "InvalidRequest", code, "type mismatch → %s", code)
 
 	// A declared session requires each part entry to carry its checksum.
 	_, err = mpComplete(t, b, key, uploadID, []types.CompletedPart{
 		{PartNumber: &one, ETag: out.ETag},
 	}, nil)
-	if code := apiErrCode(t, err); code != "InvalidRequest" {
-		t.Fatalf("missing part checksum → %s, want InvalidRequest", code)
-	}
+	require.Equal(t, "InvalidRequest", apiErrCode(t, err), "missing part checksum")
 
 	// More than one checksum on a part entry.
 	shaSum := sha256B64(data)
 	_, err = mpComplete(t, b, key, uploadID, []types.CompletedPart{
 		{PartNumber: &one, ETag: out.ETag, ChecksumCRC32C: &sum, ChecksumSHA256: &shaSum},
 	}, nil)
-	if code := apiErrCode(t, err); code != "InvalidArgument" {
-		t.Fatalf("multiple checksums → %s, want InvalidArgument", code)
-	}
+	require.Equal(t, "InvalidArgument", apiErrCode(t, err), "multiple checksums")
 
 	// A wrong value for the session's algorithm is an InvalidPart.
 	wrong := crc32cB64([]byte("different bytes"))
 	_, err = mpComplete(t, b, key, uploadID, []types.CompletedPart{
 		{PartNumber: &one, ETag: out.ETag, ChecksumCRC32C: &wrong},
 	}, nil)
-	if code := apiErrCode(t, err); code != "InvalidPart" {
-		t.Fatalf("wrong same-algo value → %s, want InvalidPart", code)
-	}
+	require.Equal(t, "InvalidPart", apiErrCode(t, err), "wrong same-algo value")
 
 	// A checksum for a different algorithm is a BadDigest.
 	_, err = mpComplete(t, b, key, uploadID, []types.CompletedPart{
 		{PartNumber: &one, ETag: out.ETag, ChecksumSHA256: &shaSum},
 	}, nil)
-	if code := apiErrCode(t, err); code != "BadDigest" {
-		t.Fatalf("wrong-algo value → %s, want BadDigest", code)
-	}
+	require.Equal(t, "BadDigest", apiErrCode(t, err), "wrong-algo value")
 
 	// The valid entry completes with a checksum; the idempotent re-Complete
 	// succeeds but omits the checksum, matching AWS (verified: re-Complete
@@ -365,21 +322,13 @@ func TestComplete_PartChecksumValidation(t *testing.T) {
 	res, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{
 		{PartNumber: &one, ETag: out.ETag, ChecksumCRC32C: &sum},
 	}, nil)
-	if err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
-	if res.ChecksumCRC32C == nil {
-		t.Fatalf("first Complete missing ChecksumCRC32C")
-	}
+	require.NoError(t, err, "Complete")
+	require.NotNil(t, res.ChecksumCRC32C, "first Complete missing ChecksumCRC32C")
 	res2, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{
 		{PartNumber: &one, ETag: out.ETag, ChecksumCRC32C: &sum},
 	}, nil)
-	if err != nil {
-		t.Fatalf("re-Complete: %v", err)
-	}
-	if res2.ChecksumCRC32C != nil {
-		t.Fatalf("re-Complete should omit the checksum (AWS), got %q", *res2.ChecksumCRC32C)
-	}
+	require.NoError(t, err, "re-Complete")
+	require.Nil(t, res2.ChecksumCRC32C, "re-Complete should omit the checksum (AWS)")
 }
 
 // TestListParts_Checksums: a declared session echoes each part's checksum and
@@ -392,47 +341,34 @@ func TestListParts_Checksums(t *testing.T) {
 
 	key := "lp-declared"
 	uploadID := mpCreate(t, b, key, types.ChecksumAlgorithmCrc32c, types.ChecksumTypeFullObject)
-	if _, err := mpUploadPart(t, b, key, uploadID, 1, dataA, nil); err != nil {
-		t.Fatalf("UploadPart: %v", err)
-	}
+	_, err := mpUploadPart(t, b, key, uploadID, 1, dataA, nil)
+	require.NoError(t, err, "UploadPart")
 	res, err := b.ListParts(context.Background(), &s3.ListPartsInput{Bucket: &bucket, Key: &key, UploadId: &uploadID})
-	if err != nil {
-		t.Fatalf("ListParts: %v", err)
-	}
-	if res.ChecksumAlgorithm != types.ChecksumAlgorithmCrc32c || res.ChecksumType != types.ChecksumTypeFullObject {
-		t.Fatalf("declared session: algo/type = %s/%s", res.ChecksumAlgorithm, res.ChecksumType)
-	}
-	if len(res.Parts) != 1 || res.Parts[0].ChecksumCRC32C == nil || *res.Parts[0].ChecksumCRC32C != crc32cB64(dataA) {
-		t.Fatalf("part checksum not echoed: %+v", res.Parts)
-	}
+	require.NoError(t, err, "ListParts")
+	require.Equal(t, types.ChecksumAlgorithmCrc32c, res.ChecksumAlgorithm, "declared session: algo/type = %s/%s", res.ChecksumAlgorithm, res.ChecksumType)
+	require.Equal(t, types.ChecksumTypeFullObject, res.ChecksumType, "declared session: algo/type = %s/%s", res.ChecksumAlgorithm, res.ChecksumType)
+	require.Len(t, res.Parts, 1, "part checksum not echoed")
+	require.NotNil(t, res.Parts[0].ChecksumCRC32C, "part checksum not echoed")
+	require.Equal(t, crc32cB64(dataA), *res.Parts[0].ChecksumCRC32C, "part checksum not echoed")
 
 	// Re-uploading the part supersedes its stored checksum.
-	if _, err := mpUploadPart(t, b, key, uploadID, 1, dataB, nil); err != nil {
-		t.Fatalf("re-UploadPart: %v", err)
-	}
+	_, err = mpUploadPart(t, b, key, uploadID, 1, dataB, nil)
+	require.NoError(t, err, "re-UploadPart")
 	res, err = b.ListParts(context.Background(), &s3.ListPartsInput{Bucket: &bucket, Key: &key, UploadId: &uploadID})
-	if err != nil {
-		t.Fatalf("ListParts: %v", err)
-	}
-	if len(res.Parts) != 1 || res.Parts[0].ChecksumCRC32C == nil || *res.Parts[0].ChecksumCRC32C != crc32cB64(dataB) {
-		t.Fatalf("superseded part checksum not updated: %+v", res.Parts)
-	}
+	require.NoError(t, err, "ListParts")
+	require.Len(t, res.Parts, 1, "superseded part checksum not updated")
+	require.NotNil(t, res.Parts[0].ChecksumCRC32C, "superseded part checksum not updated")
+	require.Equal(t, crc32cB64(dataB), *res.Parts[0].ChecksumCRC32C, "superseded part checksum not updated")
 
 	key = "lp-null"
 	uploadID = mpCreate(t, b, key, "", "")
-	if _, err := mpUploadPart(t, b, key, uploadID, 1, dataA, nil); err != nil {
-		t.Fatalf("UploadPart: %v", err)
-	}
+	_, err = mpUploadPart(t, b, key, uploadID, 1, dataA, nil)
+	require.NoError(t, err, "UploadPart")
 	res, err = b.ListParts(context.Background(), &s3.ListPartsInput{Bucket: &bucket, Key: &key, UploadId: &uploadID})
-	if err != nil {
-		t.Fatalf("ListParts: %v", err)
-	}
-	if string(res.ChecksumAlgorithm) != "null" || string(res.ChecksumType) != "null" {
-		t.Fatalf("undeclared session: algo/type = %q/%q, want null/null", res.ChecksumAlgorithm, res.ChecksumType)
-	}
-	if res.Parts[0].ChecksumCRC64NVME != nil {
-		t.Fatalf("internal CRC64NVME leaked into ListParts: %s", *res.Parts[0].ChecksumCRC64NVME)
-	}
+	require.NoError(t, err, "ListParts")
+	require.Equal(t, "null", string(res.ChecksumAlgorithm), "undeclared session: algo")
+	require.Equal(t, "null", string(res.ChecksumType), "undeclared session: type")
+	require.Nil(t, res.Parts[0].ChecksumCRC64NVME, "internal CRC64NVME leaked into ListParts")
 }
 
 // TestCopyObject_Checksums: a copy without a checksum request propagates the
@@ -446,33 +382,26 @@ func TestCopyObject_Checksums(t *testing.T) {
 	crcSum := crc32cB64(data)
 
 	srcKey := "cp-src"
-	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{
+	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{
 		Bucket: &bucket,
 		Key:    &srcKey,
 		Body:   bytes.NewReader(data), ContentLength: byteLen(data),
 		ChecksumCRC32C: &crcSum,
-	}); err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
+	})
+	require.NoError(t, err, "PutObject")
 
 	// No checksum request → the source's CRC32C carries over.
 	dstKey, src := "cp-propagate", bucket+"/"+srcKey
 	out, err := b.CopyObject(context.Background(), s3response.CopyObjectInput{
 		Bucket: &bucket, Key: &dstKey, CopySource: &src,
 	})
-	if err != nil {
-		t.Fatalf("CopyObject: %v", err)
-	}
-	if out.CopyObjectResult.ChecksumCRC32C == nil || *out.CopyObjectResult.ChecksumCRC32C != crcSum {
-		t.Fatalf("propagate: result CRC32C = %v, want %s", out.CopyObjectResult.ChecksumCRC32C, crcSum)
-	}
-	if out.CopyObjectResult.ChecksumType != types.ChecksumTypeFullObject {
-		t.Fatalf("propagate: type = %v, want FULL_OBJECT", out.CopyObjectResult.ChecksumType)
-	}
+	require.NoError(t, err, "CopyObject")
+	require.NotNil(t, out.CopyObjectResult.ChecksumCRC32C, "propagate: result CRC32C")
+	require.Equal(t, crcSum, *out.CopyObjectResult.ChecksumCRC32C, "propagate: result CRC32C")
+	require.Equal(t, types.ChecksumTypeFullObject, out.CopyObjectResult.ChecksumType, "propagate: type")
 	hCrc32c, _, _, _ := headChecksum(t, b, dstKey)
-	if hCrc32c == nil || *hCrc32c != crcSum {
-		t.Fatalf("propagate: HEAD CRC32C = %v, want %s", hCrc32c, crcSum)
-	}
+	require.NotNil(t, hCrc32c, "propagate: HEAD CRC32C")
+	require.Equal(t, crcSum, *hCrc32c, "propagate: HEAD CRC32C")
 
 	// A different requested algorithm replaces the checksum: SHA256 set to the
 	// recomputed body digest, the source's CRC32C dropped.
@@ -481,19 +410,14 @@ func TestCopyObject_Checksums(t *testing.T) {
 		Bucket: &bucket, Key: &dstKey, CopySource: &src,
 		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
 	})
-	if err != nil {
-		t.Fatalf("CopyObject: %v", err)
-	}
-	if out.CopyObjectResult.ChecksumSHA256 == nil || *out.CopyObjectResult.ChecksumSHA256 != sha256B64(data) {
-		t.Fatalf("replace: result SHA256 = %v, want %s", out.CopyObjectResult.ChecksumSHA256, sha256B64(data))
-	}
-	if out.CopyObjectResult.ChecksumCRC32C != nil {
-		t.Fatalf("replace: source CRC32C survived: %s", *out.CopyObjectResult.ChecksumCRC32C)
-	}
+	require.NoError(t, err, "CopyObject")
+	require.NotNil(t, out.CopyObjectResult.ChecksumSHA256, "replace: result SHA256")
+	require.Equal(t, sha256B64(data), *out.CopyObjectResult.ChecksumSHA256, "replace: result SHA256")
+	require.Nil(t, out.CopyObjectResult.ChecksumCRC32C, "replace: source CRC32C survived")
 	_, _, hSha, hType := headChecksum(t, b, dstKey)
-	if hSha == nil || *hSha != sha256B64(data) || hType != types.ChecksumTypeFullObject {
-		t.Fatalf("replace: HEAD = %v/%v, want %s/FULL_OBJECT", hSha, hType, sha256B64(data))
-	}
+	require.NotNil(t, hSha, "replace: HEAD SHA256")
+	require.Equal(t, sha256B64(data), *hSha, "replace: HEAD SHA256")
+	require.Equal(t, types.ChecksumTypeFullObject, hType, "replace: HEAD checksum type")
 
 	// Self-copy with REPLACE swapping the algorithm again.
 	selfSrc := bucket + "/" + dstKey
@@ -502,13 +426,8 @@ func TestCopyObject_Checksums(t *testing.T) {
 		MetadataDirective: types.MetadataDirectiveReplace,
 		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32c,
 	})
-	if err != nil {
-		t.Fatalf("self-copy: %v", err)
-	}
-	if out.CopyObjectResult.ChecksumCRC32C == nil || *out.CopyObjectResult.ChecksumCRC32C != crcSum {
-		t.Fatalf("self-copy: result CRC32C = %v, want %s", out.CopyObjectResult.ChecksumCRC32C, crcSum)
-	}
-	if out.CopyObjectResult.ChecksumSHA256 != nil {
-		t.Fatalf("self-copy: SHA256 survived: %s", *out.CopyObjectResult.ChecksumSHA256)
-	}
+	require.NoError(t, err, "self-copy")
+	require.NotNil(t, out.CopyObjectResult.ChecksumCRC32C, "self-copy: result CRC32C")
+	require.Equal(t, crcSum, *out.CopyObjectResult.ChecksumCRC32C, "self-copy: result CRC32C")
+	require.Nil(t, out.CopyObjectResult.ChecksumSHA256, "self-copy: SHA256 survived")
 }

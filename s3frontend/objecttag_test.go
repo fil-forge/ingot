@@ -3,7 +3,6 @@ package s3frontend
 import (
 	"bytes"
 	"context"
-	"reflect"
 	"testing"
 	"time"
 
@@ -11,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/stretchr/testify/require"
 )
 
 // Object-tagging tests over the same in-process harness, covering
@@ -22,9 +22,7 @@ import (
 func getTags(t *testing.T, b *Backend, key, versionID string) map[string]string {
 	t.Helper()
 	tags, err := b.GetObjectTagging(context.Background(), "bk", key, versionID)
-	if err != nil {
-		t.Fatalf("GetObjectTagging(%s, %q): %v", key, versionID, err)
-	}
+	require.NoError(t, err, "GetObjectTagging(%s, %q)", key, versionID)
 	return tags
 }
 
@@ -36,145 +34,93 @@ func TestObjectTagging_RoundTripUnversioned(t *testing.T) {
 	// Tagging has no bucket gate: an unversioned, lock-free bucket carries
 	// tags. The untagged answer is the empty set, never a sentinel.
 	putObjV(t, b, "k", []byte("v1"))
-	if tags := getTags(t, b, "k", ""); len(tags) != 0 {
-		t.Fatalf("untagged Get = %v, want empty set", tags)
-	}
+	tags := getTags(t, b, "k", "")
+	require.Empty(t, tags, "untagged Get")
 	want := map[string]string{"team": "forge", "env": "dev"}
-	if err := b.PutObjectTagging(ctx, "bk", "k", "", want); err != nil {
-		t.Fatalf("PutObjectTagging: %v", err)
-	}
-	if tags := getTags(t, b, "k", ""); !reflect.DeepEqual(tags, want) {
-		t.Fatalf("tag round-trip = %v, want %v", tags, want)
-	}
+	require.NoError(t, b.PutObjectTagging(ctx, "bk", "k", "", want), "PutObjectTagging")
+	require.Equal(t, want, getTags(t, b, "k", ""), "tag round-trip")
 	// The first state write upgraded the manifest-arm key; reads still work
 	// and Head echoes the count.
-	if _, data, err := getObjV(t, b, "k", ""); err != nil || string(data) != "v1" {
-		t.Fatalf("read after tag upgrade = (%q, %v), want v1", data, err)
-	}
+	_, data, err := getObjV(t, b, "k", "")
+	require.NoError(t, err, "read after tag upgrade")
+	require.Equal(t, "v1", string(data), "read after tag upgrade")
 	head, err := b.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &bucket, Key: strPtrOrNil("k")})
-	if err != nil {
-		t.Fatalf("HeadObject: %v", err)
-	}
-	if head.TagCount == nil || *head.TagCount != 2 {
-		t.Fatalf("TagCount = %v, want 2", head.TagCount)
-	}
+	require.NoError(t, err, "HeadObject")
+	require.NotNil(t, head.TagCount, "TagCount")
+	require.Equal(t, int32(2), *head.TagCount, "TagCount")
 
 	// Replacement is last-write-wins; an empty replacement clears (elision),
 	// and delete is idempotent.
-	if err := b.PutObjectTagging(ctx, "bk", "k", "", map[string]string{"only": "one"}); err != nil {
-		t.Fatalf("replace tags: %v", err)
-	}
-	if tags := getTags(t, b, "k", ""); len(tags) != 1 || tags["only"] != "one" {
-		t.Fatalf("replaced tags = %v, want {only:one}", tags)
-	}
-	if err := b.PutObjectTagging(ctx, "bk", "k", "", map[string]string{}); err != nil {
-		t.Fatalf("clear via empty put: %v", err)
-	}
-	if tags := getTags(t, b, "k", ""); len(tags) != 0 {
-		t.Fatalf("tags after empty put = %v, want empty", tags)
-	}
+	require.NoError(t, b.PutObjectTagging(ctx, "bk", "k", "", map[string]string{"only": "one"}), "replace tags")
+	require.Equal(t, map[string]string{"only": "one"}, getTags(t, b, "k", ""), "replaced tags")
+	require.NoError(t, b.PutObjectTagging(ctx, "bk", "k", "", map[string]string{}), "clear via empty put")
+	require.Empty(t, getTags(t, b, "k", ""), "tags after empty put")
 	rv, err := b.resolveVersion(ctx, "bk", "k", "")
-	if err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	if rv.leaf == nil || rv.leaf.State != nil {
-		t.Fatalf("leaf after clearing last state = %+v, want nil State (elision)", rv.leaf)
-	}
-	if err := b.DeleteObjectTagging(ctx, "bk", "k", ""); err != nil {
-		t.Fatalf("idempotent DeleteObjectTagging: %v", err)
-	}
+	require.NoError(t, err, "resolve")
+	require.NotNil(t, rv.leaf, "leaf after clearing last state")
+	require.Nil(t, rv.leaf.State, "leaf after clearing last state")
+	require.NoError(t, b.DeleteObjectTagging(ctx, "bk", "k", ""), "idempotent DeleteObjectTagging")
 	head, err = b.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &bucket, Key: strPtrOrNil("k")})
-	if err != nil || head.TagCount != nil {
-		t.Fatalf("TagCount after clear = (%v, %v), want nil", head.TagCount, err)
-	}
+	require.NoError(t, err, "HeadObject after clear")
+	require.Nil(t, head.TagCount, "TagCount after clear")
 
 	// Overwrite on the unversioned bucket discards the old null version and
 	// prunes its tag entry in the same commit (the §9 cleanup rule's discard
 	// path, live for tags).
-	if err := b.PutObjectTagging(ctx, "bk", "k", "", want); err != nil {
-		t.Fatalf("re-tag: %v", err)
-	}
+	require.NoError(t, b.PutObjectTagging(ctx, "bk", "k", "", want), "re-tag")
 	putObjV(t, b, "k", []byte("v2"))
-	if tags := getTags(t, b, "k", ""); len(tags) != 0 {
-		t.Fatalf("tags after unversioned overwrite = %v, want empty (new version)", tags)
-	}
-	if rv, err = b.resolveVersion(ctx, "bk", "k", ""); err != nil || rv.leaf == nil || rv.leaf.State != nil {
-		t.Fatalf("leaf state after discard = %+v (%v), want pruned", rv.leaf, err)
-	}
+	require.Empty(t, getTags(t, b, "k", ""), "tags after unversioned overwrite (new version)")
+	rv, err = b.resolveVersion(ctx, "bk", "k", "")
+	require.NoError(t, err, "resolve after discard")
+	require.NotNil(t, rv.leaf, "leaf after discard")
+	require.Nil(t, rv.leaf.State, "leaf state after discard")
 }
 
 func TestObjectTagging_SentinelsAndVersions(t *testing.T) {
 	b, _, _ := newRefTestBackend(t)
 	ctx := context.Background()
 
-	if _, err := b.GetObjectTagging(ctx, "nope", "k", ""); err == nil {
-		t.Fatal("missing bucket: want error")
-	} else {
-		wantAPIErr(t, err, s3err.ErrNoSuchBucket)
-	}
-	if _, err := b.GetObjectTagging(ctx, "bk", "absent", ""); err == nil {
-		t.Fatal("missing key: want error")
-	} else {
-		wantAPIErr(t, err, s3err.ErrNoSuchKey)
-	}
+	_, err := b.GetObjectTagging(ctx, "nope", "k", "")
+	require.Error(t, err, "missing bucket")
+	wantAPIErr(t, err, s3err.ErrNoSuchBucket)
+	_, err = b.GetObjectTagging(ctx, "bk", "absent", "")
+	require.Error(t, err, "missing key")
+	wantAPIErr(t, err, s3err.ErrNoSuchKey)
 
 	setVersioning(t, b, types.BucketVersioningStatusEnabled)
 	out1 := putObjV(t, b, "k", []byte("v1"))
 	out2 := putObjV(t, b, "k", []byte("v2"))
 
-	if err := b.PutObjectTagging(ctx, "bk", "k", "not-a-version", map[string]string{"a": "b"}); err == nil {
-		t.Fatal("malformed versionId: want error")
-	} else if code := apiErrCode(t, err); code != "InvalidArgument" {
-		t.Fatalf("malformed versionId code = %s, want InvalidArgument", code)
-	}
-	if _, err := b.GetObjectTagging(ctx, "bk", "k", "01G65Z755AFWAKHE12NY0CQ9FH"); err == nil {
-		t.Fatal("unknown version: want error")
-	} else if code := apiErrCode(t, err); code != "NoSuchVersion" {
-		t.Fatalf("unknown version code = %s, want NoSuchVersion", code)
-	}
+	err = b.PutObjectTagging(ctx, "bk", "k", "not-a-version", map[string]string{"a": "b"})
+	require.Error(t, err, "malformed versionId")
+	require.Equal(t, "InvalidArgument", apiErrCode(t, err), "malformed versionId code")
+	_, err = b.GetObjectTagging(ctx, "bk", "k", "01G65Z755AFWAKHE12NY0CQ9FH")
+	require.Error(t, err, "unknown version")
+	require.Equal(t, "NoSuchVersion", apiErrCode(t, err), "unknown version code")
 
 	// Version-scoped tagging: the noncurrent version tagged, the current
 	// untouched, and vice versa.
-	if err := b.PutObjectTagging(ctx, "bk", "k", out1.VersionID, map[string]string{"gen": "old"}); err != nil {
-		t.Fatalf("tag noncurrent: %v", err)
-	}
-	if tags := getTags(t, b, "k", out1.VersionID); tags["gen"] != "old" {
-		t.Fatalf("noncurrent tags = %v, want gen:old", tags)
-	}
-	if tags := getTags(t, b, "k", ""); len(tags) != 0 {
-		t.Fatalf("current tags = %v, want empty", tags)
-	}
-	if tags := getTags(t, b, "k", out2.VersionID); len(tags) != 0 {
-		t.Fatalf("current-by-id tags = %v, want empty", tags)
-	}
-	if err := b.DeleteObjectTagging(ctx, "bk", "k", out1.VersionID); err != nil {
-		t.Fatalf("delete noncurrent tags: %v", err)
-	}
-	if tags := getTags(t, b, "k", out1.VersionID); len(tags) != 0 {
-		t.Fatalf("noncurrent tags after delete = %v, want empty", tags)
-	}
+	require.NoError(t, b.PutObjectTagging(ctx, "bk", "k", out1.VersionID, map[string]string{"gen": "old"}), "tag noncurrent")
+	tags := getTags(t, b, "k", out1.VersionID)
+	require.Equal(t, "old", tags["gen"], "noncurrent tags")
+	require.Empty(t, getTags(t, b, "k", ""), "current tags")
+	require.Empty(t, getTags(t, b, "k", out2.VersionID), "current-by-id tags")
+	require.NoError(t, b.DeleteObjectTagging(ctx, "bk", "k", out1.VersionID), "delete noncurrent tags")
+	require.Empty(t, getTags(t, b, "k", out1.VersionID), "noncurrent tags after delete")
 
 	// All three methods answer 405 on a delete marker.
 	del, err := deleteObjV(t, b, "k", "")
-	if err != nil {
-		t.Fatalf("insert marker: %v", err)
-	}
+	require.NoError(t, err, "insert marker")
 	markerID := *del.VersionId
-	if _, err := b.GetObjectTagging(ctx, "bk", "k", markerID); err == nil {
-		t.Fatal("marker get: want error")
-	} else {
-		wantAPIErr(t, err, s3err.ErrMethodNotAllowed)
-	}
-	if err := b.PutObjectTagging(ctx, "bk", "k", markerID, map[string]string{"a": "b"}); err == nil {
-		t.Fatal("marker put: want error")
-	} else {
-		wantAPIErr(t, err, s3err.ErrMethodNotAllowed)
-	}
-	if err := b.DeleteObjectTagging(ctx, "bk", "k", markerID); err == nil {
-		t.Fatal("marker delete: want error")
-	} else {
-		wantAPIErr(t, err, s3err.ErrMethodNotAllowed)
-	}
+	_, err = b.GetObjectTagging(ctx, "bk", "k", markerID)
+	require.Error(t, err, "marker get")
+	wantAPIErr(t, err, s3err.ErrMethodNotAllowed)
+	err = b.PutObjectTagging(ctx, "bk", "k", markerID, map[string]string{"a": "b"})
+	require.Error(t, err, "marker put")
+	wantAPIErr(t, err, s3err.ErrMethodNotAllowed)
+	err = b.DeleteObjectTagging(ctx, "bk", "k", markerID)
+	require.Error(t, err, "marker delete")
+	wantAPIErr(t, err, s3err.ErrMethodNotAllowed)
 }
 
 func TestObjectTagging_MergeWithLockFields(t *testing.T) {
@@ -184,29 +130,23 @@ func TestObjectTagging_MergeWithLockFields(t *testing.T) {
 	putObjV(t, b, "k", []byte("v1"))
 
 	ret := retentionDoc(t, types.ObjectLockRetentionModeGovernance, time.Now().Add(time.Hour))
-	if err := b.PutObjectRetention(ctx, "bk", "k", "", ret); err != nil {
-		t.Fatalf("PutObjectRetention: %v", err)
-	}
-	if err := b.PutObjectTagging(ctx, "bk", "k", "", map[string]string{"a": "b"}); err != nil {
-		t.Fatalf("PutObjectTagging: %v", err)
-	}
+	require.NoError(t, b.PutObjectRetention(ctx, "bk", "k", "", ret), "PutObjectRetention")
+	require.NoError(t, b.PutObjectTagging(ctx, "bk", "k", "", map[string]string{"a": "b"}), "PutObjectTagging")
 	// Each operation owns its field and carries the rest.
-	if got, err := b.GetObjectRetention(ctx, "bk", "k", ""); err != nil || !bytes.Equal(got, ret) {
-		t.Fatalf("retention after tag write = (%s, %v), want carried", got, err)
-	}
-	if tags := getTags(t, b, "k", ""); tags["a"] != "b" {
-		t.Fatalf("tags = %v, want a:b", tags)
-	}
-	if err := b.DeleteObjectTagging(ctx, "bk", "k", ""); err != nil {
-		t.Fatalf("DeleteObjectTagging: %v", err)
-	}
-	if got, err := b.GetObjectRetention(ctx, "bk", "k", ""); err != nil || !bytes.Equal(got, ret) {
-		t.Fatalf("retention after tag delete = (%s, %v), want carried", got, err)
-	}
+	got, err := b.GetObjectRetention(ctx, "bk", "k", "")
+	require.NoError(t, err, "retention after tag write")
+	require.Equal(t, ret, got, "retention after tag write")
+	tags := getTags(t, b, "k", "")
+	require.Equal(t, "b", tags["a"], "tags")
+	require.NoError(t, b.DeleteObjectTagging(ctx, "bk", "k", ""), "DeleteObjectTagging")
+	got, err = b.GetObjectRetention(ctx, "bk", "k", "")
+	require.NoError(t, err, "retention after tag delete")
+	require.Equal(t, ret, got, "retention after tag delete")
 	// The block is not elided while a lock field remains.
-	if rv, err := b.resolveVersion(ctx, "bk", "k", ""); err != nil || rv.leaf == nil || rv.leaf.State == nil {
-		t.Fatalf("state after tag delete = %+v (%v), want retention block kept", rv, err)
-	}
+	rv, err := b.resolveVersion(ctx, "bk", "k", "")
+	require.NoError(t, err, "resolve after tag delete")
+	require.NotNil(t, rv.leaf, "leaf after tag delete")
+	require.NotNil(t, rv.leaf.State, "state after tag delete")
 }
 
 func TestObjectTagging_CreationTimeStamping(t *testing.T) {
@@ -216,85 +156,66 @@ func TestObjectTagging_CreationTimeStamping(t *testing.T) {
 
 	// PUT with x-amz-tagging: parsed before ingest, stamped in the commit.
 	key, tagging := "tagged", "team=forge&env=dev"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{
+	_, err := b.PutObject(ctx, s3response.PutObjectInput{
 		Bucket: &bucket, Key: &key, Body: bytes.NewReader([]byte("x")), ContentLength: byteLen([]byte("x")), Tagging: &tagging,
-	}); err != nil {
-		t.Fatalf("PutObject with tagging: %v", err)
-	}
-	if tags := getTags(t, b, key, ""); tags["team"] != "forge" || tags["env"] != "dev" {
-		t.Fatalf("stamped tags = %v, want header set", tags)
-	}
+	})
+	require.NoError(t, err, "PutObject with tagging")
+	tags := getTags(t, b, key, "")
+	require.Equal(t, "forge", tags["team"], "stamped tags")
+	require.Equal(t, "dev", tags["env"], "stamped tags")
 	// An invalid header fails the PUT and writes nothing.
 	badKey, badTagging := "bad", "k="+string(bytes.Repeat([]byte("v"), 300))
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{
+	_, err = b.PutObject(ctx, s3response.PutObjectInput{
 		Bucket: &bucket, Key: &badKey, Body: bytes.NewReader([]byte("x")), ContentLength: byteLen([]byte("x")), Tagging: &badTagging,
-	}); err == nil {
-		t.Fatal("oversize tag value: want error")
-	}
-	if _, err := b.GetObjectTagging(ctx, "bk", badKey, ""); err == nil {
-		t.Fatal("failed PUT wrote the key")
-	} else {
-		wantAPIErr(t, err, s3err.ErrNoSuchKey)
-	}
+	})
+	require.Error(t, err, "oversize tag value")
+	_, err = b.GetObjectTagging(ctx, "bk", badKey, "")
+	require.Error(t, err, "failed PUT wrote the key")
+	wantAPIErr(t, err, s3err.ErrNoSuchKey)
 
 	// Copy directives: COPY inherits the source version's tags, REPLACE takes
 	// the request header (or nothing when it carries none).
 	src := bucket + "/" + key
 	dstCopy := "copied"
-	if _, err := b.CopyObject(ctx, s3response.CopyObjectInput{
+	_, err = b.CopyObject(ctx, s3response.CopyObjectInput{
 		Bucket: &bucket, Key: &dstCopy, CopySource: &src,
 		TaggingDirective: types.TaggingDirectiveCopy,
-	}); err != nil {
-		t.Fatalf("CopyObject COPY: %v", err)
-	}
-	if tags := getTags(t, b, dstCopy, ""); tags["team"] != "forge" || len(tags) != 2 {
-		t.Fatalf("COPY-directive tags = %v, want source set", tags)
-	}
+	})
+	require.NoError(t, err, "CopyObject COPY")
+	tags = getTags(t, b, dstCopy, "")
+	require.Equal(t, "forge", tags["team"], "COPY-directive tags")
+	require.Len(t, tags, 2, "COPY-directive tags")
 	dstReplace, replTagging := "replaced", "fresh=yes"
-	if _, err := b.CopyObject(ctx, s3response.CopyObjectInput{
+	_, err = b.CopyObject(ctx, s3response.CopyObjectInput{
 		Bucket: &bucket, Key: &dstReplace, CopySource: &src,
 		TaggingDirective: types.TaggingDirectiveReplace, Tagging: &replTagging,
-	}); err != nil {
-		t.Fatalf("CopyObject REPLACE: %v", err)
-	}
-	if tags := getTags(t, b, dstReplace, ""); len(tags) != 1 || tags["fresh"] != "yes" {
-		t.Fatalf("REPLACE-directive tags = %v, want {fresh:yes}", tags)
-	}
+	})
+	require.NoError(t, err, "CopyObject REPLACE")
+	require.Equal(t, map[string]string{"fresh": "yes"}, getTags(t, b, dstReplace, ""), "REPLACE-directive tags")
 	dstBare := "replaced-bare"
-	if _, err := b.CopyObject(ctx, s3response.CopyObjectInput{
+	_, err = b.CopyObject(ctx, s3response.CopyObjectInput{
 		Bucket: &bucket, Key: &dstBare, CopySource: &src,
 		TaggingDirective: types.TaggingDirectiveReplace,
-	}); err != nil {
-		t.Fatalf("CopyObject REPLACE bare: %v", err)
-	}
-	if tags := getTags(t, b, dstBare, ""); len(tags) != 0 {
-		t.Fatalf("bare-REPLACE tags = %v, want empty", tags)
-	}
+	})
+	require.NoError(t, err, "CopyObject REPLACE bare")
+	require.Empty(t, getTags(t, b, dstBare, ""), "bare-REPLACE tags")
 
 	// Multipart: the header carried on the session stamps at Complete.
 	mpKey, mpTagging := "mp-tagged", "stage=upload"
 	res, err := b.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
 		Bucket: &bucket, Key: &mpKey, Tagging: &mpTagging,
 	})
-	if err != nil {
-		t.Fatalf("CreateMultipartUpload: %v", err)
-	}
+	require.NoError(t, err, "CreateMultipartUpload")
 	part, err := mpUploadPart(t, b, mpKey, res.UploadId, 1, []byte("part-1-bytes"), nil)
-	if err != nil {
-		t.Fatalf("UploadPart: %v", err)
-	}
+	require.NoError(t, err, "UploadPart")
 	one := int32(1)
-	if _, err := mpComplete(t, b, mpKey, res.UploadId, []types.CompletedPart{{ETag: part.ETag, PartNumber: &one}}, nil); err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
-	if tags := getTags(t, b, mpKey, ""); len(tags) != 1 || tags["stage"] != "upload" {
-		t.Fatalf("MPU-stamped tags = %v, want {stage:upload}", tags)
-	}
+	_, err = mpComplete(t, b, mpKey, res.UploadId, []types.CompletedPart{{ETag: part.ETag, PartNumber: &one}}, nil)
+	require.NoError(t, err, "Complete")
+	require.Equal(t, map[string]string{"stage": "upload"}, getTags(t, b, mpKey, ""), "MPU-stamped tags")
 	// An invalid header fails the create.
 	badMp := "mp-bad"
-	if _, err := b.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
+	_, err = b.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{
 		Bucket: &bucket, Key: &badMp, Tagging: &badTagging,
-	}); err == nil {
-		t.Fatal("MPU with oversize tag value: want error")
-	}
+	})
+	require.Error(t, err, "MPU with oversize tag value")
 }

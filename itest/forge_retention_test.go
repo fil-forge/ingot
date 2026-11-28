@@ -3,7 +3,6 @@
 package itest
 
 import (
-	"bytes"
 	"fmt"
 	"strings"
 	"testing"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/stretchr/testify/require"
 
 	ingottest "github.com/fil-forge/ingot/testing"
 	"github.com/fil-forge/smelt/pkg/stack"
@@ -44,16 +44,12 @@ func TestForgeReadAfterCatalogRetention(t *testing.T) {
 	cfg := forgeConfig(ingotEndpoint, accessKey, secretKey)
 
 	const bucket = "retention-bucket"
-	if err := ingottest.CreateBucket(ctx, cfg, bucket); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, ingottest.CreateBucket(ctx, cfg, bucket), "create bucket")
 
 	// The early object: its manifest lands in the first catalog segment(s),
 	// which the later writes will push out of the retain window.
 	early := patternBytes(64 << 10)
-	if err := ingottest.PutBytes(ctx, cfg, bucket, "early-obj", early); err != nil {
-		t.Fatalf("put early object: %v", err)
-	}
+	require.NoError(t, ingottest.PutBytes(ctx, cfg, bucket, "early-obj", early), "put early object")
 
 	// Count the segment CARs currently on disk; the early manifest lives in
 	// one of these. Retirement is proven when every one of them is gone.
@@ -73,9 +69,7 @@ func TestForgeReadAfterCatalogRetention(t *testing.T) {
 	// initial segment file is gone from the container.
 	waitFor(t, 5*time.Minute, "initial catalog segments to retire", func() bool {
 		key := fmt.Sprintf("filler/obj-%d", time.Now().UnixNano())
-		if err := ingottest.PutBytes(ctx, cfg, bucket, key, patternBytes(4<<10)); err != nil {
-			t.Fatalf("put filler object: %v", err)
-		}
+		require.NoError(t, ingottest.PutBytes(ctx, cfg, bucket, key, patternBytes(4<<10)), "put filler object")
 		// Slower than seal_age so each segment seals and ships with headroom
 		// (no flush-queue overflow → no re-ships through the dedup path).
 		time.Sleep(3 * time.Second)
@@ -94,20 +88,14 @@ func TestForgeReadAfterCatalogRetention(t *testing.T) {
 	// GET the early object: its manifest exists only in a retired segment, so
 	// this read MUST come through inclusion → shard → ranged piri retrieval.
 	got, err := ingottest.GetBytes(ctx, cfg, bucket, "early-obj")
-	if err != nil {
-		t.Fatalf("get early object after its catalog segment retired: %v", err)
-	}
-	if !bytes.Equal(got, early) {
-		t.Fatalf("early object mismatch after retention: got %d bytes, want %d", len(got), len(early))
-	}
+	require.NoError(t, err, "get early object after its catalog segment retired")
+	require.Equal(t, early, got, "early object mismatch after retention")
 
 	// Undelimited list walks every leaf and fetches every manifest — the
 	// regression that motivated this test (root listing failed with
 	// "blockstore: not found" once a manifest's segment was retired).
 	keys, err := ingottest.ListKeys(ctx, cfg, bucket)
-	if err != nil {
-		t.Fatalf("list bucket after retention: %v", err)
-	}
+	require.NoError(t, err, "list bucket after retention")
 	found := false
 	for _, k := range keys {
 		if k == "early-obj" {
@@ -115,23 +103,17 @@ func TestForgeReadAfterCatalogRetention(t *testing.T) {
 			break
 		}
 	}
-	if !found {
-		t.Fatalf("early-obj missing from listing: %v", keys)
-	}
+	require.True(t, found, "early-obj missing from listing: %v", keys)
 	t.Logf("read-after-retention OK: %d bytes via ranged shard retrieval; %d keys listed", len(got), len(keys))
 
 	for _, k := range keys {
-		if err := ingottest.DeleteObject(ctx, cfg, bucket, k); err != nil {
-			t.Fatalf("delete %s: %v", k, err)
-		}
+		require.NoError(t, ingottest.DeleteObject(ctx, cfg, bucket, k), "delete %s", k)
 	}
 	cl := sdkClient(forgeS3Conf(ingotEndpoint, accessKey, secretKey))
-	if _, err := cl.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		t.Fatalf("DeleteBucket after its catalog segments retired: %v", err)
-	}
-	if _, err := cl.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err == nil {
-		t.Fatalf("HeadBucket succeeded after DeleteBucket")
-	}
+	_, err = cl.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)})
+	require.NoError(t, err, "DeleteBucket after its catalog segments retired")
+	_, err = cl.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)})
+	require.Error(t, err, "HeadBucket succeeded after DeleteBucket")
 }
 
 // catalogSegments lists the catalog-plane CAR files currently on the ingot
@@ -141,9 +123,7 @@ func catalogSegments(t *testing.T, s *stack.Stack, bucket string) []string {
 	t.Helper()
 	out, _, err := s.Exec(t.Context(), "ingot", "sh", "-c",
 		"ls /data/segments/"+bucket+"/catalog/ 2>/dev/null | grep '\\.car$' || true")
-	if err != nil {
-		t.Fatalf("list catalog segments: %v", err)
-	}
+	require.NoError(t, err, "list catalog segments")
 	fields := strings.Fields(strings.TrimSpace(out))
 	return fields
 }
@@ -158,5 +138,5 @@ func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool)
 			return
 		}
 	}
-	t.Fatalf("timed out after %s waiting for %s", timeout, what)
+	require.FailNow(t, "timed out", "after %s waiting for %s", timeout, what)
 }

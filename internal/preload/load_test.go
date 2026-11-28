@@ -5,10 +5,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func testConfig(t *testing.T, buckets int, until uint64) Config {
@@ -42,45 +43,32 @@ func checkBucket(t *testing.T, f *fakeS3, cfg Config, bucket string, bulk uint64
 	for n := range bulk {
 		key := BulkKey(cfg.KeyPrefix, cfg.Seed, bucket, n)
 		size, ok := objs[key]
-		if !ok {
-			t.Fatalf("%s: bulk object %d (%s) missing", bucket, n, key)
-		}
-		if size != 0 {
-			t.Fatalf("%s: bulk object %d has %d bytes", bucket, n, size)
-		}
+		require.True(t, ok, "%s: bulk object %d (%s) missing", bucket, n, key)
+		require.Zero(t, size, "%s: bulk object %d has %d bytes", bucket, n, size)
 		delete(objs, key)
 	}
 	for j, r := range st.Real {
-		if r.Index != uint64(j) {
-			t.Fatalf("%s: real object %d recorded with index %d", bucket, j, r.Index)
-		}
+		require.Equal(t, uint64(j), r.Index, "%s: real object %d recorded with index %d", bucket, j, r.Index)
 		body := RealBody(cfg.Seed, bucket, r.Index, cfg.RealMinSize, cfg.RealMaxSize)
 		sum, err := body.SHA256()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if want := RealKey(cfg.KeyPrefix, sum); r.Key != want {
-			t.Fatalf("%s: real object %d recorded as %s, want %s", bucket, j, r.Key, want)
-		}
-		if size, ok := objs[r.Key]; !ok || size != r.Size || size != body.Size() {
-			t.Fatalf("%s: real object %d: stored %d bytes (present %v), recorded %d, body %d", bucket, j, size, ok, r.Size, body.Size())
-		}
-		if r.Size < cfg.RealMinSize || r.Size > cfg.RealMaxSize {
-			t.Fatalf("%s: real object %d is %d bytes, outside %d to %d", bucket, j, r.Size, cfg.RealMinSize, cfg.RealMaxSize)
-		}
+		require.NoError(t, err)
+		want := RealKey(cfg.KeyPrefix, sum)
+		require.Equal(t, want, r.Key, "%s: real object %d recorded as %s", bucket, j, r.Key)
+		size, ok := objs[r.Key]
+		require.True(t, ok, "%s: real object %d missing", bucket, j)
+		require.Equal(t, r.Size, size, "%s: real object %d: stored bytes against recorded", bucket, j)
+		require.Equal(t, body.Size(), size, "%s: real object %d: stored bytes against body", bucket, j)
+		require.GreaterOrEqual(t, r.Size, cfg.RealMinSize, "%s: real object %d is %d bytes, outside %d to %d", bucket, j, r.Size, cfg.RealMinSize, cfg.RealMaxSize)
+		require.LessOrEqual(t, r.Size, cfg.RealMaxSize, "%s: real object %d is %d bytes, outside %d to %d", bucket, j, r.Size, cfg.RealMinSize, cfg.RealMaxSize)
 		delete(objs, r.Key)
 	}
-	if len(objs) != 0 {
-		t.Fatalf("%s: %d unexpected objects", bucket, len(objs))
-	}
+	require.Empty(t, objs, "%s: %d unexpected objects", bucket, len(objs))
 }
 
 func readTestState(t *testing.T, cfg Config) *State {
 	t.Helper()
 	st, err := ReadState(cfg.StatePath, cfg.Seed, cfg.KeyPrefix)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	return st
 }
 
@@ -89,29 +77,28 @@ func TestLoadWritesEveryObject(t *testing.T) {
 	cfg := testConfig(t, 3, 50)
 	cfg.RealEvery = 20
 	r, err := Load(t.Context(), f, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	st := readTestState(t, cfg)
 	for _, b := range cfg.Buckets {
 		bs := st.Buckets[b]
-		if !bs.Ready || bs.Bulk != 50 || len(bs.Real) != 2 {
-			t.Fatalf("%s: state %+v, want ready with 50 bulk and 2 real", b, bs)
-		}
+		require.True(t, bs.Ready, "%s: state %+v, want ready with 50 bulk and 2 real", b, bs)
+		require.Equal(t, uint64(50), bs.Bulk, "%s: state %+v, want ready with 50 bulk and 2 real", b, bs)
+		require.Len(t, bs.Real, 2, "%s: state %+v, want ready with 50 bulk and 2 real", b, bs)
 		checkBucket(t, f, cfg, b, 50, bs)
-		if sse := f.buckets[b].sse; sse != "none" {
-			t.Fatalf("%s: encryption %q, want none", b, sse)
-		}
-		if br := r.Buckets[b]; br.Bulk != 50 || br.Written != 52 || br.Real != 2 {
-			t.Fatalf("%s: report %+v", b, br)
-		}
+		sse := f.buckets[b].sse
+		require.Equal(t, "none", sse, "%s: encryption %q", b, sse)
+		br := r.Buckets[b]
+		require.Equal(t, uint64(50), br.Bulk, "%s: report %+v", b, br)
+		require.Equal(t, uint64(52), br.Written, "%s: report %+v", b, br)
+		require.Equal(t, uint64(2), br.Real, "%s: report %+v", b, br)
 	}
-	if !r.Final || r.Total.Written != 156 || r.Total.Existed != 0 || r.Total.Errors != 0 || r.Total.Real != 6 {
-		t.Fatalf("final report totals %+v", r.Total)
-	}
-	if r.Latency[OpPutBulk].Total.Count != 150 || r.Latency[OpPutReal].Total.Count != 6 {
-		t.Fatalf("latency counts %+v", r.Latency)
-	}
+	require.True(t, r.Final, "final report totals %+v", r.Total)
+	require.Equal(t, uint64(156), r.Total.Written, "final report totals %+v", r.Total)
+	require.Zero(t, r.Total.Existed, "final report totals %+v", r.Total)
+	require.Zero(t, r.Total.Errors, "final report totals %+v", r.Total)
+	require.Equal(t, uint64(6), r.Total.Real, "final report totals %+v", r.Total)
+	require.Equal(t, uint64(150), r.Latency[OpPutBulk].Total.Count, "latency counts %+v", r.Latency)
+	require.Equal(t, uint64(6), r.Latency[OpPutReal].Total.Count, "latency counts %+v", r.Latency)
 }
 
 // A second load with a higher target writes only what the first did not.
@@ -119,28 +106,22 @@ func TestLoadResumesPastATestPoint(t *testing.T) {
 	f := newFakeS3()
 	cfg := testConfig(t, 2, 30)
 	cfg.RealEvery = 20
-	if _, err := Load(t.Context(), f, cfg); err != nil {
-		t.Fatal(err)
-	}
+	_, err := Load(t.Context(), f, cfg)
+	require.NoError(t, err)
 	cfg.Until = 60
 	r, err := Load(t.Context(), f, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if f.creates != 2 {
-		t.Fatalf("%d bucket creates, want 2: a ready bucket is not set up again", f.creates)
-	}
+	require.NoError(t, err)
+	require.Equal(t, 2, f.creates, "%d bucket creates, want 2: a ready bucket is not set up again", f.creates)
 	st := readTestState(t, cfg)
 	for _, b := range cfg.Buckets {
-		if bs := st.Buckets[b]; bs.Bulk != 60 || len(bs.Real) != 3 {
-			t.Fatalf("%s: state %+v, want 60 bulk and 3 real", b, bs)
-		}
+		bs := st.Buckets[b]
+		require.Equal(t, uint64(60), bs.Bulk, "%s: state %+v, want 60 bulk and 3 real", b, bs)
+		require.Len(t, bs.Real, 3, "%s: state %+v, want 60 bulk and 3 real", b, bs)
 		checkBucket(t, f, cfg, b, 60, st.Buckets[b])
 	}
 	// 30 bulk and 2 real per bucket.
-	if r.Total.Written != 64 || r.Total.Existed != 0 {
-		t.Fatalf("second load totals %+v", r.Total)
-	}
+	require.Equal(t, uint64(64), r.Total.Written, "second load totals %+v", r.Total)
+	require.Zero(t, r.Total.Existed, "second load totals %+v", r.Total)
 }
 
 // A load interrupted part way records a watermark it can resume from, and
@@ -156,9 +137,7 @@ func TestLoadResumesAfterInterrupt(t *testing.T) {
 		}
 	}
 	_, err := Load(ctx, f, cfg)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("interrupted load returned %v, want context.Canceled", err)
-	}
+	require.ErrorIs(t, err, context.Canceled, "interrupted load")
 	st := readTestState(t, cfg)
 	// Every object the state does not account for was written past the
 	// watermark, or is a real object written but not recorded: the resumed
@@ -167,30 +146,23 @@ func TestLoadResumesAfterInterrupt(t *testing.T) {
 	var unrecorded uint64
 	for _, b := range cfg.Buckets {
 		bs := st.Buckets[b]
-		if bs.Bulk >= 200 {
-			t.Fatalf("%s: watermark %d after an interrupt", b, bs.Bulk)
-		}
+		require.Less(t, bs.Bulk, uint64(200), "%s: watermark %d after an interrupt", b, bs.Bulk)
 		objs := f.objects(b)
 		for n := range bs.Bulk {
-			if _, ok := objs[BulkKey(cfg.KeyPrefix, cfg.Seed, b, n)]; !ok {
-				t.Fatalf("%s: bulk object %d below the watermark %d missing", b, n, bs.Bulk)
-			}
+			_, ok := objs[BulkKey(cfg.KeyPrefix, cfg.Seed, b, n)]
+			require.True(t, ok, "%s: bulk object %d below the watermark %d missing", b, n, bs.Bulk)
 		}
 		unrecorded += uint64(len(objs)) - bs.Bulk - uint64(len(bs.Real))
 	}
 
 	f.after = nil
 	r, err := Load(t.Context(), f, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	st = readTestState(t, cfg)
 	for _, b := range cfg.Buckets {
 		checkBucket(t, f, cfg, b, 200, st.Buckets[b])
 	}
-	if r.Total.Existed != unrecorded {
-		t.Fatalf("resumed load found %d keys taken, want the %d written but not recorded", r.Total.Existed, unrecorded)
-	}
+	require.Equal(t, unrecorded, r.Total.Existed, "resumed load found %d keys taken, want the %d written but not recorded", r.Total.Existed, unrecorded)
 }
 
 // An interrupted load whose final save fails says so, so the command does
@@ -207,9 +179,8 @@ func TestLoadReportsAFailedFinalSave(t *testing.T) {
 		}
 	}
 	_, err := Load(ctx, f, cfg)
-	if !errors.Is(err, context.Canceled) || !errors.Is(err, ErrStateNotSaved) {
-		t.Fatalf("load returned %v, want the interrupt and ErrStateNotSaved", err)
-	}
+	require.ErrorIs(t, err, context.Canceled, "load returned %v, want the interrupt and ErrStateNotSaved", err)
+	require.ErrorIs(t, err, ErrStateNotSaved, "load returned %v, want the interrupt and ErrStateNotSaved", err)
 }
 
 func TestLoadRetriesPassingFailures(t *testing.T) {
@@ -228,15 +199,10 @@ func TestLoadRetriesPassingFailures(t *testing.T) {
 		return nil
 	}
 	r, err := Load(t.Context(), f, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Total.Errors != 2 || r.Total.Written != 10 {
-		t.Fatalf("totals %+v, want 2 errors and 10 written", r.Total)
-	}
-	if !strings.Contains(r.LastError, victim) {
-		t.Fatalf("last error %q does not name %s", r.LastError, victim)
-	}
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), r.Total.Errors, "totals %+v, want 2 errors and 10 written", r.Total)
+	require.Equal(t, uint64(10), r.Total.Written, "totals %+v, want 2 errors and 10 written", r.Total)
+	require.Contains(t, r.LastError, victim, "last error %q does not name %s", r.LastError, victim)
 }
 
 func TestLoadTimesOutHungAttempts(t *testing.T) {
@@ -257,12 +223,10 @@ func TestLoadTimesOutHungAttempts(t *testing.T) {
 		return nil
 	}
 	r, err := Load(t.Context(), f, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Total.Errors != 1 || r.Total.Written != 10 || r.Buckets[cfg.Buckets[0]].Bulk != 10 {
-		t.Fatalf("report %+v, want the hung attempt retried", r.Total)
-	}
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), r.Total.Errors, "report %+v, want the hung attempt retried", r.Total)
+	require.Equal(t, uint64(10), r.Total.Written, "report %+v, want the hung attempt retried", r.Total)
+	require.Equal(t, uint64(10), r.Buckets[cfg.Buckets[0]].Bulk, "report %+v, want the hung attempt retried", r.Total)
 }
 
 func TestLoadGivesUpAfterMaxAttempts(t *testing.T) {
@@ -276,12 +240,9 @@ func TestLoadGivesUpAfterMaxAttempts(t *testing.T) {
 		return nil
 	}
 	_, err := Load(t.Context(), f, cfg)
-	if err == nil || !strings.Contains(err.Error(), "giving up after 3 attempts") {
-		t.Fatalf("load returned %v, want it to give up", err)
-	}
-	if st := readTestState(t, cfg); st.Buckets[cfg.Buckets[0]].Bulk > 3 {
-		t.Fatalf("watermark %d passed the failed object 3", st.Buckets[cfg.Buckets[0]].Bulk)
-	}
+	require.ErrorContains(t, err, "giving up after 3 attempts", "load must give up")
+	st := readTestState(t, cfg)
+	require.LessOrEqual(t, st.Buckets[cfg.Buckets[0]].Bulk, uint64(3), "watermark passed the failed object 3")
 }
 
 func TestLoadStopsOnRefusal(t *testing.T) {
@@ -290,9 +251,8 @@ func TestLoadStopsOnRefusal(t *testing.T) {
 	f.fail = func(context.Context, string, string) error { return &statusError{403} }
 	_, err := Load(t.Context(), f, cfg)
 	var se *statusError
-	if !errors.As(err, &se) || se.code != 403 {
-		t.Fatalf("load returned %v, want the 403", err)
-	}
+	require.ErrorAs(t, err, &se, "load returned %v, want the 403", err)
+	require.Equal(t, 403, se.code, "load")
 }
 
 func TestLoadCountsTakenKeysAsWritten(t *testing.T) {
@@ -304,12 +264,10 @@ func TestLoadCountsTakenKeysAsWritten(t *testing.T) {
 		BulkKey(cfg.KeyPrefix, cfg.Seed, b, 7): 0,
 	}}
 	r, err := Load(t.Context(), f, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Total.Written != 8 || r.Total.Existed != 2 || r.Buckets[b].Bulk != 10 {
-		t.Fatalf("report %+v", r)
-	}
+	require.NoError(t, err)
+	require.Equal(t, uint64(8), r.Total.Written, "report %+v", r)
+	require.Equal(t, uint64(2), r.Total.Existed, "report %+v", r)
+	require.Equal(t, uint64(10), r.Buckets[b].Bulk, "report %+v", r)
 	checkBucket(t, f, cfg, b, 10, readTestState(t, cfg).Buckets[b])
 }
 
@@ -318,29 +276,24 @@ func TestLoadRefusesAnotherEncryption(t *testing.T) {
 	f := newFakeS3()
 	cfg := testConfig(t, 1, 5)
 	cfg.Encryption = ""
-	if _, err := Load(t.Context(), f, cfg); err != nil {
-		t.Fatal(err)
-	}
+	_, err := Load(t.Context(), f, cfg)
+	require.NoError(t, err)
 	cfg.Encryption = "none"
 	cfg.Until = 10
-	if _, err := Load(t.Context(), f, cfg); err == nil || !strings.Contains(err.Error(), "encryption") {
-		t.Fatalf("load with another encryption returned %v", err)
-	}
-	if n := len(f.objects(cfg.Buckets[0])); n != 5 {
-		t.Fatalf("%d objects after the refused load, want 5", n)
-	}
+	_, err = Load(t.Context(), f, cfg)
+	require.ErrorContains(t, err, "encryption", "load with another encryption")
+	n := len(f.objects(cfg.Buckets[0]))
+	require.Equal(t, 5, n, "%d objects after the refused load", n)
 }
 
 func TestLoadRefusesAnotherSeedsState(t *testing.T) {
 	f := newFakeS3()
 	cfg := testConfig(t, 1, 5)
-	if _, err := Load(t.Context(), f, cfg); err != nil {
-		t.Fatal(err)
-	}
+	_, err := Load(t.Context(), f, cfg)
+	require.NoError(t, err)
 	cfg.Seed = "other"
-	if _, err := Load(t.Context(), f, cfg); err == nil || !strings.Contains(err.Error(), "seed") {
-		t.Fatalf("load with another seed returned %v", err)
-	}
+	_, err = Load(t.Context(), f, cfg)
+	require.ErrorContains(t, err, "seed", "load with another seed")
 }
 
 func TestLoadRejectsBadConfig(t *testing.T) {
@@ -354,9 +307,8 @@ func TestLoadRejectsBadConfig(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cfg := testConfig(t, 1, 5)
 			mutate(&cfg)
-			if _, err := Load(t.Context(), newFakeS3(), cfg); err == nil {
-				t.Fatal("load accepted the config")
-			}
+			_, err := Load(t.Context(), newFakeS3(), cfg)
+			require.Error(t, err, "load accepted the config")
 		})
 	}
 }

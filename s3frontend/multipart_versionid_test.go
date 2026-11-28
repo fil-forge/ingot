@@ -2,7 +2,6 @@ package s3frontend
 
 import (
 	"context"
-	"errors"
 	"slices"
 	"testing"
 
@@ -10,6 +9,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/queue/bucketqueue"
@@ -81,9 +82,9 @@ func completeReporting(t *testing.T, b *Backend, key, uploadID string, parts []t
 		encryptions = append(encryptions, r.ServerSideEncryption)
 		report(r.VersionID)
 	})
-	for _, sse := range encryptions {
-		if err == nil && sse != res.ServerSideEncryption {
-			t.Errorf("reported encryption %q, result has %q", sse, res.ServerSideEncryption)
+	if err == nil {
+		for _, sse := range encryptions {
+			assert.Equal(t, res.ServerSideEncryption, sse, "reported encryption")
 		}
 	}
 	return reported, versionID, err
@@ -94,9 +95,7 @@ func currentVersionID(t *testing.T, b *Backend, key string) string {
 	t.Helper()
 	bucket := "bk"
 	out, err := b.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &bucket, Key: &key})
-	if err != nil {
-		t.Fatalf("HeadObject %s: %v", key, err)
-	}
+	require.NoError(t, err, "HeadObject %s", key)
 	if out.VersionId == nil {
 		return ""
 	}
@@ -106,9 +105,7 @@ func currentVersionID(t *testing.T, b *Backend, key string) string {
 func sessionState(t *testing.T, store registry.MultipartStore, uploadID string) string {
 	t.Helper()
 	sess, err := store.GetSession(context.Background(), uploadID)
-	if err != nil {
-		t.Fatalf("GetSession: %v", err)
-	}
+	require.NoError(t, err, "GetSession")
 	return sess.State
 }
 
@@ -122,18 +119,12 @@ func TestCompleteAnnouncesTheVersionItCommits(t *testing.T) {
 	mp.hook = func() { putObjV(t, b, "other", []byte("other")) }
 
 	announced, versionID, err := completeAnnounced(t, b, key, uploadID, parts)
-	if err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
-	if len(announced) != 1 || announced[0] == "" {
-		t.Fatalf("announced %q, want one version id", announced)
-	}
-	if versionID != announced[0] {
-		t.Fatalf("Complete returned version %q, announced %q", versionID, announced[0])
-	}
-	if got := currentVersionID(t, b, key); got != versionID {
-		t.Fatalf("current version %q, want the announced %q", got, versionID)
-	}
+	require.NoError(t, err, "Complete")
+	require.Len(t, announced, 1, "announced")
+	require.NotEmpty(t, announced[0], "announced")
+	require.Equal(t, announced[0], versionID, "Complete returned version")
+	got := currentVersionID(t, b, key)
+	require.Equal(t, versionID, got, "current version %q", got)
 }
 
 func TestCompleteReportsNoVersionOutsideAnEnabledBucket(t *testing.T) {
@@ -150,12 +141,9 @@ func TestCompleteReportsNoVersionOutsideAnEnabledBucket(t *testing.T) {
 			uploadID, parts := completeTwoParts(t, b, key)
 
 			announced, versionID, err := completeAnnounced(t, b, key, uploadID, parts)
-			if err != nil {
-				t.Fatalf("Complete: %v", err)
-			}
-			if !slices.Equal(announced, []string{""}) || versionID != "" {
-				t.Fatalf("reported %q, returned %q; want one empty report and no version", announced, versionID)
-			}
+			require.NoError(t, err, "Complete")
+			require.True(t, slices.Equal(announced, []string{""}), "reported %q, returned %q; want one empty report and no version", announced, versionID)
+			require.Empty(t, versionID, "reported %q, returned %q; want one empty report and no version", announced, versionID)
 		})
 	}
 }
@@ -173,26 +161,18 @@ func TestCompleteRefusedWhenTheKeyIsWrittenDuringIt(t *testing.T) {
 	mp.hook = func() { put = putObjV(t, b, key, []byte("written during the completion")) }
 
 	announced, _, err := completeAnnounced(t, b, key, uploadID, parts)
-	if !errors.Is(err, bucketqueue.ErrReservationSuperseded) {
-		t.Fatalf("Complete: err = %v, want bucketqueue.ErrReservationSuperseded", err)
-	}
-	if got := currentVersionID(t, b, key); got != put.VersionID {
-		t.Fatalf("current version %q, want the PUT's %q", got, put.VersionID)
-	}
-	if st := sessionState(t, mp.multipart, uploadID); st != registry.SessionOpen {
-		t.Fatalf("session state %q after the refusal, want open", st)
-	}
+	require.ErrorIs(t, err, bucketqueue.ErrReservationSuperseded, "Complete: err")
+	got := currentVersionID(t, b, key)
+	require.Equal(t, put.VersionID, got, "current version %q", got)
+	st := sessionState(t, mp.multipart, uploadID)
+	require.Equal(t, registry.SessionOpen, st, "session state %q after the refusal", st)
 
 	retried, versionID, err := completeAnnounced(t, b, key, uploadID, parts)
-	if err != nil {
-		t.Fatalf("retried Complete: %v", err)
-	}
-	if len(retried) != 1 || retried[0] != versionID || versionID == announced[0] {
-		t.Fatalf("retry announced %q and returned %q, want one fresh id (first attempt announced %q)", retried, versionID, announced)
-	}
-	if got := currentVersionID(t, b, key); got != versionID {
-		t.Fatalf("current version %q, want the retry's %q", got, versionID)
-	}
+	require.NoError(t, err, "retried Complete")
+	require.Len(t, retried, 1, "retry announced %q and returned %q, want one fresh id (first attempt announced %q)", retried, versionID, announced)
+	require.Equal(t, versionID, retried[0], "retry announced %q and returned %q, want one fresh id (first attempt announced %q)", retried, versionID, announced)
+	require.NotEqual(t, announced[0], versionID, "retry announced %q and returned %q, want one fresh id (first attempt announced %q)", retried, versionID, announced)
+	require.Equal(t, versionID, currentVersionID(t, b, key), "current version")
 }
 
 // Suspending versioning while Complete accepts the parts would make its
@@ -204,20 +184,15 @@ func TestCompleteRefusedWhenVersioningIsSuspendedDuringIt(t *testing.T) {
 	uploadID, parts := completeTwoParts(t, b, key)
 	mp.hook = func() { setVersioning(t, b, types.BucketVersioningStatusSuspended) }
 
-	if _, _, err := completeAnnounced(t, b, key, uploadID, parts); !errors.Is(err, bucketqueue.ErrReservationSuperseded) {
-		t.Fatalf("Complete: err = %v, want bucketqueue.ErrReservationSuperseded", err)
-	}
-	if st := sessionState(t, mp.multipart, uploadID); st != registry.SessionOpen {
-		t.Fatalf("session state %q after the refusal, want open", st)
-	}
+	_, _, err := completeAnnounced(t, b, key, uploadID, parts)
+	require.ErrorIs(t, err, bucketqueue.ErrReservationSuperseded, "Complete")
+	st := sessionState(t, mp.multipart, uploadID)
+	require.Equal(t, registry.SessionOpen, st, "session state %q after the refusal", st)
 
 	announced, versionID, err := completeAnnounced(t, b, key, uploadID, parts)
-	if err != nil {
-		t.Fatalf("retried Complete: %v", err)
-	}
-	if !slices.Equal(announced, []string{""}) || versionID != "" {
-		t.Fatalf("retry in the suspended bucket reported %q and returned %q, want one empty report and no version", announced, versionID)
-	}
+	require.NoError(t, err, "retried Complete")
+	require.True(t, slices.Equal(announced, []string{""}), "retry in the suspended bucket reported %q and returned %q, want one empty report and no version", announced, versionID)
+	require.Empty(t, versionID, "retry in the suspended bucket reported %q and returned %q, want one empty report and no version", announced, versionID)
 }
 
 // An idempotent re-Complete replays the version the first Complete
@@ -237,24 +212,14 @@ func TestReCompleteReplaysTheVersionID(t *testing.T) {
 			key := "replayed"
 			uploadID, parts := completeTwoParts(t, b, key)
 			_, first, err := completeAnnounced(t, b, key, uploadID, parts)
-			if err != nil {
-				t.Fatalf("Complete: %v", err)
-			}
-			if (first != "") != (status == types.BucketVersioningStatusEnabled) {
-				t.Fatalf("Complete returned version %q", first)
-			}
+			require.NoError(t, err, "Complete")
+			require.Equal(t, status == types.BucketVersioningStatusEnabled, first != "", "Complete returned version %q", first)
 
 			announced, again, err := completeAnnounced(t, b, key, uploadID, parts)
-			if err != nil {
-				t.Fatalf("re-Complete: %v", err)
-			}
-			if again != first {
-				t.Fatalf("re-Complete returned version %q, want the first Complete's %q", again, first)
-			}
+			require.NoError(t, err, "re-Complete")
+			require.Equal(t, first, again, "re-Complete returned version %q", again)
 			want := []string{first}
-			if !slices.Equal(announced, want) {
-				t.Fatalf("re-Complete announced %q, want %q", announced, want)
-			}
+			require.True(t, slices.Equal(announced, want), "re-Complete announced %q, want %q", announced, want)
 		})
 	}
 }
@@ -270,23 +235,16 @@ func TestCompleteRefusedWhenVersioningIsEnabledDuringIt(t *testing.T) {
 	reported, _, err := completeReporting(t, b, key, uploadID, parts, func(string) {
 		setVersioning(t, b, types.BucketVersioningStatusEnabled)
 	})
-	if !errors.Is(err, bucketqueue.ErrReservationSuperseded) {
-		t.Fatalf("Complete: err = %v, want bucketqueue.ErrReservationSuperseded", err)
-	}
-	if !slices.Equal(reported, []string{""}) {
-		t.Fatalf("reported %q, want one empty report", reported)
-	}
-	if st := sessionState(t, mp.multipart, uploadID); st != registry.SessionOpen {
-		t.Fatalf("session state %q after the refusal, want open", st)
-	}
+	require.ErrorIs(t, err, bucketqueue.ErrReservationSuperseded, "Complete: err")
+	require.True(t, slices.Equal(reported, []string{""}), "reported %q, want one empty report", reported)
+	st := sessionState(t, mp.multipart, uploadID)
+	require.Equal(t, registry.SessionOpen, st, "session state %q after the refusal", st)
 
 	retried, versionID, err := completeAnnounced(t, b, key, uploadID, parts)
-	if err != nil {
-		t.Fatalf("retried Complete: %v", err)
-	}
-	if len(retried) != 1 || retried[0] == "" || retried[0] != versionID {
-		t.Fatalf("retry reported %q and returned %q, want the same non-empty id", retried, versionID)
-	}
+	require.NoError(t, err, "retried Complete")
+	require.Len(t, retried, 1, "retry reported %q and returned %q, want the same non-empty id", retried, versionID)
+	require.NotEmpty(t, retried[0], "retry reported %q and returned %q, want the same non-empty id", retried, versionID)
+	require.Equal(t, versionID, retried[0], "retry reported %q and returned %q, want the same non-empty id", retried, versionID)
 }
 
 // TestCompleteRunAgainKeepsItsReportedVersion: a Complete whose commit fails
@@ -315,26 +273,18 @@ func TestCompleteRunAgainKeepsItsReportedVersion(t *testing.T) {
 		`CREATE TRIGGER test_skip_complete BEFORE UPDATE ON ingot.multipart_sessions
 		 FOR EACH ROW EXECUTE FUNCTION ingot.test_skip_complete()`,
 	} {
-		if _, err := mem.pool.Exec(ctx, sql); err != nil {
-			t.Fatalf("install the skip: %v", err)
-		}
+		_, err := mem.pool.Exec(ctx, sql)
+		require.NoError(t, err, "install the skip")
 	}
 
 	announced, versionID, err := completeAnnounced(t, b, key, uploadID, parts)
-	if err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
+	require.NoError(t, err, "Complete")
 	var n int64
-	if err := mem.pool.QueryRow(ctx, `SELECT last_value FROM ingot.test_skip_complete`).Scan(&n); err != nil || n < 2 {
-		t.Fatalf("the Complete's commit ran %d times (%v), want a run again", n, err)
-	}
-	if len(announced) != 1 || announced[0] == "" {
-		t.Fatalf("reported %q, want one version id", announced)
-	}
-	if versionID != announced[0] {
-		t.Fatalf("Complete returned version %q, reported %q", versionID, announced[0])
-	}
-	if got := currentVersionID(t, b, key); got != announced[0] {
-		t.Fatalf("current version %q, reported %q", got, announced[0])
-	}
+	err = mem.pool.QueryRow(ctx, `SELECT last_value FROM ingot.test_skip_complete`).Scan(&n)
+	require.NoError(t, err, "read the Complete's commit count")
+	require.GreaterOrEqual(t, n, int64(2), "the Complete's commit ran %d times", n)
+	require.Len(t, announced, 1, "reported")
+	require.NotEmpty(t, announced[0], "reported")
+	require.Equal(t, announced[0], versionID, "Complete returned version")
+	require.Equal(t, announced[0], currentVersionID(t, b, key), "current version")
 }

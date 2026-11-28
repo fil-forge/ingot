@@ -15,6 +15,7 @@ import (
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/uploader"
@@ -169,9 +170,7 @@ func (a *streamingAdapter) AbortBlob(ctx context.Context, space did.DID, add cid
 func streamCounts(t testing.TB, b *Backend, digest multihash.Multihash) (sent, accepted, aborted int) {
 	t.Helper()
 	a, ok := b.deferred.(*streamingAdapter)
-	if !ok {
-		t.Fatalf("backend has no streaming adapter")
-	}
+	require.True(t, ok, "backend has no streaming adapter")
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for _, d := range a.digests {
@@ -228,12 +227,8 @@ func withStreaming(t testing.TB, deps *Deps, dir string) {
 		return
 	}
 	up, ok := deps.Deferred.(deferredTestUploader)
-	if !ok {
-		t.Fatalf("test deps: deferred uploader %T cannot stand behind the streaming seam", deps.Deferred)
-	}
-	if err := os.MkdirAll(streamingDir(dir), 0o755); err != nil {
-		t.Fatalf("streams dir: %v", err)
-	}
+	require.True(t, ok, "test deps: deferred uploader %T cannot stand behind the streaming seam", deps.Deferred)
+	require.NoError(t, os.MkdirAll(streamingDir(dir), 0o755), "streams dir")
 	a := newStreamingAdapter(up, streamingDir(dir))
 	deps.Streaming, deps.Deferred = a, a
 	deps.Reads = blockstore.NewLayered(deps.Cache, deps.Log, a)
@@ -254,6 +249,6 @@ func storedBytes(t testing.TB, b *Backend, digest multihash.Multihash) []byte {
 			return data
 		}
 	}
-	t.Fatalf("blob %x: no local copy, and its provider holds none", digest)
+	require.FailNow(t, "no local copy, and its provider holds none", "blob %x", digest)
 	return nil
 }

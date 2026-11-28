@@ -86,24 +86,21 @@ func TestForgeShipProofsCache(t *testing.T) {
 	storeA := ucanlib.ProofStore(iam.NewDelegationCache(nil))
 
 	// Absent before any capture.
-	if _, ok := fg.shipProofStore(ctx, spaceA); ok {
-		t.Fatal("expected no ship store before capture")
-	}
+	_, ok := fg.shipProofStore(ctx, spaceA)
+	require.False(t, ok, "expected no ship store before capture")
 
 	// Capture for spaceA; it resolves, but a different space stays absent.
 	fg.captureShipProofs(borrowable(storeA), spaceA)
 	got, ok := fg.shipProofStore(ctx, spaceA)
 	require.True(t, ok)
 	require.Same(t, storeA, got)
-	if _, ok := fg.shipProofStore(ctx, spaceB); ok {
-		t.Fatal("spaceB should not resolve from spaceA's capture")
-	}
+	_, ok = fg.shipProofStore(ctx, spaceB)
+	require.False(t, ok, "spaceB should not resolve from spaceA's capture")
 
 	// A context with no store captures nothing.
 	fg.captureShipProofs(context.WithValue(ctx, reqscope.BorrowableKey(), true), spaceB)
-	if _, ok := fg.shipProofStore(ctx, spaceB); ok {
-		t.Fatal("a capture with no store must not populate the cache")
-	}
+	_, ok = fg.shipProofStore(ctx, spaceB)
+	require.False(t, ok, "a capture with no store must not populate the cache")
 }
 
 // TestForgeShipProofsOnlyBorrowable: a write captures its store only when the
@@ -116,9 +113,8 @@ func TestForgeShipProofsOnlyBorrowable(t *testing.T) {
 
 	scoped := ucanlib.ProofStore(iam.NewDelegationCache(nil))
 	fg.captureShipProofs(context.WithValue(ctx, reqscope.ProofStoreKey(), scoped), space)
-	if _, ok := fg.shipProofStore(ctx, space); ok {
-		t.Fatal("captured a store not marked borrowable")
-	}
+	_, ok := fg.shipProofStore(ctx, space)
+	require.False(t, ok, "captured a store not marked borrowable")
 
 	held := ucanlib.ProofStore(iam.NewDelegationCache(nil))
 	fg.captureShipProofs(borrowable(held), space)
@@ -295,9 +291,8 @@ func TestForgeCaptureShipAuthority(t *testing.T) {
 	fg.CaptureShipAuthority(withStore(shippingStore(t)), other)
 	_, ok = fg.catalogShipStore(ctx, other)
 	require.True(t, ok)
-	if _, ok := fg.shipProofStore(ctx, other); ok {
-		t.Fatal("a commit's capture must not serve release, abort or renewal")
-	}
+	_, ok = fg.shipProofStore(ctx, other)
+	require.False(t, ok, "a commit's capture must not serve release, abort or renewal")
 }
 
 // TestForgeShipProbeAsksForBlobAdd checks the probe against real chains: a

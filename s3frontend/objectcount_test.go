@@ -41,18 +41,14 @@ func newCountingBackend(t *testing.T, opts ...func(*Deps)) (*Backend, *testStore
 	dir := t.TempDir()
 	mem := newTestStore(t)
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
-	if err != nil {
-		t.Fatalf("cache: %v", err)
-	}
+	require.NoError(t, err, "cache")
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(dir, "segments"),
 		Meta:    mem,
 		Catalog: logstore.PlaneConfig{Ship: false},
 		Logger:  zaptest.NewLogger(t),
 	})
-	if err != nil {
-		t.Fatalf("logstore: %v", err)
-	}
+	require.NoError(t, err, "logstore")
 	t.Cleanup(func() { _ = log.Close(ctx) })
 
 	deps := Deps{
@@ -78,9 +74,7 @@ func newCountingBackend(t *testing.T, opts ...func(*Deps)) (*Backend, *testStore
 		opt(&deps)
 	}
 	b := mem.newBackend(t, deps)
-	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{}); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{}), "create bucket")
 	return b, mem
 }
 
@@ -131,9 +125,8 @@ func TestDeleteMarkerCounts(t *testing.T) {
 	setVersioning(t, b, types.BucketVersioningStatusEnabled)
 
 	putObjV(t, b, "a", []byte("hello"))
-	if _, err := deleteObjV(t, b, "a", ""); err != nil {
-		t.Fatalf("DeleteObject: %v", err)
-	}
+	_, err := deleteObjV(t, b, "a", "")
+	require.NoError(t, err, "DeleteObject")
 
 	wantObjects(t, mem, 2, 0, "the object version and the delete marker")
 }
@@ -144,9 +137,8 @@ func TestUnversionedDeleteTakesTheObjectAway(t *testing.T) {
 	b, mem := newCountingBackend(t)
 
 	putObjV(t, b, "a", []byte("hello"))
-	if _, err := deleteObjV(t, b, "a", ""); err != nil {
-		t.Fatalf("DeleteObject: %v", err)
-	}
+	_, err := deleteObjV(t, b, "a", "")
+	require.NoError(t, err, "DeleteObject")
 
 	wantObjects(t, mem, 1, 1, "the key is gone")
 }
@@ -160,9 +152,8 @@ func TestVersionScopedDeleteTakesThatVersionAway(t *testing.T) {
 	first := putObjV(t, b, "a", []byte("first"))
 	putObjV(t, b, "a", []byte("second"))
 
-	if _, err := deleteObjV(t, b, "a", first.VersionID); err != nil {
-		t.Fatalf("DeleteObject(versionId): %v", err)
-	}
+	_, err := deleteObjV(t, b, "a", first.VersionID)
+	require.NoError(t, err, "DeleteObject(versionId)")
 
 	wantObjects(t, mem, 2, 1, "one of two versions deleted")
 }
@@ -172,9 +163,8 @@ func TestVersionScopedDeleteTakesThatVersionAway(t *testing.T) {
 func TestDeletingAMissingKeyCountsNothing(t *testing.T) {
 	b, mem := newCountingBackend(t)
 
-	if _, err := deleteObjV(t, b, "gone", ""); err != nil {
-		t.Fatalf("DeleteObject: %v", err)
-	}
+	_, err := deleteObjV(t, b, "gone", "")
+	require.NoError(t, err, "DeleteObject")
 
 	wantObjects(t, mem, 0, 0, "nothing was there")
 }

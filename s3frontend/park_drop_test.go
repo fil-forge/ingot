@@ -13,6 +13,7 @@ import (
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
@@ -22,15 +23,13 @@ import (
 func partRecord(t *testing.T, mem *testStore, uploadID string, n int) registry.MultipartPart {
 	t.Helper()
 	parts, err := mem.ListParts(context.Background(), uploadID)
-	if err != nil {
-		t.Fatalf("ListParts: %v", err)
-	}
+	require.NoError(t, err, "ListParts")
 	for _, p := range parts {
 		if p.PartNumber == n {
 			return p
 		}
 	}
-	t.Fatalf("part %d not recorded for upload %s", n, uploadID)
+	require.FailNow(t, "part not recorded", "part %d not recorded for upload %s", n, uploadID)
 	return registry.MultipartPart{}
 }
 
@@ -44,41 +43,33 @@ func TestParkedPartHoldsNoLocalCopy(t *testing.T) {
 
 	uploadID := mpCreate(t, b, key, "", "")
 	out, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil)
-	if err != nil {
-		t.Fatalf("UploadPart: %v", err)
-	}
+	require.NoError(t, err, "UploadPart")
 	digests := hygienePartDigests(t, mem, uploadID, 1)
 	part := partRecord(t, mem, uploadID, 1)
-	if part.State != registry.PartParked {
-		t.Fatalf("part state = %q, want parked", part.State)
-	}
+	require.Equal(t, registry.PartParked, part.State, "part state")
 	var total int64
 	for _, n := range part.SpanLengths {
 		total += n
 	}
-	if len(part.SpanLengths) != len(digests) || total != backend.MinPartSize {
-		t.Fatalf("part span lengths = %v, want one per blob summing to %d", part.SpanLengths, backend.MinPartSize)
-	}
+	require.Len(t, part.SpanLengths, len(digests), "part span lengths = %v, want one per blob summing to %d", part.SpanLengths, backend.MinPartSize)
+	require.Equal(t, int64(backend.MinPartSize), total, "part span lengths = %v, want one per blob summing to %d", part.SpanLengths, backend.MinPartSize)
 	for _, d := range digests {
-		if _, err := os.Stat(localPath(b, d)); !os.IsNotExist(err) {
-			t.Fatalf("parked blob %s local copy: stat err=%v, want not-exist", d, err)
-		}
-		if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentParked {
-			t.Fatalf("parked blob %s intent = %v/%v, want parked", d, in, err)
-		}
-		if _, err := mem.ParkByDigest(ctx, d); err != nil {
-			t.Fatalf("parked blob %s park row: %v", d, err)
-		}
+		_, err := os.Stat(localPath(b, d))
+		require.True(t, os.IsNotExist(err), "parked blob %s local copy: stat err=%v, want not-exist", d, err)
+		in, err := mem.IntentByDigest(ctx, d)
+		require.NoError(t, err, "parked blob %s intent", d)
+		require.Equal(t, registry.IntentParked, in.State, "parked blob %s intent", d)
+		_, err = mem.ParkByDigest(ctx, d)
+		require.NoError(t, err, "parked blob %s park row", d)
 	}
 
 	one := int32(1)
-	if _, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}, nil); err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
+	_, err = mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}, nil)
+	require.NoError(t, err, "Complete")
 	for _, d := range digests {
-		if loc, err := mem.GetLocation(ctx, mem.bk(), d); err != nil || loc == nil {
-			t.Fatalf("blob %s location after Complete = %v/%v, want recorded", d, loc, err)
-		}
+		loc, err := mem.GetLocation(ctx, mem.bk(), d)
+		require.NoError(t, err, "blob %s location after Complete", d)
+		require.NotNil(t, loc, "blob %s location after Complete", d)
 	}
 }
 
@@ -99,18 +90,16 @@ func TestFailedParkIsInvalidAtComplete(t *testing.T) {
 	body := testBody(int(backend.MinPartSize))
 
 	uploadID := mpCreate(t, b, key, "", "")
-	if _, err := mpUploadPart(t, b, key, uploadID, 1, body, nil); err == nil {
-		t.Fatalf("UploadPart succeeded, want the park failure")
-	}
-	if parts, err := mem.ListParts(context.Background(), uploadID); err != nil || len(parts) != 0 {
-		t.Fatalf("parts after a failed park = %v/%v, want none", parts, err)
-	}
+	_, err := mpUploadPart(t, b, key, uploadID, 1, body, nil)
+	require.Error(t, err, "UploadPart succeeded, want the park failure")
+	parts, err := mem.ListParts(context.Background(), uploadID)
+	require.NoError(t, err, "parts after a failed park")
+	require.Empty(t, parts, "parts after a failed park")
 	sum := md5.Sum(body)
 	etag := `"` + hex.EncodeToString(sum[:]) + `"`
 	one := int32(1)
-	_, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: &etag}}, nil)
+	_, err = mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: &etag}}, nil)
 	var apiErr s3err.APIError
-	if !errors.As(err, &apiErr) || apiErr.Code != "InvalidPart" {
-		t.Fatalf("Complete = %v, want InvalidPart", err)
-	}
+	require.ErrorAs(t, err, &apiErr, "Complete")
+	require.Equal(t, "InvalidPart", apiErr.Code, "Complete")
 }

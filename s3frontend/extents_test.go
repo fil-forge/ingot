@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/google/uuid"
 	"io"
 	"testing"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/versitygw/s3response"
@@ -46,19 +48,14 @@ func assertExtents(t *testing.T, b *Backend, key string, extents int) *resolvedV
 func assertExtentsIn(t *testing.T, b *Backend, bucket, key string, extents int) *resolvedVersion {
 	t.Helper()
 	rv, err := b.resolveVersion(context.Background(), bucket, key, "")
-	if err != nil {
-		t.Fatalf("resolve %s: %v", key, err)
-	}
+	require.NoError(t, err, "resolve %s", key)
 	head := storeFor(b).blobList.Head
 	if head == 0 {
 		head = 1024
 	}
-	if got := len(rv.mf.Body.Blobs.Head); got != head {
-		t.Fatalf("%s: Head holds %d blobs, want %d", key, got, head)
-	}
-	if got := len(rv.mf.Body.Blobs.Extents); got != extents {
-		t.Fatalf("%s: %d extents, want %d", key, got, extents)
-	}
+	got := len(rv.mf.Body.Blobs.Head)
+	require.Equal(t, head, got, "%s: Head holds %d blobs", key, got)
+	require.Len(t, rv.mf.Body.Blobs.Extents, extents, "%s: extents", key)
 	return rv
 }
 
@@ -70,14 +67,12 @@ func TestExtents_PutObjectReadsBack(t *testing.T) {
 	b, _, _ := newRefTestBackend(t, extentBlobSize)
 	data := testBody(1100*extentBlobSize + 300) // 1,101 blobs
 	bucket, key := "bk", "big"
-	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)}); err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
+	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
+	require.NoError(t, err, "PutObject")
 	assertExtents(t, b, key, 1)
 
-	if got := getRange(t, b, key, ""); !bytes.Equal(got, data) {
-		t.Fatalf("full GET: %d bytes, mismatch", len(got))
-	}
+	got := getRange(t, b, key, "")
+	require.Equal(t, data, got, "full GET: %d bytes, mismatch", len(got))
 	boundary := int64(1024 * extentBlobSize)
 	for _, r := range [][2]int64{
 		{100, 5000},                      // inside the head
@@ -86,9 +81,7 @@ func TestExtents_PutObjectReadsBack(t *testing.T) {
 		{int64(len(data)) - 1, int64(len(data)) - 1},
 	} {
 		got := getRange(t, b, key, fmt.Sprintf("bytes=%d-%d", r[0], r[1]))
-		if !bytes.Equal(got, data[r[0]:r[1]+1]) {
-			t.Fatalf("range %v: %d bytes, mismatch", r, len(got))
-		}
+		require.Equal(t, data[r[0]:r[1]+1], got, "range %v: %d bytes, mismatch", r, len(got))
 	}
 }
 
@@ -99,25 +92,20 @@ func TestExtents_DeleteReleasesEveryBlob(t *testing.T) {
 	ctx := context.Background()
 	data := testBody(20 * extentBlobSize) // a head of 8, extents of 8 and 4
 	bucket, key := "bk", "big"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)}); err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
+	_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
+	require.NoError(t, err, "PutObject")
 	rv := assertExtents(t, b, key, 2)
 	digests := storedBlobs(t, b, rv).DigestList()
-	if len(digests) != 20 {
-		t.Fatalf("%d blobs, want 20", len(digests))
-	}
+	require.Len(t, digests, 20, "%d blobs", len(digests))
 	for _, d := range digests {
-		if n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil); n != 1 {
-			t.Fatalf("blob %x: %d claims before the delete, want 1", d, n)
-		}
+		n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil)
+		require.Equal(t, 1, n, "blob %x: %d claims before the delete", d, n)
 	}
 	deleteFrom(t, b, bucket, key)
 	drainReleases(t, b)
 	for _, d := range digests {
-		if n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil); n != 0 {
-			t.Fatalf("blob %x: %d claims after the delete, want 0", d, n)
-		}
+		n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil)
+		require.Zero(t, n, "blob %x: %d claims after the delete", d, n)
 	}
 }
 
@@ -130,46 +118,34 @@ func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 	ctx := context.Background()
 	mem := newSmallListStore(t, smallLists)
 	logs, err := logstore.OpenManager(ctx, logstore.ManagerConfig{Dir: t.TempDir(), Meta: mem, Logger: zaptest.NewLogger(t)})
-	if err != nil {
-		t.Fatalf("logstore: %v", err)
-	}
+	require.NoError(t, err, "logstore")
 	t.Cleanup(func() { _ = logs.Close(ctx) })
 	b, mem, _ := newRefTestBackendOver(t, mem, logs, extentBlobSize)
 	tenant := testutil.RandomDID(t)
 	for _, name := range []string{"src", "dst"} {
-		if err := mem.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: tenant}); err != nil {
-			t.Fatalf("create bucket %s: %v", name, err)
-		}
+		require.NoError(t, mem.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: tenant}), "create bucket %s", name)
 	}
 	data := testBody(20 * extentBlobSize) // a head of 8, extents of 8 and 4
 	bucket, key := "src", "big"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)}); err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
+	_, err = b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
+	require.NoError(t, err, "PutObject")
 	dstBucket, dst, src := "dst", "copy", "src/big"
-	if _, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dstBucket, Key: &dst, CopySource: &src}); err != nil {
-		t.Fatalf("CopyObject: %v", err)
-	}
+	_, err = b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dstBucket, Key: &dst, CopySource: &src})
+	require.NoError(t, err, "CopyObject")
 	rv := assertExtentsIn(t, b, dstBucket, dst, 2)
 	for _, d := range storedBlobs(t, b, rv).DigestList() {
-		if n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil); n != 1 {
-			t.Fatalf("blob %x: %d claims in the copy's space, want the copy's", d, n)
-		}
+		n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil)
+		require.Equal(t, 1, n, "blob %x: %d claims in the copy's space", d, n)
 	}
 	// The source bucket's catalog goes, as DeleteBucket removes it: the copy
 	// still reads back whole from its own.
-	if err := logs.RemoveBucketLog(ctx, bucket); err != nil {
-		t.Fatalf("RemoveBucketLog: %v", err)
-	}
+	require.NoError(t, logs.RemoveBucketLog(ctx, bucket), "RemoveBucketLog")
 	out, err := b.GetObject(ctx, &s3.GetObjectInput{Bucket: &dstBucket, Key: &dst})
-	if err != nil {
-		t.Fatalf("GetObject copy: %v", err)
-	}
+	require.NoError(t, err, "GetObject copy")
 	got, err := io.ReadAll(out.Body)
 	out.Body.Close()
-	if err != nil || !bytes.Equal(got, data) {
-		t.Fatalf("copy reads back %d bytes, err %v; want the source's %d", len(got), err, len(data))
-	}
+	require.NoError(t, err, "copy reads back %d bytes, err %v", len(got), err)
+	require.Equal(t, data, got, "copy reads back %d bytes, err %v", len(got), err)
 }
 
 // TestExtents_MultipartPartNumberAcrossExtents: a multipart object whose
@@ -184,28 +160,19 @@ func TestExtents_MultipartPartNumberAcrossExtents(t *testing.T) {
 	key := "mp"
 	whole := completeAll(t, b, key, [][]byte{part1, part2}, []int32{1, 2})
 	rv := assertExtents(t, b, key, 5)
-	if rv.mf.Body.Size != int64(len(whole)) {
-		t.Fatalf("Size = %d, want %d", rv.mf.Body.Size, len(whole))
-	}
+	require.Equal(t, int64(len(whole)), rv.mf.Body.Size, "Size")
 
 	bucket := "bk"
 	for pn, want := range map[int32][]byte{1: part1, 2: part2} {
 		out, err := b.GetObject(context.Background(), &s3.GetObjectInput{Bucket: &bucket, Key: &key, PartNumber: &pn})
-		if err != nil {
-			t.Fatalf("GetObject partNumber=%d: %v", pn, err)
-		}
+		require.NoError(t, err, "GetObject partNumber=%d", pn)
 		got, err := io.ReadAll(out.Body)
 		out.Body.Close()
-		if err != nil {
-			t.Fatalf("read part %d: %v", pn, err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Fatalf("part %d: %d bytes, mismatch", pn, len(got))
-		}
+		require.NoError(t, err, "read part %d", pn)
+		require.Equal(t, want, got, "part %d: %d bytes, mismatch", pn, len(got))
 	}
-	if got := getRange(t, b, key, ""); !bytes.Equal(got, whole) {
-		t.Fatal("full GET mismatch")
-	}
+	got := getRange(t, b, key, "")
+	require.Equal(t, whole, got, "full GET mismatch")
 	assertObjectTree(t, b, key, whole)
 }
 
@@ -214,9 +181,8 @@ func TestExtents_MultipartPartNumberAcrossExtents(t *testing.T) {
 func TestExtents_CompleteCapFollowsListSizes(t *testing.T) {
 	for _, sizes := range []msbucket.BlobListSizes{{}, smallLists} {
 		b, _, _ := newRefTestBackendOn(t, newSmallListStore(t, sizes), extentBlobSize)
-		if got, want := storeFor(b).limits.MaxBodyBlobs, sizes.MaxBlobs(); got != want {
-			t.Fatalf("lists of %+v: a Complete takes %d blobs, the lists hold %d", sizes, got, want)
-		}
+		got, want := storeFor(b).limits.MaxBodyBlobs, sizes.MaxBlobs()
+		require.Equal(t, want, got, "lists of %+v: a Complete takes %d blobs, the lists hold %d", sizes, got, want)
 	}
 }
 
@@ -229,14 +195,9 @@ func TestExtents_CompleteRefusesTooManyBlobs(t *testing.T) {
 	key := "mp"
 	uploadID, completed, _ := uploadAll(t, b, key, [][]byte{testBody(11 * extentBlobSize)}, []int32{1})
 	_, err := mpComplete(t, b, key, uploadID, completed, nil)
-	if got := apiErrCode(t, err); got != "EntityTooLarge" {
-		t.Fatalf("Complete of 11 blobs over a cap of 10: %s (%v), want EntityTooLarge", got, err)
-	}
+	got := apiErrCode(t, err)
+	require.Equal(t, "EntityTooLarge", got, "Complete of 11 blobs over a cap of 10: %s (%v)", got, err)
 	sess, err := mem.GetSession(context.Background(), uploadID)
-	if err != nil {
-		t.Fatalf("GetSession: %v", err)
-	}
-	if sess.State != registry.SessionOpen {
-		t.Fatalf("session %s after the refusal, want open", sess.State)
-	}
+	require.NoError(t, err, "GetSession")
+	require.Equal(t, registry.SessionOpen, sess.State, "session %s after the refusal", sess.State)
 }

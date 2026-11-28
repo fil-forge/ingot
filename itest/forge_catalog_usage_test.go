@@ -11,6 +11,7 @@ import (
 
 	ingottest "github.com/fil-forge/ingot/testing"
 	"github.com/fil-forge/smelt/pkg/stack"
+	"github.com/stretchr/testify/require"
 )
 
 // TestForgeCatalogUsage runs `ingot catalog usage` inside the running Ingot
@@ -30,26 +31,20 @@ func TestForgeCatalogUsage(t *testing.T) {
 	cfg := forgeConfig(ingotEndpoint, accessKey, secretKey)
 
 	const bucket = "catalog-usage-bucket"
-	if err := ingottest.CreateBucket(ctx, cfg, bucket); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, ingottest.CreateBucket(ctx, cfg, bucket), "create bucket")
 	// Objects written once, whose manifests stay in the first segment, then
 	// rounds of overwrites past seal_age, so later segments hold superseded
 	// blocks and enough segments ship that the first retires.
 	for i := range 4 {
 		key := fmt.Sprintf("kept-%d", i)
-		if err := ingottest.PutBytes(ctx, cfg, bucket, key, patternBytes(16<<10+i)); err != nil {
-			t.Fatalf("put %s: %v", key, err)
-		}
+		require.NoError(t, ingottest.PutBytes(ctx, cfg, bucket, key, patternBytes(16<<10+i)), "put %s", key)
 	}
 	time.Sleep(3 * time.Second)
 	const rounds = 10
 	for round := range rounds {
 		for i := range 4 {
 			key := fmt.Sprintf("obj-%d", i)
-			if err := ingottest.PutBytes(ctx, cfg, bucket, key, patternBytes(16<<10+round*100+i)); err != nil {
-				t.Fatalf("put %s: %v", key, err)
-			}
+			require.NoError(t, ingottest.PutBytes(ctx, cfg, bucket, key, patternBytes(16<<10+round*100+i)), "put %s", key)
 		}
 		time.Sleep(3 * time.Second)
 	}
@@ -90,42 +85,28 @@ func TestForgeCatalogUsage(t *testing.T) {
 		t.Helper()
 		args := append(append([]string{"env"}, env...), "/usr/bin/ingot", "catalog", "usage", "--config", "/etc/ingot/config.yaml")
 		out, errOut, err := s.Exec(ctx, "ingot", args...)
-		if err != nil {
-			t.Fatalf("ingot catalog usage: %v (stderr=%s)", err, errOut)
-		}
+		require.NoError(t, err, "ingot catalog usage (stderr=%s)", errOut)
 		var r report
-		if err := json.Unmarshal([]byte(out), &r); err != nil {
-			t.Fatalf("parse the report: %v\n%s", err, out)
-		}
-		if len(r.Buckets) != 1 || r.Buckets[0].Space != space {
-			t.Fatalf("buckets = %+v, want one, for space %s", r.Buckets, space)
-		}
-		if r.Buckets[0].figures != r.Total {
-			t.Fatalf("total %+v differs from the one bucket's %+v", r.Total, r.Buckets[0].figures)
-		}
+		require.NoError(t, json.Unmarshal([]byte(out), &r), "parse the report\n%s", out)
+		require.Len(t, r.Buckets, 1, "buckets")
+		require.Equal(t, space, r.Buckets[0].Space, "buckets")
+		require.Equal(t, r.Buckets[0].figures, r.Total, "the total against the one bucket's figures")
 		return r.Total
 	}
 
 	got := usage("AWS_ACCESS_KEY_ID="+accessKey, "AWS_SECRET_ACCESS_KEY="+secretKey)
 	t.Logf("catalog usage: %+v", got)
-	switch {
-	case got.ForgeBytes == 0:
-		t.Fatal("no catalog bytes on Forge after every segment shipped")
-	case got.UnmeasuredBytes != 0:
-		t.Fatalf("%d bytes shipped unmeasured; every segment here shipped after the measurement existed", got.UnmeasuredBytes)
-	case got.LocalBytes >= got.ForgeBytes:
-		t.Fatalf("local segment files hold %d bytes, no fewer than the %d on Forge, with segments retired", got.LocalBytes, got.ForgeBytes)
-	case got.FetchedSegments == 0:
-		t.Fatal("the walk read no retired segment from Forge; the kept objects' manifests are in the first one")
-	case got.LiveBlocks == 0 || got.LiveBytes > got.ForgeBytes:
-		t.Fatalf("live walk found %d blocks of %d bytes over %d bytes on Forge", got.LiveBlocks, got.LiveBytes, got.ForgeBytes)
-	case got.MissingBlocks != 0:
-		t.Fatalf("live walk missed %d catalog blocks with Forge to read them from", got.MissingBlocks)
-	}
+	require.NotZero(t, got.ForgeBytes, "no catalog bytes on Forge after every segment shipped")
+	require.Zero(t, got.UnmeasuredBytes, "bytes shipped unmeasured; every segment here shipped after the measurement existed")
+	require.Less(t, got.LocalBytes, got.ForgeBytes, "local segment files should hold fewer bytes than Forge, with segments retired")
+	require.NotZero(t, got.FetchedSegments, "the walk read no retired segment from Forge; the kept objects' manifests are in the first one")
+	require.NotZero(t, got.LiveBlocks, "live walk found no blocks")
+	require.LessOrEqual(t, got.LiveBytes, got.ForgeBytes, "live walk found more bytes than Forge holds")
+	require.Zero(t, got.MissingBlocks, "live walk missed catalog blocks with Forge to read them from")
 
 	without := usage()
 	t.Logf("catalog usage without a key: %+v", without)
-	if without.MissingBlocks == 0 || without.FetchedSegments != 0 || without.LiveBlocks >= got.LiveBlocks {
-		t.Fatalf("without a key the walk found %+v, want missing blocks, no fetch and fewer live blocks than %d", without, got.LiveBlocks)
-	}
+	require.NotZero(t, without.MissingBlocks, "without a key the walk found %+v, want missing blocks, no fetch and fewer live blocks than %d", without, got.LiveBlocks)
+	require.Zero(t, without.FetchedSegments, "without a key the walk found %+v, want missing blocks, no fetch and fewer live blocks than %d", without, got.LiveBlocks)
+	require.Less(t, without.LiveBlocks, got.LiveBlocks, "without a key the walk found %+v, want missing blocks, no fetch and fewer live blocks than %d", without, got.LiveBlocks)
 }

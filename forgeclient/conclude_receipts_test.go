@@ -30,6 +30,7 @@ import (
 	"github.com/fil-forge/ucantone/ucan/receipt"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -209,7 +210,7 @@ func concludeFixture(t *testing.T) (*Client, *fakeSprue) {
 	// without this the test would fail on a missing location instead of on
 	// the panic. The logger runs on the handler goroutine, hence Errorf.
 	srv := server.NewHTTP(service, server.WithPanicLogger(func(_ execution.Request, value any) {
-		t.Errorf("fake upload service panicked: %v\n%s", value, debug.Stack())
+		assert.Fail(t, "fake upload service panicked", "%v\n%s", value, debug.Stack())
 	}))
 	srv.Handle(ucancmds.Conclude.Command, ucancmds.Conclude.Handler(fake.conclude))
 
@@ -285,7 +286,7 @@ func TestBlobConcludeAllDeliversOnce(t *testing.T) {
 	require.Len(t, out, len(parked))
 	for i, blob := range out {
 		require.Equal(t, parked[i].Digest, blob.Digest, "results must stay in the order given")
-		require.NotNil(t, blob.Location, "blob %d got no location", i)
+		require.NotNil(t, blob.Location, "blob %d", i)
 		require.Nil(t, blob.PutInvocation, "the spent put invocation must be dropped")
 	}
 }
@@ -328,7 +329,7 @@ func TestBlobConcludeAllChunks(t *testing.T) {
 		"one past the cap must split into a full conclude and a remainder")
 	require.Len(t, out, len(parked))
 	for i, blob := range out {
-		require.NotNil(t, blob.Location, "blob %d of %d got no location", i, len(parked))
+		require.NotNil(t, blob.Location, "blob %d of %d", i, len(parked))
 	}
 }
 

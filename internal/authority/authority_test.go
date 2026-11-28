@@ -12,6 +12,7 @@ import (
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/tokenstore"
@@ -27,29 +28,23 @@ func TestALentStoreReachesWorkForItsSpace(t *testing.T) {
 	req := context.WithValue(context.Background(), reqscope.ProofStoreKey(), store)
 	lent := func(space did.DID) (ucanlib.ProofStore, bool) {
 		ctx, err := r.WithProofs(context.Background(), space)
-		if err != nil {
-			t.Fatalf("WithProofs: %v", err)
-		}
+		require.NoError(t, err, "WithProofs")
 		return reqscope.ProofStore(ctx)
 	}
 
 	r.Lend(req, space)() // not borrowable: nothing lent
-	if _, ok := lent(space); ok {
-		t.Fatal("a store that may not be borrowed was lent")
-	}
+	_, ok := lent(space)
+	require.False(t, ok, "a store that may not be borrowed was lent")
 
 	end := r.Lend(context.WithValue(req, reqscope.BorrowableKey(), true), space)
 	got, ok := lent(space)
-	if !ok || got != store {
-		t.Fatal("work for the space did not read the lent store")
-	}
-	if _, ok := lent(other); ok {
-		t.Fatal("work for another space read the lent store")
-	}
+	require.True(t, ok, "work for the space did not read the lent store")
+	require.Same(t, store, got, "work for the space did not read the lent store")
+	_, ok = lent(other)
+	require.False(t, ok, "work for another space read the lent store")
 	end()
-	if _, ok := lent(space); ok {
-		t.Fatal("the store stayed lent after the lend ended")
-	}
+	_, ok = lent(space)
+	require.False(t, ok, "the store stayed lent after the lend ended")
 }
 
 // chainStore answers every lookup with its chain, or err.
@@ -81,14 +76,13 @@ func TestProofStoresReadsInTurn(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, links, err := proofStores(tc.stores).ProofChain(t.Context(), did.Undef, blobcmds.Remove.Command, did.Undef)
-			if err != nil || len(links) != 1 || links[0] != tc.want[0] {
-				t.Fatalf("ProofChain = %v, %v; want %v", links, err, tc.want)
-			}
+			require.NoError(t, err, "ProofChain")
+			require.Len(t, links, 1, "ProofChain")
+			require.Equal(t, tc.want[0], links[0], "ProofChain")
 		})
 	}
-	if _, _, err := (proofStores{chainStore{err: errors.New("none")}}).ProofChain(t.Context(), did.Undef, blobcmds.Remove.Command, did.Undef); err == nil {
-		t.Fatal("ProofChain with no chain anywhere succeeded")
-	}
+	_, _, err := (proofStores{chainStore{err: errors.New("none")}}).ProofChain(t.Context(), did.Undef, blobcmds.Remove.Command, did.Undef)
+	require.Error(t, err, "ProofChain with no chain anywhere succeeded")
 }
 
 // capturer captures from whichever store ctx carries, encoding it as the
@@ -146,9 +140,9 @@ func TestPrepareReadsTheLentStoreFirst(t *testing.T) {
 				defer r.Lend(lending, space)()
 			}
 			got, fresh, err := r.Prepare(t.Context(), space, blobcmds.Remove.Command, []byte("stored"))
-			if err != nil || string(got) != tc.want || fresh != tc.fresh {
-				t.Fatalf("Prepare = %q, %v, %v; want %q, %v", got, fresh, err, tc.want, tc.fresh)
-			}
+			require.NoError(t, err, "Prepare = %q, %v, %v", got, fresh, err)
+			require.Equal(t, tc.want, string(got), "Prepare = %q, %v, %v", got, fresh, err)
+			require.Equal(t, tc.fresh, fresh, "Prepare = %q, %v, %v", got, fresh, err)
 		})
 	}
 }
@@ -156,8 +150,6 @@ func TestPrepareReadsTheLentStoreFirst(t *testing.T) {
 func link(t *testing.T, s string) cid.Cid {
 	t.Helper()
 	h, err := multihash.Sum([]byte(s), multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	return cid.NewCidV1(cid.Raw, h)
 }

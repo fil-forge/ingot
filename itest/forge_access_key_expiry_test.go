@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/smelt/pkg/stack"
+	"github.com/stretchr/testify/require"
 
 	ingottest "github.com/fil-forge/ingot/testing"
 )
@@ -33,9 +34,7 @@ func TestForgeAccessKeyExpiry(t *testing.T) {
 
 	const tenant, bucket, key = "keyexpiry", "keyexpiry", "obj"
 	ak, sk := hiltProvisionTenant(t, ctx, s, tenant)
-	if err := ingottest.CreateBucket(ctx, forgeConfig(endpoint, ak, sk), bucket); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, ingottest.CreateBucket(ctx, forgeConfig(endpoint, ak, sk), bucket), "create bucket")
 
 	// Long enough for the requests before expiry, short enough to wait out.
 	// The host and the containers share a clock, so the host decides when
@@ -59,25 +58,17 @@ func TestForgeAccessKeyExpiry(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if !bytes.Equal(got, data) {
-			t.Fatalf("read back %d bytes, want %d", len(got), len(data))
-		}
+		require.Equal(t, data, got, "read back %d bytes", len(got))
 		return nil
 	}
 
 	// Before expiry: the write goes to Hilt and fills ingot's caches, so the
 	// second read is served by the fast path.
-	if err := put(); err != nil {
-		t.Fatalf("put before expiry: %v", err)
-	}
+	require.NoError(t, put(), "put before expiry")
 	for attempt := 1; attempt <= 2; attempt++ {
-		if err := get(); err != nil {
-			t.Fatalf("get before expiry (attempt %d): %v", attempt, err)
-		}
+		require.NoError(t, get(), "get before expiry (attempt %d)", attempt)
 	}
-	if time.Now().After(expiresAt) {
-		t.Fatalf("requests before expiry ran past %s; lengthen the key's life", expiresAt.Format(time.RFC3339))
-	}
+	require.False(t, time.Now().After(expiresAt), "requests before expiry ran past %s; lengthen the key's life", expiresAt.Format(time.RFC3339))
 
 	// A few seconds' margin past expiry absorbs rounding to whole seconds.
 	wait := time.Until(expiresAt) + 3*time.Second
@@ -85,7 +76,7 @@ func TestForgeAccessKeyExpiry(t *testing.T) {
 	select {
 	case <-time.After(wait):
 	case <-ctx.Done():
-		t.Fatal(ctx.Err())
+		require.FailNow(t, "context done waiting for the key to expire", "%v", ctx.Err())
 	}
 
 	// After expiry: Hilt's AccessKeyExpired maps to InvalidAccessKeyId, the
@@ -98,16 +89,14 @@ func TestForgeAccessKeyExpiry(t *testing.T) {
 	}{{"get", get}, {"put", put}} {
 		for attempt := 1; attempt <= 2; attempt++ {
 			code, status := apiErrorOf(t, op.do())
-			if code != "InvalidAccessKeyId" || status != http.StatusForbidden {
-				t.Fatalf("%s after expiry (attempt %d): %s/%d, want InvalidAccessKeyId/403", op.name, attempt, code, status)
-			}
+			require.Equal(t, "InvalidAccessKeyId", code, "%s after expiry (attempt %d): %s/%d", op.name, attempt, code, status)
+			require.Equal(t, http.StatusForbidden, status, "%s after expiry (attempt %d): %s/%d", op.name, attempt, code, status)
 		}
 	}
 
 	// The tenant's other key is untouched.
-	if _, err := ingottest.GetBytes(ctx, forgeConfig(endpoint, ak, sk), bucket, key); err != nil {
-		t.Fatalf("get with the tenant's unexpiring key: %v", err)
-	}
+	_, err := ingottest.GetBytes(ctx, forgeConfig(endpoint, ak, sk), bucket, key)
+	require.NoError(t, err, "get with the tenant's unexpiring key")
 	t.Logf("expired key refused on the Hilt path and the cached fast path")
 }
 
@@ -117,26 +106,21 @@ func TestForgeAccessKeyExpiry(t *testing.T) {
 func hiltCreateExpiringAccessKey(t *testing.T, ctx context.Context, s *stack.Stack, tenantID, name string, permissions []string, expiresAt time.Time) (accessKey, secretKey string) {
 	t.Helper()
 	body, err := json.Marshal(map[string]any{"name": name, "permissions": permissions, "expiresAt": expiresAt.UTC()})
-	if err != nil {
-		t.Fatalf("marshal access-key request: %v", err)
-	}
+	require.NoError(t, err, "marshal access-key request")
 	out, errOut, err := s.Exec(ctx, "hilt", "curl", "-sS", "-f", "-X", "POST",
 		"http://localhost:80/tenants/"+tenantID+"/access-keys",
 		"-H", "Authorization: Bearer dev-partner-key", "-H", "Content-Type: application/json",
 		"-d", string(body))
-	if err != nil {
-		t.Fatalf("hilt create access key %q for %q: %v (stdout=%s stderr=%s)", name, tenantID, err, out, errOut)
-	}
+	require.NoError(t, err, "hilt create access key %q for %q (stdout=%s stderr=%s)", name, tenantID, out, errOut)
 	var created struct {
 		AccessKeyID     string     `json:"accessKeyId"`
 		SecretAccessKey string     `json:"secretAccessKey"`
 		ExpiresAt       *time.Time `json:"expiresAt"`
 	}
-	if err := json.Unmarshal([]byte(out), &created); err != nil || created.AccessKeyID == "" || created.SecretAccessKey == "" {
-		t.Fatalf("parse access-key response %q: %v", out, err)
-	}
-	if created.ExpiresAt == nil || !created.ExpiresAt.Equal(expiresAt) {
-		t.Fatalf("hilt stored expiry %v, want %s", created.ExpiresAt, expiresAt.Format(time.RFC3339))
-	}
+	require.NoError(t, json.Unmarshal([]byte(out), &created), "parse access-key response %q", out)
+	require.NotEmpty(t, created.AccessKeyID, "parse access-key response %q", out)
+	require.NotEmpty(t, created.SecretAccessKey, "parse access-key response %q", out)
+	require.NotNil(t, created.ExpiresAt, "hilt stored no expiry")
+	require.True(t, created.ExpiresAt.Equal(expiresAt), "hilt stored expiry %s, want %s", created.ExpiresAt.Format(time.RFC3339), expiresAt.Format(time.RFC3339))
 	return created.AccessKeyID, created.SecretAccessKey
 }

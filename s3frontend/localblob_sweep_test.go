@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 	"time"
 
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 
@@ -35,9 +35,7 @@ const sweepBucket = "sweep"
 func newSweepBackend(t *testing.T, mods ...func(*Deps)) (*Backend, *testStore) {
 	t.Helper()
 	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, mods...)
-	if err := mem.Create(t.Context(), sweepBucket, testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, mem.Create(t.Context(), sweepBucket, testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}), "create bucket")
 	return b, mem
 }
 
@@ -45,9 +43,7 @@ func newSweepBackend(t *testing.T, mods ...func(*Deps)) (*Backend, *testStore) {
 func sweepSpace(t *testing.T, mem *testStore) did.DID {
 	t.Helper()
 	st, err := mem.Get(t.Context(), sweepBucket)
-	if err != nil {
-		t.Fatalf("get bucket: %v", err)
-	}
+	require.NoError(t, err, "get bucket")
 	return st.Space
 }
 
@@ -60,17 +56,12 @@ func putSweepObjects(t *testing.T, b *Backend, n int) []multihash.Multihash {
 	for i := range n {
 		bucket, key := sweepBucket, fmt.Sprintf("obj-%d", i)
 		body := bytes.Repeat([]byte{byte('a' + i)}, 1000)
-		if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body), ContentLength: byteLen(body)}); err != nil {
-			t.Fatalf("PutObject %s: %v", key, err)
-		}
+		_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body), ContentLength: byteLen(body)})
+		require.NoError(t, err, "PutObject %s", key)
 		rv, err := b.resolveVersion(ctx, bucket, key, "")
-		if err != nil {
-			t.Fatalf("resolveVersion %s: %v", key, err)
-		}
+		require.NoError(t, err, "resolveVersion %s", key)
 		blobs := storedBlobs(t, b, rv)
-		if len(blobs) != 1 {
-			t.Fatalf("object %s has %d blobs, want 1", key, len(blobs))
-		}
+		require.Len(t, blobs, 1, "object %s has %d blobs", key, len(blobs))
 		digests = append(digests, blobs[0].Digest)
 		settleCache(t, b, blobs[0].Digest)
 		// Distinct modification times, so eviction order is by age.
@@ -92,9 +83,7 @@ func onDisk(t *testing.T, b *Backend, digests []multihash.Multihash) []bool {
 	var out []bool
 	for _, d := range digests {
 		_, err := os.Stat(localPath(b, d))
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("stat %x: %v", d, err)
-		}
+		require.True(t, err == nil || errors.Is(err, os.ErrNotExist), "stat %x: %v", d, err)
 		out = append(out, err == nil)
 	}
 	return out
@@ -103,9 +92,7 @@ func onDisk(t *testing.T, b *Backend, digests []multihash.Multihash) []bool {
 func sweepLocalBlobs(t *testing.T, b *Backend) LocalBlobSweepStats {
 	t.Helper()
 	stats, err := b.SweepLocalBlobs(t.Context())
-	if err != nil {
-		t.Fatalf("SweepLocalBlobs: %v", err)
-	}
+	require.NoError(t, err, "SweepLocalBlobs")
 	return stats
 }
 
@@ -114,21 +101,16 @@ func sweepLocalBlobs(t *testing.T, b *Backend) LocalBlobSweepStats {
 func inProgress(t *testing.T, b *Backend, body []byte) {
 	t.Helper()
 	local, err := b.cache.CreateTemp()
-	if err != nil {
-		t.Fatalf("CreateTemp: %v", err)
-	}
+	require.NoError(t, err, "CreateTemp")
 	t.Cleanup(local.Discard)
-	if _, err := local.Write(body); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
+	_, err = local.Write(body)
+	require.NoError(t, err, "Write")
 }
 
 func blobSize(t *testing.T, b *Backend, d multihash.Multihash) int64 {
 	t.Helper()
 	info, err := os.Stat(localPath(b, d))
-	if err != nil {
-		t.Fatalf("stat %x: %v", d, err)
-	}
+	require.NoError(t, err, "stat %x", d)
 	return info.Size()
 }
 
@@ -140,9 +122,8 @@ func TestSweepLocalBlobs_EvictsOldestFirstToTheLowWatermark(t *testing.T) {
 	sweepLocalBlobs(t, b)
 
 	want := []bool{false, false, true, true}
-	if got := onDisk(t, b, digests); !reflect.DeepEqual(got, want) {
-		t.Fatalf("blobs on disk after the sweep = %v, want %v", got, want)
-	}
+	got := onDisk(t, b, digests)
+	require.Equal(t, want, got, "blobs on disk after the sweep")
 }
 
 // TestSweepLocalBlobs_EvictsInOrderOfRenewal: a blob whose time in the cache
@@ -151,17 +132,16 @@ func TestSweepLocalBlobs_EvictsOldestFirstToTheLowWatermark(t *testing.T) {
 func TestSweepLocalBlobs_EvictsInOrderOfRenewal(t *testing.T) {
 	b, _ := newSweepBackend(t)
 	digests := putSweepObjects(t, b, 3)
-	if ok, err := b.cache.Touch(digests[0], time.Now().Add(time.Minute)); err != nil || !ok {
-		t.Fatalf("Touch = %v, %v", ok, err)
-	}
+	ok, err := b.cache.Touch(digests[0], time.Now().Add(time.Minute))
+	require.NoError(t, err, "Touch = %v, %v", ok, err)
+	require.True(t, ok, "Touch = %v, %v", ok, err)
 	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
 
 	sweepLocalBlobs(t, b)
 
 	want := []bool{true, false, true}
-	if got := onDisk(t, b, digests); !reflect.DeepEqual(got, want) {
-		t.Fatalf("blobs on disk after the sweep = %v, want %v", got, want)
-	}
+	got := onDisk(t, b, digests)
+	require.Equal(t, want, got, "blobs on disk after the sweep")
 }
 
 func TestSweepLocalBlobs_UsageEndsAtOrBelowTheLowWatermark(t *testing.T) {
@@ -171,9 +151,7 @@ func TestSweepLocalBlobs_UsageEndsAtOrBelowTheLowWatermark(t *testing.T) {
 
 	sweepLocalBlobs(t, b)
 
-	if target := b.localBlobMaxBytes * lowWatermarkPercent / 100; b.cache.Usage() > target {
-		t.Fatalf("usage after the sweep = %d, want at most %d", b.cache.Usage(), target)
-	}
+	require.LessOrEqual(t, b.cache.Usage(), b.localBlobMaxBytes*lowWatermarkPercent/100, "usage after the sweep")
 }
 
 // TestSweepLocalBlobs_KeepsWritesInProgress: the budget pass removes no
@@ -184,9 +162,8 @@ func TestSweepLocalBlobs_KeepsWritesInProgress(t *testing.T) {
 
 	stats := sweepLocalBlobs(t, b)
 
-	if got := fmt.Sprint(stats.BudgetFiles, b.cache.InFlight()); got != fmt.Sprint(0, 1000) {
-		t.Fatalf("[evicted] [in flight] = %s, want [0] [1000]", got)
-	}
+	got := fmt.Sprint(stats.BudgetFiles, b.cache.InFlight())
+	require.Equal(t, fmt.Sprint(0, 1000), got, "[evicted] [in flight]")
 }
 
 func TestSweepLocalBlobs_NoBudgetEvictsNothing(t *testing.T) {
@@ -195,9 +172,7 @@ func TestSweepLocalBlobs_NoBudgetEvictsNothing(t *testing.T) {
 
 	stats := sweepLocalBlobs(t, b)
 
-	if stats != (LocalBlobSweepStats{}) {
-		t.Fatalf("sweep stats = %+v, want nothing removed", stats)
-	}
+	require.Equal(t, LocalBlobSweepStats{}, stats, "sweep stats")
 }
 
 // TestSweepLocalBlobs_OrphanPass: old .tmp-* files are deleted from the
@@ -212,18 +187,12 @@ func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
 	writeFile := func(name, body string, modTime time.Time) string {
 		t.Helper()
 		path := filepath.Join(cacheDir, name)
-		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chtimes(path, modTime, modTime); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
+		require.NoError(t, os.Chtimes(path, modTime, modTime))
 		return path
 	}
 	digests := putSweepObjects(t, b, 1)
-	if err := os.Chtimes(localPath(b, digests[0]), old, old); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Chtimes(localPath(b, digests[0]), old, old))
 	paths := map[string]string{
 		"old temp":        writeFile(".tmp-old", "partial", old),
 		"young temp":      writeFile(".tmp-young", "partial", time.Now()),
@@ -254,9 +223,7 @@ func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
 		OrphanFiles: 1,
 		Usage:       blobSize(t, b, digests[0]),
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("cache after the orphan pass = %+v, want %+v", got, want)
-	}
+	require.Equal(t, want, got, "cache after the orphan pass")
 }
 
 // TestSweepLocalBlobs_SkipsAFileItCannotRemove: a file whose removal fails is
@@ -269,17 +236,14 @@ func TestSweepLocalBlobs_SkipsAFileItCannotRemove(t *testing.T) {
 	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
 	// A read-only cache directory makes every removal fail.
 	dir := filepath.Dir(b.cache.Path(digests[0]))
-	if err := os.Chmod(dir, 0o555); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Chmod(dir, 0o555))
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
 
 	stats := sweepLocalBlobs(t, b)
 
 	got := fmt.Sprint(onDisk(t, b, digests), stats.BudgetFiles, logs.FilterMessageSnippet("could not remove some files").Len())
-	if want := fmt.Sprint([]bool{true, true, true}, 0, 1); got != want {
-		t.Fatalf("[on disk] [evicted] [failure logs] = %s, want %s", got, want)
-	}
+	want := fmt.Sprint([]bool{true, true, true}, 0, 1)
+	require.Equal(t, want, got, "[on disk] [evicted] [failure logs]")
 }
 
 // TestEvictToBudget_ReportsWhyItStopped: each way a pass ends is reported.
@@ -290,23 +254,15 @@ func TestEvictToBudget_ReportsWhyItStopped(t *testing.T) {
 		digests := putSweepObjects(t, b, 2)
 		budgetToEvict(b, 1, blobSize(t, b, digests[0]))
 		pass, err := b.evictToBudget(ctx, -time.Second)
-		if err != nil {
-			t.Fatalf("evictToBudget: %v", err)
-		}
-		if pass != (budgetPass{stop: stopDeadline}) {
-			t.Fatalf("pass = %+v, want nothing evicted, stopped at the deadline", pass)
-		}
+		require.NoError(t, err, "evictToBudget")
+		require.Equal(t, budgetPass{stop: stopDeadline}, pass, "want nothing evicted, stopped at the deadline")
 	})
 	t.Run("no cached blobs", func(t *testing.T) {
 		b, _ := newSweepBackend(t, func(d *Deps) { d.LocalBlobMaxBytes = 1 })
 		inProgress(t, b, []byte("in progress"))
 		pass, err := b.evictToBudget(ctx, time.Minute)
-		if err != nil {
-			t.Fatalf("evictToBudget: %v", err)
-		}
-		if pass != (budgetPass{stop: stopExhausted}) {
-			t.Fatalf("pass = %+v, want exhausted", pass)
-		}
+		require.NoError(t, err, "evictToBudget")
+		require.Equal(t, budgetPass{stop: stopExhausted}, pass)
 	})
 	t.Run("watermark", func(t *testing.T) {
 		b, _ := newSweepBackend(t)
@@ -314,12 +270,8 @@ func TestEvictToBudget_ReportsWhyItStopped(t *testing.T) {
 		size := blobSize(t, b, digests[0])
 		budgetToEvict(b, 1, size)
 		pass, err := b.evictToBudget(ctx, time.Minute)
-		if err != nil {
-			t.Fatalf("evictToBudget: %v", err)
-		}
-		if pass != (budgetPass{files: 1, bytes: size, stop: stopWatermark}) {
-			t.Fatalf("pass = %+v, want one eviction, stopped at the watermark", pass)
-		}
+		require.NoError(t, err, "evictToBudget")
+		require.Equal(t, budgetPass{files: 1, bytes: size, stop: stopWatermark}, pass, "want one eviction, stopped at the watermark")
 	})
 }
 
@@ -329,13 +281,9 @@ func TestSweepLocalBlobs_OrphanPassRunsHourly(t *testing.T) {
 	b, _ := newSweepBackend(t)
 	sweepLocalBlobs(t, b)
 	path := filepath.Join(filepath.Dir(b.cache.Path(multihash.Multihash{0})), ".tmp-old")
-	if err := os.WriteFile(path, []byte("partial"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.WriteFile(path, []byte("partial"), 0o644))
 	old := time.Now().Add(-2 * DefaultLocalBlobOrphanAge)
-	if err := os.Chtimes(path, old, old); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Chtimes(path, old, old))
 
 	sweepLocalBlobs(t, b)
 	_, errSoon := os.Stat(path)
@@ -344,9 +292,7 @@ func TestSweepLocalBlobs_OrphanPassRunsHourly(t *testing.T) {
 	_, errDue := os.Stat(path)
 
 	got := [2]bool{errSoon == nil, errDue == nil}
-	if got != [2]bool{true, false} {
-		t.Fatalf("orphan present after [a sweep within the hour, the next one due] = %v, want [true false]", got)
-	}
+	require.Equal(t, [2]bool{true, false}, got, "orphan present after [a sweep within the hour, the next one due]")
 }
 
 // TestSweepLocalBlobs_OrphanPassBacksOffAfterAFailure: an orphan pass whose
@@ -355,16 +301,12 @@ func TestSweepLocalBlobs_OrphanPassRunsHourly(t *testing.T) {
 func TestSweepLocalBlobs_OrphanPassBacksOffAfterAFailure(t *testing.T) {
 	ctx := t.Context()
 	b, _ := newSweepBackend(t)
-	if err := os.RemoveAll(filepath.Dir(b.cache.Path(multihash.Multihash{0}))); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.RemoveAll(filepath.Dir(b.cache.Path(multihash.Multihash{0}))))
 
 	_, firstErr := b.SweepLocalBlobs(ctx)
 	_, secondErr := b.SweepLocalBlobs(ctx)
 
-	if got := [2]bool{firstErr != nil, secondErr != nil}; got != [2]bool{true, false} {
-		t.Fatalf("[first failed, second failed] = %v, want [true false]", got)
-	}
+	require.Equal(t, [2]bool{true, false}, [2]bool{firstErr != nil, secondErr != nil}, "[first failed, second failed]")
 }
 
 // TestSweepLocalBlobs_OrphanPassSkipsFilesItCannotRemove: orphans whose
@@ -377,25 +319,18 @@ func TestSweepLocalBlobs_OrphanPassSkipsFilesItCannotRemove(t *testing.T) {
 	dir := filepath.Dir(b.cache.Path(multihash.Multihash{0}))
 	for _, name := range []string{".tmp-stuck", ".tmp-other"} {
 		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, []byte("partial"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chtimes(path, old, old); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.WriteFile(path, []byte("partial"), 0o644))
+		require.NoError(t, os.Chtimes(path, old, old))
 	}
 	// A read-only cache directory makes every removal fail.
-	if err := os.Chmod(dir, 0o555); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Chmod(dir, 0o555))
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
 
 	stats := sweepLocalBlobs(t, b)
 
 	got := fmt.Sprint(stats.OrphanFiles, logs.FilterMessageSnippet("could not remove some files").Len(), !b.lastOrphanPass.IsZero())
-	if want := fmt.Sprint(0, 1, true); got != want {
-		t.Fatalf("[removed] [failure logs] [recorded] = %s, want %s", got, want)
-	}
+	want := fmt.Sprint(0, 1, true)
+	require.Equal(t, want, got, "[removed] [failure logs] [recorded]")
 }
 
 // TestWrittenBlobIsInTheCache: once a PUT's blob is accepted and its location
@@ -407,9 +342,8 @@ func TestWrittenBlobIsInTheCache(t *testing.T) {
 
 	_, cacheErr := os.Stat(b.cache.Path(d))
 	got := fmt.Sprint(cacheErr == nil, b.cache.InFlight(), b.cache.Usage())
-	if want := fmt.Sprint(true, 0, size); got != want {
-		t.Fatalf("[cache copy] in-flight usage = %s, want %s", got, want)
-	}
+	want := fmt.Sprint(true, 0, size)
+	require.Equal(t, want, got, "[cache copy] in-flight usage")
 }
 
 // TestSweepLocalBlobs_WarnsOncePerOverBudgetEpisode: the warning that nothing is
@@ -425,9 +359,8 @@ func TestSweepLocalBlobs_WarnsOncePerOverBudgetEpisode(t *testing.T) {
 	b.localBlobMaxBytes = 1 << 20
 	sweepLocalBlobs(t, b)
 	got = append(got, b.overBudgetWarned)
-	if want := []bool{true, true, false}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("warned after [over, still over, back under] = %v, want %v", got, want)
-	}
+	want := []bool{true, true, false}
+	require.Equal(t, want, got, "warned after [over, still over, back under]")
 }
 
 // TestSweepLocalBlobs_LatchesResetAtTheLowWatermark: the once-per-episode
@@ -448,9 +381,7 @@ func TestSweepLocalBlobs_LatchesResetAtTheLowWatermark(t *testing.T) {
 		got = append(got, latches{b.overBudgetWarned, b.timeLimitLogged})
 	}
 	want := []latches{{true, true}, {true, true}, {false, false}}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("latches after [over budget, at 95%%, at 89%%] = %+v, want %+v", got, want)
-	}
+	require.Equal(t, want, got, "latches after [over budget, at 95%, at 89%]")
 }
 
 // TestSweepLocalBlobs_TimeLimit: a scan cut off by the budget pass's own time
@@ -467,9 +398,8 @@ func TestSweepLocalBlobs_TimeLimit(t *testing.T) {
 	sweepLocalBlobs(t, b)
 
 	got := fmt.Sprint(onDisk(t, b, digests), logs.FilterMessageSnippet("budget pass reached its time limit").Len(), b.timeLimitLogged)
-	if want := fmt.Sprint([]bool{true}, 1, true); got != want {
-		t.Fatalf("[on disk] [logs] [latched] = %s, want %s", got, want)
-	}
+	want := fmt.Sprint([]bool{true}, 1, true)
+	require.Equal(t, want, got, "[on disk] [logs] [latched]")
 }
 
 // TestSweepLocalBlobs_OrphanPassCorrectsCountsAfterAManualRemoval: a cached
@@ -480,14 +410,10 @@ func TestSweepLocalBlobs_OrphanPassCorrectsCountsAfterAManualRemoval(t *testing.
 	digests := putSweepObjects(t, b, 2)
 	size := blobSize(t, b, digests[0])
 	before := b.cache.Usage()
-	if err := os.Remove(localPath(b, digests[0])); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Remove(localPath(b, digests[0])))
 	stale := b.cache.Usage()
 
 	sweepLocalBlobs(t, b)
 
-	if got, want := [2]int64{stale, b.cache.Usage()}, [2]int64{before, before - size}; got != want {
-		t.Fatalf("usage [after the manual removal, after the sweep] = %v, want %v", got, want)
-	}
+	require.Equal(t, [2]int64{before, before - size}, [2]int64{stale, b.cache.Usage()}, "usage [after the manual removal, after the sweep]")
 }

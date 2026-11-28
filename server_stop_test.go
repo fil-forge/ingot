@@ -66,7 +66,7 @@ func TestStopLogsNoListenerError(t *testing.T) {
 	select {
 	case <-served:
 	case <-time.After(5 * time.Second):
-		t.Fatal("serve did not return after Stop")
+		require.FailNow(t, "serve did not return after Stop")
 	}
 	require.Empty(t, logs.All())
 }

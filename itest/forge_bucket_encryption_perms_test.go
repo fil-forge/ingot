@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/stretchr/testify/require"
 )
 
 // TestForgeBucketEncryptionPermissions proves the bucket encryption
@@ -30,9 +31,8 @@ func TestForgeBucketEncryptionPermissions(t *testing.T) {
 	const tenant, bucket = "encryption-perms", "guarded"
 	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, tenant)
 	full := sdkClient(forgeS3Conf(endpoint, accessKey, secretKey))
-	if _, err := full.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		t.Fatalf("CreateBucket: %v", err)
-	}
+	_, err := full.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+	require.NoError(t, err, "CreateBucket")
 
 	client := func(name string, permissions []string) *s3.Client {
 		ak, sk := hiltCreateAccessKey(t, ctx, s, tenant, name, permissions, nil)
@@ -59,9 +59,9 @@ func TestForgeBucketEncryptionPermissions(t *testing.T) {
 	denied := func(t *testing.T, what string, do func() error) {
 		t.Helper()
 		for attempt := 1; attempt <= 2; attempt++ {
-			if code, status := apiErrorOf(t, do()); code != "AccessDenied" || status != http.StatusForbidden {
-				t.Fatalf("%s (attempt %d): %s/%d, want AccessDenied/403", what, attempt, code, status)
-			}
+			code, status := apiErrorOf(t, do())
+			require.Equal(t, "AccessDenied", code, "%s (attempt %d): %s/%d", what, attempt, code, status)
+			require.Equal(t, http.StatusForbidden, status, "%s (attempt %d): %s/%d", what, attempt, code, status)
 		}
 	}
 
@@ -71,9 +71,8 @@ func TestForgeBucketEncryptionPermissions(t *testing.T) {
 	admin := client("bucket-admin", slices.DeleteFunc(slices.Clone(hiltAllPermissions), func(p string) bool {
 		return p == "s3:GetEncryptionConfiguration" || p == "s3:PutEncryptionConfiguration"
 	}))
-	if _, err := admin.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("seed"), Body: bytes.NewReader(patternBytes(1 << 10))}); err != nil {
-		t.Fatalf("seed write: %v", err)
-	}
+	_, err = admin.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("seed"), Body: bytes.NewReader(patternBytes(1 << 10))})
+	require.NoError(t, err, "seed write")
 	// Refused before the configuration is looked up: an authorized read of an
 	// unconfigured bucket answers 404, a denied one 403.
 	denied(t, "bucket-admin key reading the configuration", func() error { return get(admin) })
@@ -83,27 +82,21 @@ func TestForgeBucketEncryptionPermissions(t *testing.T) {
 	// The write permission writes and removes the configuration, as in S3,
 	// and does not read it.
 	writer := client("encryption-writer", []string{"s3:PutEncryptionConfiguration"})
-	if err := put(writer); err != nil {
-		t.Fatalf("PutBucketEncryption with the write permission: %v", err)
-	}
+	require.NoError(t, put(writer), "PutBucketEncryption with the write permission")
 	denied(t, "write-only key reading the configuration", func() error { return get(writer) })
 
 	// The read permission reads the configuration and nothing more.
 	reader := client("encryption-reader", []string{"s3:GetEncryptionConfiguration"})
 	got, err := reader.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{Bucket: aws.String(bucket)})
-	if err != nil {
-		t.Fatalf("GetBucketEncryption with the read permission: %v", err)
-	}
-	if rules := got.ServerSideEncryptionConfiguration.Rules; len(rules) != 1 || rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm != types.ServerSideEncryptionAes256 {
-		t.Fatalf("GetBucketEncryption = %+v, want one rule naming AES256", rules)
-	}
+	require.NoError(t, err, "GetBucketEncryption with the read permission")
+	rules := got.ServerSideEncryptionConfiguration.Rules
+	require.Len(t, rules, 1, "GetBucketEncryption = %+v, want one rule naming AES256", rules)
+	require.Equal(t, types.ServerSideEncryptionAes256, rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm, "GetBucketEncryption = %+v, want one rule naming AES256", rules)
 	denied(t, "read-only key writing the configuration", func() error { return put(reader) })
 	denied(t, "read-only key removing the configuration", func() error { return del(reader) })
 
-	if err := del(writer); err != nil {
-		t.Fatalf("DeleteBucketEncryption with the write permission: %v", err)
-	}
-	if code, status := apiErrorOf(t, get(full)); code != "ServerSideEncryptionConfigurationNotFoundError" || status != http.StatusNotFound {
-		t.Fatalf("GetBucketEncryption after the removal = %s/%d, want ServerSideEncryptionConfigurationNotFoundError/404", code, status)
-	}
+	require.NoError(t, del(writer), "DeleteBucketEncryption with the write permission")
+	code, status := apiErrorOf(t, get(full))
+	require.Equal(t, "ServerSideEncryptionConfigurationNotFoundError", code, "GetBucketEncryption after the removal = %s/%d", code, status)
+	require.Equal(t, http.StatusNotFound, status, "GetBucketEncryption after the removal = %s/%d", code, status)
 }

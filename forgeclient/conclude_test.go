@@ -78,7 +78,7 @@ func TestLocationFromBatchedAccepts(t *testing.T) {
 	for i := range blobs {
 		got, err := locationFromAccept(rcpts[i], idx)
 		require.NoError(t, err, "blob %d", i)
-		require.Equal(t, claims[i].Link(), got.Link(), "blob %d got another blob's commitment", i)
+		require.Equal(t, claims[i].Link(), got.Link(), "blob %d", i)
 	}
 }
 

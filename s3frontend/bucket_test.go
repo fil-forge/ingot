@@ -3,6 +3,8 @@ package s3frontend
 import (
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 // TestValidBucketName pins the AWS general-purpose bucket naming rules,
@@ -27,9 +29,7 @@ func TestValidBucketName(t *testing.T) {
 		{"sthree-bucket", "reserved sthree- prefix"},
 	}
 	for _, tc := range reject {
-		if validBucketName(tc.name) {
-			t.Errorf("validBucketName(%q) = true, want false (%s)", tc.name, tc.why)
-		}
+		assert.False(t, validBucketName(tc.name), "validBucketName(%q) = true, want false (%s)", tc.name, tc.why)
 	}
 
 	accept := []string{
@@ -43,8 +43,6 @@ func TestValidBucketName(t *testing.T) {
 		strings.Repeat("a", 63),
 	}
 	for _, name := range accept {
-		if !validBucketName(name) {
-			t.Errorf("validBucketName(%q) = false, want true", name)
-		}
+		assert.True(t, validBucketName(name), "validBucketName(%q) = false, want true", name)
 	}
 }

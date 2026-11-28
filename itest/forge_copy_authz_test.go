@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/smelt/pkg/stack"
+	"github.com/stretchr/testify/require"
 
 	ingottest "github.com/fil-forge/ingot/testing"
 )
@@ -37,14 +38,10 @@ func TestForgeCopyAuthorization(t *testing.T) {
 	const srcBucket, dstBucket, key = "copyauthz-src", "copyauthz-dst", "obj"
 	cfgA := forgeConfig(endpoint, akA, skA)
 	for _, b := range []string{srcBucket, dstBucket} {
-		if err := ingottest.CreateBucket(ctx, cfgA, b); err != nil {
-			t.Fatalf("create %s: %v", b, err)
-		}
+		require.NoError(t, ingottest.CreateBucket(ctx, cfgA, b), "create %s", b)
 	}
 	data := patternBytes(64 << 10)
-	if err := ingottest.PutBytes(ctx, cfgA, srcBucket, key, data); err != nil {
-		t.Fatalf("put source: %v", err)
-	}
+	require.NoError(t, ingottest.PutBytes(ctx, cfgA, srcBucket, key, data), "put source")
 	akPut, skPut := hiltCreateAccessKey(t, ctx, s, "copyauthz-a", "put-only", []string{"s3:PutObject"}, nil)
 	putOnly := bigObjectClient(t, endpoint, akPut, skPut)
 	akScoped, skScoped := hiltCreateAccessKey(t, ctx, s, "copyauthz-a", "dst-scoped", hiltAllPermissions, []string{dstBucket})
@@ -54,9 +51,7 @@ func TestForgeCopyAuthorization(t *testing.T) {
 	akB, skB := hiltProvisionTenant(t, ctx, s, "copyauthz-b")
 	clientB := bigObjectClient(t, endpoint, akB, skB)
 	const bucketB = "copyauthz-b"
-	if err := ingottest.CreateBucket(ctx, forgeConfig(endpoint, akB, skB), bucketB); err != nil {
-		t.Fatalf("tenant B create bucket: %v", err)
-	}
+	require.NoError(t, ingottest.CreateBucket(ctx, forgeConfig(endpoint, akB, skB), bucketB), "tenant B create bucket")
 
 	copyObj := func(c *s3.Client, dst, source string) error {
 		_, err := c.CopyObject(ctx, &s3.CopyObjectInput{
@@ -72,21 +67,19 @@ func TestForgeCopyAuthorization(t *testing.T) {
 		t.Helper()
 		for attempt := 1; attempt <= 2; attempt++ {
 			code, status := apiErrorOf(t, do())
-			if (wantCode != "" && code != wantCode) || status != wantStatus {
-				t.Fatalf("%s (attempt %d): %s/%d, want %s/%d", what, attempt, code, status, wantCode, wantStatus)
+			if wantCode != "" {
+				require.Equal(t, wantCode, code, "%s (attempt %d)", what, attempt)
 			}
+			require.Equal(t, wantStatus, status, "%s (attempt %d)", what, attempt)
 		}
 	}
 
 	// The full key copies within the source bucket: read and write authorized
 	// on one bucket, and the copy-source header was signed by the SDK.
-	if err := copyObj(full, srcBucket, srcBucket+"/"+key); err != nil {
-		t.Fatalf("same-bucket copy with a full key: %v", err)
-	}
+	require.NoError(t, copyObj(full, srcBucket, srcBucket+"/"+key), "same-bucket copy with a full key")
 	got, err := ingottest.GetBytes(ctx, cfgA, srcBucket, "copied")
-	if err != nil || !bytes.Equal(got, data) {
-		t.Fatalf("copied object: %d bytes, err %v; want %d bytes", len(got), err, len(data))
-	}
+	require.NoError(t, err, "copied object")
+	require.Equal(t, data, got, "copied object")
 
 	// Seed every denied key with an allowed write first. A refusal caches
 	// nothing, so without this the second attempt in twice would take the
@@ -97,9 +90,8 @@ func TestForgeCopyAuthorization(t *testing.T) {
 	// retrieve command over the source's space, so only the permission check
 	// stands between it and a copy it may not make.
 	seed := func(c *s3.Client, bucket string) {
-		if _, err := c.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("seed"), Body: bytes.NewReader(data)}); err != nil {
-			t.Fatalf("seed write to %s: %v", bucket, err)
-		}
+		_, err := c.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("seed"), Body: bytes.NewReader(data)})
+		require.NoError(t, err, "seed write to %s", bucket)
 	}
 	seed(putOnly, srcBucket)
 	seed(putOnly, dstBucket)
@@ -117,9 +109,7 @@ func TestForgeCopyAuthorization(t *testing.T) {
 		"AccessDenied", http.StatusForbidden)
 	// The scoped key's copy within its own bucket is fine as far as hilt is
 	// concerned; it must not have been the source scope that let it through.
-	if err := copyObj(dstScoped, dstBucket, dstBucket+"/seed"); err != nil {
-		t.Fatalf("destination-scoped key copying within its bucket: %v", err)
-	}
+	require.NoError(t, copyObj(dstScoped, dstBucket, dstBucket+"/seed"), "destination-scoped key copying within its bucket")
 
 	// Across tenants, another tenant's bucket is AccessDenied as a copy source
 	// and on the direct path alike — S3's answer for another account's bucket
@@ -141,22 +131,18 @@ func TestForgeCopyAuthorization(t *testing.T) {
 func hiltCreateAccessKey(t *testing.T, ctx context.Context, s *stack.Stack, tenantID, name string, permissions, buckets []string) (accessKey, secretKey string) {
 	t.Helper()
 	body, err := json.Marshal(map[string]any{"name": name, "permissions": permissions, "buckets": buckets})
-	if err != nil {
-		t.Fatalf("marshal access-key request: %v", err)
-	}
+	require.NoError(t, err, "marshal access-key request")
 	out, errOut, err := s.Exec(ctx, "hilt", "curl", "-sS", "-f", "-X", "POST",
 		"http://localhost:80/tenants/"+tenantID+"/access-keys",
 		"-H", "Authorization: Bearer dev-partner-key", "-H", "Content-Type: application/json",
 		"-d", string(body))
-	if err != nil {
-		t.Fatalf("hilt create access key %q for %q: %v (stdout=%s stderr=%s)", name, tenantID, err, out, errOut)
-	}
+	require.NoError(t, err, "hilt create access key %q for %q (stdout=%s stderr=%s)", name, tenantID, out, errOut)
 	var created struct {
 		AccessKeyID     string `json:"accessKeyId"`
 		SecretAccessKey string `json:"secretAccessKey"`
 	}
-	if err := json.Unmarshal([]byte(out), &created); err != nil || created.AccessKeyID == "" || created.SecretAccessKey == "" {
-		t.Fatalf("parse access-key response %q: %v", out, err)
-	}
+	require.NoError(t, json.Unmarshal([]byte(out), &created), "parse access-key response %q", out)
+	require.NotEmpty(t, created.AccessKeyID, "parse access-key response %q", out)
+	require.NotEmpty(t, created.SecretAccessKey, "parse access-key response %q", out)
 	return created.AccessKeyID, created.SecretAccessKey
 }

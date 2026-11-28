@@ -2,13 +2,14 @@ package s3frontend
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"testing"
 
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3err"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/internal/cors"
@@ -23,24 +24,16 @@ func TestGetBucketCors(t *testing.T) {
 	ctx := context.Background()
 	const origin = "https://app.example"
 	cfg, err := cors.Build([]string{origin})
-	if err != nil {
-		t.Fatalf("cors.Build: %v", err)
-	}
+	require.NoError(t, err, "cors.Build")
 
 	newBackend := func(t *testing.T, corsCfg *auth.CORSConfiguration) *Backend {
 		t.Helper()
 		mem := newTestStore(t)
-		if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
-			t.Fatalf("create bucket: %v", err)
-		}
+		require.NoError(t, mem.Create(ctx, "bk", did.Undef, registry.CreateState{}), "create bucket")
 		cache, err := blockstore.NewBlobCache(filepath.Join(t.TempDir(), "cache"))
-		if err != nil {
-			t.Fatalf("cache: %v", err)
-		}
+		require.NoError(t, err, "cache")
 		b, err := New(Deps{Tasks: mem.tasks, Capturer: testfakes.NopUploader{}, Registry: mem, Intents: mem, Cache: cache, CORS: corsCfg})
-		if err != nil {
-			t.Fatalf("backend: %v", err)
-		}
+		require.NoError(t, err, "backend")
 		return b
 	}
 
@@ -49,29 +42,20 @@ func TestGetBucketCors(t *testing.T) {
 	// whole contract between internal/cors and the S3 API.
 	t.Run("configured", func(t *testing.T) {
 		got, err := newBackend(t, cfg).GetBucketCors(ctx, "bk")
-		if err != nil {
-			t.Fatalf("GetBucketCors: %v", err)
-		}
+		require.NoError(t, err, "GetBucketCors")
 		parsed, err := auth.ParseCORSOutput(got)
-		if err != nil {
-			t.Fatalf("ParseCORSOutput(%q): %v", got, err)
-		}
-		if _, err := parsed.IsAllowed(origin, "PUT", nil, s3err.ResourceType("")); err != nil {
-			t.Errorf("IsAllowed(%q) = %v, want allowed", origin, err)
-		}
+		require.NoError(t, err, "ParseCORSOutput(%q)", got)
+		_, err = parsed.IsAllowed(origin, "PUT", nil, s3err.ResourceType(""))
+		assert.NoError(t, err, "IsAllowed(%q)", origin)
 	})
 
 	t.Run("unconfigured", func(t *testing.T) {
 		_, err := newBackend(t, nil).GetBucketCors(ctx, "bk")
-		if !errors.Is(err, s3err.GetAPIError(s3err.ErrNoSuchCORSConfiguration)) {
-			t.Errorf("GetBucketCors = %v, want NoSuchCORSConfiguration", err)
-		}
+		assert.ErrorIs(t, err, s3err.GetAPIError(s3err.ErrNoSuchCORSConfiguration), "GetBucketCors")
 	})
 
 	t.Run("unknown bucket", func(t *testing.T) {
 		_, err := newBackend(t, cfg).GetBucketCors(ctx, "missing")
-		if !errors.Is(err, s3err.GetAPIError(s3err.ErrNoSuchBucket)) {
-			t.Errorf("GetBucketCors = %v, want NoSuchBucket", err)
-		}
+		assert.ErrorIs(t, err, s3err.GetAPIError(s3err.ErrNoSuchBucket), "GetBucketCors")
 	})
 }

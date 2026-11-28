@@ -11,6 +11,7 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 	"github.com/google/uuid"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
@@ -53,9 +54,8 @@ func TestPlaintextRelease_WriteWaitsBehindARetryingRelease(t *testing.T) {
 	d := blobDigestOf(t, b, "old", "")
 	deleteFrom(t, b, "bk", "old")
 	drainReleases(t, b) // the remove goes through, and its answer is lost
-	if n := rm.removedDigests()[string(d)]; n != 1 {
-		t.Fatalf("removes of %x before the write = %d, want 1", d, n)
-	}
+	n := rm.removedDigests()[string(d)]
+	require.Equal(t, 1, n, "removes of %x before the write", d)
 
 	done := make(chan error, 1)
 	go func() {
@@ -65,22 +65,18 @@ func TestPlaintextRelease_WriteWaitsBehindARetryingRelease(t *testing.T) {
 	}()
 	select {
 	case err := <-done:
-		t.Fatalf("PutObject returned %v while the release waited to retry", err)
+		require.FailNow(t, "PutObject returned while the release waited to retry", "err: %v", err)
 	case <-time.After(200 * time.Millisecond):
 	}
 	drainReleases(t, b) // the retry finishes the release
-	if err := <-done; err != nil {
-		t.Fatalf("PutObject after the retry: %v", err)
-	}
-	if sent, accepted, _ := streamCounts(t, b, d); sent != 2 || accepted != 2 {
-		t.Fatalf("streams of %x: %d sent, %d accepted; want 2 and 2 (the write concluded its own stream)", d, sent, accepted)
-	}
-	if _, err := mem.GetLocation(ctx, mem.bk(), d); err != nil {
-		t.Fatalf("no location after the write: %v", err)
-	}
-	if got := getFrom(t, b, "bk", "new"); !bytes.Equal(got, data) {
-		t.Fatalf("the rewritten object does not read back")
-	}
+	require.NoError(t, <-done, "PutObject after the retry")
+	sent, accepted, _ := streamCounts(t, b, d)
+	require.Equal(t, 2, sent, "streams of %x: %d sent, %d accepted; want 2 and 2 (the write concluded its own stream)", d, sent, accepted)
+	require.Equal(t, 2, accepted, "streams of %x: %d sent, %d accepted; want 2 and 2 (the write concluded its own stream)", d, sent, accepted)
+	_, err := mem.GetLocation(ctx, mem.bk(), d)
+	require.NoError(t, err, "no location after the write")
+	got := getFrom(t, b, "bk", "new")
+	require.Equal(t, data, got, "the rewritten object does not read back")
 }
 
 // TestPendingReferenceHoldsTheBlobUntilItExpires: a write's reference keeps a
@@ -92,34 +88,24 @@ func TestPendingReferenceHoldsTheBlobUntilItExpires(t *testing.T) {
 	ctx := context.Background()
 	putIn(t, b, "bk", "k", testBody(4<<10))
 	st, err := mem.Get(ctx, "bk")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	rv, err := b.resolveVersion(ctx, "bk", "k", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	blobs := storedBlobs(t, b, rv)
 	d := blobs[0].Digest
 	// A same-space copy that takes its reference and dies before its commit.
 	refs, err := b.pinBlobs(ctx, st, blobs)
-	if err != nil {
-		t.Fatalf("pinBlobs: %v", err)
-	}
+	require.NoError(t, err, "pinBlobs")
 
 	deleteFrom(t, b, "bk", "k")
 	drainReleases(t, b)
-	if n := rm.removedDigests()[string(d)]; n != 0 {
-		t.Fatalf("the blob the copy references was removed %d times", n)
-	}
+	n := rm.removedDigests()[string(d)]
+	require.Zero(t, n, "the blob the copy references was removed %d times", n)
 
 	b.blobs.DropRefsNow(ctx, mem.bk(), []taskrunner.TaskID{refs[string(d)]}, []multihash.Multihash{d})
-	if n := rm.removedDigests()[string(d)]; n != 1 {
-		t.Fatalf("removes of %x once its reference expired = %d, want 1", d, n)
-	}
-	if n, _ := mem.CountReferences(ctx, mem.bk(), d, uuid.Nil); n != 0 {
-		t.Fatalf("references to %x after the expiry = %d, want 0", d, n)
-	}
+	require.Equal(t, 1, rm.removedDigests()[string(d)], "removes of %x once its reference expired", d)
+	refsLeft, _ := mem.CountReferences(ctx, mem.bk(), d, uuid.Nil)
+	require.Zero(t, refsLeft, "references to %x after the expiry", d)
 }
 
 // TestAFailedWritesCleanupLeavesAnotherWritesReference: two writes in flight
@@ -131,32 +117,22 @@ func TestAFailedWritesCleanupLeavesAnotherWritesReference(t *testing.T) {
 	ctx := context.Background()
 	putIn(t, b, "bk", "k", testBody(4<<10))
 	st, err := mem.Get(ctx, "bk")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	rv, err := b.resolveVersion(ctx, "bk", "k", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	blobs := storedBlobs(t, b, rv)
 	d := blobs[0].Digest
 	failed, err := b.pinBlobs(ctx, st, blobs)
-	if err != nil {
-		t.Fatalf("pinBlobs: %v", err)
-	}
-	if _, err := b.pinBlobs(ctx, st, blobs); err != nil {
-		t.Fatalf("pinBlobs: %v", err)
-	}
+	require.NoError(t, err, "pinBlobs")
+	_, err = b.pinBlobs(ctx, st, blobs)
+	require.NoError(t, err, "pinBlobs")
 	deleteFrom(t, b, "bk", "k")
 	drainReleases(t, b)
 
 	b.blobs.DropRefsNow(ctx, mem.bk(), []taskrunner.TaskID{failed[string(d)]}, []multihash.Multihash{d})
-	if n, _ := mem.CountReferences(ctx, mem.bk(), d, uuid.Nil); n != 1 {
-		t.Fatalf("references to %x after one write's cleanup = %d, want the other write's", d, n)
-	}
-	if n := rm.removedDigests()[string(d)]; n != 0 {
-		t.Fatalf("the blob another write references was removed %d times", n)
-	}
+	n, _ := mem.CountReferences(ctx, mem.bk(), d, uuid.Nil)
+	require.Equal(t, 1, n, "references to %x after one write's cleanup", d)
+	require.Zero(t, rm.removedDigests()[string(d)], "removes of the blob another write references")
 }
 
 // TestCommitCancelsItsReferencesExpiries: the commit that claims a write's
@@ -166,22 +142,16 @@ func TestCommitCancelsItsReferencesExpiries(t *testing.T) {
 	ctx := context.Background()
 	putIn(t, b, "bk", "k", testBody(4<<10))
 	tasks, err := taskrunnertest.Tasks(ctx, mem.pool, "ingot", spaceshardqueue.Name)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	expiries := 0
 	for _, q := range tasks {
 		if q.Action != spaceshardqueue.ExpireAction {
 			continue
 		}
 		expiries++
-		if q.State != "cancelled" {
-			t.Fatalf("expiry %s is %s after the commit, want cancelled", q.ID, q.State)
-		}
+		require.Equal(t, "cancelled", q.State, "expiry %s is %s after the commit", q.ID, q.State)
 	}
-	if expiries == 0 {
-		t.Fatal("the write queued no expiry")
-	}
+	require.NotZero(t, expiries, "the write queued no expiry")
 }
 
 // expireRefsTo expires every pending reference to digest in space at once, as
@@ -189,9 +159,8 @@ func TestCommitCancelsItsReferencesExpiries(t *testing.T) {
 func expireRefsTo(t *testing.T, b *Backend, space did.DID, digest multihash.Multihash) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := storeFor(b).tasks.Expedite(ctx, spaceshardqueue.Name, spaceshardqueue.Subject(space, digest), spaceshardqueue.ExpireAction); err != nil {
-		t.Fatalf("expedite the expiries: %v", err)
-	}
+	_, err := storeFor(b).tasks.Expedite(ctx, spaceshardqueue.Name, spaceshardqueue.Subject(space, digest), spaceshardqueue.ExpireAction)
+	require.NoError(t, err, "expedite the expiries")
 	b.blobs.ReleaseNow(ctx, space, []multihash.Multihash{digest})
 	b.blobs.ReleaseNow(ctx, space, []multihash.Multihash{digest})
 }

@@ -1,12 +1,12 @@
 package s3frontend
 
 import (
-	"errors"
 	"strings"
 	"testing"
 
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/versitygw/s3err"
+	"github.com/stretchr/testify/assert"
 )
 
 // TestObjectKeyError locks the key-validation error mapping: a key over the
@@ -27,18 +27,13 @@ func TestObjectKeyError(t *testing.T) {
 	for _, c := range cases {
 		err := objectKeyError(c.key)
 		if c.wantCode == "" {
-			if err != nil {
-				t.Errorf("%s: got %v, want nil", c.name, err)
-			}
+			assert.NoError(t, err, c.name)
 			continue
 		}
 		var apiErr s3err.APIError
-		if !errors.As(err, &apiErr) {
-			t.Errorf("%s: got %v, want APIError with code %q", c.name, err, c.wantCode)
+		if !assert.ErrorAs(t, err, &apiErr, "%s: want APIError with code %q", c.name, c.wantCode) {
 			continue
 		}
-		if apiErr.Code != c.wantCode {
-			t.Errorf("%s: code = %q, want %q", c.name, apiErr.Code, c.wantCode)
-		}
+		assert.Equal(t, c.wantCode, apiErr.Code, "%s: code", c.name)
 	}
 }

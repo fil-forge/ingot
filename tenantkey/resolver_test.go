@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/internal/reqscope"
 )
@@ -20,9 +21,7 @@ var testTenant = did.MustParse("did:plc:ewvi7nxzyoun6zhxrhs64oiz")
 func wrapDoc(t *testing.T, edit func(vm *did.VerificationMethod)) (did.Document, *ecdh.PrivateKey) {
 	t.Helper()
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	doc := did.NewDocument(testTenant)
 	hilt := did.VerificationMethod{
 		ID: doc.Fragment("hilt"), Controller: testTenant,
@@ -38,9 +37,7 @@ func wrapDoc(t *testing.T, edit func(vm *did.VerificationMethod)) (did.Document,
 		edit(&wrap)
 	}
 	for _, vm := range []did.VerificationMethod{hilt, wrap} {
-		if err := doc.VerificationMethods.Add(vm); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, doc.VerificationMethods.Add(vm))
 	}
 	return doc, priv
 }
@@ -57,32 +54,21 @@ func fixedDocs(doc did.Document) did.Resolver {
 func TestResolver_WrapKey(t *testing.T) {
 	doc, priv := wrapDoc(t, nil)
 	kid, pub, err := NewResolver(fixedDocs(doc)).WrapKey(context.Background(), testTenant)
-	if err != nil {
-		t.Fatalf("WrapKey: %v", err)
-	}
-	if !pub.Equal(priv.PublicKey()) {
-		t.Fatal("resolved key differs from the published one")
-	}
-	if want := EncodePublicKey(priv.PublicKey()); kid != want {
-		t.Fatalf("kid = %s, want the fingerprint %s", kid, want)
-	}
+	require.NoError(t, err, "WrapKey")
+	require.True(t, pub.Equal(priv.PublicKey()), "resolved key differs from the published one")
+	want := EncodePublicKey(priv.PublicKey())
+	require.Equal(t, want, kid, "kid")
 }
 
 func TestResolver_RelativeMethodID(t *testing.T) {
 	doc, priv := wrapDoc(t, func(vm *did.VerificationMethod) {
 		u, err := did.ParseURL("#" + WrapFragment)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		vm.ID = u
 	})
 	_, pub, err := NewResolver(fixedDocs(doc)).WrapKey(context.Background(), testTenant)
-	if err != nil {
-		t.Fatalf("WrapKey with relative id: %v", err)
-	}
-	if !pub.Equal(priv.PublicKey()) {
-		t.Fatal("resolved key differs from the published one")
-	}
+	require.NoError(t, err, "WrapKey with relative id")
+	require.True(t, pub.Equal(priv.PublicKey()), "resolved key differs from the published one")
 }
 
 func TestResolver_Failures(t *testing.T) {
@@ -105,18 +91,15 @@ func TestResolver_Failures(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			doc, _ := wrapDoc(t, tc.edit)
 			_, _, err := NewResolver(fixedDocs(doc)).WrapKey(context.Background(), testTenant)
-			if !errors.Is(err, tc.want) {
-				t.Fatalf("err = %v, want %v", err, tc.want)
-			}
+			require.ErrorIs(t, err, tc.want, "err")
 		})
 	}
 
 	t.Run("resolver error", func(t *testing.T) {
 		boom := errors.New("directory down")
 		docs := did.ResolverFunc(func(context.Context, did.DID) (did.Document, error) { return did.Document{}, boom })
-		if _, _, err := NewResolver(docs).WrapKey(context.Background(), testTenant); !errors.Is(err, boom) {
-			t.Fatalf("err = %v, want the resolver's", err)
-		}
+		_, _, err := NewResolver(docs).WrapKey(context.Background(), testTenant)
+		require.ErrorIs(t, err, boom, "err")
 	})
 }
 
@@ -124,24 +107,20 @@ func TestRequestSource(t *testing.T) {
 	doc, priv := wrapDoc(t, nil)
 	src := NewRequestSource(NewResolver(fixedDocs(doc)))
 
-	if _, _, err := src.WrapKey(context.Background()); !errors.Is(err, ErrNoTenant) {
-		t.Fatalf("no tenant on ctx: err = %v, want ErrNoTenant", err)
-	}
+	_, _, err := src.WrapKey(context.Background())
+	require.ErrorIs(t, err, ErrNoTenant, "no tenant on ctx")
 	ctx := context.WithValue(context.Background(), reqscope.TenantKey(), testTenant)
 	kid, pub, err := src.WrapKey(ctx)
-	if err != nil {
-		t.Fatalf("WrapKey: %v", err)
-	}
-	if !pub.Equal(priv.PublicKey()) || kid != EncodePublicKey(pub) {
-		t.Fatal("unexpected key or kid")
-	}
+	require.NoError(t, err, "WrapKey")
+	require.True(t, pub.Equal(priv.PublicKey()), "unexpected key or kid")
+	require.Equal(t, EncodePublicKey(pub), kid, "unexpected key or kid")
 }
 
 func TestStatic(t *testing.T) {
 	priv, _ := ecdh.X25519().GenerateKey(rand.Reader)
 	s := NewStatic(priv.PublicKey())
 	kid, pub, err := s.WrapKey(context.Background())
-	if err != nil || !pub.Equal(priv.PublicKey()) || kid != EncodePublicKey(pub) {
-		t.Fatalf("Static.WrapKey = (%s, %v, %v)", kid, pub, err)
-	}
+	require.NoError(t, err, "Static.WrapKey = (%s, %v, %v)", kid, pub, err)
+	require.True(t, pub.Equal(priv.PublicKey()), "Static.WrapKey = (%s, %v, %v)", kid, pub, err)
+	require.Equal(t, EncodePublicKey(pub), kid, "Static.WrapKey = (%s, %v, %v)", kid, pub, err)
 }

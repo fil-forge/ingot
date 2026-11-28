@@ -4,13 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
-	"errors"
-	"github.com/google/uuid"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -61,22 +63,14 @@ func TestEvaluateCopySourcePreconditions(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			err := evaluateCopySourcePreconditions(etag, mod, tc.pc)
 			if tc.want == "" {
-				if err != nil {
-					t.Fatalf("got %v, want the copy to proceed", err)
-				}
+				require.NoError(t, err, "got %v, want the copy to proceed", err)
 				return
 			}
 			var pf s3err.PreconditionFailedError
-			if !errors.As(err, &pf) {
-				t.Fatalf("got %v, want PreconditionFailedError", err)
-			}
-			if pf.HTTPStatusCode != http.StatusPreconditionFailed {
-				t.Fatalf("status = %d, want 412", pf.HTTPStatusCode)
-			}
+			require.ErrorAs(t, err, &pf, "got %v, want PreconditionFailedError", err)
+			require.Equal(t, http.StatusPreconditionFailed, pf.HTTPStatusCode, "status")
 			want := s3err.Condition(copySourceConditionPrefix + string(tc.want))
-			if pf.Condition != want {
-				t.Fatalf("condition = %q, want %q", pf.Condition, want)
-			}
+			require.Equal(t, want, pf.Condition, "condition")
 		})
 	}
 }
@@ -99,25 +93,21 @@ func TestCopyObject_IfNoneMatchIs412(t *testing.T) {
 		CopySource:            &src,
 		CopySourceIfNoneMatch: &etag,
 	})
-	if !errors.Is(err, s3err.GetAPIError(s3err.ErrPreconditionFailed)) {
-		t.Fatalf("matching if-none-match: got %v, want PreconditionFailed", err)
-	}
-	if _, _, gerr := getObjV(t, b, dst, ""); apiErrCode(t, gerr) != "NoSuchKey" {
-		t.Fatalf("destination must not exist after a failed precondition: %v", gerr)
-	}
+	require.ErrorIs(t, err, s3err.GetAPIError(s3err.ErrPreconditionFailed), "matching if-none-match")
+	_, _, gerr := getObjV(t, b, dst, "")
+	require.Equal(t, "NoSuchKey", apiErrCode(t, gerr), "destination must not exist after a failed precondition: %v", gerr)
 
 	other := "00000000000000000000000000000000"
-	if _, err := b.CopyObject(context.Background(), s3response.CopyObjectInput{
+	_, err = b.CopyObject(context.Background(), s3response.CopyObjectInput{
 		Bucket:                &bucket,
 		Key:                   &dst,
 		CopySource:            &src,
 		CopySourceIfNoneMatch: &other,
-	}); err != nil {
-		t.Fatalf("non-matching if-none-match: %v", err)
-	}
-	if _, data, err := getObjV(t, b, dst, ""); err != nil || string(data) != "copy me" {
-		t.Fatalf("copied GET = %q, %v", data, err)
-	}
+	})
+	require.NoError(t, err, "non-matching if-none-match")
+	_, data, err := getObjV(t, b, dst, "")
+	require.NoError(t, err, "copied GET")
+	require.Equal(t, "copy me", string(data), "copied GET")
 }
 
 // A copy source in another tenant's bucket is AccessDenied before any key
@@ -129,32 +119,21 @@ func TestCopyObject_ForeignTenantSourceIsAccessDenied(t *testing.T) {
 	ctx := context.Background()
 	tenantA, tenantB := testutil.RandomDID(t), testutil.RandomDID(t)
 	for name, tenant := range map[string]did.DID{"a": tenantA, "a2": tenantA, "b": tenantB} {
-		if err := mem.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: tenant}); err != nil {
-			t.Fatalf("create %s: %v", name, err)
-		}
+		require.NoError(t, mem.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: tenant}), "create %s", name)
 	}
 	srcBucket, srcKey := "a", "obj"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("secret")), ContentLength: byteLen([]byte("secret"))}); err != nil {
-		t.Fatalf("put source: %v", err)
-	}
+	_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("secret")), ContentLength: byteLen([]byte("secret"))})
+	require.NoError(t, err, "put source")
 
 	copyFrom := func(dst, source string) error {
 		key := "copied"
 		_, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dst, Key: &key, CopySource: &source})
 		return err
 	}
-	if err := copyFrom("b", "a/obj"); apiErrCode(t, err) != "AccessDenied" {
-		t.Fatalf("foreign source with existing key: %v, want AccessDenied", err)
-	}
-	if err := copyFrom("b", "a/no-such-key"); apiErrCode(t, err) != "AccessDenied" {
-		t.Fatalf("foreign source with missing key: %v, want AccessDenied (not NoSuchKey)", err)
-	}
-	if err := copyFrom("b", "no-such-bucket/obj"); apiErrCode(t, err) != "NoSuchBucket" {
-		t.Fatalf("nonexistent source bucket: %v, want NoSuchBucket", err)
-	}
-	if err := copyFrom("a2", "a/obj"); err != nil {
-		t.Fatalf("same-tenant cross-space source: %v, want the copy to proceed", err)
-	}
+	require.Equal(t, "AccessDenied", apiErrCode(t, copyFrom("b", "a/obj")), "foreign source with existing key")
+	require.Equal(t, "AccessDenied", apiErrCode(t, copyFrom("b", "a/no-such-key")), "foreign source with missing key (not NoSuchKey)")
+	require.Equal(t, "NoSuchBucket", apiErrCode(t, copyFrom("b", "no-such-bucket/obj")), "nonexistent source bucket")
+	require.NoError(t, copyFrom("a2", "a/obj"), "same-tenant cross-space source: want the copy to proceed")
 }
 
 // A copy between spaces re-ingests the source's bytes: the destination reads
@@ -167,87 +146,68 @@ func TestCopyObject_CrossSpaceReingest(t *testing.T) {
 	ctx := context.Background()
 	tenant := testutil.RandomDID(t)
 	for _, name := range []string{"src-bkt", "dst-bkt"} {
-		if err := mem.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: tenant}); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, mem.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: tenant}))
 	}
 	srcSt, _ := mem.Get(ctx, "src-bkt")
 	dstSt, _ := mem.Get(ctx, "dst-bkt")
 
 	data := bytes.Repeat([]byte("re-ingest me "), 20000) // ~260 KiB
 	srcBucket, srcKey, ctype := "src-bkt", "obj", "text/bla"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{
+	_, err := b.PutObject(ctx, s3response.PutObjectInput{
 		Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader(data), ContentLength: byteLen(data),
 		ChecksumAlgorithm: types.ChecksumAlgorithmSha256, ContentType: &ctype,
 		Metadata: map[string]string{"foo": "bar"},
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
+	require.NoError(t, err)
 	srcRv, err := b.resolveVersion(ctx, "src-bkt", "obj", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	dstBucket, dstKey, source := "dst-bkt", "copied", "src-bkt/obj"
 	out, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dstBucket, Key: &dstKey, CopySource: &source})
-	if err != nil {
-		t.Fatalf("cross-space copy: %v", err)
-	}
-	if want := `"` + hex.EncodeToString(md5Sum(data)) + `"`; *out.CopyObjectResult.ETag != want {
-		t.Fatalf("copy ETag = %s, want md5 of the bytes %s", *out.CopyObjectResult.ETag, want)
-	}
-	if out.CopyObjectResult.ChecksumSHA256 == nil || *out.CopyObjectResult.ChecksumSHA256 != sha256B64(data) || out.CopyObjectResult.ChecksumType != types.ChecksumTypeFullObject {
-		t.Fatalf("copy checksum = %+v, want the source's SHA256 as FULL_OBJECT", out.CopyObjectResult)
-	}
+	require.NoError(t, err, "cross-space copy")
+	require.Equal(t, `"`+hex.EncodeToString(md5Sum(data))+`"`, *out.CopyObjectResult.ETag, "copy ETag: want md5 of the bytes")
+	require.NotNil(t, out.CopyObjectResult.ChecksumSHA256, "copy checksum = %+v, want the source's SHA256 as FULL_OBJECT", out.CopyObjectResult)
+	require.Equal(t, sha256B64(data), *out.CopyObjectResult.ChecksumSHA256, "copy checksum = %+v, want the source's SHA256 as FULL_OBJECT", out.CopyObjectResult)
+	require.Equal(t, types.ChecksumTypeFullObject, out.CopyObjectResult.ChecksumType, "copy checksum = %+v, want the source's SHA256 as FULL_OBJECT", out.CopyObjectResult)
 
 	got, err := b.GetObject(ctx, &s3.GetObjectInput{Bucket: &dstBucket, Key: &dstKey})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	gotBytes, _ := io.ReadAll(got.Body)
 	got.Body.Close()
-	if !bytes.Equal(gotBytes, data) || *got.ContentType != ctype || got.Metadata["foo"] != "bar" {
-		t.Fatalf("copied object: %d bytes, %q, %v", len(gotBytes), *got.ContentType, got.Metadata)
-	}
+	require.True(t, bytes.Equal(data, gotBytes), "copied object: %d bytes, want %d", len(gotBytes), len(data))
+	require.Equal(t, ctype, *got.ContentType, "copied object content type")
+	require.Equal(t, "bar", got.Metadata["foo"], "copied object metadata")
 
 	// New blobs under the destination's space, each with one claim there; the
 	// source's blobs keep exactly their one claim in the source's space.
 	dstRv, err := b.resolveVersion(ctx, "dst-bkt", "copied", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	dstBlobs := storedBlobs(t, b, dstRv)
-	if len(dstBlobs) < 2 {
-		t.Fatalf("expected a multi-blob body, got %d blobs", len(dstBlobs))
-	}
+	require.GreaterOrEqual(t, len(dstBlobs), 2, "expected a multi-blob body, got %d blobs", len(dstBlobs))
 	srcDigests := map[string]bool{}
 	for _, ref := range storedBlobs(t, b, srcRv) {
 		srcDigests[string(ref.Digest)] = true
-		if n, _ := mem.CountReferences(ctx, srcSt.Space, ref.Digest, uuid.Nil); n != 1 {
-			t.Fatalf("source blob claims = %d, want 1 (untouched)", n)
-		}
+		n, _ := mem.CountReferences(ctx, srcSt.Space, ref.Digest, uuid.Nil)
+		require.Equal(t, 1, n, "source blob claims")
 	}
 	for _, ref := range dstBlobs {
-		if srcDigests[string(ref.Digest)] {
-			t.Fatalf("destination pins a source blob %x; a cross-space copy must re-ingest", ref.Digest)
-		}
-		if n, _ := mem.CountReferences(ctx, dstSt.Space, ref.Digest, uuid.Nil); n != 1 {
-			t.Fatalf("destination blob claims = %d, want 1", n)
-		}
+		require.False(t, srcDigests[string(ref.Digest)], "destination pins a source blob %x; a cross-space copy must re-ingest", ref.Digest)
+		n, _ := mem.CountReferences(ctx, dstSt.Space, ref.Digest, uuid.Nil)
+		require.Equal(t, 1, n, "destination blob claims")
 	}
 
 	// REPLACE takes the request's metadata instead of the source's.
 	replaced, newType := "replaced", "application/x-new"
-	if _, err := b.CopyObject(ctx, s3response.CopyObjectInput{
+	_, err = b.CopyObject(ctx, s3response.CopyObjectInput{
 		Bucket: &dstBucket, Key: &replaced, CopySource: &source,
 		MetadataDirective: types.MetadataDirectiveReplace, ContentType: &newType, Metadata: map[string]string{"k": "v"},
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
+	require.NoError(t, err)
 	head, err := b.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &dstBucket, Key: &replaced})
-	if err != nil || *head.ContentType != newType || head.Metadata["k"] != "v" || head.Metadata["foo"] != "" {
-		t.Fatalf("REPLACE copy head: %v %v %v", err, head.ContentType, head.Metadata)
-	}
+	require.NoError(t, err, "REPLACE copy head: %v %v %v", err, head.ContentType, head.Metadata)
+	require.Equal(t, newType, *head.ContentType, "REPLACE copy head: %v %v %v", err, head.ContentType, head.Metadata)
+	require.Equal(t, "v", head.Metadata["k"], "REPLACE copy head: %v %v %v", err, head.ContentType, head.Metadata)
+	require.Empty(t, head.Metadata["foo"], "REPLACE copy head: %v %v %v", err, head.ContentType, head.Metadata)
 }
 
 // hookCommitCapture is an authority capturer that runs hook once, at the
@@ -291,45 +251,33 @@ func TestCopyObject_PinnedSourceDeletedBeforeCommitKeepsItsBlobs(t *testing.T) {
 	})
 	ctx := context.Background()
 	space, tenant := testutil.RandomDID(t), testutil.RandomDID(t)
-	if err := mem.Create(ctx, "src", space, registry.CreateState{Tenant: tenant}); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, mem.Create(ctx, "src", space, registry.CreateState{Tenant: tenant}))
 	srcBucket, srcKey := "src", "obj"
 	body := []byte("pin me")
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader(body), ContentLength: byteLen(body)}); err != nil {
-		t.Fatal(err)
-	}
+	_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader(body), ContentLength: byteLen(body)})
+	require.NoError(t, err)
 	srcRv, err := b.resolveVersion(ctx, "src", "obj", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	digests := storedBlobs(t, b, srcRv).DigestList()
 
 	reg.skip = 1
 	reg.hook = func() {
-		if _, err := b.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &srcBucket, Key: &srcKey}); err != nil {
-			t.Errorf("DeleteObject during the copy: %v", err)
-		}
+		_, err := b.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &srcBucket, Key: &srcKey})
+		assert.NoError(t, err, "DeleteObject during the copy")
 		drainReleases(t, b)
 	}
 	dstBucket, dstKey, source := "src", "copied", "src/obj"
-	if _, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dstBucket, Key: &dstKey, CopySource: &source}); err != nil {
-		t.Fatalf("copy whose source was deleted before its commit: %v", err)
-	}
-	if reg.hook != nil {
-		t.Fatal("the source was never deleted")
-	}
+	_, err = b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dstBucket, Key: &dstKey, CopySource: &source})
+	require.NoError(t, err, "copy whose source was deleted before its commit")
+	require.Nil(t, reg.hook, "the source was never deleted")
 	for _, d := range digests {
-		if n := rm.removedDigests()[string(d)]; n != 0 {
-			t.Fatalf("blob %x the copy references was removed %d times", d, n)
-		}
-		if n, _ := mem.CountClaimRows(ctx, space, d); n != 1 {
-			t.Fatalf("claims on blob %x = %d, want the copy's", d, n)
-		}
+		n := rm.removedDigests()[string(d)]
+		require.Zero(t, n, "removals of blob %x the copy references", d)
+		rows, _ := mem.CountClaimRows(ctx, space, d)
+		require.Equal(t, 1, rows, "claims on blob %x", d)
 	}
-	if got := getFrom(t, b, "src", "copied"); !bytes.Equal(got, body) {
-		t.Fatalf("the copy does not read back")
-	}
+	got := getFrom(t, b, "src", "copied")
+	require.Equal(t, body, got, "the copy does not read back")
 }
 
 // TestPinBlobsRefusesABlobTheSpaceNoLongerHolds: a same-space copy's
@@ -339,14 +287,11 @@ func TestPinBlobsRefusesABlobTheSpaceNoLongerHolds(t *testing.T) {
 	b, mem := newDeferredBackend(t, testfakes.NopUploader{})
 	ctx := context.Background()
 	st, err := mem.Get(ctx, "bk")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	var blobs msbucket.BlobRefs
 	blobs.Append(mustSum([]byte("released")), 8)
-	if _, err := b.pinBlobs(ctx, st, blobs); !errors.Is(err, spaceshardqueue.ErrBlobGone) {
-		t.Fatalf("pinBlobs of an unlocated blob: err = %v, want spaceshardqueue.ErrBlobGone", err)
-	}
+	_, err = b.pinBlobs(ctx, st, blobs)
+	require.ErrorIs(t, err, spaceshardqueue.ErrBlobGone, "pinBlobs of an unlocated blob")
 }
 
 // A copy of a multipart object is a single-part object on S3: its ETag is the
@@ -358,37 +303,24 @@ func TestCopyObject_MultipartSourceETag(t *testing.T) {
 	p2 := bytes.Repeat([]byte("q"), 100)
 	id := mpCreate(t, b, "mpsrc", "", "")
 	u1, err := mpUploadPart(t, b, "mpsrc", id, 1, p1, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	u2, err := mpUploadPart(t, b, "mpsrc", id, 2, p2, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	n1, n2 := int32(1), int32(2)
 	res, err := mpComplete(t, b, "mpsrc", id, []types.CompletedPart{{ETag: u1.ETag, PartNumber: &n1}, {ETag: u2.ETag, PartNumber: &n2}}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains([]byte(*res.ETag), []byte("-2")) {
-		t.Fatalf("multipart source ETag = %s, want a -2 suffix", *res.ETag)
-	}
+	require.NoError(t, err)
+	require.Contains(t, *res.ETag, "-2", "multipart source ETag")
 
 	bucket, key, source := "bk", "mpcopy", "bk/mpsrc"
 	out, err := b.CopyObject(context.Background(), s3response.CopyObjectInput{Bucket: &bucket, Key: &key, CopySource: &source})
-	if err != nil {
-		t.Fatalf("copy of a multipart object: %v", err)
-	}
+	require.NoError(t, err, "copy of a multipart object")
 	all := append(append([]byte{}, p1...), p2...)
-	if want := `"` + hex.EncodeToString(md5Sum(all)) + `"`; *out.CopyObjectResult.ETag != want {
-		t.Fatalf("copy ETag = %s, want md5 of the bytes %s", *out.CopyObjectResult.ETag, want)
-	}
-	if out.CopyObjectResult.ChecksumType != types.ChecksumTypeFullObject || out.CopyObjectResult.ChecksumCRC64NVME == nil {
-		t.Fatalf("copy checksum = %+v, want a FULL_OBJECT CRC64NVME", out.CopyObjectResult)
-	}
-	if _, got, err := getObjV(t, b, "mpcopy", ""); err != nil || !bytes.Equal(got, all) {
-		t.Fatalf("copy GET: %d bytes, %v", len(got), err)
-	}
+	require.Equal(t, `"`+hex.EncodeToString(md5Sum(all))+`"`, *out.CopyObjectResult.ETag, "copy ETag: want md5 of the bytes")
+	require.Equal(t, types.ChecksumTypeFullObject, out.CopyObjectResult.ChecksumType, "copy checksum")
+	require.NotNil(t, out.CopyObjectResult.ChecksumCRC64NVME, "copy checksum")
+	_, got, err := getObjV(t, b, "mpcopy", "")
+	require.NoError(t, err, "copy GET")
+	require.True(t, bytes.Equal(all, got), "copy GET: %d bytes, want %d", len(got), len(all))
 }
 
 // Buckets whose owner was never recorded carry the same sentinel tenant, which
@@ -398,25 +330,18 @@ func TestCopyObject_UnknownTenantSourceIsAccessDenied(t *testing.T) {
 	b, mem, _ := newRefTestBackend(t)
 	ctx := context.Background()
 	for _, name := range []string{"legacy1", "legacy2"} {
-		if err := mem.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: registry.UnknownTenant}); err != nil {
-			t.Fatalf("create %s: %v", name, err)
-		}
+		require.NoError(t, mem.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: registry.UnknownTenant}), "create %s", name)
 	}
 	srcBucket, srcKey := "legacy1", "obj"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("legacy")), ContentLength: byteLen([]byte("legacy"))}); err != nil {
-		t.Fatalf("put source: %v", err)
-	}
+	_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("legacy")), ContentLength: byteLen([]byte("legacy"))})
+	require.NoError(t, err, "put source")
 	copyFrom := func(dst, source string) error {
 		key := "copied"
 		_, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dst, Key: &key, CopySource: &source})
 		return err
 	}
-	if err := copyFrom("legacy2", "legacy1/obj"); apiErrCode(t, err) != "AccessDenied" {
-		t.Fatalf("copy between two unknown-tenant buckets: %v, want AccessDenied", err)
-	}
-	if err := copyFrom("legacy1", "legacy1/obj"); err != nil {
-		t.Fatalf("copy within an unknown-tenant bucket: %v", err)
-	}
+	require.Equal(t, "AccessDenied", apiErrCode(t, copyFrom("legacy2", "legacy1/obj")), "copy between two unknown-tenant buckets")
+	require.NoError(t, copyFrom("legacy1", "legacy1/obj"), "copy within an unknown-tenant bucket")
 }
 
 func TestIsMultipartETag(t *testing.T) {
@@ -429,9 +354,8 @@ func TestIsMultipartETag(t *testing.T) {
 		"6eb9fc855f310f9dc251ab2e5dfe179f-":     false,
 		"6eb9fc855f310f9dc251ab2e5dfe179f-2-3":  false,
 	} {
-		if got := isMultipartETag(etag); got != want {
-			t.Errorf("isMultipartETag(%q) = %v, want %v", etag, got, want)
-		}
+		got := isMultipartETag(etag)
+		assert.Equal(t, want, got, "isMultipartETag(%q)", etag)
 	}
 }
 
@@ -441,30 +365,19 @@ func TestCopyObject_SourceWithoutChecksumGetsDefault(t *testing.T) {
 	b, mem, _ := newRefTestBackend(t)
 	ctx := context.Background()
 	st, err := mem.Get(ctx, "bk")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	data := []byte("legacy object")
 	body, blobs, refs, err := b.ingestBody(ctx, st, bytes.NewReader(data), int64(len(data)), nil, false)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	legacy := &msbucket.ObjectManifest{Key: "legacy", Created: time.Now().Unix(), Body: body, ETag: hex.EncodeToString(body.MD5), ContentType: "application/octet-stream"}
-	if err := commitPut(ctx, b, st, "legacy", legacy, blobs, refs); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, commitPut(ctx, b, st, "legacy", legacy, blobs, refs))
 
 	bucket, key, source := "bk", "copied", "bk/legacy"
 	out, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &bucket, Key: &key, CopySource: &source})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out.CopyObjectResult.ChecksumCRC64NVME == nil || out.CopyObjectResult.ChecksumType != types.ChecksumTypeFullObject {
-		t.Fatalf("copy of a checksum-less source = %+v, want a FULL_OBJECT CRC64NVME", out.CopyObjectResult)
-	}
-	if want := `"` + legacy.ETag + `"`; *out.CopyObjectResult.ETag != want {
-		t.Fatalf("copy ETag = %s, want the source's %s", *out.CopyObjectResult.ETag, want)
-	}
+	require.NoError(t, err)
+	require.NotNil(t, out.CopyObjectResult.ChecksumCRC64NVME, "copy of a checksum-less source")
+	require.Equal(t, types.ChecksumTypeFullObject, out.CopyObjectResult.ChecksumType, "copy of a checksum-less source")
+	require.Equal(t, `"`+legacy.ETag+`"`, *out.CopyObjectResult.ETag, "copy ETag")
 }
 
 // A source over S3's single-copy ceiling is refused before any byte is read;
@@ -473,17 +386,11 @@ func TestCopyObject_SourceOverCopyLimit(t *testing.T) {
 	b, mem, _ := newRefTestBackend(t)
 	ctx := context.Background()
 	st, err := mem.Get(ctx, "bk")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	huge := &msbucket.ObjectManifest{Key: "huge", Created: time.Now().Unix(), Body: msbucket.Body{Size: maxCopySize + 1}, ETag: "00000000000000000000000000000000"}
 	// No blobs: an empty list, so the commit has nothing to read or claim.
-	if err := commitPut(ctx, b, st, "huge", huge, msbucket.BlobRefs{}, nil); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, commitPut(ctx, b, st, "huge", huge, msbucket.BlobRefs{}, nil))
 	bucket, key, source := "bk", "copied", "bk/huge"
 	_, err = b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &bucket, Key: &key, CopySource: &source})
-	if got := apiErrCode(t, err); got != "InvalidRequest" {
-		t.Fatalf("copy of a %d-byte source: %s (%v), want InvalidRequest", maxCopySize+1, got, err)
-	}
+	require.Equal(t, "InvalidRequest", apiErrCode(t, err), "copy of a %d-byte source: %v", maxCopySize+1, err)
 }

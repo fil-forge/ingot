@@ -12,6 +12,7 @@ import (
 	usagecmds "github.com/fil-forge/libforge/commands/s3/usage"
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/usage"
 )
@@ -33,44 +34,32 @@ func TestGetObjectCountsEgressForTheBucketsSpace(t *testing.T) {
 	counter := usage.NewCounter()
 	b, mem := newSweepBackend(t, func(d *Deps) { d.Usage = counter })
 	svc, err := usage.New(usage.Config{Counter: counter, Store: mem.Postgres, Reporter: nopUsageReporter{}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	ctx := t.Context()
 	space := sweepSpace(t, mem)
 	started := time.Now().UTC().Truncate(time.Hour)
 
 	bucket, key := sweepBucket, "obj"
 	body := bytes.Repeat([]byte{'a'}, 1000)
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body), ContentLength: byteLen(body)}); err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
+	_, err = b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body), ContentLength: byteLen(body)})
+	require.NoError(t, err, "PutObject")
 	// The object is stored encrypted, so what is read from storage is more
 	// than its 1000 bytes.
 	rv, err := b.resolveVersion(ctx, bucket, key, "")
-	if err != nil {
-		t.Fatalf("resolveVersion: %v", err)
-	}
+	require.NoError(t, err, "resolveVersion")
 	var stored int64
 	for _, blob := range storedBlobs(t, b, rv) {
 		stored += blobSize(t, b, blob.Digest)
 	}
-	if stored <= 1000 {
-		t.Fatalf("the object's stored bytes are %d: this test needs an encrypted object, which stores more than its 1000", stored)
-	}
+	require.Greater(t, stored, int64(1000), "the object's stored bytes are %d: this test needs an encrypted object, which stores more than its 1000", stored)
 
 	get := func(rng string, read int64) {
 		t.Helper()
 		out, err := b.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &key, Range: backend.GetPtrFromString(rng)})
-		if err != nil {
-			t.Fatalf("GetObject %q: %v", rng, err)
-		}
-		if _, err := io.CopyN(io.Discard, out.Body, read); err != nil {
-			t.Fatalf("read %q: %v", rng, err)
-		}
-		if err := out.Body.Close(); err != nil {
-			t.Fatalf("close %q: %v", rng, err)
-		}
+		require.NoError(t, err, "GetObject %q", rng)
+		_, err = io.CopyN(io.Discard, out.Body, read)
+		require.NoError(t, err, "read %q", rng)
+		require.NoError(t, out.Body.Close(), "close %q", rng)
 	}
 	get("", 1000)
 	get("bytes=0-99", 100)
@@ -78,31 +67,21 @@ func TestGetObjectCountsEgressForTheBucketsSpace(t *testing.T) {
 	get("", 10) // the client went away after 10 bytes
 
 	dst, src := "copy", bucket+"/"+key
-	if _, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &bucket, Key: &dst, CopySource: &src}); err != nil {
-		t.Fatalf("CopyObject: %v", err)
-	}
+	_, err = b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &bucket, Key: &dst, CopySource: &src})
+	require.NoError(t, err, "CopyObject")
 
-	if err := svc.Flush(ctx); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
+	require.NoError(t, svc.Flush(ctx), "Flush")
 	due, err := mem.DueEgress(ctx, 10)
-	if err != nil {
-		t.Fatalf("DueEgress: %v", err)
-	}
+	require.NoError(t, err, "DueEgress")
 	// One count, unless the test ran across the top of an hour.
 	var sent int64
 	for _, c := range due {
-		if c.Space != space {
-			t.Fatalf("egress counted under %s, want the bucket's space %s", c.Space, space)
-		}
-		if c.Hour.Before(started) || c.Hour.After(time.Now()) {
-			t.Fatalf("egress counted in hour %s, want the hour it was sent in", c.Hour)
-		}
+		require.Equal(t, space, c.Space, "egress counted under another space than the bucket's")
+		require.False(t, c.Hour.Before(started), "egress counted in hour %s, want the hour it was sent in", c.Hour)
+		require.False(t, c.Hour.After(time.Now()), "egress counted in hour %s, want the hour it was sent in", c.Hour)
 		sent += c.Bytes
 	}
-	if sent != 1111 {
-		t.Fatalf("egress counted: %d bytes, want the 1111 the GETs read", sent)
-	}
+	require.Equal(t, int64(1111), sent, "egress counted: %d bytes, want the 1111 the GETs read", sent)
 }
 
 // TestGetObjectCountsNothingWithoutACounter: a backend built with no usage
@@ -112,23 +91,15 @@ func TestGetObjectCountsNothingWithoutACounter(t *testing.T) {
 	ctx := t.Context()
 	bucket, key := sweepBucket, "obj"
 	body := bytes.Repeat([]byte{'a'}, 100)
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body), ContentLength: byteLen(body)}); err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
+	_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body), ContentLength: byteLen(body)})
+	require.NoError(t, err, "PutObject")
 	out, err := b.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &key})
-	if err != nil {
-		t.Fatalf("GetObject: %v", err)
-	}
+	require.NoError(t, err, "GetObject")
 	got, err := io.ReadAll(out.Body)
-	if err != nil || !bytes.Equal(got, body) {
-		t.Fatalf("GetObject body: %d bytes, err %v", len(got), err)
-	}
+	require.NoError(t, err, "GetObject body")
+	require.Equal(t, body, got, "GetObject body")
 	_ = out.Body.Close()
 	due, err := mem.DueEgress(ctx, 10)
-	if err != nil {
-		t.Fatalf("DueEgress: %v", err)
-	}
-	if len(due) != 0 {
-		t.Fatalf("egress was counted with no counter: %v", due)
-	}
+	require.NoError(t, err, "DueEgress")
+	require.Empty(t, due, "egress was counted with no counter")
 }

@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/fil-forge/ucantone/did"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	"github.com/filecoin-project/go-fee/aesstream"
@@ -27,14 +29,11 @@ import (
 func TestDefaultMaxBlobSizeFitsPiri(t *testing.T) {
 	const headerBudget = 1024
 	enc := aesstream.EncryptedSize(DefaultMaxBlobSize, aesstream.DefaultChunkSize) + headerBudget
-	if enc > blobcmds.MaxBlobSize {
-		t.Fatalf("DefaultMaxBlobSize %d: envelope %d exceeds the network blob ceiling %d", DefaultMaxBlobSize, enc, int64(blobcmds.MaxBlobSize))
-	}
+	require.LessOrEqual(t, enc, int64(blobcmds.MaxBlobSize), "DefaultMaxBlobSize %d: envelope %d exceeds the network blob ceiling %d", DefaultMaxBlobSize, enc, int64(blobcmds.MaxBlobSize))
 	// And the allowance is not vacuous: a split at a round 256 MiB — over
 	// the ceiling by less than the allowance — must NOT fit once framed.
-	if enc := aesstream.EncryptedSize(256<<20, aesstream.DefaultChunkSize); enc <= blobcmds.MaxBlobSize {
-		t.Fatalf("a 256 MiB blob's envelope (%d) fits the ceiling %d — revisit DefaultMaxBlobSize", enc, int64(blobcmds.MaxBlobSize))
-	}
+	require.Greater(t, aesstream.EncryptedSize(256<<20, aesstream.DefaultChunkSize), int64(blobcmds.MaxBlobSize),
+		"a 256 MiB blob's envelope fits the ceiling: revisit DefaultMaxBlobSize")
 }
 
 // memBlobs is a blob store in memory: a blockstore.BlobWriter that keys each
@@ -83,41 +82,25 @@ func TestSplitBody_StreamingRoundTrip(t *testing.T) {
 	data := makeData(10000) // → blobs of 4096, 4096, 1808
 
 	body, blobs, err := SplitBody(ctx, sp, bytes.NewReader(data), max)
-	if err != nil {
-		t.Fatalf("SplitBody: %v", err)
-	}
+	require.NoError(t, err, "SplitBody")
 
-	if body.Size != int64(len(data)) {
-		t.Fatalf("Size = %d, want %d", body.Size, len(data))
-	}
+	require.Equal(t, int64(len(data)), body.Size, "Size")
 	wantMD5 := md5.Sum(data)
-	if !bytes.Equal(body.MD5, wantMD5[:]) {
-		t.Errorf("whole-body MD5 mismatch")
-	}
+	assert.Equal(t, wantMD5[:], body.MD5, "whole-body MD5 mismatch")
 
 	wantBounds := []struct{ start, end int64 }{{0, 4095}, {4096, 8191}, {8192, 9999}}
-	if len(blobs) != len(wantBounds) {
-		t.Fatalf("got %d blobs, want %d", len(blobs), len(wantBounds))
-	}
+	require.Len(t, blobs, len(wantBounds))
 	for i, w := range wantBounds {
 		b := blobs[i]
-		if b.Start != w.start || b.End != w.end {
-			t.Errorf("blob %d = [%d,%d], want [%d,%d]", i, b.Start, b.End, w.start, w.end)
-		}
+		assert.Equal(t, [2]int64{w.start, w.end}, [2]int64{b.Start, b.End}, "blob %d bounds", i)
 		// The recorded digest must be the sha256 multihash of exactly that slice.
 		want, _ := mh.Sum(data[w.start:w.end+1], mh.SHA2_256, -1)
-		if !bytes.Equal(b.Digest, want) {
-			t.Errorf("blob %d digest mismatch", i)
-		}
+		assert.True(t, bytes.Equal(b.Digest, want), "blob %d digest mismatch", i)
 	}
 
 	got, err := io.ReadAll(OpenBody(ctx, NewPlainOpener(sp), did.Undef, blobs))
-	if err != nil {
-		t.Fatalf("OpenBody read: %v", err)
-	}
-	if !bytes.Equal(got, data) {
-		t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(data))
-	}
+	require.NoError(t, err, "OpenBody read")
+	require.Equal(t, data, got, "round-trip mismatch")
 }
 
 // TestOpenBodyRange covers ranged reads that start mid-blob and span blob
@@ -128,9 +111,7 @@ func TestOpenBodyRange(t *testing.T) {
 	const max = int64(4096)
 	data := makeData(10000)
 	_, blobs, err := SplitBody(ctx, sp, bytes.NewReader(data), max)
-	if err != nil {
-		t.Fatalf("SplitBody: %v", err)
-	}
+	require.NoError(t, err, "SplitBody")
 
 	cases := []struct{ start, end int64 }{
 		{0, 9999},    // whole object
@@ -143,13 +124,9 @@ func TestOpenBodyRange(t *testing.T) {
 	}
 	for _, c := range cases {
 		got, err := io.ReadAll(OpenBodyRange(ctx, NewPlainOpener(sp), did.Undef, blobs, c.start, c.end))
-		if err != nil {
-			t.Fatalf("range [%d,%d]: %v", c.start, c.end, err)
-		}
+		require.NoError(t, err, "range [%d,%d]", c.start, c.end)
 		want := data[c.start : c.end+1]
-		if !bytes.Equal(got, want) {
-			t.Errorf("range [%d,%d]: got %d bytes, want %d (mismatch)", c.start, c.end, len(got), len(want))
-		}
+		assert.Equal(t, want, got, "range [%d,%d]", c.start, c.end)
 	}
 }
 
@@ -158,16 +135,11 @@ func TestSplitBody_Empty(t *testing.T) {
 	ctx := context.Background()
 	sp := testBlobs(t)
 	body, blobs, err := SplitBody(ctx, sp, bytes.NewReader(nil), 4096)
-	if err != nil {
-		t.Fatalf("SplitBody: %v", err)
-	}
-	if body.Size != 0 || len(blobs) != 0 {
-		t.Fatalf("empty body: Size=%d Blobs=%d, want 0/0", body.Size, len(blobs))
-	}
+	require.NoError(t, err, "SplitBody")
+	require.Zero(t, body.Size, "empty body: Size=%d Blobs", body.Size)
+	require.Empty(t, blobs, "empty body: Size=%d Blobs", body.Size)
 	emptyMD5 := md5.Sum(nil)
-	if !bytes.Equal(body.MD5, emptyMD5[:]) {
-		t.Errorf("empty MD5 = %x, want %x", body.MD5, emptyMD5)
-	}
+	assert.Equal(t, emptyMD5[:], body.MD5, "empty MD5")
 }
 
 // The MD5 pass starts with the first byte: a body that never delivers one
@@ -176,28 +148,19 @@ func TestSplitBody_Empty(t *testing.T) {
 func TestLazyETagHash(t *testing.T) {
 	var l lazyETagHash
 	l.Write(nil)
-	if l.a != nil {
-		t.Fatal("an empty write started the MD5 hasher")
-	}
+	require.Nil(t, l.a, "an empty write started the MD5 hasher")
 	emptyMD5 := md5.Sum(nil)
-	if got := l.Sum(); !bytes.Equal(got, emptyMD5[:]) {
-		t.Fatalf("empty Sum = %x, want %x", got, emptyMD5)
-	}
-	if l.a != nil {
-		t.Fatal("Sum started the MD5 hasher")
-	}
+	got := l.Sum()
+	require.Equal(t, emptyMD5[:], got, "empty Sum")
+	require.Nil(t, l.a, "Sum started the MD5 hasher")
 
 	data := makeData(100<<10 + 3)
 	var started lazyETagHash
 	started.Write(data[:1])
-	if started.a == nil {
-		t.Fatal("the first byte did not start the MD5 hasher")
-	}
+	require.NotNil(t, started.a, "the first byte did not start the MD5 hasher")
 	started.Write(data[1:])
 	want := md5.Sum(data)
-	if got := started.Sum(); !bytes.Equal(got, want[:]) {
-		t.Fatalf("Sum = %x, want %x", got, want)
-	}
+	require.Equal(t, want[:], started.Sum(), "Sum")
 }
 
 // hashingDiscardWriter stands in for a blob store in benchmarks: it pays the
@@ -224,9 +187,8 @@ func BenchmarkSplitBody(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		if _, _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0); err != nil {
-			b.Fatal(err)
-		}
+		_, _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0)
+		require.NoError(b, err)
 	}
 }
 
@@ -242,9 +204,8 @@ func BenchmarkSplitBodyParallel(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			if _, _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0); err != nil {
-				b.Fatal(err)
-			}
+			_, _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0)
+			require.NoError(b, err)
 		}
 	})
 }
@@ -255,27 +216,19 @@ func TestSplitBody_WithoutMD5(t *testing.T) {
 	sp := testBlobs(t)
 	data := makeData(3*4096 + 100)
 	with, withBlobs, err := SplitBody(ctx, sp, bytes.NewReader(data), 4096)
-	if err != nil {
-		t.Fatalf("SplitBody: %v", err)
-	}
+	require.NoError(t, err, "SplitBody")
 	without, withoutBlobs, err := SplitBody(ctx, testBlobs(t), bytes.NewReader(data), 4096, WithoutMD5())
-	if err != nil {
-		t.Fatalf("SplitBody without md5: %v", err)
-	}
-	if without.MD5 != nil {
-		t.Errorf("Body.MD5 = %x, want nil", without.MD5)
-	}
+	require.NoError(t, err, "SplitBody without md5")
+	assert.Nil(t, without.MD5, "Body.MD5")
 	wantMD5 := md5.Sum(data)
-	if !bytes.Equal(with.MD5, wantMD5[:]) {
-		t.Errorf("default Body.MD5 mismatch")
-	}
-	if !bytes.Equal(with.BLAKE3, without.BLAKE3) || with.Size != without.Size || len(withBlobs) != len(withoutBlobs) {
-		t.Fatalf("split differs without md5: %+v vs %+v", with, without)
-	}
+	assert.Equal(t, wantMD5[:], with.MD5, "default Body.MD5 mismatch")
+	require.Equal(t, without.BLAKE3, with.BLAKE3, "split differs without md5: %+v vs %+v", with, without)
+	require.Equal(t, without.Size, with.Size, "split differs without md5: %+v vs %+v", with, without)
+	require.Len(t, withBlobs, len(withoutBlobs), "split differs without md5: %+v vs %+v", with, without)
 	for i := range withBlobs {
-		if !bytes.Equal(withBlobs[i].Digest, withoutBlobs[i].Digest) || withBlobs[i].Start != withoutBlobs[i].Start || withBlobs[i].End != withoutBlobs[i].End {
-			t.Fatalf("blob %d differs without md5", i)
-		}
+		require.True(t, bytes.Equal(withBlobs[i].Digest, withoutBlobs[i].Digest), "blob %d differs without md5", i)
+		require.Equal(t, withoutBlobs[i].Start, withBlobs[i].Start, "blob %d differs without md5", i)
+		require.Equal(t, withoutBlobs[i].End, withBlobs[i].End, "blob %d differs without md5", i)
 	}
 }
 
@@ -288,16 +241,12 @@ func TestMD5Writer(t *testing.T) {
 	defer w.Sum()
 	for i := 0; i < len(data); i += 33 * 1024 {
 		end := min(i+33*1024, len(data))
-		if _, err := w.Write(data[i:end]); err != nil {
-			t.Fatal(err)
-		}
+		_, err := w.Write(data[i:end])
+		require.NoError(t, err)
 	}
-	if got := w.Sum(); !bytes.Equal(got, want[:]) {
-		t.Fatalf("MD5Writer = %x, want %x", got, want)
-	}
-	if got := w.Sum(); !bytes.Equal(got, want[:]) {
-		t.Fatalf("second Sum = %x, want %x", got, want)
-	}
+	got := w.Sum()
+	require.Equal(t, want[:], got, "MD5Writer")
+	require.Equal(t, want[:], w.Sum(), "second Sum")
 }
 
 // BenchmarkSplitBodyNoMD5 is BenchmarkSplitBody with the md5 pass off: the
@@ -309,9 +258,8 @@ func BenchmarkSplitBodyNoMD5(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		if _, _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0, WithoutMD5()); err != nil {
-			b.Fatal(err)
-		}
+		_, _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0, WithoutMD5())
+		require.NoError(b, err)
 	}
 }
 
@@ -339,20 +287,12 @@ func TestPlainOpenerAsksForTheRange(t *testing.T) {
 	data := bytes.Repeat([]byte("plaintext blob "), 1000)
 	rr := &rangeRecordingReader{data: data}
 	d, err := mh.Sum(data, mh.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash: %v", err)
-	}
+	require.NoError(t, err, "multihash")
 	blobs := BlobRefs{{Digest: d, Start: 0, End: int64(len(data)) - 1}}
 	start, end := int64(len(data))-20, int64(len(data))-1
 
 	got, err := io.ReadAll(OpenBodyRange(context.Background(), NewPlainOpener(rr), did.Undef, blobs, start, end))
-	if err != nil {
-		t.Fatalf("read range: %v", err)
-	}
-	if !bytes.Equal(got, data[start:end+1]) {
-		t.Fatalf("range read %q, want %q", got, data[start:end+1])
-	}
-	if want := [][2]int64{{start, end}}; len(rr.ranges) != 1 || rr.ranges[0] != want[0] {
-		t.Fatalf("ranges asked of the reader = %v, want %v", rr.ranges, want)
-	}
+	require.NoError(t, err, "read range")
+	require.Equal(t, data[start:end+1], got, "range read")
+	require.Equal(t, [][2]int64{{start, end}}, rr.ranges, "ranges asked of the reader")
 }

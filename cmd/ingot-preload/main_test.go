@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/fil-forge/ingot/internal/preload"
+	"github.com/stretchr/testify/require"
 )
 
 // isolateAWS points the SDK at no shared config and placeholder credentials.
@@ -53,35 +54,25 @@ func TestLoadCommand(t *testing.T) {
 		"--buckets", "2", "--until", "7",
 		"--state", state, "--metrics", metrics,
 	})
-	if err := cmd.ExecuteContext(t.Context()); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, cmd.ExecuteContext(t.Context()))
 
 	// Two bucket creates, two encryption settings, seven objects each.
-	if puts["PUT preload-000"] != 9 || puts["PUT preload-001"] != 9 {
-		t.Fatalf("requests %v", puts)
-	}
+	require.Equal(t, 9, puts["PUT preload-000"], "requests %v", puts)
+	require.Equal(t, 9, puts["PUT preload-001"], "requests %v", puts)
 	st, err := preload.ReadState(state, "preload", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if b := st.Buckets["preload-001"]; b == nil || !b.Ready || b.Bulk != 7 {
-		t.Fatalf("state %+v", st.Buckets)
-	}
+	require.NoError(t, err)
+	b := st.Buckets["preload-001"]
+	require.NotNil(t, b, "state %+v", st.Buckets)
+	require.True(t, b.Ready, "state %+v", st.Buckets)
+	require.Equal(t, uint64(7), b.Bulk, "state %+v", st.Buckets)
 	raw, err := os.ReadFile(metrics)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	var last preload.Report
-	if err := json.Unmarshal(bytes.TrimSpace(raw), &last); err != nil {
-		t.Fatalf("metrics %q: %v", raw, err)
-	}
-	if !last.Final || last.Total.Written != 14 {
-		t.Fatalf("final report %+v", last)
-	}
-	if !strings.Contains(out.String(), "14 written") || !strings.Contains(out.String(), "(final)") {
-		t.Fatalf("progress %q", out.String())
-	}
+	require.NoError(t, json.Unmarshal(bytes.TrimSpace(raw), &last), "metrics %q", raw)
+	require.True(t, last.Final, "final report %+v", last)
+	require.Equal(t, uint64(14), last.Total.Written, "final report %+v", last)
+	require.Contains(t, out.String(), "14 written", "progress")
+	require.Contains(t, out.String(), "(final)", "progress")
 }
 
 // keyServer keeps the keys PUT to it, empty: enough for a load and for
@@ -132,41 +123,33 @@ func TestValidateCommand(t *testing.T) {
 		err := cmd.ExecuteContext(t.Context())
 		return out.String(), err
 	}
-	if _, err := run("load", "--until", "6", "--metrics", ""); err != nil {
-		t.Fatal(err)
-	}
+	_, err := run("load", "--until", "6", "--metrics", "")
+	require.NoError(t, err)
 	validate := func(label string) (string, error) {
 		return run("validate", "--label", label, "--steps", "head,write", "--samples", "6",
 			"--write-real", "2", "--real-min-mib", "1", "--real-max-mib", "1", "--report", report)
 	}
-	if out, err := validate("all-there"); err != nil || !strings.Contains(out, "steps finished: head,write. Buckets: 1, holding 6 to 6 bulk objects each. Failed or wrong: 0.") {
-		t.Fatalf("validate: %v\n%s", err, out)
-	}
+	out, err := validate("all-there")
+	require.NoError(t, err, "validate:\n%s", out)
+	require.Contains(t, out, "steps finished: head,write. Buckets: 1, holding 6 to 6 bulk objects each. Failed or wrong: 0.", "validate")
 	srv.mu.Lock()
 	srv.missing["preload-000/"+preload.BulkKey("", "preload", "preload-000", 4)] = true
 	srv.mu.Unlock()
-	out, err := validate("one-missing")
-	if err == nil || !strings.Contains(out, "Failed or wrong: 1.") || !strings.Contains(out, "StatusCode: 404") {
-		t.Fatalf("validate with a missing object: %v\n%s", err, out)
-	}
+	out, err = validate("one-missing")
+	require.Error(t, err, "validate with a missing object: %v\n%s", err, out)
+	require.Contains(t, out, "Failed or wrong: 1.", "validate with a missing object: %v\n%s", err, out)
+	require.Contains(t, out, "StatusCode: 404", "validate with a missing object: %v\n%s", err, out)
 
 	raw, err := os.ReadFile(report)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("report %q", raw)
-	}
+	require.Len(t, lines, 2, "report %q", raw)
 	var last preload.ValidateReport
-	if err := json.Unmarshal([]byte(lines[1]), &last); err != nil {
-		t.Fatal(err)
-	}
-	if last.Label != "one-missing" || last.Failures != 1 || last.Latency[preload.OpPut].Count != 6 ||
-		last.Latency[preload.OpPutReal].Count != 2 || last.Latency[preload.OpDeleteReal].Count != 2 {
-		t.Fatalf("report %+v", last)
-	}
-	if len(srv.keys) != 6 {
-		t.Fatalf("%d keys left, want the load's 6", len(srv.keys))
-	}
+	require.NoError(t, json.Unmarshal([]byte(lines[1]), &last))
+	require.Equal(t, "one-missing", last.Label, "report %+v", last)
+	require.Equal(t, uint64(1), last.Failures, "report %+v", last)
+	require.Equal(t, uint64(6), last.Latency[preload.OpPut].Count, "report %+v", last)
+	require.Equal(t, uint64(2), last.Latency[preload.OpPutReal].Count, "report %+v", last)
+	require.Equal(t, uint64(2), last.Latency[preload.OpDeleteReal].Count, "report %+v", last)
+	require.Len(t, srv.keys, 6, "%d keys left", len(srv.keys))
 }

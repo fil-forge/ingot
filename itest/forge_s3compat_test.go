@@ -17,6 +17,7 @@ import (
 	"github.com/cloud-portable/s3tests/packages/go/report"
 	"github.com/cloud-portable/s3tests/packages/go/report/gotest"
 	"github.com/cloud-portable/s3tests/packages/go/report/html"
+	"github.com/stretchr/testify/require"
 )
 
 // TestForgeS3Compat runs the cloud-portable S3 compatibility corpus (via the
@@ -55,9 +56,10 @@ func TestForgeS3Compat(t *testing.T) {
 
 	concurrency := 4
 	if v := os.Getenv("INGOT_S3COMPAT_CONCURRENCY"); v != "" {
-		if n, err := fmt.Sscanf(v, "%d", &concurrency); n != 1 || err != nil || concurrency < 1 {
-			t.Fatalf("INGOT_S3COMPAT_CONCURRENCY = %q, want a positive integer", v)
-		}
+		n, err := fmt.Sscanf(v, "%d", &concurrency)
+		require.Equal(t, 1, n, "INGOT_S3COMPAT_CONCURRENCY")
+		require.NoError(t, err, "INGOT_S3COMPAT_CONCURRENCY")
+		require.GreaterOrEqual(t, concurrency, 1, "INGOT_S3COMPAT_CONCURRENCY")
 	}
 
 	runner, err := s3tests.New(s3tests.Config{
@@ -82,14 +84,10 @@ func TestForgeS3Compat(t *testing.T) {
 			return s3tests.Credential{AccessKeyID: ak, SecretAccessKey: sk}, nil
 		},
 	})
-	if err != nil {
-		t.Fatalf("s3tests.New: %v", err)
-	}
+	require.NoError(t, err, "s3tests.New")
 
 	vectors, err := s3tests.Vectors()
-	if err != nil {
-		t.Fatalf("load corpus vectors: %v", err)
-	}
+	require.NoError(t, err, "load corpus vectors")
 	var filters []s3tests.FilterFunc
 	properties := map[string]string{}
 	if groups := os.Getenv("INGOT_S3COMPAT_GROUPS"); groups != "" {
@@ -101,22 +99,16 @@ func TestForgeS3Compat(t *testing.T) {
 		properties["tags"] = tags
 	}
 	selected := s3tests.ApplyFilters(vectors, filters...)
-	if len(selected) == 0 {
-		t.Fatalf("no vectors selected (groups=%q tags=%q)", os.Getenv("INGOT_S3COMPAT_GROUPS"), os.Getenv("INGOT_S3COMPAT_TAGS"))
-	}
+	require.NotEmpty(t, selected, "no vectors selected (groups=%q tags=%q)", os.Getenv("INGOT_S3COMPAT_GROUPS"), os.Getenv("INGOT_S3COMPAT_TAGS"))
 
 	outPath := os.Getenv("INGOT_S3COMPAT_OUT")
 	if outPath == "" {
 		outPath = "ingot-s3compat.html"
 	}
 	abs, err := filepath.Abs(outPath)
-	if err != nil {
-		t.Fatalf("resolve output path %q: %v", outPath, err)
-	}
+	require.NoError(t, err, "resolve output path %q", outPath)
 	f, err := os.Create(outPath)
-	if err != nil {
-		t.Fatalf("create report %q: %v", outPath, err)
-	}
+	require.NoError(t, err, "create report %q", outPath)
 	defer func() { _ = f.Close() }()
 
 	t.Logf("running %d vectors (corpus %s) against %s → %s", len(selected), runner.CorpusVersion(), endpoint, abs)
@@ -227,14 +219,12 @@ func TestForgeS3Compat(t *testing.T) {
 		}
 	})
 
-	if err := html.Write(f, slices.Values(collected), report.Meta{
+	require.NoError(t, html.Write(f, slices.Values(collected), report.Meta{
 		CorpusVersion: runner.CorpusVersion(),
 		Target:        "Ingot (smelt forge stack)",
 		Properties:    properties,
 		GeneratedAt:   time.Now(),
-	}); err != nil {
-		t.Fatalf("write HTML report: %v", err)
-	}
+	}), "write HTML report")
 
 	counts := map[s3tests.Outcome]int{}
 	for _, v := range collected {

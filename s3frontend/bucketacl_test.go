@@ -5,6 +5,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestUnsupportedBucketACL(t *testing.T) {
@@ -25,9 +26,8 @@ func TestUnsupportedBucketACL(t *testing.T) {
 		{"empty grant pointer is ignored", &s3.CreateBucketInput{GrantRead: str("")}, false},
 	}
 	for _, c := range cases {
-		if got := unsupportedBucketACL(c.in); got != c.want {
-			t.Errorf("%s: unsupportedBucketACL = %v, want %v", c.name, got, c.want)
-		}
+		got := unsupportedBucketACL(c.in)
+		assert.Equal(t, c.want, got, "%s: unsupportedBucketACL", c.name)
 	}
 }
 
@@ -48,8 +48,7 @@ func TestUnsupportedObjectACL(t *testing.T) {
 		{"grant plus no acl", "", []*string{nil, str("id=abc")}, true},
 	}
 	for _, c := range cases {
-		if got := unsupportedObjectACL(c.acl, c.grant...); got != c.want {
-			t.Errorf("%s: unsupportedObjectACL = %v, want %v", c.name, got, c.want)
-		}
+		got := unsupportedObjectACL(c.acl, c.grant...)
+		assert.Equal(t, c.want, got, "%s: unsupportedObjectACL", c.name)
 	}
 }

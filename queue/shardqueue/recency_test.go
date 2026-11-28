@@ -3,6 +3,8 @@ package shardqueue
 import (
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestRecencyMapDropsLeastRecentlyTouched(t *testing.T) {
@@ -15,7 +17,5 @@ func TestRecencyMapDropsLeastRecentlyTouched(t *testing.T) {
 	_, hasA := m.get("a")
 	_, hasB := m.get("b")
 	_, hasC := m.get("c")
-	if got := [3]bool{hasA, hasB, hasC}; got != [3]bool{true, false, true} {
-		t.Fatalf("remembered [a b c] = %v, want [true false true]", got)
-	}
+	require.Equal(t, [3]bool{true, false, true}, [3]bool{hasA, hasB, hasC}, "remembered [a b c]")
 }

@@ -102,7 +102,7 @@ func serveS3API(t *testing.T, api *s3api.S3ApiServer) string {
 		case err := <-serveErr:
 			require.NoError(t, err, "s3api serve")
 		case <-time.After(5 * time.Second):
-			t.Fatal("s3api did not stop")
+			require.FailNow(t, "s3api did not stop")
 		}
 	})
 	waitListening(t, addr)
@@ -131,5 +131,5 @@ func waitListening(t *testing.T, addr string) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("s3api never listened on %s", addr)
+	require.FailNow(t, "s3api never listened", "addr %s", addr)
 }

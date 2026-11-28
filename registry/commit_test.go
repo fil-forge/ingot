@@ -6,10 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/multiformats/go-multihash"
 	"sync/atomic"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/queue/spaceshardqueue"
 	"github.com/fil-forge/ingot/registry"
@@ -31,14 +33,10 @@ func commit(t *testing.T, st registry.Registry, bucket string, space did.DID, c 
 	ctx := context.Background()
 	s, err := st.Get(ctx, bucket)
 	if errors.Is(err, registry.ErrNotFound) {
-		if err := st.Create(ctx, bucket, space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-			t.Fatalf("Create %q: %v", bucket, err)
-		}
+		require.NoError(t, st.Create(ctx, bucket, space, registry.CreateState{Tenant: testutil.RandomDID(t)}), "Create %q", bucket)
 		s, err = st.Get(ctx, bucket)
 	}
-	if err != nil {
-		t.Fatalf("Get %q: %v", bucket, err)
-	}
+	require.NoError(t, err, "Get %q", bucket)
 	return st.(*registry.Postgres).CommitRoot(ctx, bucket, s.Root, liveCid(t, fmt.Sprintf("commit-%d", commitSeq.Add(1))), c)
 }
 
@@ -50,17 +48,13 @@ func claim(t *testing.T, st registry.Registry, c registry.BlobClaim) error {
 
 func mustClaim(t *testing.T, st registry.Registry, c registry.BlobClaim) {
 	t.Helper()
-	if err := claim(t, st, c); err != nil {
-		t.Fatalf("claim %x in %s/%s: %v", c.Digest, c.Bucket, c.ObjectKey, err)
-	}
+	require.NoError(t, claim(t, st, c), "claim %x in %s/%s", c.Digest, c.Bucket, c.ObjectKey)
 }
 
 // drop commits the removal of one claim.
 func drop(t *testing.T, st registry.Registry, d registry.ClaimDrop) {
 	t.Helper()
-	if err := commit(t, st, d.Bucket, d.Space, registry.RootCommit{Drops: []registry.ClaimDrop{d}}); err != nil {
-		t.Fatalf("drop %x in %s/%s: %v", d.Digest, d.Bucket, d.ObjectKey, err)
-	}
+	require.NoError(t, commit(t, st, d.Bucket, d.Space, registry.RootCommit{Drops: []registry.ClaimDrop{d}}), "drop %x in %s/%s", d.Digest, d.Bucket, d.ObjectKey)
 }
 
 // queuedRelease is a pending release, as a test reads it.
@@ -73,18 +67,14 @@ type queuedRelease struct {
 func mustListReleases(t *testing.T, pool *pgxpool.Pool, space did.DID) []queuedRelease {
 	t.Helper()
 	tasks, err := taskrunnertest.Tasks(context.Background(), pool, "ingot", spaceshardqueue.Name)
-	if err != nil {
-		t.Fatalf("list releases: %v", err)
-	}
+	require.NoError(t, err, "list releases")
 	var out []queuedRelease
 	for _, q := range tasks {
 		if q.Action != spaceshardqueue.ReleaseAction || q.State != "pending" {
 			continue
 		}
 		sp, d, err := spaceshardqueue.ParseSubject(q.Subject)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		if sp != space {
 			continue
 		}

@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/stretchr/testify/require"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
@@ -19,9 +20,7 @@ import (
 func collectTransferMetrics(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("collect: %v", err)
-	}
+	require.NoError(t, reader.Collect(context.Background(), &rm), "collect")
 	got := map[string]int64{}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
@@ -30,8 +29,8 @@ func collectTransferMetrics(t *testing.T, reader *sdkmetric.ManualReader) map[st
 				continue
 			}
 			for _, dp := range d.DataPoints {
-				if strings.HasPrefix(m.Name, "ingot.s3.") && dp.Attributes.Len() > 0 {
-					t.Fatalf("%s carries attributes %v, want none", m.Name, dp.Attributes.ToSlice())
+				if strings.HasPrefix(m.Name, "ingot.s3.") {
+					require.Empty(t, dp.Attributes.ToSlice(), "%s carries attributes", m.Name)
 				}
 				got[m.Name] = dp.Value
 			}
@@ -50,46 +49,34 @@ func TestTransferMetrics(t *testing.T) {
 
 	bucket, key := sweepBucket, "obj"
 	body := bytes.Repeat([]byte{'a'}, 1000)
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body), ContentLength: byteLen(body)}); err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
-	if got := collectTransferMetrics(t, reader); got["ingot.s3.object_ingress_bytes"] != 1000 || got["ingot.s3.object_egress_bytes"] != 0 {
-		t.Fatalf("after PutObject: %v, want 1000 bytes in and none out", got)
-	}
+	_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body), ContentLength: byteLen(body)})
+	require.NoError(t, err, "PutObject")
+	got := collectTransferMetrics(t, reader)
+	require.Equal(t, int64(1000), got["ingot.s3.object_ingress_bytes"], "after PutObject: ingress")
+	require.Zero(t, got["ingot.s3.object_egress_bytes"], "after PutObject: egress")
 
 	var sent int64
 	get := func(rng string, read int64) {
 		t.Helper()
 		out, err := b.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &key, Range: backend.GetPtrFromString(rng)})
-		if err != nil {
-			t.Fatalf("GetObject %q: %v", rng, err)
-		}
-		if _, err := io.CopyN(io.Discard, out.Body, read); err != nil {
-			t.Fatalf("read %q: %v", rng, err)
-		}
-		if got := collectTransferMetrics(t, reader)["ingot.s3.object_egress_bytes"]; got != sent {
-			t.Fatalf("egress before Close of %q = %d, want %d", rng, got, sent)
-		}
+		require.NoError(t, err, "GetObject %q", rng)
+		_, err = io.CopyN(io.Discard, out.Body, read)
+		require.NoError(t, err, "read %q", rng)
+		got := collectTransferMetrics(t, reader)["ingot.s3.object_egress_bytes"]
+		require.Equal(t, sent, got, "egress before Close of %q", rng)
 		sent += read
-		if err := out.Body.Close(); err != nil {
-			t.Fatalf("close %q: %v", rng, err)
-		}
-		if err := out.Body.Close(); err != nil {
-			t.Fatalf("second close %q: %v", rng, err)
-		}
+		require.NoError(t, out.Body.Close(), "close %q", rng)
+		require.NoError(t, out.Body.Close(), "second close %q", rng)
 	}
 
 	get("", 1000)
 	get("bytes=0-99", 100)
 	get("", 10) // the client went away after 10 bytes
-	got := collectTransferMetrics(t, reader)
-	if got["ingot.s3.object_egress_bytes"] != 1110 {
-		t.Fatalf("after GetObjects: %v, want 1110 bytes out", got)
-	}
+	got = collectTransferMetrics(t, reader)
+	require.Equal(t, int64(1110), got["ingot.s3.object_egress_bytes"], "after GetObjects: egress")
 
 	uploadID := mpCreate(t, b, "mp", "", "")
 	uploadDistinctParts(t, b, "mp", uploadID, 1)
-	if got := collectTransferMetrics(t, reader); got["ingot.s3.object_ingress_bytes"] != 1000+backend.MinPartSize {
-		t.Fatalf("after UploadPart: ingress = %d, want %d", got["ingot.s3.object_ingress_bytes"], 1000+backend.MinPartSize)
-	}
+	got = collectTransferMetrics(t, reader)
+	require.Equal(t, int64(1000+backend.MinPartSize), got["ingot.s3.object_ingress_bytes"], "after UploadPart: ingress")
 }

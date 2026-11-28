@@ -8,6 +8,7 @@ import (
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3log"
 	"github.com/gofiber/fiber/v3"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -25,34 +26,25 @@ func logAuditError(t *testing.T, err error) []observer.LoggedEntry {
 		audit.Log(c, err, nil, s3log.LogMeta{Action: "GetObject"})
 		return nil
 	})
-	if _, terr := app.Test(httptest.NewRequest("GET", "/bucket/key", nil)); terr != nil {
-		t.Fatalf("app.Test: %v", terr)
-	}
+	_, terr := app.Test(httptest.NewRequest("GET", "/bucket/key", nil))
+	require.NoError(t, terr, "app.Test")
 	return recorded.All()
 }
 
 func TestAuditLogger_LogsUnexpectedError(t *testing.T) {
 	entries := logAuditError(t, errors.New("hilt: authorize: connection refused"))
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 log entry, got %d: %v", len(entries), entries)
-	}
-	if got := entries[0].ContextMap()["error"]; got != "hilt: authorize: connection refused" {
-		t.Fatalf("expected the error on the entry, got %v", got)
-	}
+	require.Len(t, entries, 1)
+	require.Equal(t, "hilt: authorize: connection refused", entries[0].ContextMap()["error"], "the error on the entry")
 }
 
 // The S3 error table is an expected outcome the response already carries, so
 // it must not reach the log.
 func TestAuditLogger_SkipsS3Errors(t *testing.T) {
 	entries := logAuditError(t, s3err.GetAPIError(s3err.ErrNoSuchKey))
-	if len(entries) != 0 {
-		t.Fatalf("expected no log entries, got %v", entries)
-	}
+	require.Empty(t, entries)
 }
 
 func TestAuditLogger_SkipsSuccess(t *testing.T) {
 	entries := logAuditError(t, nil)
-	if len(entries) != 0 {
-		t.Fatalf("expected no log entries, got %v", entries)
-	}
+	require.Empty(t, entries)
 }

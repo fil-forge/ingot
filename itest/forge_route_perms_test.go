@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/stretchr/testify/require"
 )
 
 // TestForgeRoutePermissions proves, through the real hilt, that a request
@@ -36,21 +37,17 @@ func TestForgeRoutePermissions(t *testing.T) {
 	const tenant, bucket = "route-perms", "versioned"
 	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, tenant)
 	full := sdkClient(forgeS3Conf(endpoint, accessKey, secretKey))
-	if _, err := full.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		t.Fatalf("CreateBucket: %v", err)
-	}
-	if _, err := full.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+	_, err := full.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+	require.NoError(t, err, "CreateBucket")
+	_, err = full.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
 		Bucket:                  aws.String(bucket),
 		VersioningConfiguration: &types.VersioningConfiguration{Status: types.BucketVersioningStatusEnabled},
-	}); err != nil {
-		t.Fatalf("PutBucketVersioning with the permission: %v", err)
-	}
+	})
+	require.NoError(t, err, "PutBucketVersioning with the permission")
 	put := func(key string) string {
 		t.Helper()
 		out, err := full.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(patternBytes(1 << 10))})
-		if err != nil {
-			t.Fatalf("PutObject %q: %v", key, err)
-		}
+		require.NoError(t, err, "PutObject %q", key)
 		return aws.ToString(out.VersionId)
 	}
 	client := func(name string, permissions []string) *s3.Client {
@@ -60,9 +57,9 @@ func TestForgeRoutePermissions(t *testing.T) {
 	denied := func(t *testing.T, what string, do func() error) {
 		t.Helper()
 		for attempt := 1; attempt <= 2; attempt++ {
-			if code, status := apiErrorOf(t, do()); code != "AccessDenied" || status != http.StatusForbidden {
-				t.Fatalf("%s (attempt %d): %s/%d, want AccessDenied/403", what, attempt, code, status)
-			}
+			code, status := apiErrorOf(t, do())
+			require.Equal(t, "AccessDenied", code, "%s (attempt %d): %s/%d", what, attempt, code, status)
+			require.Equal(t, http.StatusForbidden, status, "%s (attempt %d): %s/%d", what, attempt, code, status)
 		}
 	}
 	deleteObjects := func(c *s3.Client, ids ...types.ObjectIdentifier) (*s3.DeleteObjectsOutput, error) {
@@ -71,9 +68,8 @@ func TestForgeRoutePermissions(t *testing.T) {
 
 	t.Run("bucket create does not reach an existing bucket", func(t *testing.T) {
 		creator := client("creator", []string{"s3:CreateBucket", "s3:ListAllMyBuckets"})
-		if _, err := creator.ListBuckets(ctx, &s3.ListBucketsInput{}); err != nil {
-			t.Fatalf("ListBuckets: %v", err)
-		}
+		_, err := creator.ListBuckets(ctx, &s3.ListBucketsInput{})
+		require.NoError(t, err, "ListBuckets")
 		denied(t, "create-only key suspending versioning", func() error {
 			_, err := creator.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
 				Bucket:                  aws.String(bucket),
@@ -94,9 +90,8 @@ func TestForgeRoutePermissions(t *testing.T) {
 		if _, err := reader.GetBucketCors(ctx, &s3.GetBucketCorsInput{Bucket: aws.String(bucket)}); err != nil {
 			// The gateway-wide document, or NoSuchCORSConfiguration when the
 			// stack runs without one: either way the read was authorized.
-			if code, _ := apiErrorOf(t, err); code != "NoSuchCORSConfiguration" {
-				t.Fatalf("GetBucketCors with the read permission: %v", err)
-			}
+			code, _ := apiErrorOf(t, err)
+			require.Equal(t, "NoSuchCORSConfiguration", code, "GetBucketCors with the read permission: %v", err)
 		}
 		rule := types.CORSRule{AllowedOrigins: []string{"https://app.example"}, AllowedMethods: []string{"GET"}}
 		denied(t, "read-only key writing CORS", func() error {
@@ -110,14 +105,12 @@ func TestForgeRoutePermissions(t *testing.T) {
 			return err
 		})
 		writer := client("cors-writer", []string{"s3:PutBucketCORS"})
-		if _, err := writer.PutBucketCors(ctx, &s3.PutBucketCorsInput{
+		_, err := writer.PutBucketCors(ctx, &s3.PutBucketCorsInput{
 			Bucket: aws.String(bucket), CORSConfiguration: &types.CORSConfiguration{CORSRules: []types.CORSRule{rule}},
-		}); err != nil {
-			t.Fatalf("PutBucketCors with the write permission: %v", err)
-		}
-		if _, err := writer.DeleteBucketCors(ctx, &s3.DeleteBucketCorsInput{Bucket: aws.String(bucket)}); err != nil {
-			t.Fatalf("DeleteBucketCors with the write permission: %v", err)
-		}
+		})
+		require.NoError(t, err, "PutBucketCors with the write permission")
+		_, err = writer.DeleteBucketCors(ctx, &s3.DeleteBucketCorsInput{Bucket: aws.String(bucket)})
+		require.NoError(t, err, "DeleteBucketCors with the write permission")
 	})
 
 	t.Run("an entry naming a version needs the version permission", func(t *testing.T) {
@@ -127,9 +120,8 @@ func TestForgeRoutePermissions(t *testing.T) {
 		put("marked")
 		// An allowed request first, so the key's action set and chains are
 		// cached and the second denial below runs against them.
-		if _, err := deleteObjects(deleter, types.ObjectIdentifier{Key: aws.String("probe")}); err != nil {
-			t.Fatalf("priming DeleteObjects with s3:DeleteObject: %v", err)
-		}
+		_, err := deleteObjects(deleter, types.ObjectIdentifier{Key: aws.String("probe")})
+		require.NoError(t, err, "priming DeleteObjects with s3:DeleteObject")
 
 		// The mixed batch is refused as a whole, once through hilt and once
 		// against the caches, with nothing in it deleted.
@@ -140,29 +132,24 @@ func TestForgeRoutePermissions(t *testing.T) {
 			)
 			return err
 		})
-		if _, err := full.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("kept"), VersionId: aws.String(v1)}); err != nil {
-			t.Fatalf("refused version is gone: %v", err)
-		}
-		if _, err := full.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("marked")}); err != nil {
-			t.Fatalf("\"marked\" was deleted by a refused batch: %v", err)
-		}
+		_, err = full.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("kept"), VersionId: aws.String(v1)})
+		require.NoError(t, err, "refused version is gone")
+		_, err = full.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("marked")})
+		require.NoError(t, err, "\"marked\" was deleted by a refused batch")
 
 		// The plain batch is authorized on s3:DeleteObject alone.
 		out, err := deleteObjects(deleter, types.ObjectIdentifier{Key: aws.String("marked")})
-		if err != nil {
-			t.Fatalf("DeleteObjects with s3:DeleteObject: %v", err)
-		}
-		if len(out.Errors) != 0 || len(out.Deleted) != 1 || aws.ToString(out.Deleted[0].Key) != "marked" || !aws.ToBool(out.Deleted[0].DeleteMarker) {
-			t.Fatalf("result = deleted %+v, errors %+v; want a delete marker for \"marked\"", out.Deleted, out.Errors)
-		}
+		require.NoError(t, err, "DeleteObjects with s3:DeleteObject")
+		require.Empty(t, out.Errors, "result = deleted %+v, errors %+v; want a delete marker for \"marked\"", out.Deleted, out.Errors)
+		require.Len(t, out.Deleted, 1, "result = deleted %+v, errors %+v; want a delete marker for \"marked\"", out.Deleted, out.Errors)
+		require.Equal(t, "marked", aws.ToString(out.Deleted[0].Key), "result = deleted %+v, errors %+v; want a delete marker for \"marked\"", out.Deleted, out.Errors)
+		require.True(t, aws.ToBool(out.Deleted[0].DeleteMarker), "result = deleted %+v, errors %+v; want a delete marker for \"marked\"", out.Deleted, out.Errors)
 
 		versionDeleter := client("version-deleter", []string{"s3:DeleteObject", "s3:DeleteObjectVersion"})
 		out, err = deleteObjects(versionDeleter, types.ObjectIdentifier{Key: aws.String("kept"), VersionId: aws.String(v1)})
-		if err != nil {
-			t.Fatalf("DeleteObjects with s3:DeleteObjectVersion: %v", err)
-		}
-		if len(out.Errors) != 0 || len(out.Deleted) != 1 || aws.ToString(out.Deleted[0].VersionId) != v1 {
-			t.Fatalf("result = deleted %+v, errors %+v; want version %s deleted", out.Deleted, out.Errors, v1)
-		}
+		require.NoError(t, err, "DeleteObjects with s3:DeleteObjectVersion")
+		require.Empty(t, out.Errors, "result = deleted %+v, errors %+v", out.Deleted, out.Errors)
+		require.Len(t, out.Deleted, 1, "result = deleted %+v, errors %+v", out.Deleted, out.Errors)
+		require.Equal(t, v1, aws.ToString(out.Deleted[0].VersionId), "result = deleted %+v, errors %+v", out.Deleted, out.Errors)
 	})
 }

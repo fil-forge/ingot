@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/internal/reqscope"
@@ -41,9 +42,7 @@ func TestDeleteCapturesShipAuthority(t *testing.T) {
 		Catalog: logstore.PlaneConfig{Ship: false},
 		Logger:  zaptest.NewLogger(t),
 	})
-	if err != nil {
-		t.Fatalf("logstore: %v", err)
-	}
+	require.NoError(t, err, "logstore")
 	t.Cleanup(func() { _ = log.Close(ctx) })
 	ships := &recordingShips{}
 	b, _, _ := newRefTestBackendOver(t, mem, log, 0, func(d *Deps) { d.Ships = ships })
@@ -51,17 +50,12 @@ func TestDeleteCapturesShipAuthority(t *testing.T) {
 
 	store := ucanlib.ProofStore(tokenstore.NewMemStore())
 	bucket, key := "bk", "k"
-	if _, err := b.DeleteObject(context.WithValue(ctx, reqscope.ProofStoreKey(), store),
-		&s3.DeleteObjectInput{Bucket: &bucket, Key: &key}); err != nil {
-		t.Fatalf("DeleteObject: %v", err)
-	}
+	_, err = b.DeleteObject(context.WithValue(ctx, reqscope.ProofStoreKey(), store),
+		&s3.DeleteObjectInput{Bucket: &bucket, Key: &key})
+	require.NoError(t, err, "DeleteObject")
 
 	ships.mu.Lock()
 	defer ships.mu.Unlock()
-	if n := len(ships.stores); n != 2 {
-		t.Fatalf("captured %d times, want 2 (the put's commit and the delete's)", n)
-	}
-	if ships.stores[1] != store {
-		t.Fatal("the delete's commit didn't hand over its request's proof store")
-	}
+	require.Len(t, ships.stores, 2, "captures: want the put's commit and the delete's")
+	require.Same(t, store, ships.stores[1], "the delete's commit didn't hand over its request's proof store")
 }

@@ -8,21 +8,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
 	mh "github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func newTestCache(t *testing.T) *BlobCache {
 	t.Helper()
 	c, err := NewBlobCache(filepath.Join(t.TempDir(), "cache"))
-	if err != nil {
-		t.Fatalf("NewBlobCache: %v", err)
-	}
+	require.NoError(t, err, "NewBlobCache")
 	return c
 }
 
@@ -31,17 +30,12 @@ func newTestCache(t *testing.T) *BlobCache {
 func writeTemp(t *testing.T, c *BlobCache, body string) (*TempBlob, mh.Multihash) {
 	t.Helper()
 	tb, err := c.CreateTemp()
-	if err != nil {
-		t.Fatalf("CreateTemp: %v", err)
-	}
-	if _, err := tb.Write([]byte(body)); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
+	require.NoError(t, err, "CreateTemp")
+	_, err = tb.Write([]byte(body))
+	require.NoError(t, err, "Write")
 	sum := sha256.Sum256([]byte(body))
 	digest, err := mh.Encode(sum[:], mh.SHA2_256)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	return tb, digest
 }
 
@@ -49,9 +43,8 @@ func writeTemp(t *testing.T, c *BlobCache, body string) (*TempBlob, mh.Multihash
 func cacheTestBlob(t *testing.T, c *BlobCache, body string) mh.Multihash {
 	t.Helper()
 	tb, digest := writeTemp(t, c, body)
-	if _, err := c.Adopt(tb, digest); err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
+	_, err := c.Adopt(tb, digest)
+	require.NoError(t, err, "Adopt")
 	return digest
 }
 
@@ -64,23 +57,17 @@ func TestBlobCacheCountsTemporaryFiles(t *testing.T) {
 	discarded, _ := writeTemp(t, c, "gone")
 	midway := [2]int64{c.Usage(), c.InFlight()}
 	n, err := c.Adopt(adopted, d)
-	if err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
+	require.NoError(t, err, "Adopt")
 	discarded.Discard()
 	discarded.Discard()
 	adopted.Discard()
 	entries, err := os.ReadDir(c.dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	got := fmt.Sprint(midway, n, c.Usage(), c.InFlight(), len(entries))
-	if want := fmt.Sprint([2]int64{9, 9}, 5, 5, 0, 1); got != want {
-		t.Fatalf("[usage in-flight] midway, adopted, usage, in flight, files = %s, want %s", got, want)
-	}
-	if _, err := c.Adopt(adopted, d); err == nil {
-		t.Fatal("Adopt of an adopted file: want an error")
-	}
+	want := fmt.Sprint([2]int64{9, 9}, 5, 5, 0, 1)
+	require.Equal(t, want, got, "[usage in-flight] midway, adopted, usage, in flight, files")
+	_, err = c.Adopt(adopted, d)
+	require.Error(t, err, "Adopt of an adopted file")
 }
 
 func TestBlobCacheRemoveReportsFreedBytes(t *testing.T) {
@@ -89,14 +76,11 @@ func TestBlobCacheRemoveReportsFreedBytes(t *testing.T) {
 	var freed []int64
 	for range 2 {
 		n, err := c.Remove(d)
-		if err != nil {
-			t.Fatalf("Remove: %v", err)
-		}
+		require.NoError(t, err, "Remove")
 		freed = append(freed, n)
 	}
-	if freed[0] != 5 || freed[1] != 0 {
-		t.Fatalf("freed = %v, want [5 0]", freed)
-	}
+	require.Equal(t, int64(5), freed[0], "freed")
+	require.Zero(t, freed[1], "freed")
 }
 
 // TestNewBlobCacheReopen: reopening a cache counts the blob files, deletes a
@@ -104,25 +88,15 @@ func TestBlobCacheRemoveReportsFreedBytes(t *testing.T) {
 func TestNewBlobCacheReopen(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "cache")
 	first, err := NewBlobCache(dir)
-	if err != nil {
-		t.Fatalf("NewBlobCache: %v", err)
-	}
+	require.NoError(t, err, "NewBlobCache")
 	cacheTestBlob(t, first, "hello")
 	cacheTestBlob(t, first, "world!")
-	if err := os.WriteFile(filepath.Join(dir, ".tmp-123"), []byte("partial"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(filepath.Join(dir, "lost+found"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "README"), []byte("not a blob"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".tmp-123"), []byte("partial"), 0o644))
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "lost+found"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "README"), []byte("not a blob"), 0o644))
 
 	reopened, err := NewBlobCache(dir)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
+	require.NoError(t, err, "reopen")
 	_, statErr := os.Stat(filepath.Join(dir, ".tmp-123"))
 	got := struct {
 		Usage       int64
@@ -132,9 +106,7 @@ func TestNewBlobCacheReopen(t *testing.T) {
 		Usage       int64
 		TempRemoved bool
 	}{11, true}
-	if got != want {
-		t.Fatalf("reopened cache = %+v, want %+v", got, want)
-	}
+	require.Equal(t, want, got, "reopened cache")
 }
 
 // TestBlobCacheScan: Scan reports blob files and .tmp-* files and leaves the
@@ -142,18 +114,12 @@ func TestNewBlobCacheReopen(t *testing.T) {
 func TestBlobCacheScan(t *testing.T) {
 	c := newTestCache(t)
 	d := cacheTestBlob(t, c, "hello")
-	if err := os.WriteFile(filepath.Join(c.dir, ".tmp-abc"), []byte("partial"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.WriteFile(filepath.Join(c.dir, ".tmp-abc"), []byte("partial"), 0o644))
 	c.usage.Store(999)
 	seen := map[string]bool{}
-	if err := c.Scan(t.Context(), func(f BlobFile) { seen[f.Name] = f.Digest != nil }); err != nil {
-		t.Fatalf("Scan: %v", err)
-	}
+	require.NoError(t, c.Scan(t.Context(), func(f BlobFile) { seen[f.Name] = f.Digest != nil }), "Scan")
 	afterScan := c.Usage()
-	if err := c.count(func(BlobFile) {}); err != nil {
-		t.Fatalf("count: %v", err)
-	}
+	require.NoError(t, c.count(func(BlobFile) {}), "count")
 	got := struct {
 		AfterScan, AfterCount int64
 		Seen                  map[string]bool
@@ -162,17 +128,14 @@ func TestBlobCacheScan(t *testing.T) {
 		AfterScan, AfterCount int64
 		Seen                  map[string]bool
 	}{999, 5, map[string]bool{filepath.Base(c.Path(d)): true, ".tmp-abc": false}}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("Scan = %+v, want %+v", got, want)
-	}
+	require.Equal(t, want, got, "Scan")
 }
 
 func TestBlobCacheRemoveTempRejectsBlobNames(t *testing.T) {
 	c := newTestCache(t)
 	d := cacheTestBlob(t, c, "hello")
-	if _, err := c.RemoveTemp(filepath.Base(c.Path(d))); err == nil {
-		t.Fatal("RemoveTemp of a blob file name succeeded, want an error")
-	}
+	_, err := c.RemoveTemp(filepath.Base(c.Path(d)))
+	require.Error(t, err, "RemoveTemp of a blob file name succeeded, want an error")
 }
 
 // TestBlobCacheRemoveTempLeavesTheCountAlone: RemoveTemp reports the size it
@@ -181,15 +144,11 @@ func TestBlobCacheRemoveTempRejectsBlobNames(t *testing.T) {
 func TestBlobCacheRemoveTempLeavesTheCountAlone(t *testing.T) {
 	c := newTestCache(t)
 	cacheTestBlob(t, c, "hello")
-	if err := os.WriteFile(filepath.Join(c.dir, ".tmp-abc"), []byte("partial"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.WriteFile(filepath.Join(c.dir, ".tmp-abc"), []byte("partial"), 0o644))
 	var freed []int64
 	for range 2 {
 		n, err := c.RemoveTemp(".tmp-abc")
-		if err != nil {
-			t.Fatalf("RemoveTemp: %v", err)
-		}
+		require.NoError(t, err, "RemoveTemp")
 		freed = append(freed, n)
 	}
 	got := struct {
@@ -200,9 +159,7 @@ func TestBlobCacheRemoveTempLeavesTheCountAlone(t *testing.T) {
 		Freed []int64
 		Usage int64
 	}{[]int64{7, 0}, 5}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("RemoveTemp = %+v, want %+v", got, want)
-	}
+	require.Equal(t, want, got, "RemoveTemp")
 }
 
 // TestScanKeepsCountsExact: the hourly scans and corrections racing writes,
@@ -219,13 +176,11 @@ func TestScanKeepsCountsExact(t *testing.T) {
 			defer wg.Done()
 			for i := range 50 {
 				tb, err := c.CreateTemp()
-				if err != nil {
-					t.Errorf("CreateTemp: %v", err)
+				if !assert.NoError(t, err, "CreateTemp") {
 					return
 				}
 				body := fmt.Sprintf("writer %d blob %d", w, i)
-				if _, err := tb.Write([]byte(body)); err != nil {
-					t.Errorf("Write: %v", err)
+				if _, err := tb.Write([]byte(body)); !assert.NoError(t, err, "Write") {
 					return
 				}
 				sum := sha256.Sum256([]byte(body))
@@ -240,8 +195,7 @@ func TestScanKeepsCountsExact(t *testing.T) {
 						_, err = c.Remove(d)
 					}
 				}
-				if err != nil {
-					t.Errorf("adopt or remove: %v", err)
+				if !assert.NoError(t, err, "adopt or remove") {
 					return
 				}
 			}
@@ -265,16 +219,13 @@ func TestScanKeepsCountsExact(t *testing.T) {
 	scans.Wait()
 
 	var total int64
-	if err := c.Scan(ctx, func(f BlobFile) {
+	require.NoError(t, c.Scan(ctx, func(f BlobFile) {
 		if f.Digest != nil {
 			total += f.Size
 		}
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if counted, actual := fmt.Sprint(c.Usage(), c.InFlight()), fmt.Sprint(total, 0); counted != actual {
-		t.Fatalf("usage in-flight counted = %s, on disk = %s", counted, actual)
-	}
+	}))
+	counted, actual := fmt.Sprint(c.Usage(), c.InFlight()), fmt.Sprint(total, 0)
+	require.Equal(t, actual, counted, "usage in-flight counted = %s, on disk = %s", counted, actual)
 }
 
 // TestBlobCacheOnRead: every hit reports its digest to the read hook, and a
@@ -290,9 +241,7 @@ func TestBlobCacheOnRead(t *testing.T) {
 			name: "OpenBlob hit records the read",
 			read: func(t *testing.T, c *BlobCache, d mh.Multihash) {
 				r, err := c.OpenBlob(ctx, did.Undef, d)
-				if err != nil {
-					t.Fatalf("OpenBlob: %v", err)
-				}
+				require.NoError(t, err, "OpenBlob")
 				_ = r.Close()
 			},
 			want: true,
@@ -301,9 +250,7 @@ func TestBlobCacheOnRead(t *testing.T) {
 			name: "OpenBlobRange hit records the read",
 			read: func(t *testing.T, c *BlobCache, d mh.Multihash) {
 				r, err := c.OpenBlobRange(ctx, did.Undef, d, 0, 1)
-				if err != nil {
-					t.Fatalf("OpenBlobRange: %v", err)
-				}
+				require.NoError(t, err, "OpenBlobRange")
 				_ = r.Close()
 			},
 			want: true,
@@ -311,12 +258,10 @@ func TestBlobCacheOnRead(t *testing.T) {
 		{
 			name: "miss records nothing",
 			read: func(t *testing.T, c *BlobCache, d mh.Multihash) {
-				if _, err := c.Remove(d); err != nil {
-					t.Fatalf("Remove: %v", err)
-				}
-				if _, err := c.OpenBlob(ctx, did.Undef, d); !errors.Is(err, ErrNotFound) {
-					t.Fatalf("OpenBlob after remove: %v, want ErrNotFound", err)
-				}
+				_, err := c.Remove(d)
+				require.NoError(t, err, "Remove")
+				_, err = c.OpenBlob(ctx, did.Undef, d)
+				require.ErrorIs(t, err, ErrNotFound, "OpenBlob after remove")
 			},
 			want: false,
 		},
@@ -333,9 +278,8 @@ func TestBlobCacheOnRead(t *testing.T) {
 			c.OnRead(func(_ context.Context, d mh.Multihash) { reads = append(reads, d) })
 			d := cacheTestBlob(t, c, "hello")
 			tc.read(t, c, d)
-			if got := len(reads) == 1 && bytes.Equal(reads[0], d); got != tc.want {
-				t.Fatalf("reported %v, want the digest reported: %v", reads, tc.want)
-			}
+			got := len(reads) == 1 && bytes.Equal(reads[0], d)
+			require.Equal(t, tc.want, got, "reported %v", reads)
 		})
 	}
 }
@@ -345,23 +289,18 @@ func TestBlobCacheOnRead(t *testing.T) {
 func TestBlobCacheTouch(t *testing.T) {
 	c := newTestCache(t)
 	tb, d := writeTemp(t, c, "hello")
-	if ok, err := c.Touch(d, time.Now()); err != nil || ok {
-		t.Fatalf("Touch before Adopt = %v, %v; want false", ok, err)
-	}
-	if _, err := c.Adopt(tb, d); err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
+	ok, err := c.Touch(d, time.Now())
+	require.NoError(t, err, "Touch before Adopt")
+	require.False(t, ok, "Touch before Adopt")
+	_, err = c.Adopt(tb, d)
+	require.NoError(t, err, "Adopt")
 	at := time.Now().Add(-time.Hour).Truncate(time.Second)
-	if ok, err := c.Touch(d, at); err != nil || !ok {
-		t.Fatalf("Touch = %v, %v; want true", ok, err)
-	}
+	ok, err = c.Touch(d, at)
+	require.NoError(t, err, "Touch")
+	require.True(t, ok, "Touch")
 	info, err := os.Stat(c.Path(d))
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
-	if !info.ModTime().Equal(at) {
-		t.Fatalf("modification time = %v, want %v", info.ModTime(), at)
-	}
+	require.NoError(t, err, "stat")
+	require.True(t, info.ModTime().Equal(at), "modification time = %v, want %v", info.ModTime(), at)
 }
 
 // TestScanAndCorrect: a file removed outside the process stays counted until a
@@ -372,9 +311,7 @@ func TestScanAndCorrect(t *testing.T) {
 	c := newTestCache(t)
 	gone := cacheTestBlob(t, c, "removed by hand")
 	cacheTestBlob(t, c, "kept")
-	if err := os.Remove(c.Path(gone)); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Remove(c.Path(gone)))
 	stale := c.Usage()
 
 	var wrote bool
@@ -384,22 +321,16 @@ func TestScanAndCorrect(t *testing.T) {
 			cacheTestBlob(t, c, "written during the scan")
 		}
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	afterOverlap := c.Usage()
 	quiet, err := c.ScanAndCorrect(ctx, func(BlobFile) {})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	removed := int64(len("removed by hand"))
 	written := int64(len("written during the scan"))
 	got := [4]int64{overlapped, afterOverlap, quiet, c.Usage()}
 	want := [4]int64{0, stale + written, removed, stale + written - removed}
-	if got != want {
-		t.Fatalf("[overlapped correction, usage after it, quiet correction, usage after it] = %v, want %v", got, want)
-	}
+	require.Equal(t, want, got, "[overlapped correction, usage after it, quiet correction, usage after it]")
 }
 
 // TestScanAndCorrectSkipsOverlappedRemoves: a removal during the scan stops
@@ -410,24 +341,17 @@ func TestScanAndCorrectSkipsOverlappedRemoves(t *testing.T) {
 	c := newTestCache(t)
 	gone := cacheTestBlob(t, c, "removed by hand")
 	changed := cacheTestBlob(t, c, "changed during the scan")
-	if err := os.Remove(c.Path(gone)); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Remove(c.Path(gone)))
 	var done bool
 	drift, err := c.ScanAndCorrect(ctx, func(BlobFile) {
 		if !done {
 			done = true
-			if _, err := c.Remove(changed); err != nil {
-				t.Errorf("Remove: %v", err)
-			}
+			_, err := c.Remove(changed)
+			assert.NoError(t, err, "Remove")
 		}
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if drift != 0 {
-		t.Fatalf("correction = %d, want none: a change overlapped the scan", drift)
-	}
+	require.NoError(t, err)
+	require.Zero(t, drift, "correction = %d, want none: a change overlapped the scan", drift)
 }
 
 // TestBlobCacheAdoptIntoMissingCacheIsAnError: a rename that fails because
@@ -435,15 +359,10 @@ func TestScanAndCorrectSkipsOverlappedRemoves(t *testing.T) {
 func TestBlobCacheAdoptIntoMissingCacheIsAnError(t *testing.T) {
 	c := newTestCache(t)
 	tb, d := writeTemp(t, c, "hello")
-	if err := os.RemoveAll(c.dir); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := c.Adopt(tb, d); err == nil {
-		t.Fatal("Adopt into a missing cache directory: want an error")
-	}
-	if got := [2]int64{c.Usage(), c.InFlight()}; got != [2]int64{0, 0} {
-		t.Fatalf("[usage, in flight] = %v, want [0 0]", got)
-	}
+	require.NoError(t, os.RemoveAll(c.dir))
+	_, err := c.Adopt(tb, d)
+	require.Error(t, err, "Adopt into a missing cache directory: want an error")
+	require.Equal(t, [2]int64{0, 0}, [2]int64{c.Usage(), c.InFlight()}, "[usage, in flight]")
 }
 
 // TestScanReadsLargeDirectoriesInChunks: a directory with more entries than
@@ -460,12 +379,8 @@ func TestScanReadsLargeDirectoriesInChunks(t *testing.T) {
 	c.usage.Store(0)
 	seen := 0
 	drift, err := c.ScanAndCorrect(ctx, func(BlobFile) { seen++ })
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := [3]int64{int64(seen), drift, c.Usage()}; got != [3]int64{walkChunk + 10, -want, want} {
-		t.Fatalf("[files seen, correction, usage] = %v, want [%d %d %d]", got, walkChunk+10, -want, want)
-	}
+	require.NoError(t, err)
+	require.Equal(t, [3]int64{walkChunk + 10, -want, want}, [3]int64{int64(seen), drift, c.Usage()}, "[files seen, correction, usage]")
 }
 
 // TestBlobCacheAdoptReplacesACachedCopy: the same bytes stored as received
@@ -475,12 +390,9 @@ func TestBlobCacheAdoptReplacesACachedCopy(t *testing.T) {
 	c := newTestCache(t)
 	d := cacheTestBlob(t, c, "hello")
 	again := cacheTestBlob(t, c, "hello")
-	if string(again) != string(d) {
-		t.Fatalf("second write stored under another digest")
-	}
-	if got, want := fmt.Sprint(c.Usage(), c.InFlight()), fmt.Sprint(5, 0); got != want {
-		t.Fatalf("usage in-flight = %s, want %s", got, want)
-	}
+	require.Equal(t, string(d), string(again), "second write stored under another digest")
+	got, want := fmt.Sprint(c.Usage(), c.InFlight()), fmt.Sprint(5, 0)
+	require.Equal(t, want, got, "usage in-flight")
 }
 
 // A closed temporary file holds no descriptor, still counts toward usage, and
@@ -488,34 +400,21 @@ func TestBlobCacheAdoptReplacesACachedCopy(t *testing.T) {
 func TestBlobCacheTempBlobClosesBeforeItEnds(t *testing.T) {
 	c := newTestCache(t)
 	tb, d := writeTemp(t, c, "hello")
-	if err := tb.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if err := tb.Close(); err != nil {
-		t.Fatalf("second Close: %v", err)
-	}
-	if _, err := tb.Write([]byte("more")); err == nil {
-		t.Fatal("Write after Close succeeded")
-	}
-	if got := c.InFlight(); got != 5 {
-		t.Fatalf("in flight after Close = %d, want 5", got)
-	}
-	if n, err := c.Adopt(tb, d); err != nil || n != 5 {
-		t.Fatalf("Adopt after Close = %d, %v; want 5", n, err)
-	}
-	if got, want := fmt.Sprint(c.Usage(), c.InFlight()), fmt.Sprint(5, 0); got != want {
-		t.Fatalf("usage in-flight = %s, want %s", got, want)
-	}
+	require.NoError(t, tb.Close(), "Close")
+	require.NoError(t, tb.Close(), "second Close")
+	_, err := tb.Write([]byte("more"))
+	require.Error(t, err, "Write after Close succeeded")
+	got := c.InFlight()
+	require.Equal(t, int64(5), got, "in flight after Close")
+	n, err := c.Adopt(tb, d)
+	require.NoError(t, err, "Adopt after Close")
+	require.Equal(t, int64(5), n, "Adopt after Close")
+	require.Equal(t, fmt.Sprint(5, 0), fmt.Sprint(c.Usage(), c.InFlight()), "usage in-flight")
 
 	dropped, _ := writeTemp(t, c, "bye")
-	if err := dropped.Close(); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, dropped.Close())
 	dropped.Discard()
-	if _, err := os.Stat(dropped.f.Name()); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("discarded file: %v, want gone", err)
-	}
-	if got := c.InFlight(); got != 0 {
-		t.Fatalf("in flight after Discard = %d, want 0", got)
-	}
+	_, err = os.Stat(dropped.f.Name())
+	require.ErrorIs(t, err, os.ErrNotExist, "discarded file")
+	require.Equal(t, int64(0), c.InFlight(), "in flight after Discard")
 }

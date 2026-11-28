@@ -5,12 +5,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/ucantone/did/web"
 	"github.com/gofiber/fiber/v3"
+	"github.com/stretchr/testify/require"
 )
 
 // TestDIDDocumentHandler serves a did:web agent's document at the well-known
@@ -20,18 +20,12 @@ import (
 // table is) must not shadow it.
 func TestDIDDocumentHandler(t *testing.T) {
 	id, err := identity.New("", "did:web:ingot.test")
-	if err != nil {
-		t.Fatalf("identity.New: %v", err)
-	}
+	require.NoError(t, err, "identity.New")
 	doc, err := id.DIDDocument()
-	if err != nil {
-		t.Fatalf("DIDDocument: %v", err)
-	}
+	require.NoError(t, err, "DIDDocument")
 
 	handler, err := didDocumentHandler(doc)
-	if err != nil {
-		t.Fatalf("didDocumentHandler: %v", err)
-	}
+	require.NoError(t, err, "didDocumentHandler")
 
 	app := fiber.New()
 	app.Get(web.WellKnownDIDPath, handler)
@@ -40,20 +34,13 @@ func TestDIDDocumentHandler(t *testing.T) {
 	})
 
 	res, err := app.Test(httptest.NewRequest(http.MethodGet, web.WellKnownDIDPath, nil))
-	if err != nil {
-		t.Fatalf("GET %s: %v", web.WellKnownDIDPath, err)
-	}
+	require.NoError(t, err, "GET %s", web.WellKnownDIDPath)
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", res.StatusCode)
-	}
-	if ct := res.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
-		t.Fatalf("Content-Type = %q, want application/json", ct)
-	}
+	require.Equal(t, http.StatusOK, res.StatusCode, "status")
+	ct := res.Header.Get("Content-Type")
+	require.Contains(t, ct, "application/json", "Content-Type")
 	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
+	require.NoError(t, err, "read body")
 
 	var got struct {
 		ID                 string `json:"id"`
@@ -65,52 +52,31 @@ func TestDIDDocumentHandler(t *testing.T) {
 		} `json:"verificationMethod"`
 		CapabilityInvocation []string `json:"capabilityInvocation"`
 	}
-	if err := json.Unmarshal(body, &got); err != nil {
-		t.Fatalf("decode document %s: %v", body, err)
-	}
-	if got.ID != "did:web:ingot.test" {
-		t.Fatalf("id = %q, want did:web:ingot.test", got.ID)
-	}
-	if len(got.VerificationMethod) != 1 {
-		t.Fatalf("verificationMethod count = %d, want 1: %s", len(got.VerificationMethod), body)
-	}
+	require.NoError(t, json.Unmarshal(body, &got), "decode document %s", body)
+	require.Equal(t, "did:web:ingot.test", got.ID, "id")
+	require.Len(t, got.VerificationMethod, 1, "verificationMethod count")
 	vm := got.VerificationMethod[0]
-	if vm.ID != "did:web:ingot.test#key-0" {
-		t.Fatalf("verificationMethod id = %q, want did:web:ingot.test#key-0", vm.ID)
-	}
-	if vm.Type != "Multikey" || vm.PublicKeyMultibase == "" {
-		t.Fatalf("verificationMethod = %+v, want a Multikey with publicKeyMultibase", vm)
-	}
-	if vm.Controller != "did:web:ingot.test" {
-		t.Fatalf("verificationMethod controller = %q, want did:web:ingot.test", vm.Controller)
-	}
-	if len(got.CapabilityInvocation) != 1 || got.CapabilityInvocation[0] != vm.ID {
-		t.Fatalf("capabilityInvocation = %v, want [%s]", got.CapabilityInvocation, vm.ID)
-	}
+	require.Equal(t, "did:web:ingot.test#key-0", vm.ID, "verificationMethod id = %q, want did:web:ingot.test#key-0", vm.ID)
+	require.Equal(t, "Multikey", vm.Type, "verificationMethod = %+v, want a Multikey with publicKeyMultibase", vm)
+	require.NotEmpty(t, vm.PublicKeyMultibase, "verificationMethod = %+v, want a Multikey with publicKeyMultibase", vm)
+	require.Equal(t, "did:web:ingot.test", vm.Controller, "verificationMethod controller")
+	require.Len(t, got.CapabilityInvocation, 1, "capabilityInvocation")
+	require.Equal(t, vm.ID, got.CapabilityInvocation[0], "capabilityInvocation")
 
-	if cc := res.Header.Get("Cache-Control"); cc != "max-age=300" {
-		t.Fatalf("Cache-Control = %q, want max-age=300", cc)
-	}
-	if lm := res.Header.Get("Last-Modified"); lm == "" {
-		t.Fatal("Last-Modified is not set")
-	}
+	cc := res.Header.Get("Cache-Control")
+	require.Equal(t, "max-age=300", cc, "Cache-Control")
+	lm := res.Header.Get("Last-Modified")
+	require.NotEmpty(t, lm, "Last-Modified is not set")
 	etag := res.Header.Get("ETag")
-	if etag == "" {
-		t.Fatal("ETag is not set")
-	}
+	require.NotEmpty(t, etag, "ETag is not set")
 
 	// A client that already holds the document gets a 304.
 	req := httptest.NewRequest(http.MethodGet, web.WellKnownDIDPath, nil)
 	req.Header.Set("If-None-Match", etag)
 	res, err = app.Test(req)
-	if err != nil {
-		t.Fatalf("conditional GET %s: %v", web.WellKnownDIDPath, err)
-	}
+	require.NoError(t, err, "conditional GET %s", web.WellKnownDIDPath)
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusNotModified {
-		t.Fatalf("conditional status = %d, want 304", res.StatusCode)
-	}
-	if body, _ := io.ReadAll(res.Body); len(body) != 0 {
-		t.Fatalf("conditional body = %q, want none", body)
-	}
+	require.Equal(t, http.StatusNotModified, res.StatusCode, "conditional status")
+	body, _ = io.ReadAll(res.Body)
+	require.Empty(t, body, "conditional body")
 }

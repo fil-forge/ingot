@@ -3,10 +3,11 @@ package s3frontend
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"testing"
 
 	"github.com/fil-forge/versitygw/s3err"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/queue/bucketqueue"
@@ -48,32 +49,25 @@ func TestMapBucketError(t *testing.T) {
 		{"suspending a locked bucket", bucketqueue.ErrLockedVersioning, s3err.GetAPIError(s3err.ErrSuspendedVersioningNotAllowed)},
 		{"lock without versioning", bucketqueue.ErrLockNeedsVersioning, s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotAllowed)},
 	} {
-		if got := mapBucketError(tc.err, "commit"); !reflect.DeepEqual(got, tc.want) {
-			t.Errorf("%s: %#v, want %#v", tc.name, got, tc.want)
-		}
+		got := mapBucketError(tc.err, "commit")
+		assert.Equal(t, tc.want, got, "%s", tc.name)
 	}
 }
 
 // A superseded reservation and a storage error answer InternalError, and
 // keep their cause for the log and the Complete that checks for it.
 func TestMapBucketErrorWrapsTheRest(t *testing.T) {
-	if err := mapBucketError(nil, "commit"); err != nil {
-		t.Fatalf("no error answered %v", err)
-	}
+	err := mapBucketError(nil, "commit")
+	require.NoError(t, err, "no error answered %v", err)
 	for _, err := range []error{
 		&bucketqueue.ChangeError{Kind: bucketqueue.KindReservationSuperseded},
 		errors.New("disk full"),
 	} {
 		got := mapBucketError(err, "commit")
 		var api s3err.APIError
-		if errors.As(got, &api) {
-			t.Fatalf("%v answered %s, want an internal error", err, api.Code)
-		}
-		if !errors.Is(got, err) {
-			t.Fatalf("%v lost its cause: %v", err, got)
-		}
+		require.False(t, errors.As(got, &api), "%v answered %s, want an internal error", err, api.Code)
+		require.ErrorIs(t, got, err, "%v lost its cause: %v", err, got)
 	}
-	if got := mapBucketError(&bucketqueue.ChangeError{Kind: bucketqueue.KindReservationSuperseded}, "commit"); !errors.Is(got, bucketqueue.ErrReservationSuperseded) {
-		t.Fatalf("a superseded reservation is not ErrReservationSuperseded: %v", got)
-	}
+	got := mapBucketError(&bucketqueue.ChangeError{Kind: bucketqueue.KindReservationSuperseded}, "commit")
+	require.ErrorIs(t, got, bucketqueue.ErrReservationSuperseded, "a superseded reservation is not ErrReservationSuperseded")
 }

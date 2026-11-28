@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/stretchr/testify/require"
 )
 
 func i32(n int32) *int32   { return &n }
@@ -22,18 +23,11 @@ func TestListObjectsV2_ExactFitNotTruncated(t *testing.T) {
 	}
 
 	res, err := b.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bucket, MaxKeys: i32(5)})
-	if err != nil {
-		t.Fatalf("ListObjectsV2: %v", err)
-	}
-	if len(res.Contents) != 5 {
-		t.Fatalf("Contents = %d, want 5", len(res.Contents))
-	}
-	if res.IsTruncated == nil || *res.IsTruncated {
-		t.Fatalf("IsTruncated = %v, want false (exact fit)", res.IsTruncated)
-	}
-	if res.NextContinuationToken != nil {
-		t.Fatalf("NextContinuationToken = %q, want nil", *res.NextContinuationToken)
-	}
+	require.NoError(t, err, "ListObjectsV2")
+	require.Len(t, res.Contents, 5, "Contents")
+	require.NotNil(t, res.IsTruncated, "IsTruncated")
+	require.False(t, *res.IsTruncated, "IsTruncated (exact fit)")
+	require.Nil(t, res.NextContinuationToken, "NextContinuationToken")
 }
 
 // TestListObjectsV2_GenuineTruncationAndResume confirms a real truncation still
@@ -47,28 +41,20 @@ func TestListObjectsV2_GenuineTruncationAndResume(t *testing.T) {
 	}
 
 	res, err := b.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bucket, MaxKeys: i32(4)})
-	if err != nil {
-		t.Fatalf("ListObjectsV2 page1: %v", err)
-	}
-	if len(res.Contents) != 4 || res.IsTruncated == nil || !*res.IsTruncated {
-		t.Fatalf("page1: Contents=%d truncated=%v, want 4/true", len(res.Contents), res.IsTruncated)
-	}
-	if res.NextContinuationToken == nil {
-		t.Fatal("page1 missing NextContinuationToken")
-	}
+	require.NoError(t, err, "ListObjectsV2 page1")
+	require.Len(t, res.Contents, 4, "page1: Contents=%d truncated", len(res.Contents))
+	require.NotNil(t, res.IsTruncated, "page1: Contents=%d truncated", len(res.Contents))
+	require.True(t, *res.IsTruncated, "page1: Contents=%d truncated=%v, want 4/true", len(res.Contents), res.IsTruncated)
+	require.NotNil(t, res.NextContinuationToken, "page1 missing NextContinuationToken")
 
 	res2, err := b.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket: &bucket, MaxKeys: i32(4), ContinuationToken: res.NextContinuationToken,
 	})
-	if err != nil {
-		t.Fatalf("ListObjectsV2 page2: %v", err)
-	}
-	if len(res2.Contents) != 1 || *res2.Contents[0].Key != "k4" {
-		t.Fatalf("page2 Contents = %d (%v), want 1 [k4]", len(res2.Contents), res2.Contents)
-	}
-	if res2.IsTruncated == nil || *res2.IsTruncated {
-		t.Fatalf("page2 IsTruncated = %v, want false", res2.IsTruncated)
-	}
+	require.NoError(t, err, "ListObjectsV2 page2")
+	require.Len(t, res2.Contents, 1, "page2 Contents")
+	require.Equal(t, "k4", *res2.Contents[0].Key, "page2 Contents")
+	require.NotNil(t, res2.IsTruncated, "page2 IsTruncated")
+	require.False(t, *res2.IsTruncated, "page2 IsTruncated")
 }
 
 // TestListObjectsV2_DelimiterExactFit covers the delimiter case where contents
@@ -85,15 +71,11 @@ func TestListObjectsV2_DelimiterExactFit(t *testing.T) {
 	res, err := b.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket: &bucket, Delimiter: str("/"), MaxKeys: i32(3),
 	})
-	if err != nil {
-		t.Fatalf("ListObjectsV2: %v", err)
-	}
-	if len(res.Contents) != 1 || len(res.CommonPrefixes) != 2 {
-		t.Fatalf("Contents=%d CommonPrefixes=%d, want 1/2", len(res.Contents), len(res.CommonPrefixes))
-	}
-	if res.IsTruncated == nil || *res.IsTruncated {
-		t.Fatalf("IsTruncated = %v, want false (exact fit)", res.IsTruncated)
-	}
+	require.NoError(t, err, "ListObjectsV2")
+	require.Len(t, res.Contents, 1, "Contents")
+	require.Len(t, res.CommonPrefixes, 2, "CommonPrefixes")
+	require.NotNil(t, res.IsTruncated, "IsTruncated")
+	require.False(t, *res.IsTruncated, "IsTruncated (exact fit)")
 }
 
 // TestListObjectsV2_DelimiterGenuineTruncation confirms more common prefixes
@@ -109,28 +91,20 @@ func TestListObjectsV2_DelimiterGenuineTruncation(t *testing.T) {
 	res, err := b.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket: &bucket, Delimiter: str("/"), MaxKeys: i32(2),
 	})
-	if err != nil {
-		t.Fatalf("ListObjectsV2 page1: %v", err)
-	}
-	if len(res.CommonPrefixes) != 2 || res.IsTruncated == nil || !*res.IsTruncated {
-		t.Fatalf("page1: CommonPrefixes=%d truncated=%v, want 2/true", len(res.CommonPrefixes), res.IsTruncated)
-	}
-	if res.NextContinuationToken == nil {
-		t.Fatal("page1 missing NextContinuationToken")
-	}
+	require.NoError(t, err, "ListObjectsV2 page1")
+	require.Len(t, res.CommonPrefixes, 2, "page1: CommonPrefixes=%d truncated", len(res.CommonPrefixes))
+	require.NotNil(t, res.IsTruncated, "page1: CommonPrefixes=%d truncated", len(res.CommonPrefixes))
+	require.True(t, *res.IsTruncated, "page1: CommonPrefixes=%d truncated=%v, want 2/true", len(res.CommonPrefixes), res.IsTruncated)
+	require.NotNil(t, res.NextContinuationToken, "page1 missing NextContinuationToken")
 
 	res2, err := b.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket: &bucket, Delimiter: str("/"), MaxKeys: i32(2), ContinuationToken: res.NextContinuationToken,
 	})
-	if err != nil {
-		t.Fatalf("ListObjectsV2 page2: %v", err)
-	}
-	if len(res2.CommonPrefixes) != 1 || *res2.CommonPrefixes[0].Prefix != "p2/" {
-		t.Fatalf("page2 CommonPrefixes = %v, want [p2/]", res2.CommonPrefixes)
-	}
-	if res2.IsTruncated == nil || *res2.IsTruncated {
-		t.Fatalf("page2 IsTruncated = %v, want false", res2.IsTruncated)
-	}
+	require.NoError(t, err, "ListObjectsV2 page2")
+	require.Len(t, res2.CommonPrefixes, 1, "page2 CommonPrefixes")
+	require.Equal(t, "p2/", *res2.CommonPrefixes[0].Prefix, "page2 CommonPrefixes")
+	require.NotNil(t, res2.IsTruncated, "page2 IsTruncated")
+	require.False(t, *res2.IsTruncated, "page2 IsTruncated")
 }
 
 // TestListObjectsV1_DelimiterNextMarker covers V1's delimiter-gated NextMarker
@@ -146,26 +120,19 @@ func TestListObjectsV1_DelimiterNextMarker(t *testing.T) {
 	res, err := b.ListObjects(ctx, &s3.ListObjectsInput{
 		Bucket: &bucket, Delimiter: str("/"), MaxKeys: i32(2),
 	})
-	if err != nil {
-		t.Fatalf("ListObjects page1: %v", err)
-	}
-	if len(res.CommonPrefixes) != 2 || res.IsTruncated == nil || !*res.IsTruncated {
-		t.Fatalf("page1: CommonPrefixes=%d truncated=%v, want 2/true", len(res.CommonPrefixes), res.IsTruncated)
-	}
-	if res.NextMarker == nil || *res.NextMarker != "p1/" {
-		t.Fatalf("NextMarker = %v, want p1/", res.NextMarker)
-	}
+	require.NoError(t, err, "ListObjects page1")
+	require.Len(t, res.CommonPrefixes, 2, "page1: CommonPrefixes=%d truncated", len(res.CommonPrefixes))
+	require.NotNil(t, res.IsTruncated, "page1: CommonPrefixes=%d truncated", len(res.CommonPrefixes))
+	require.True(t, *res.IsTruncated, "page1: CommonPrefixes=%d truncated=%v, want 2/true", len(res.CommonPrefixes), res.IsTruncated)
+	require.NotNil(t, res.NextMarker, "NextMarker")
+	require.Equal(t, "p1/", *res.NextMarker, "NextMarker")
 
 	res2, err := b.ListObjects(ctx, &s3.ListObjectsInput{
 		Bucket: &bucket, Delimiter: str("/"), MaxKeys: i32(2), Marker: res.NextMarker,
 	})
-	if err != nil {
-		t.Fatalf("ListObjects page2: %v", err)
-	}
-	if len(res2.CommonPrefixes) != 1 || *res2.CommonPrefixes[0].Prefix != "p2/" {
-		t.Fatalf("page2 CommonPrefixes = %v, want [p2/]", res2.CommonPrefixes)
-	}
-	if res2.IsTruncated == nil || *res2.IsTruncated {
-		t.Fatalf("page2 IsTruncated = %v, want false", res2.IsTruncated)
-	}
+	require.NoError(t, err, "ListObjects page2")
+	require.Len(t, res2.CommonPrefixes, 1, "page2 CommonPrefixes")
+	require.Equal(t, "p2/", *res2.CommonPrefixes[0].Prefix, "page2 CommonPrefixes")
+	require.NotNil(t, res2.IsTruncated, "page2 IsTruncated")
+	require.False(t, *res2.IsTruncated, "page2 IsTruncated")
 }

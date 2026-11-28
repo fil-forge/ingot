@@ -9,6 +9,8 @@ import (
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // A change error unwraps to its kind's error, through any wrapping, and
@@ -17,35 +19,27 @@ func TestChangeErrorUnwrapsToItsKind(t *testing.T) {
 	for kind, want := range kindErrors {
 		in := &ChangeError{Kind: kind, Condition: ConditionIfMatch, Key: "k", VersionID: "v"}
 		var buf bytes.Buffer
-		if err := (&BucketCommitResult{Results: []ChangeResult{{Err: in}}}).MarshalCBOR(&buf); err != nil {
-			t.Fatalf("%s: encode: %v", kind, err)
-		}
+		require.NoError(t, (&BucketCommitResult{Results: []ChangeResult{{Err: in}}}).MarshalCBOR(&buf), "%s: encode", kind)
 		var res BucketCommitResult
-		if err := res.UnmarshalCBOR(&buf); err != nil {
-			t.Fatalf("%s: decode: %v", kind, err)
-		}
+		require.NoError(t, res.UnmarshalCBOR(&buf), "%s: decode", kind)
 		got := res.Results[0].Err
-		if *got != *in {
-			t.Fatalf("%s: decoded %+v, want %+v", kind, *got, *in)
-		}
-		if err := fmt.Errorf("commit: %w", got); !errors.Is(err, want) {
-			t.Fatalf("%s: %v is not %v", kind, err, want)
-		}
+		require.Equal(t, *in, *got, "%s: decoded", kind)
+		err := fmt.Errorf("commit: %w", got)
+		require.ErrorIs(t, err, want, "%s: %v is not %v", kind, err, want)
 	}
 }
 
 // A change fails on its own terms only with a change error or an expired
 // reference; anything else fails the whole commit.
 func TestChangeErrorClassifies(t *testing.T) {
-	if ce, ok := changeError(fmt.Errorf("put: %w", errNoSuchKey)); !ok || ce.Kind != KindNoSuchKey {
-		t.Fatalf("a wrapped change error = (%v, %v), want no-such-key", ce, ok)
-	}
-	if ce, ok := changeError(registry.ErrReferenceExpired); !ok || ce.Kind != KindReferenceExpired {
-		t.Fatalf("an expired reference = (%v, %v), want reference-expired", ce, ok)
-	}
-	if _, ok := changeError(errors.New("disk full")); ok {
-		t.Fatal("a storage error classified as the change's own")
-	}
+	ce, ok := changeError(fmt.Errorf("put: %w", errNoSuchKey))
+	require.True(t, ok, "a wrapped change error")
+	require.Equal(t, KindNoSuchKey, ce.Kind, "a wrapped change error")
+	ce, ok = changeError(registry.ErrReferenceExpired)
+	require.True(t, ok, "an expired reference")
+	require.Equal(t, KindReferenceExpired, ce.Kind, "an expired reference")
+	_, ok = changeError(errors.New("disk full"))
+	require.False(t, ok, "a storage error classified as the change's own")
 }
 
 // Delete preconditions compare as S3 does: If-Match "*" matches any version,
@@ -69,15 +63,12 @@ func TestDeletePreconditionsCheck(t *testing.T) {
 	} {
 		err := tc.pre.check(mf)
 		if tc.want == "" {
-			if err != nil {
-				t.Errorf("%s: %v, want it to pass", tc.name, err)
-			}
+			assert.NoError(t, err, "%s", tc.name)
 			continue
 		}
 		var ce *ChangeError
-		if !errors.As(err, &ce) || ce.Kind != KindPreconditionFailed || ce.Condition != tc.want {
-			t.Errorf("%s: %v, want %s failed", tc.name, err, tc.want)
-		}
+		assert.True(t, errors.As(err, &ce) && ce.Kind == KindPreconditionFailed && ce.Condition == tc.want,
+			"%s: %v, want %s failed", tc.name, err, tc.want)
 	}
 }
 
@@ -107,17 +98,14 @@ func TestPutPreconditionsCheck(t *testing.T) {
 		{"marker over a new key", PutChange{DeletePre: &DeletePreconditions{HasIfMatch: true, IfMatch: "abd"}}, nil, nil, ""},
 	} {
 		check, err := (&Queue{}).putPreCheck(t.Context(), &tc.put)
-		if err != nil {
-			t.Fatalf("%s: %v", tc.name, err)
-		}
+		require.NoError(t, err, "%s", tc.name)
 		err = check(tc.superseded)
-		if !errors.Is(err, tc.want) {
-			t.Errorf("%s: %v, want %v", tc.name, err, tc.want)
+		if !assert.ErrorIs(t, err, tc.want, "%s", tc.name) {
 			continue
 		}
 		var ce *ChangeError
-		if tc.want == ErrPreconditionFailed && errors.As(err, &ce) && ce.Condition != tc.condition {
-			t.Errorf("%s: condition %q, want %q", tc.name, ce.Condition, tc.condition)
+		if tc.want == ErrPreconditionFailed && errors.As(err, &ce) {
+			assert.Equal(t, tc.condition, ce.Condition, "%s: condition", tc.name)
 		}
 	}
 }

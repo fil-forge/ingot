@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"reflect"
 	"sort"
 	"sync"
 	"testing"
@@ -16,6 +15,7 @@ import (
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -63,13 +63,10 @@ func sorted(counts []registry.EgressCount) []registry.EgressCount {
 func wantCounts(t *testing.T, got []registry.EgressCount, want ...registry.EgressCount) {
 	t.Helper()
 	got, want = sorted(got), sorted(want)
-	if len(got) != len(want) {
-		t.Fatalf("counts:\n got %v\nwant %v", got, want)
-	}
+	require.Len(t, got, len(want), "counts")
 	for i := range got {
-		if got[i].Space != want[i].Space || !got[i].Hour.Equal(want[i].Hour) || got[i].Bytes != want[i].Bytes {
-			t.Fatalf("counts:\n got %v\nwant %v", got, want)
-		}
+		require.True(t, got[i].Space == want[i].Space && got[i].Hour.Equal(want[i].Hour) && got[i].Bytes == want[i].Bytes,
+			"counts:\n got %v\nwant %v", got, want)
 	}
 }
 
@@ -82,15 +79,12 @@ func TestCounterCountsWhatAResponseReads(t *testing.T) {
 	c := newTestCounter(&clock{now: hour0.Add(5 * time.Minute)})
 	a, b := testutil.RandomDID(t), testutil.RandomDID(t)
 
-	if _, err := io.Copy(io.Discard, c.Egress(a, body(1000))); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.Copy(io.Discard, c.Egress(a, body(24))); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.Copy(io.Discard, c.Egress(b, body(7))); err != nil {
-		t.Fatal(err)
-	}
+	_, err := io.Copy(io.Discard, c.Egress(a, body(1000)))
+	require.NoError(t, err)
+	_, err = io.Copy(io.Discard, c.Egress(a, body(24)))
+	require.NoError(t, err)
+	_, err = io.Copy(io.Discard, c.Egress(b, body(7)))
+	require.NoError(t, err)
 
 	wantCounts(t, c.take(),
 		registry.EgressCount{Space: a, Hour: hour0, Bytes: 1024},
@@ -107,13 +101,10 @@ func TestCounterCountsAnAbandonedResponse(t *testing.T) {
 	space := testutil.RandomDID(t)
 
 	rc := c.Egress(space, body(1000))
-	if _, err := io.ReadFull(rc, make([]byte, 300)); err != nil {
-		t.Fatal(err)
-	}
+	_, err := io.ReadFull(rc, make([]byte, 300))
+	require.NoError(t, err)
 	wantCounts(t, c.take(), registry.EgressCount{Space: space, Hour: hour0, Bytes: 300})
-	if err := rc.Close(); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, rc.Close())
 	wantCounts(t, c.take())
 }
 
@@ -125,13 +116,11 @@ func TestCounterSplitsAResponseAcrossHours(t *testing.T) {
 	space := testutil.RandomDID(t)
 
 	rc := c.Egress(space, body(1000))
-	if _, err := io.ReadFull(rc, make([]byte, 800)); err != nil {
-		t.Fatal(err)
-	}
+	_, err := io.ReadFull(rc, make([]byte, 800))
+	require.NoError(t, err)
 	clk.set(hour0.Add(61 * time.Minute))
-	if _, err := io.Copy(io.Discard, rc); err != nil {
-		t.Fatal(err)
-	}
+	_, err = io.Copy(io.Discard, rc)
+	require.NoError(t, err)
 
 	wantCounts(t, c.take(),
 		registry.EgressCount{Space: space, Hour: hour0, Bytes: 800},
@@ -142,9 +131,7 @@ func TestCounterSplitsAResponseAcrossHours(t *testing.T) {
 func TestNilCounterCountsNothing(t *testing.T) {
 	var c *Counter
 	rc := body(10)
-	if got := c.Egress(testutil.RandomDID(t), rc); got != rc {
-		t.Fatal("a nil counter should hand the body back as it is")
-	}
+	require.True(t, c.Egress(testutil.RandomDID(t), rc) == rc, "a nil counter should hand the body back as it is")
 }
 
 func TestCounterIsSafeForConcurrentResponses(t *testing.T) {
@@ -246,9 +233,7 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	f.counter = newTestCounter(f.clock)
 	cfg.Counter, cfg.Store, cfg.Reporter = f.counter, f.store, f.reporter
 	svc, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = svc.CloseMetrics() })
 	f.svc = svc
 	return f
@@ -256,18 +241,15 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 
 func (f *fixture) send(t *testing.T, space did.DID, n int) {
 	t.Helper()
-	if _, err := io.Copy(io.Discard, f.counter.Egress(space, body(n))); err != nil {
-		t.Fatal(err)
-	}
+	_, err := io.Copy(io.Discard, f.counter.Egress(space, body(n)))
+	require.NoError(t, err)
 }
 
 // bucket creates a bucket and returns its space.
 func (f *fixture) bucket(t *testing.T, name string) did.DID {
 	t.Helper()
 	space := testutil.RandomDID(t)
-	if err := f.store.Create(context.Background(), name, space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, f.store.Create(context.Background(), name, space, registry.CreateState{Tenant: testutil.RandomDID(t)}), "create bucket")
 	return space
 }
 
@@ -276,25 +258,20 @@ func (f *fixture) bucket(t *testing.T, name string) did.DID {
 func (f *fixture) change(t *testing.T, name string, added, removed int64) {
 	t.Helper()
 	for _, st := range registry.ObjectCountWrites(name, added, removed) {
-		if _, err := f.pool.Exec(context.Background(), st.SQL, st.Args...); err != nil {
-			t.Fatalf("object count write: %v", err)
-		}
+		_, err := f.pool.Exec(context.Background(), st.SQL, st.Args...)
+		require.NoError(t, err, "object count write")
 	}
 }
 
 func (f *fixture) flush(t *testing.T) {
 	t.Helper()
-	if err := f.svc.Flush(context.Background()); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
+	require.NoError(t, f.svc.Flush(context.Background()), "Flush")
 }
 
 func (f *fixture) report(t *testing.T) ReportStats {
 	t.Helper()
 	stats, err := f.svc.Report(context.Background())
-	if err != nil {
-		t.Fatalf("Report: %v", err)
-	}
+	require.NoError(t, err, "Report")
 	return stats
 }
 
@@ -309,36 +286,26 @@ func TestReportSendsWhatWasCountedGroupedBySpace(t *testing.T) {
 	f.flush(t)
 
 	stats := f.report(t)
-	if stats.Reports != 1 || stats.Counts != 3 || stats.Warnings != 0 {
-		t.Fatalf("stats: %+v", stats)
-	}
-	if len(f.reporter.reports) != 1 {
-		t.Fatalf("reports sent: %d, want 1", len(f.reporter.reports))
-	}
+	require.Equal(t, 1, stats.Reports, "stats: %+v", stats)
+	require.Equal(t, 3, stats.Counts, "stats: %+v", stats)
+	require.Zero(t, stats.Warnings, "stats: %+v", stats)
+	require.Len(t, f.reporter.reports, 1, "reports sent")
 	// One entry for each space, its hours in order.
 	for _, e := range f.reporter.reports[0] {
 		switch e.Space {
 		case a:
 			want := []usagecmds.HourEgress{{Hour: hour0.Unix(), Bytes: 100}, {Hour: hour0.Add(time.Hour).Unix(), Bytes: 50}}
-			if len(e.Hours) != 2 || e.Hours[0] != want[0] || e.Hours[1] != want[1] {
-				t.Fatalf("space a hours: %v, want %v", e.Hours, want)
-			}
+			require.Equal(t, want, e.Hours, "space a hours")
 		case b:
-			if len(e.Hours) != 1 || e.Hours[0] != (usagecmds.HourEgress{Hour: hour0.Unix(), Bytes: 7}) {
-				t.Fatalf("space b hours: %v", e.Hours)
-			}
+			require.Equal(t, []usagecmds.HourEgress{{Hour: hour0.Unix(), Bytes: 7}}, e.Hours, "space b hours")
 		default:
-			t.Fatalf("report names an unknown space %s", e.Space)
+			require.FailNow(t, "report names an unknown space", "space %s", e.Space)
 		}
 	}
-	if len(f.reporter.reports[0]) != 2 {
-		t.Fatalf("report has %d entries, want one for each of 2 spaces", len(f.reporter.reports[0]))
-	}
+	require.Len(t, f.reporter.reports[0], 2, "report entries, want one for each of 2 spaces")
 
 	// Nothing has changed, so the next pass sends nothing.
-	if stats := f.report(t); stats.Reports != 0 {
-		t.Fatalf("a pass with nothing due sent %d reports", stats.Reports)
-	}
+	require.Zero(t, f.report(t).Reports, "a pass with nothing due sent reports")
 }
 
 // The hour in progress is reported as it stands, and again with its new total
@@ -354,12 +321,9 @@ func TestReportSendsAnHourAgainAsItGrows(t *testing.T) {
 	f.flush(t)
 	f.report(t)
 
-	if got := f.reporter.held()[space][hour0.Unix()]; got != 125 {
-		t.Fatalf("the service holds %d for the hour, want 125", got)
-	}
-	if len(f.reporter.reports) != 2 {
-		t.Fatalf("reports sent: %d, want 2", len(f.reporter.reports))
-	}
+	got := f.reporter.held()[space][hour0.Unix()]
+	require.Equal(t, uint64(125), got, "the service holds %d for the hour", got)
+	require.Len(t, f.reporter.reports, 2, "reports sent")
 }
 
 // A backlog larger than one report goes out as several, oldest hour first,
@@ -374,17 +338,12 @@ func TestReportWorksThroughABacklog(t *testing.T) {
 	f.flush(t)
 
 	stats := f.report(t)
-	if stats.Reports != 3 || stats.Counts != 5 {
-		t.Fatalf("stats: %+v, want 3 reports carrying 5 counts", stats)
-	}
-	if first := f.reporter.reports[0][0].Hours[0].Hour; first != hour0.Unix() {
-		t.Fatalf("the first report starts at %d, want the oldest hour %d", first, hour0.Unix())
-	}
+	require.Equal(t, 3, stats.Reports, "stats: %+v, want 3 reports carrying 5 counts", stats)
+	require.Equal(t, 5, stats.Counts, "stats: %+v, want 3 reports carrying 5 counts", stats)
+	require.Equal(t, hour0.Unix(), f.reporter.reports[0][0].Hours[0].Hour, "the first report should start at the oldest hour")
 	held := f.reporter.held()[space]
 	for i := range 5 {
-		if got := held[hour0.Add(time.Duration(i)*time.Hour).Unix()]; got != uint64(10+i) {
-			t.Fatalf("hour %d: the service holds %d, want %d", i, got, 10+i)
-		}
+		require.Equal(t, uint64(10+i), held[hour0.Add(time.Duration(i)*time.Hour).Unix()], "hour %d: the service holds", i)
 	}
 }
 
@@ -396,17 +355,15 @@ func TestReportRetriesAfterAFailure(t *testing.T) {
 	f.flush(t)
 
 	f.reporter.err = errors.New("auth service unreachable")
-	if _, err := f.svc.Report(context.Background()); err == nil {
-		t.Fatal("Report succeeded though the service was unreachable")
-	}
+	_, err := f.svc.Report(context.Background())
+	require.Error(t, err, "Report succeeded though the service was unreachable")
 	f.send(t, space, 5)
 	f.flush(t)
 
 	f.reporter.err = nil
 	f.report(t)
-	if got := f.reporter.held()[space][hour0.Unix()]; got != 105 {
-		t.Fatalf("the service holds %d for the hour, want 105", got)
-	}
+	got := f.reporter.held()[space][hour0.Unix()]
+	require.Equal(t, uint64(105), got, "the service holds %d for the hour", got)
 }
 
 // A count the service warned about is not sent again, and the counts beside
@@ -426,26 +383,17 @@ func TestReportDoesNotResendACountItWasWarnedAbout(t *testing.T) {
 	f.flush(t)
 
 	stats := f.report(t)
-	if stats.Counts != 4 || stats.Warnings != 3 {
-		t.Fatalf("stats: %+v, want 4 counts and 3 warnings", stats)
-	}
-	if stats := f.report(t); stats.Reports != 0 {
-		t.Fatalf("a count that was warned about was sent again: %+v", stats)
-	}
+	require.Equal(t, 4, stats.Counts, "stats: %+v, want 4 counts and 3 warnings", stats)
+	require.Equal(t, 3, stats.Warnings, "stats: %+v, want 4 counts and 3 warnings", stats)
+	stats = f.report(t)
+	require.Zero(t, stats.Reports, "a count that was warned about was sent again: %+v", stats)
 	got := warningCounts(t, reader)
 	want := map[string]int64{
 		usagecmds.UnknownBucketWarningName:        1,
 		usagecmds.BucketRegionMismatchWarningName: 1,
 		"SomethingNewer":                          1,
 	}
-	if len(got) != len(want) {
-		t.Fatalf("ingot.usage.report_warnings by name: %v, want %v", got, want)
-	}
-	for name, n := range want {
-		if got[name] != n {
-			t.Fatalf("ingot.usage.report_warnings by name: %v, want %v", got, want)
-		}
-	}
+	require.Equal(t, want, got, "ingot.usage.report_warnings by name")
 }
 
 // A count that grows during a pass does not keep the pass going: it is sent
@@ -459,22 +407,17 @@ func TestReportEndsThoughCountsKeepGrowing(t *testing.T) {
 	reports := 0
 	f.reporter.onReport = func() {
 		reports++
-		if reports > 50 {
-			t.Fatal("the pass did not end")
-		}
+		require.LessOrEqual(t, reports, 50, "the pass did not end")
 		f.send(t, space, 1)
 		f.flush(t)
 	}
 	stats := f.report(t)
-	if stats.Reports != 1 {
-		t.Fatalf("the pass sent %d reports, want the 1 that was waiting when it began", stats.Reports)
-	}
+	require.Equal(t, 1, stats.Reports, "the pass sent %d reports, want the 1 that was waiting when it began", stats.Reports)
 
 	f.reporter.onReport = nil
 	f.report(t)
-	if got := f.reporter.held()[space][hour0.Unix()]; got != 101 {
-		t.Fatalf("the service holds %d for the hour, want 101", got)
-	}
+	got := f.reporter.held()[space][hour0.Unix()]
+	require.Equal(t, uint64(101), got, "the service holds %d for the hour", got)
 }
 
 // A flush the database refuses keeps its counts for the next one.
@@ -485,16 +428,12 @@ func TestFlushKeepsCountsItCouldNotStore(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := f.svc.Flush(ctx); err == nil {
-		t.Fatal("Flush succeeded on a cancelled context")
-	}
+	require.Error(t, f.svc.Flush(ctx), "Flush succeeded on a cancelled context")
 	f.send(t, space, 5)
 	f.flush(t)
 
 	due, err := f.store.DueEgress(context.Background(), 10)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	wantCounts(t, due, registry.EgressCount{Space: space, Hour: hour0, Bytes: 105})
 }
 
@@ -503,24 +442,17 @@ func TestBacklogGauges(t *testing.T) {
 	f := newFixture(t, Config{MeterProvider: sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))})
 	a, b := testutil.RandomDID(t), testutil.RandomDID(t)
 
-	if got := metricValue(t, reader, "ingot.usage.egress_unreported_counts"); got != 0 {
-		t.Fatalf("unreported counts with nothing sent: %d", got)
-	}
-	if got := metricValue(t, reader, "ingot.usage.egress_oldest_unreported_age"); got != 0 {
-		t.Fatalf("oldest unreported age with nothing sent: %d", got)
-	}
+	got := metricValue(t, reader, "ingot.usage.egress_unreported_counts")
+	require.Zero(t, got, "unreported counts with nothing sent")
+	require.Zero(t, metricValue(t, reader, "ingot.usage.egress_oldest_unreported_age"), "oldest unreported age with nothing sent")
 
 	f.send(t, a, 1)
 	f.send(t, b, 1)
 	f.flush(t)
-	if got := metricValue(t, reader, "ingot.usage.egress_unreported_counts"); got != 2 {
-		t.Fatalf("unreported counts: %d, want 2", got)
-	}
+	require.Equal(t, int64(2), metricValue(t, reader, "ingot.usage.egress_unreported_counts"), "unreported counts")
 
 	f.report(t)
-	if got := metricValue(t, reader, "ingot.usage.egress_unreported_counts"); got != 0 {
-		t.Fatalf("unreported counts after a report: %d, want 0", got)
-	}
+	require.Zero(t, metricValue(t, reader, "ingot.usage.egress_unreported_counts"), "unreported counts after a report")
 }
 
 func TestNewRequiresItsParts(t *testing.T) {
@@ -530,9 +462,8 @@ func TestNewRequiresItsParts(t *testing.T) {
 		"no store":    {Counter: NewCounter(), Reporter: &fakeReporter{}},
 		"no reporter": {Counter: NewCounter(), Store: store},
 	} {
-		if _, err := New(cfg); err == nil {
-			t.Fatalf("New accepted a config with %s", name)
-		}
+		_, err := New(cfg)
+		require.Error(t, err, "New accepted a config with %s", name)
 	}
 }
 
@@ -541,9 +472,7 @@ func TestNewRequiresItsParts(t *testing.T) {
 func metricValue(t *testing.T, reader *sdkmetric.ManualReader, name string) int64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("collect: %v", err)
-	}
+	require.NoError(t, reader.Collect(context.Background(), &rm), "collect")
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			if m.Name != name {
@@ -563,12 +492,8 @@ func metricValue(t *testing.T, reader *sdkmetric.ManualReader, name string) int6
 
 func onePoint(t *testing.T, name string, points []metricdata.DataPoint[int64]) int64 {
 	t.Helper()
-	if len(points) != 1 {
-		t.Fatalf("%s has %d data points, want 1", name, len(points))
-	}
-	if points[0].Attributes != *attribute.EmptySet() {
-		t.Fatalf("%s carries attributes %v, want none", name, points[0].Attributes)
-	}
+	require.Len(t, points, 1, "%s data points", name)
+	require.Equal(t, *attribute.EmptySet(), points[0].Attributes, "%s carries attributes", name)
 	return points[0].Value
 }
 
@@ -577,9 +502,7 @@ func onePoint(t *testing.T, name string, points []metricdata.DataPoint[int64]) i
 func warningCounts(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("collect: %v", err)
-	}
+	require.NoError(t, reader.Collect(context.Background(), &rm), "collect")
 	out := map[string]int64{}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
@@ -587,9 +510,7 @@ func warningCounts(t *testing.T, reader *sdkmetric.ManualReader) map[string]int6
 				continue
 			}
 			sum, ok := m.Data.(metricdata.Sum[int64])
-			if !ok {
-				t.Fatalf("ingot.usage.report_warnings is a %T", m.Data)
-			}
+			require.True(t, ok, "ingot.usage.report_warnings is a %T", m.Data)
 			for _, dp := range sum.DataPoints {
 				name, _ := dp.Attributes.Value("name")
 				out[name.AsString()] = dp.Value
@@ -612,37 +533,27 @@ func TestReportSendsObjectCounts(t *testing.T) {
 	f.flush(t)
 
 	stats := f.report(t)
-	if stats.Reports != 2 || stats.Counts != 3 {
-		t.Fatalf("stats %+v, want 2 reports carrying 3 counts", stats)
-	}
-	if len(f.reporter.reports) != 1 || len(f.reporter.objects) != 1 {
-		t.Fatalf("sent %d egress and %d object reports, want one of each", len(f.reporter.reports), len(f.reporter.objects))
-	}
+	require.Equal(t, 2, stats.Reports, "stats %+v, want 2 reports carrying 3 counts", stats)
+	require.Equal(t, 3, stats.Counts, "stats %+v, want 2 reports carrying 3 counts", stats)
+	require.Len(t, f.reporter.reports, 1, "sent %d egress and %d object reports", len(f.reporter.reports), len(f.reporter.objects))
+	require.Len(t, f.reporter.objects, 1, "sent %d egress and %d object reports", len(f.reporter.reports), len(f.reporter.objects))
 	got := map[did.DID][2]uint64{}
 	for _, o := range f.reporter.objects[0] {
-		if len(o.Hours) != 1 {
-			t.Fatalf("space %s reported %d hours, want 1", o.Space, len(o.Hours))
-		}
-		if o.Hours[0].Hour%3600 != 0 {
-			t.Fatalf("reported hour %d is not a whole hour", o.Hours[0].Hour)
-		}
+		require.Len(t, o.Hours, 1, "space %s reported %d hours", o.Space, len(o.Hours))
+		require.Zero(t, o.Hours[0].Hour%3600, "reported hour %d is not a whole hour", o.Hours[0].Hour)
 		got[o.Space] = [2]uint64{o.Hours[0].Added, o.Hours[0].Removed}
 	}
 	want := map[did.DID][2]uint64{a: {4, 2}, b: {1, 0}}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("reported %v, want %v", got, want)
-	}
+	require.Equal(t, want, got, "reported object counts")
 
 	// Nothing has changed, so nothing is sent.
-	if stats := f.report(t); stats.Reports != 0 {
-		t.Fatalf("a pass with nothing due sent %d reports", stats.Reports)
-	}
+	require.Zero(t, f.report(t).Reports, "a pass with nothing due sent reports")
 	f.change(t, "bucket-b", 0, 1)
 	f.report(t)
-	if len(f.reporter.objects) != 2 || len(f.reporter.objects[1]) != 1 ||
-		f.reporter.objects[1][0].Space != b || f.reporter.objects[1][0].Hours[0].Removed != 1 {
-		t.Fatalf("after a change, sent %+v", f.reporter.objects)
-	}
+	require.Len(t, f.reporter.objects, 2, "object reports after a change")
+	require.Len(t, f.reporter.objects[1], 1, "after a change, sent %+v", f.reporter.objects)
+	require.Equal(t, b, f.reporter.objects[1][0].Space, "after a change, sent %+v", f.reporter.objects)
+	require.Equal(t, uint64(1), f.reporter.objects[1][0].Hours[0].Removed, "after a change, sent %+v", f.reporter.objects)
 }
 
 // A report that fails leaves its object counts due, and a count the service
@@ -653,35 +564,26 @@ func TestReportRetriesObjectCountsAndSettlesWarnedOnes(t *testing.T) {
 	f.change(t, "bucket-a", 2, 0)
 
 	f.reporter.err = errors.New("unreachable")
-	if _, err := f.svc.Report(context.Background()); err == nil {
-		t.Fatal("Report succeeded though the service was unreachable")
-	}
+	_, err := f.svc.Report(context.Background())
+	require.Error(t, err, "Report succeeded though the service was unreachable")
 	f.reporter.err = nil
 	f.reporter.warn[space] = usagecmds.UnknownBucketWarningName
-	if stats := f.report(t); stats.Reports != 1 || stats.Warnings != 1 {
-		t.Fatalf("stats %+v, want one report with one warning", stats)
-	}
-	if stats := f.report(t); stats.Reports != 0 {
-		t.Fatalf("a warned-about count was sent again: %+v", stats)
-	}
+	stats := f.report(t)
+	require.Equal(t, 1, stats.Reports, "stats %+v, want one report with one warning", stats)
+	require.Equal(t, 1, stats.Warnings, "stats %+v, want one report with one warning", stats)
+	stats = f.report(t)
+	require.Zero(t, stats.Reports, "a warned-about count was sent again: %+v", stats)
 }
 
 func TestObjectBacklogGauges(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	f := newFixture(t, Config{MeterProvider: sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))})
 	f.bucket(t, "bucket-a")
-	if got := metricValue(t, reader, "ingot.usage.object_unreported_counts"); got != 0 {
-		t.Fatalf("unreported object counts %d, want 0", got)
-	}
+	got := metricValue(t, reader, "ingot.usage.object_unreported_counts")
+	require.Zero(t, got, "unreported object counts")
 	f.change(t, "bucket-a", 1, 0)
-	if got := metricValue(t, reader, "ingot.usage.object_unreported_counts"); got != 1 {
-		t.Fatalf("unreported object counts %d, want 1", got)
-	}
+	require.Equal(t, int64(1), metricValue(t, reader, "ingot.usage.object_unreported_counts"), "unreported object counts")
 	f.report(t)
-	if got := metricValue(t, reader, "ingot.usage.object_unreported_counts"); got != 0 {
-		t.Fatalf("unreported object counts %d after a report, want 0", got)
-	}
-	if got := metricValue(t, reader, "ingot.usage.object_oldest_unreported_age"); got != 0 {
-		t.Fatalf("oldest unreported object count age %d, want 0", got)
-	}
+	require.Zero(t, metricValue(t, reader, "ingot.usage.object_unreported_counts"), "unreported object counts after a report")
+	require.Zero(t, metricValue(t, reader, "ingot.usage.object_oldest_unreported_age"), "oldest unreported object count age")
 }

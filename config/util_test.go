@@ -10,6 +10,7 @@ import (
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/container"
 	"github.com/fil-forge/ucantone/ucan/delegation"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/config"
 )
@@ -19,17 +20,11 @@ import (
 func mintProofsContainer(t *testing.T) (*container.Container, ucan.Delegation) {
 	t.Helper()
 	space, err := ed25519.GenerateIssuer()
-	if err != nil {
-		t.Fatalf("generate space: %v", err)
-	}
+	require.NoError(t, err, "generate space")
 	agent, err := ed25519.GenerateIssuer()
-	if err != nil {
-		t.Fatalf("generate agent: %v", err)
-	}
+	require.NoError(t, err, "generate agent")
 	d, err := blobcmds.Add.Delegate(space, agent.DID(), space.DID(), delegation.WithNoExpiration())
-	if err != nil {
-		t.Fatalf("delegate: %v", err)
-	}
+	require.NoError(t, err, "delegate")
 	return container.New(container.WithDelegations(d)), d
 }
 
@@ -37,15 +32,9 @@ func mintProofsContainer(t *testing.T) (*container.Container, ucan.Delegation) {
 func assertHoldsDelegation(t *testing.T, ct *container.Container, want ucan.Delegation) {
 	t.Helper()
 	dlgs := ct.Delegations()
-	if len(dlgs) != 1 {
-		t.Fatalf("expected 1 delegation, got %d", len(dlgs))
-	}
-	if got := dlgs[0].Command(); got != want.Command() {
-		t.Fatalf("expected command %s, got %s", want.Command(), got)
-	}
-	if got := dlgs[0].Issuer(); got != want.Issuer() {
-		t.Fatalf("expected issuer %s, got %s", want.Issuer(), got)
-	}
+	require.Len(t, dlgs, 1)
+	require.Equal(t, want.Command(), dlgs[0].Command(), "command")
+	require.Equal(t, want.Issuer(), dlgs[0].Issuer(), "issuer")
 }
 
 // TestLoadProofsContainer covers the two accepted forms of a proofs config
@@ -55,49 +44,34 @@ func TestLoadProofsContainer(t *testing.T) {
 	ct, want := mintProofsContainer(t)
 
 	rawBytes, err := container.Encode(container.Raw, ct)
-	if err != nil {
-		t.Fatalf("encode raw: %v", err)
-	}
+	require.NoError(t, err, "encode raw")
 	b64Bytes, err := container.Encode(container.Base64, ct)
-	if err != nil {
-		t.Fatalf("encode base64: %v", err)
-	}
+	require.NoError(t, err, "encode base64")
 
 	t.Run("raw file", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "proofs.cbor")
-		if err := os.WriteFile(path, rawBytes, 0o600); err != nil {
-			t.Fatalf("write: %v", err)
-		}
+		require.NoError(t, os.WriteFile(path, rawBytes, 0o600), "write")
 		got, err := config.LoadProofsContainer(path)
-		if err != nil {
-			t.Fatalf("load: %v", err)
-		}
+		require.NoError(t, err, "load")
 		assertHoldsDelegation(t, got, want)
 	})
 
 	t.Run("base64 file with trailing newline", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "proofs.b64")
-		if err := os.WriteFile(path, append(b64Bytes, '\n'), 0o600); err != nil {
-			t.Fatalf("write: %v", err)
-		}
+		require.NoError(t, os.WriteFile(path, append(b64Bytes, '\n'), 0o600), "write")
 		got, err := config.LoadProofsContainer(path)
-		if err != nil {
-			t.Fatalf("load: %v", err)
-		}
+		require.NoError(t, err, "load")
 		assertHoldsDelegation(t, got, want)
 	})
 
 	t.Run("inline string", func(t *testing.T) {
 		got, err := config.LoadProofsContainer(string(b64Bytes))
-		if err != nil {
-			t.Fatalf("load: %v", err)
-		}
+		require.NoError(t, err, "load")
 		assertHoldsDelegation(t, got, want)
 	})
 
 	t.Run("missing file / undecodable value errors", func(t *testing.T) {
-		if _, err := config.LoadProofsContainer("/nonexistent/proofs.cbor"); err == nil {
-			t.Fatal("expected error for value that is neither a file nor a container")
-		}
+		_, err := config.LoadProofsContainer("/nonexistent/proofs.cbor")
+		require.Error(t, err, "expected error for value that is neither a file nor a container")
 	})
 }

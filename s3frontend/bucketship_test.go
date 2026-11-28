@@ -51,13 +51,12 @@ func TestShipWithoutAuthorityFailsForGood(t *testing.T) {
 			deadline := time.Now().Add(10 * time.Second)
 			for log.ships.Load() == 0 || shipState(t, mem) == "pending" && tc.state == "failed" {
 				if time.Now().After(deadline) {
-					t.Fatalf("ship ran %d times, state %q; want it %s", log.ships.Load(), shipState(t, mem), tc.state)
+					require.FailNow(t, "ship did not settle", "ship ran %d times, state %q; want it %s", log.ships.Load(), shipState(t, mem), tc.state)
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
-			if got := shipState(t, mem); got != tc.state {
-				t.Fatalf("ship state = %q, want %q", got, tc.state)
-			}
+			got := shipState(t, mem)
+			require.Equal(t, tc.state, got, "ship state")
 		})
 	}
 }
@@ -100,15 +99,11 @@ func TestTheNextWriteQueuesAShipThatFoundNoAuthority(t *testing.T) {
 func shipState(t *testing.T, mem *testStore) string {
 	t.Helper()
 	tasks, err := mem.queued(context.Background(), bucketqueue.Name)
-	if err != nil {
-		t.Fatalf("queued: %v", err)
-	}
+	require.NoError(t, err, "queued")
 	state := ""
 	for _, task := range tasks {
 		if task.Action == bucketqueue.ShipAction {
-			if state != "" {
-				t.Fatal("more than one ship queued")
-			}
+			require.Empty(t, state, "more than one ship queued")
 			state = task.State
 		}
 	}

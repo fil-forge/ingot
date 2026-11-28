@@ -3,7 +3,6 @@ package blockstore
 import (
 	"context"
 	"net/url"
-	"strings"
 	"testing"
 
 	"github.com/fil-forge/libforge/blobindex"
@@ -15,6 +14,7 @@ import (
 	"github.com/fil-forge/ucantone/ucan/container"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/blockstore/locator"
 	"github.com/fil-forge/ingot/internal/reqscope"
@@ -41,21 +41,15 @@ func (s stubLocator) LocateMany(_ context.Context, _ []did.DID, digests []mh.Mul
 // error — an auth gap, not ErrNotFound.
 func TestForgeRetrieveWithoutAuthority(t *testing.T) {
 	signer, err := ed25519.GenerateIssuer()
-	if err != nil {
-		t.Fatalf("generate signer: %v", err)
-	}
+	require.NoError(t, err, "generate signer")
 	space := testutil.RandomDID(t)
 	provider := testutil.RandomDID(t)
 
 	digest, err := mh.Sum([]byte("blob"), mh.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("mh: %v", err)
-	}
+	require.NoError(t, err, "mh")
 
 	target, err := url.Parse("http://piri.example/blob")
-	if err != nil {
-		t.Fatalf("parse url: %v", err)
-	}
+	require.NoError(t, err, "parse url")
 
 	f, err := NewForge(ForgeConfig{
 		Locator: stubLocator{loc: locator.Location{
@@ -69,16 +63,13 @@ func TestForgeRetrieveWithoutAuthority(t *testing.T) {
 		}},
 		Signer: signer,
 	})
-	if err != nil {
-		t.Fatalf("NewForge: %v", err)
-	}
+	require.NoError(t, err, "NewForge")
 	blk := cid.NewCidV1(cid.Raw, digest)
 
 	t.Run("no request-scoped store", func(t *testing.T) {
 		_, err := f.GetBlock(context.Background(), space, blk)
-		if err == nil || !strings.Contains(err.Error(), "no request-scoped retrieval authority") {
-			t.Fatalf("expected missing-scoped-store error, got: %v", err)
-		}
+		require.Error(t, err, "expected missing-scoped-store error")
+		require.Contains(t, err.Error(), "no request-scoped retrieval authority", "expected missing-scoped-store error")
 	})
 
 	t.Run("empty scoped store", func(t *testing.T) {
@@ -87,8 +78,7 @@ func TestForgeRetrieveWithoutAuthority(t *testing.T) {
 		ctx := context.WithValue(context.Background(), reqscope.ProofStoreKey(),
 			ucanlib.ProofStore(ucanlib.NewContainerProofStore(container.New())))
 		_, err := f.GetBlock(ctx, space, blk)
-		if err == nil || !strings.Contains(err.Error(), "no retrieval authority") {
-			t.Fatalf("expected authority-gap error, got: %v", err)
-		}
+		require.Error(t, err, "expected authority-gap error")
+		require.Contains(t, err.Error(), "no retrieval authority")
 	})
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -54,14 +55,10 @@ func TestCommitCapturesShipAuthority(t *testing.T) {
 		Catalog: logstore.PlaneConfig{Ship: false},
 		Logger:  zaptest.NewLogger(t),
 	})
-	if err != nil {
-		t.Fatalf("logstore: %v", err)
-	}
+	require.NoError(t, err, "logstore")
 	t.Cleanup(func() { _ = log.Close(ctx) })
 	space := testutil.RandomDID(t)
-	if err := mem.Create(ctx, "bk", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, mem.Create(ctx, "bk", space, registry.CreateState{Tenant: testutil.RandomDID(t)}), "create bucket")
 	ships := &recordingShips{}
 	reads := blockstore.NewLayered(testfakes.NopBaseReader{}, log, testfakes.NopBaseReader{})
 	c := bucketop.NewCoordinator(bucketop.Deps{Reg: mem, Log: log, Reads: reads, Ships: ships})
@@ -69,29 +66,19 @@ func TestCommitCapturesShipAuthority(t *testing.T) {
 	store := ucanlib.ProofStore(tokenstore.NewMemStore())
 	reqCtx := context.WithValue(ctx, reqscope.ProofStoreKey(), store)
 	tx, err := c.Begin(reqCtx, "bk")
-	if err != nil {
-		t.Fatalf("Begin: %v", err)
-	}
+	require.NoError(t, err, "Begin")
 	defer tx.Discard()
 	mh, err := multihash.Sum([]byte("root"), multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash: %v", err)
-	}
+	require.NoError(t, err, "multihash")
 	tx.Advance(cid.NewCidV1(cid.DagCBOR, mh))
-	if _, ok, err := tx.Append(reqCtx); err != nil || !ok {
-		t.Fatalf("Append = %v, %v", ok, err)
-	}
+	_, ok, err := tx.Append(reqCtx)
+	require.NoError(t, err, "Append")
+	require.True(t, ok, "Append")
 
 	ships.mu.Lock()
 	defer ships.mu.Unlock()
-	if len(ships.captured) != 1 {
-		t.Fatalf("captured %d times, want 1", len(ships.captured))
-	}
+	require.Len(t, ships.captured, 1, "captured %d times", len(ships.captured))
 	got := ships.captured[0]
-	if got.space.String() != space.String() {
-		t.Fatalf("captured for space %s, want the bucket's %s", got.space, space)
-	}
-	if got.store != store {
-		t.Fatal("the capture's ctx didn't carry the request's proof store")
-	}
+	require.Equal(t, space.String(), got.space.String(), "captured for space %s", got.space)
+	require.Same(t, store, got.store, "the capture's ctx didn't carry the request's proof store")
 }

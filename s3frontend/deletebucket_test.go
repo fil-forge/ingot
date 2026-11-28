@@ -15,6 +15,7 @@ import (
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketauthority"
@@ -132,40 +133,27 @@ func TestDeleteBucket_RefusalLeavesBucketReadable(t *testing.T) {
 	// tree whose nodes live in the catalog log.
 	putObj(t, b, "obj", []byte("written then deleted"))
 	deleteObj(t, b, "obj")
-	if st, err := mem.Get(ctx, bucket); err != nil || !st.Root.Defined() {
-		t.Fatalf("bucket root after the delete = %v (err %v), want a defined root", st, err)
-	}
+	st, err := mem.Get(ctx, bucket)
+	require.NoError(t, err, "bucket after the delete")
+	require.True(t, st.Root.Defined(), "bucket root after the delete = %v, want a defined root", st)
 
 	auth.refuse.Store(true)
 	wantAPIErr(t, b.DeleteBucket(ctx, bucket), s3err.ErrBucketNotEmpty)
-	if !log.released.Load() {
-		t.Fatalf("the refused delete never released the catalog segment; the test proves nothing")
-	}
+	require.True(t, log.released.Load(), "the refused delete never released the catalog segment; the test proves nothing")
 	rm.mu.Lock()
 	releasedRetired, releasedUnderARoot := rm.releasedRetired, rm.releasedUnderARoot
 	rm.mu.Unlock()
-	if !releasedRetired {
-		t.Fatalf("the refused delete never released the retired catalog segment")
-	}
-	if releasedUnderARoot {
-		t.Fatalf("a catalog segment was released while the bucket's root still named catalog blocks")
-	}
+	require.True(t, releasedRetired, "the refused delete never released the retired catalog segment")
+	require.False(t, releasedUnderARoot, "a catalog segment was released while the bucket's root still named catalog blocks")
 
 	res, err := b.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bucket})
-	if err != nil {
-		t.Fatalf("ListObjectsV2 after the refused delete: %v", err)
-	}
-	if len(res.Contents) != 0 {
-		t.Fatalf("ListObjectsV2 after the refused delete = %d keys, want none", len(res.Contents))
-	}
+	require.NoError(t, err, "ListObjectsV2 after the refused delete")
+	require.Empty(t, res.Contents, "ListObjectsV2 after the refused delete")
 
 	auth.refuse.Store(false)
-	if err := b.DeleteBucket(ctx, bucket); err != nil {
-		t.Fatalf("retried DeleteBucket: %v", err)
-	}
-	if _, err := mem.Get(ctx, bucket); err == nil {
-		t.Fatalf("bucket row survived the retried delete")
-	}
+	require.NoError(t, b.DeleteBucket(ctx, bucket), "retried DeleteBucket")
+	_, err = mem.Get(ctx, bucket)
+	require.Error(t, err, "bucket row survived the retried delete")
 }
 
 // TestDeleteBucket_RefusalDropsTheJournal: the write that empties the root
@@ -185,14 +173,14 @@ func TestDeleteBucket_RefusalDropsTheJournal(t *testing.T) {
 	// journaled.
 	putObj(t, b, "obj", []byte("written then deleted"))
 	deleteObj(t, b, "obj")
-	if st, err := mem.CatalogJournalStats(ctx); err != nil || st.Blocks == 0 {
-		t.Fatalf("journal before the delete = %+v (err %v), want rows; the test proves nothing", st, err)
-	}
+	st, err := mem.CatalogJournalStats(ctx)
+	require.NoError(t, err, "journal before the delete")
+	require.NotZero(t, st.Blocks, "journal before the delete holds no rows; the test proves nothing")
 
 	wantAPIErr(t, b.DeleteBucket(ctx, "bk"), s3err.ErrBucketNotEmpty)
-	if st, err := mem.CatalogJournalStats(ctx); err != nil || st.Blocks != 0 {
-		t.Fatalf("journal after the refused delete = %+v (err %v), want empty", st, err)
-	}
+	st, err = mem.CatalogJournalStats(ctx)
+	require.NoError(t, err, "journal after the refused delete")
+	require.Zero(t, st.Blocks, "journal after the refused delete")
 }
 
 // An abandoned delete, left queued by a DeleteBucket whose caller went away,
@@ -206,12 +194,10 @@ func TestAnAbandonedDeleteNeverActs(t *testing.T) {
 
 	put := context.WithValue(ctx, reqscope.RequestKey(), cmds3.Request{})
 	err := runBucketTaskRaw(put, mem, mem.bk(), bucketqueue.DeleteAction, &bucketqueue.BucketTask{Name: "bk"})
-	if err == nil || !taskrunner.IsPermanent(err) {
-		t.Fatalf("delete run with another request's context: %v, want a permanent refusal", err)
-	}
-	if _, err := mem.Get(ctx, "bk"); err != nil {
-		t.Fatalf("the bucket after the refused delete: %v", err)
-	}
+	require.Error(t, err, "delete run with another request's context")
+	require.True(t, taskrunner.IsPermanent(err), "delete run with another request's context: %v, want a permanent refusal", err)
+	_, err = mem.Get(ctx, "bk")
+	require.NoError(t, err, "the bucket after the refused delete")
 }
 
 // answeringAuthority answers DeleteBucket with err.
@@ -243,22 +229,14 @@ func TestDeleteBucket_OnlyARefusalReopens(t *testing.T) {
 			})
 			ctx := context.WithValue(context.Background(), reqscope.RequestKey(), cmds3.Request{})
 			err := b.DeleteBucket(ctx, "bk")
-			if tc.gone != (err == nil) {
-				t.Fatalf("DeleteBucket: %v", err)
-			}
+			require.Equal(t, err == nil, tc.gone, "DeleteBucket: %v", err)
 			st, gerr := mem.Get(ctx, "bk")
 			if tc.gone {
-				if !errors.Is(gerr, registry.ErrNotFound) {
-					t.Fatalf("the bucket after the delete: %v, want gone", gerr)
-				}
+				require.ErrorIs(t, gerr, registry.ErrNotFound, "the bucket after the delete")
 				return
 			}
-			if gerr != nil {
-				t.Fatal(gerr)
-			}
-			if st.Closing != tc.closing {
-				t.Fatalf("closing = %v, want %v", st.Closing, tc.closing)
-			}
+			require.NoError(t, gerr)
+			require.Equal(t, tc.closing, st.Closing, "closing")
 		})
 	}
 }
@@ -291,19 +269,12 @@ func TestDeleteBucketRemovesItsLogWhileHoldingTheName(t *testing.T) {
 		d.Log = log
 	})
 	ctx := context.WithValue(context.Background(), reqscope.RequestKey(), cmds3.Request{})
-	if err := b.DeleteBucket(ctx, "bk"); err != nil {
-		t.Fatalf("DeleteBucket: %v", err)
-	}
-	if _, err := mem.Get(ctx, "bk"); err == nil {
-		t.Fatal("the bucket row survived the delete")
-	}
+	require.NoError(t, b.DeleteBucket(ctx, "bk"), "DeleteBucket")
+	_, err := mem.Get(ctx, "bk")
+	require.Error(t, err, "the bucket row survived the delete")
 	log.mu.Lock()
 	held, removed := log.held["bk"]
 	log.mu.Unlock()
-	if !removed {
-		t.Fatal("the delete never removed the bucket's log")
-	}
-	if !held {
-		t.Fatal("the delete removed the bucket's log after giving its name up")
-	}
+	require.True(t, removed, "the delete never removed the bucket's log")
+	require.True(t, held, "the delete removed the bucket's log after giving its name up")
 }

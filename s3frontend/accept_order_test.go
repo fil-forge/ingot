@@ -10,6 +10,7 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/s3response"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/registry"
 )
@@ -41,22 +42,19 @@ func TestUploadBlobRecordsLocationBeforeAccepted(t *testing.T) {
 		t.Helper()
 		bucket, key := sweepBucket, "obj"
 		body := bytes.Repeat([]byte{'a'}, 1000)
-		if _, err := b.PutObject(t.Context(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body), ContentLength: byteLen(body)}); err == nil {
-			t.Fatal("PutObject succeeded although recording the acceptance failed")
-		}
+		_, err := b.PutObject(t.Context(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body), ContentLength: byteLen(body)})
+		require.Error(t, err, "PutObject succeeded although recording the acceptance failed")
 	}
 	// stalledUploading checks that the intent is uploading and counted as a
 	// stalled upload, and returns it.
 	stalledUploading := func(t *testing.T, mem *testStore, digest []byte) *registry.UploadIntent {
 		t.Helper()
 		in, err := mem.IntentByDigest(t.Context(), digest)
-		if err != nil || in.State != registry.IntentUploading {
-			t.Fatalf("intent = %+v/%v, want uploading", in, err)
-		}
+		require.NoError(t, err, "intent = %+v/%v", in, err)
+		require.Equal(t, registry.IntentUploading, in.State, "intent = %+v/%v", in, err)
 		stalled, err := mem.StalledBytes(t.Context(), time.Now().Add(time.Hour))
-		if err != nil || stalled != in.Size {
-			t.Fatalf("stalled = %d/%v, want %d uploading", stalled, err, in.Size)
-		}
+		require.NoError(t, err, "stalled = %d/%v", stalled, err)
+		require.Equal(t, in.Size, stalled, "stalled = %d/%v", stalled, err)
 		return in
 	}
 
@@ -67,9 +65,7 @@ func TestUploadBlobRecordsLocationBeforeAccepted(t *testing.T) {
 			d.Locations = locs
 		})
 		put(t, b)
-		if locs.refused == nil {
-			t.Fatal("the location store never refused a write")
-		}
+		require.NotNil(t, locs.refused, "the location store never refused a write")
 		stalledUploading(t, mem, locs.refused)
 	})
 
@@ -80,18 +76,14 @@ func TestUploadBlobRecordsLocationBeforeAccepted(t *testing.T) {
 			d.Intents = intents
 		})
 		put(t, b)
-		if intents.refused == nil {
-			t.Fatal("the intent store never refused the accepted transition")
-		}
+		require.NotNil(t, intents.refused, "the intent store never refused the accepted transition")
 		stalledUploading(t, mem, intents.refused)
 		// The location landed, so a release of the stalled intent, if one
 		// runs, finds it and removes the blob from the provider.
 		st, err := mem.Get(t.Context(), sweepBucket)
-		if err != nil {
-			t.Fatalf("get bucket: %v", err)
-		}
-		if loc, err := mem.GetLocation(t.Context(), st.Space, intents.refused); err != nil || loc == nil {
-			t.Fatalf("no location recorded for the accepted blob (err=%v)", err)
-		}
+		require.NoError(t, err, "get bucket")
+		loc, err := mem.GetLocation(t.Context(), st.Space, intents.refused)
+		require.NoError(t, err, "location for the accepted blob")
+		require.NotNil(t, loc, "no location recorded for the accepted blob")
 	})
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
+	"github.com/stretchr/testify/require"
 )
 
 // TestForgeBucketPolicy drives the S3 bucket policy operations end to end: a
@@ -32,48 +33,34 @@ func TestForgeBucketPolicy(t *testing.T) {
 	client := sdkClient(forgeS3Conf(endpoint, accessKey, secretKey))
 
 	// The policy names a principal, which the tenant must hold.
-	if out, errOut, err := s.Exec(ctx, "hilt", "curl", "-sS", "-f", "-X", "PUT",
+	out, errOut, err := s.Exec(ctx, "hilt", "curl", "-sS", "-f", "-X", "PUT",
 		"http://localhost:80/tenants/"+tenant+"/principals/"+principal,
-		"-H", "Authorization: Bearer dev-partner-key"); err != nil {
-		t.Fatalf("hilt create principal: %v (stdout=%s stderr=%s)", err, out, errOut)
-	}
-	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		t.Fatalf("CreateBucket: %v", err)
-	}
+		"-H", "Authorization: Bearer dev-partner-key")
+	require.NoError(t, err, "hilt create principal (stdout=%s stderr=%s)", out, errOut)
+	_, err = client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+	require.NoError(t, err, "CreateBucket")
 
-	if _, err := client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: aws.String(bucket)}); !isS3Code(err, "NoSuchBucketPolicy") {
-		t.Fatalf("GetBucketPolicy before any write: got %v, want NoSuchBucketPolicy", err)
-	}
+	_, err = client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: aws.String(bucket)})
+	require.True(t, isS3Code(err, "NoSuchBucketPolicy"), "GetBucketPolicy before any write: got %v, want NoSuchBucketPolicy", err)
 
 	// Written out of order and with a duplicate; read back sorted and deduplicated.
 	objects := s3bkt.ObjectsARN(bucket)
 	written := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":[%q]},"Action":["s3:PutObject","s3:GetObject","s3:PutObject"],"Resource":%q}]}`,
 		s3bkt.UserARN(principal), objects)
 	put, err := client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{Bucket: aws.String(bucket), Policy: aws.String(written)})
-	if err != nil {
-		t.Fatalf("PutBucketPolicy: %v", err)
-	}
+	require.NoError(t, err, "PutBucketPolicy")
 	putETag := responseETag(put.ResultMetadata)
-	if putETag == "" {
-		t.Fatal("PutBucketPolicy answered no ETag")
-	}
+	require.NotEmpty(t, putETag, "PutBucketPolicy answered no ETag")
 	got, err := client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: aws.String(bucket)})
-	if err != nil {
-		t.Fatalf("GetBucketPolicy: %v", err)
-	}
+	require.NoError(t, err, "GetBucketPolicy")
 	want := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":[%q]},"Action":["s3:GetObject","s3:PutObject"],"Resource":[%q]}]}`,
 		s3bkt.UserARN(principal), objects)
-	if aws.ToString(got.Policy) != want {
-		t.Fatalf("GetBucketPolicy = %s, want %s", aws.ToString(got.Policy), want)
-	}
-	if getETag := responseETag(got.ResultMetadata); getETag != putETag {
-		t.Fatalf("GetBucketPolicy ETag = %q, want the PutBucketPolicy ETag %q", getETag, putETag)
-	}
+	require.Equal(t, want, aws.ToString(got.Policy), "GetBucketPolicy")
+	require.Equal(t, putETag, responseETag(got.ResultMetadata), "GetBucketPolicy ETag against the PutBucketPolicy ETag")
 
 	wildcard := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":%q}]}`, objects)
-	if _, err := client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{Bucket: aws.String(bucket), Policy: aws.String(wildcard)}); err != nil {
-		t.Fatalf("PutBucketPolicy with a wildcard principal: %v", err)
-	}
+	_, err = client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{Bucket: aws.String(bucket), Policy: aws.String(wildcard)})
+	require.NoError(t, err, "PutBucketPolicy with a wildcard principal")
 
 	for name, doc := range map[string]string{
 		// versitygw's validation finds no account for a bare name.
@@ -81,20 +68,16 @@ func TestForgeBucketPolicy(t *testing.T) {
 		// versitygw defaults the Version; Hilt requires it.
 		"no Version": fmt.Sprintf(`{"Statement":[{"Effect":"Allow","Principal":{"AWS":[%q]},"Action":"s3:GetObject","Resource":%q}]}`, s3bkt.UserARN(principal), objects),
 	} {
-		if _, err := client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{Bucket: aws.String(bucket), Policy: aws.String(doc)}); !isS3Code(err, "MalformedPolicy") {
-			t.Fatalf("PutBucketPolicy with %s: got %v, want MalformedPolicy", name, err)
-		}
+		_, err = client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{Bucket: aws.String(bucket), Policy: aws.String(doc)})
+		require.True(t, isS3Code(err, "MalformedPolicy"), "PutBucketPolicy with %s: got %v, want MalformedPolicy", name, err)
 	}
 
-	if _, err := client.DeleteBucketPolicy(ctx, &s3.DeleteBucketPolicyInput{Bucket: aws.String(bucket)}); err != nil {
-		t.Fatalf("DeleteBucketPolicy: %v", err)
-	}
-	if _, err := client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: aws.String(bucket)}); !isS3Code(err, "NoSuchBucketPolicy") {
-		t.Fatalf("GetBucketPolicy after the delete: got %v, want NoSuchBucketPolicy", err)
-	}
-	if _, err := client.DeleteBucketPolicy(ctx, &s3.DeleteBucketPolicyInput{Bucket: aws.String(bucket)}); !isS3Code(err, "NoSuchBucketPolicy") {
-		t.Fatalf("DeleteBucketPolicy twice: got %v, want NoSuchBucketPolicy", err)
-	}
+	_, err = client.DeleteBucketPolicy(ctx, &s3.DeleteBucketPolicyInput{Bucket: aws.String(bucket)})
+	require.NoError(t, err, "DeleteBucketPolicy")
+	_, err = client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: aws.String(bucket)})
+	require.True(t, isS3Code(err, "NoSuchBucketPolicy"), "GetBucketPolicy after the delete: got %v, want NoSuchBucketPolicy", err)
+	_, err = client.DeleteBucketPolicy(ctx, &s3.DeleteBucketPolicyInput{Bucket: aws.String(bucket)})
+	require.True(t, isS3Code(err, "NoSuchBucketPolicy"), "DeleteBucketPolicy twice: got %v, want NoSuchBucketPolicy", err)
 }
 
 // responseETag returns the ETag header of the response an SDK output came from.

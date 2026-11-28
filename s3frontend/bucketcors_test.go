@@ -8,6 +8,7 @@ import (
 
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/s3err"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/registry"
 )
@@ -29,16 +30,10 @@ func TestBucketCors_DisabledWithoutDocument(t *testing.T) {
 	wantAPIErr(t, err, s3err.ErrNoSuchCORSConfiguration)
 
 	// Storing a document turns CORS on for this bucket alone.
-	if err := b.PutBucketCors(ctx, "bk", []byte(corsDoc)); err != nil {
-		t.Fatalf("PutBucketCors: %v", err)
-	}
+	require.NoError(t, b.PutBucketCors(ctx, "bk", []byte(corsDoc)), "PutBucketCors")
 	got, err := b.GetBucketCors(ctx, "bk")
-	if err != nil {
-		t.Fatalf("GetBucketCors: %v", err)
-	}
-	if !bytes.Equal(got, []byte(corsDoc)) {
-		t.Fatalf("GetBucketCors = %q, want the stored document", got)
-	}
+	require.NoError(t, err, "GetBucketCors")
+	require.Equal(t, []byte(corsDoc), got, "GetBucketCors")
 }
 
 func TestBucketCors_OwnDocumentReplacesTheDefault(t *testing.T) {
@@ -46,53 +41,31 @@ func TestBucketCors_OwnDocumentReplacesTheDefault(t *testing.T) {
 	ctx := context.Background()
 	gateway := []byte(`<CORSConfiguration><CORSRule><AllowedOrigin>https://console.example</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>`)
 	b.cors = gateway
-	if err := mem.Create(ctx, "other", did.Undef, registry.CreateState{}); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
+	require.NoError(t, mem.Create(ctx, "other", did.Undef, registry.CreateState{}), "create bucket")
 
 	// Without a document of its own, every bucket answers the gateway's.
 	for _, name := range []string{"bk", "other"} {
 		got, err := b.GetBucketCors(ctx, name)
-		if err != nil {
-			t.Fatalf("GetBucketCors %q: %v", name, err)
-		}
-		if !bytes.Equal(got, gateway) {
-			t.Fatalf("GetBucketCors %q = %q, want the gateway document", name, got)
-		}
+		require.NoError(t, err, "GetBucketCors %q", name)
+		require.Equal(t, gateway, got, "GetBucketCors %q", name)
 	}
 
 	// A document on one bucket replaces the default there and nowhere else.
-	if err := b.PutBucketCors(ctx, "bk", []byte(corsDoc)); err != nil {
-		t.Fatalf("PutBucketCors: %v", err)
-	}
+	require.NoError(t, b.PutBucketCors(ctx, "bk", []byte(corsDoc)), "PutBucketCors")
 	got, err := b.GetBucketCors(ctx, "bk")
-	if err != nil {
-		t.Fatalf("GetBucketCors: %v", err)
-	}
-	if !bytes.Equal(got, []byte(corsDoc)) {
-		t.Fatalf("GetBucketCors = %q, want the bucket's own document", got)
-	}
+	require.NoError(t, err, "GetBucketCors")
+	require.Equal(t, []byte(corsDoc), got, "GetBucketCors = %q, want the bucket's own document", got)
 	got, err = b.GetBucketCors(ctx, "other")
-	if err != nil {
-		t.Fatalf("GetBucketCors other: %v", err)
-	}
-	if !bytes.Equal(got, gateway) {
-		t.Fatalf("GetBucketCors other = %q, want the gateway document still", got)
-	}
+	require.NoError(t, err, "GetBucketCors other")
+	require.Equal(t, gateway, got, "GetBucketCors other = %q, want the gateway document still", got)
 
 	// Deleting it restores the default. Deleting again is a no-op.
 	for range 2 {
-		if err := b.DeleteBucketCors(ctx, "bk"); err != nil {
-			t.Fatalf("DeleteBucketCors: %v", err)
-		}
+		require.NoError(t, b.DeleteBucketCors(ctx, "bk"), "DeleteBucketCors")
 	}
 	got, err = b.GetBucketCors(ctx, "bk")
-	if err != nil {
-		t.Fatalf("GetBucketCors after delete: %v", err)
-	}
-	if !bytes.Equal(got, gateway) {
-		t.Fatalf("GetBucketCors after delete = %q, want the gateway document", got)
-	}
+	require.NoError(t, err, "GetBucketCors after delete")
+	require.Equal(t, gateway, got, "GetBucketCors after delete")
 }
 
 // corsDocWithRules is a document of n minimal, valid rules.
@@ -112,23 +85,15 @@ func TestBucketCors_RuleLimit(t *testing.T) {
 
 	// S3's hundred rules is the most a document may hold.
 	hundred := corsDocWithRules(maxCORSRules)
-	if err := b.PutBucketCors(ctx, "bk", hundred); err != nil {
-		t.Fatalf("PutBucketCors with %d rules: %v", maxCORSRules, err)
-	}
+	require.NoError(t, b.PutBucketCors(ctx, "bk", hundred), "PutBucketCors with %d rules", maxCORSRules)
 
 	// One more is refused, and the stored document is untouched.
-	if err := b.PutBucketCors(ctx, "bk", corsDocWithRules(maxCORSRules+1)); err == nil {
-		t.Fatalf("PutBucketCors with %d rules: want error", maxCORSRules+1)
-	} else {
-		wantAPIErr(t, err, s3err.ErrMalformedXML)
-	}
+	err := b.PutBucketCors(ctx, "bk", corsDocWithRules(maxCORSRules+1))
+	require.Error(t, err, "PutBucketCors with %d rules", maxCORSRules+1)
+	wantAPIErr(t, err, s3err.ErrMalformedXML)
 	got, err := b.GetBucketCors(ctx, "bk")
-	if err != nil {
-		t.Fatalf("GetBucketCors: %v", err)
-	}
-	if !bytes.Equal(got, hundred) {
-		t.Fatalf("GetBucketCors = %d bytes, want the %d-rule document still stored", len(got), maxCORSRules)
-	}
+	require.NoError(t, err, "GetBucketCors")
+	require.Equal(t, hundred, got, "GetBucketCors: want the %d-rule document still stored", maxCORSRules)
 }
 
 func TestBucketCors_SizeCap(t *testing.T) {
@@ -139,16 +104,12 @@ func TestBucketCors_SizeCap(t *testing.T) {
 	// that is not a CORS document is MalformedXML, as the controller would
 	// have said; the backend trusts the controller's validation but not the
 	// shape of whatever it is handed.
-	if err := b.PutBucketCors(ctx, "bk", bytes.Repeat([]byte("x"), maxCORSConfig+1)); err == nil {
-		t.Fatal("PutBucketCors over the cap: want error")
-	} else {
-		wantAPIErr(t, err, s3err.ErrEntityTooLarge)
-	}
-	if err := b.PutBucketCors(ctx, "bk", bytes.Repeat([]byte("x"), maxCORSConfig)); err == nil {
-		t.Fatal("PutBucketCors with a body that is not a document: want error")
-	} else {
-		wantAPIErr(t, err, s3err.ErrMalformedXML)
-	}
+	err := b.PutBucketCors(ctx, "bk", bytes.Repeat([]byte("x"), maxCORSConfig+1))
+	require.Error(t, err, "PutBucketCors over the cap")
+	wantAPIErr(t, err, s3err.ErrEntityTooLarge)
+	err = b.PutBucketCors(ctx, "bk", bytes.Repeat([]byte("x"), maxCORSConfig))
+	require.Error(t, err, "PutBucketCors with a body that is not a document")
+	wantAPIErr(t, err, s3err.ErrMalformedXML)
 }
 
 func TestBucketCors_MissingBucket(t *testing.T) {
@@ -171,23 +132,13 @@ func TestBucketCors_DoesNotSurviveTheBucket(t *testing.T) {
 	gateway := []byte(`<CORSConfiguration/>`)
 	b.cors = gateway
 
-	if err := b.PutBucketCors(ctx, "bk", []byte(corsDoc)); err != nil {
-		t.Fatalf("PutBucketCors: %v", err)
-	}
-	if err := mem.Delete(ctx, "bk", mem.bk()); err != nil {
-		t.Fatalf("delete bucket: %v", err)
-	}
+	require.NoError(t, b.PutBucketCors(ctx, "bk", []byte(corsDoc)), "PutBucketCors")
+	require.NoError(t, mem.Delete(ctx, "bk", mem.bk()), "delete bucket")
 	_, err := b.GetBucketCors(ctx, "bk")
 	wantAPIErr(t, err, s3err.ErrNoSuchBucket)
 
-	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
-		t.Fatalf("create bucket again: %v", err)
-	}
+	require.NoError(t, mem.Create(ctx, "bk", did.Undef, registry.CreateState{}), "create bucket again")
 	got, err := b.GetBucketCors(ctx, "bk")
-	if err != nil {
-		t.Fatalf("GetBucketCors after re-creation: %v", err)
-	}
-	if !bytes.Equal(got, gateway) {
-		t.Fatalf("GetBucketCors after re-creation = %q, want the gateway document", got)
-	}
+	require.NoError(t, err, "GetBucketCors after re-creation")
+	require.Equal(t, gateway, got, "GetBucketCors after re-creation")
 }

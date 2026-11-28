@@ -7,6 +7,7 @@ import (
 	"time"
 
 	ingottest "github.com/fil-forge/ingot/testing"
+	"github.com/stretchr/testify/require"
 )
 
 // TestForgeDeleteReleasesNetworkBlob is the delete-finality regression gate
@@ -35,30 +36,22 @@ func TestForgeDeleteReleasesNetworkBlob(t *testing.T) {
 		data[i] = byte(i*13 + 11)
 	}
 
-	if err := ingottest.CreateBucket(ctx, cfg, bucket); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
-	if err := ingottest.PutBytes(ctx, cfg, bucket, key, data); err != nil {
-		t.Fatalf("put object: %v", err)
-	}
+	require.NoError(t, ingottest.CreateBucket(ctx, cfg, bucket), "create bucket")
+	require.NoError(t, ingottest.PutBytes(ctx, cfg, bucket, key, data), "put object")
 
 	// Precondition: the blob really lives on piri — wipe the local copies and prove
 	// the GET re-fetches from the network (same tier the eviction test pins).
-	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/cache"); err != nil {
-		t.Fatalf("wipe local blob copies: %v (stdout=%s stderr=%s)", err, out, errOut)
-	}
-	if got, err := ingottest.GetBytes(ctx, cfg, bucket, key); err != nil || len(got) != len(data) {
-		t.Fatalf("read-through from piri before delete: err=%v len=%d", err, len(got))
-	}
+	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/cache")
+	require.NoError(t, err, "wipe local blob copies (stdout=%s stderr=%s)", out, errOut)
+	got, err := ingottest.GetBytes(ctx, cfg, bucket, key)
+	require.NoError(t, err, "read-through from piri before delete")
+	require.Len(t, got, len(data), "read-through from piri before delete")
 
-	if err := ingottest.DeleteObject(ctx, cfg, bucket, key); err != nil {
-		t.Fatalf("delete object: %v", err)
-	}
+	require.NoError(t, ingottest.DeleteObject(ctx, cfg, bucket, key), "delete object")
 
 	// The object is gone from the gateway.
-	if _, err := ingottest.GetBytes(ctx, cfg, bucket, key); err == nil {
-		t.Fatalf("GET after delete succeeded, want NoSuchKey")
-	}
+	_, err = ingottest.GetBytes(ctx, cfg, bucket, key)
+	require.Error(t, err, "GET after delete succeeded, want NoSuchKey")
 
 	// And the release traversed the network: piri's /blob/release handler ran
 	// and, with the last claim gone, queued the piece for removal. Byte

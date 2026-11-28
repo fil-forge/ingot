@@ -3,11 +3,12 @@ package s3frontend
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/versitygw/s3err"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/queue/bucketqueue"
@@ -56,23 +57,20 @@ func TestMapUploadError(t *testing.T) {
 		{"bucket closing", fmt.Errorf("admit: %w", bucketqueue.ErrBucketClosing), errBucketClosing},
 		{"reference expired", registry.ErrReferenceExpired, s3err.GetAPIError(s3err.ErrSlowDown)},
 	} {
-		if got := mapUploadError(tc.err, "complete"); !reflect.DeepEqual(got, tc.want) {
-			t.Errorf("%s: %#v, want %#v", tc.name, got, tc.want)
-		}
+		got := mapUploadError(tc.err, "complete")
+		assert.Equal(t, tc.want, got, "%s", tc.name)
 	}
 	for kind, code := range map[string]string{
 		multipartqueue.PartChecksumMissing:  "InvalidRequest",
 		multipartqueue.PartChecksumMismatch: "BadDigest",
 	} {
 		var api s3err.APIError
-		if !errors.As(mapUploadError(part(kind), "complete"), &api) || api.Code != code {
-			t.Errorf("%s answered %v, want %s", kind, api, code)
-		}
+		ok := errors.As(mapUploadError(part(kind), "complete"), &api)
+		assert.True(t, ok && api.Code == code, "%s answered %v, want %s", kind, api, code)
 	}
-	if err := mapUploadError(nil, "complete"); err != nil {
-		t.Fatalf("no error answered %v", err)
-	}
-	if got, cause := mapUploadError(errors.New("disk full"), "complete"), "disk full"; got == nil || got.Error() != "s3frontend: complete: "+cause {
-		t.Fatalf("a storage error answered %v, want it wrapped", got)
-	}
+	err := mapUploadError(nil, "complete")
+	require.NoError(t, err, "no error answered %v", err)
+	got, cause := mapUploadError(errors.New("disk full"), "complete"), "disk full"
+	require.Error(t, got, "a storage error answered %v, want it wrapped", got)
+	require.Equal(t, "s3frontend: complete: "+cause, got.Error(), "a storage error answered %v", got)
 }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/config"
 )
@@ -16,17 +17,11 @@ import (
 func writeAgentKey(t *testing.T) (string, string) {
 	t.Helper()
 	signer, err := ed25519.Generate()
-	if err != nil {
-		t.Fatalf("generate agent key: %v", err)
-	}
+	require.NoError(t, err, "generate agent key")
 	pemBytes, err := identity.EncodeSignerToPEM(signer)
-	if err != nil {
-		t.Fatalf("encode agent key: %v", err)
-	}
+	require.NoError(t, err, "encode agent key")
 	keyFile := filepath.Join(t.TempDir(), "agent.pem")
-	if err := os.WriteFile(keyFile, pemBytes, 0o600); err != nil {
-		t.Fatalf("write agent key: %v", err)
-	}
+	require.NoError(t, os.WriteFile(keyFile, pemBytes, 0o600), "write agent key")
 	return keyFile, signer.KeyDID().String()
 }
 
@@ -36,15 +31,9 @@ func writeAgentKey(t *testing.T) (string, string) {
 func TestLoadAgentIdentity_DIDWeb(t *testing.T) {
 	keyFile, keyDID := writeAgentKey(t)
 	id, err := loadAgentIdentity(config.IdentityConfig{KeyFile: keyFile, ServiceID: "did:web:ingot.test"})
-	if err != nil {
-		t.Fatalf("loadAgentIdentity: %v", err)
-	}
-	if got := id.DID().String(); got != "did:web:ingot.test" {
-		t.Fatalf("DID = %s, want did:web:ingot.test", got)
-	}
-	if got := id.KeyDID().String(); got != keyDID {
-		t.Fatalf("KeyDID = %s, want %s", got, keyDID)
-	}
+	require.NoError(t, err, "loadAgentIdentity")
+	require.Equal(t, "did:web:ingot.test", id.DID().String(), "DID")
+	require.Equal(t, keyDID, id.KeyDID().String(), "KeyDID")
 }
 
 // TestLoadAgentIdentity_DIDKey: without a service DID the agent identifies by
@@ -52,19 +41,15 @@ func TestLoadAgentIdentity_DIDWeb(t *testing.T) {
 func TestLoadAgentIdentity_DIDKey(t *testing.T) {
 	keyFile, keyDID := writeAgentKey(t)
 	id, err := loadAgentIdentity(config.IdentityConfig{KeyFile: keyFile})
-	if err != nil {
-		t.Fatalf("loadAgentIdentity: %v", err)
-	}
-	if got := id.DID().String(); got != keyDID {
-		t.Fatalf("DID = %s, want the key DID %s", got, keyDID)
-	}
+	require.NoError(t, err, "loadAgentIdentity")
+	got := id.DID().String()
+	require.Equal(t, keyDID, got, "DID")
 }
 
 // TestLoadAgentIdentity_BadServiceID: a malformed service DID is rejected at
 // load time rather than producing an issuer nobody can resolve.
 func TestLoadAgentIdentity_BadServiceID(t *testing.T) {
 	keyFile, _ := writeAgentKey(t)
-	if _, err := loadAgentIdentity(config.IdentityConfig{KeyFile: keyFile, ServiceID: "ingot.test"}); err == nil {
-		t.Fatal("expected an error for a service id that is not a DID")
-	}
+	_, err := loadAgentIdentity(config.IdentityConfig{KeyFile: keyFile, ServiceID: "ingot.test"})
+	require.Error(t, err, "expected an error for a service id that is not a DID")
 }

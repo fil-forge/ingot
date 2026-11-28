@@ -7,6 +7,7 @@ import (
 	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 
@@ -21,9 +22,7 @@ import (
 // per-plane uploader.
 func TestModuleValidate_Enabled(t *testing.T) {
 	signer, err := ed25519.GenerateIssuer()
-	if err != nil {
-		t.Fatalf("generate signer: %v", err)
-	}
+	require.NoError(t, err, "generate signer")
 
 	cfg := config.Config{
 		Enabled:          true,
@@ -41,9 +40,7 @@ func TestModuleValidate_Enabled(t *testing.T) {
 		fx.Supply((*pgxpool.Pool)(nil)),
 		fx.Supply(identity.Identity{Issuer: signer}),
 	)
-	if err != nil {
-		t.Fatalf("ingot.Module graph does not validate: %v", err)
-	}
+	require.NoError(t, err, "ingot.Module graph does not validate")
 }
 
 // TestModuleValidate_HiltEnabled asserts the graph also validates with Hilt
@@ -51,9 +48,7 @@ func TestModuleValidate_Enabled(t *testing.T) {
 // requires.
 func TestModuleValidate_HiltEnabled(t *testing.T) {
 	signer, err := ed25519.GenerateIssuer()
-	if err != nil {
-		t.Fatalf("generate signer: %v", err)
-	}
+	require.NoError(t, err, "generate signer")
 
 	cfg := config.Config{
 		Enabled:          true,
@@ -72,9 +67,7 @@ func TestModuleValidate_HiltEnabled(t *testing.T) {
 		fx.Supply((*pgxpool.Pool)(nil)),
 		fx.Supply(identity.Identity{Issuer: signer}),
 	)
-	if err != nil {
-		t.Fatalf("ingot.Module graph with hilt does not validate: %v", err)
-	}
+	require.NoError(t, err, "ingot.Module graph with hilt does not validate")
 }
 
 // TestModuleValidate_RevocationEnabled asserts the graph also validates with
@@ -82,9 +75,7 @@ func TestModuleValidate_HiltEnabled(t *testing.T) {
 // provider and its lifecycle invoke.
 func TestModuleValidate_RevocationEnabled(t *testing.T) {
 	signer, err := ed25519.GenerateIssuer()
-	if err != nil {
-		t.Fatalf("generate signer: %v", err)
-	}
+	require.NoError(t, err, "generate signer")
 
 	cfg := config.Config{
 		Enabled:              true,
@@ -105,15 +96,11 @@ func TestModuleValidate_RevocationEnabled(t *testing.T) {
 		fx.Supply((*pgxpool.Pool)(nil)),
 		fx.Supply(identity.Identity{Issuer: signer}),
 	)
-	if err != nil {
-		t.Fatalf("ingot.Module graph with revocation service does not validate: %v", err)
-	}
+	require.NoError(t, err, "ingot.Module graph with revocation service does not validate")
 }
 
 // TestModuleValidate_Disabled asserts that a disabled module is an inert empty
 // option that needs no host inputs, so a host can always include it.
 func TestModuleValidate_Disabled(t *testing.T) {
-	if err := fx.ValidateApp(fx.NopLogger, ingot.Module(config.Config{})); err != nil {
-		t.Fatalf("disabled ingot.Module should validate as a no-op: %v", err)
-	}
+	require.NoError(t, fx.ValidateApp(fx.NopLogger, ingot.Module(config.Config{})), "disabled ingot.Module should validate as a no-op")
 }

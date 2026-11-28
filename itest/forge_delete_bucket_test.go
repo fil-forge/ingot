@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/libforge/digestutil"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 )
 
 // TestForgeDeleteBucketReleases is the regression gate for DeleteBucket's
@@ -56,24 +57,20 @@ func TestForgeDeleteBucketReleases(t *testing.T) {
 
 	const bucket, mpKey, objKey = "delete-bucket-releases", "in-flight", "obj"
 
-	if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		t.Fatalf("CreateBucket: %v", err)
-	}
+	_, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+	require.NoError(t, err, "CreateBucket")
 
 	// The open upload's part, set up first because it is the slower half: a
 	// part the upload's acceptor accepts while the upload stays open.
 	create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(bucket), Key: aws.String(mpKey),
 	})
-	if err != nil {
-		t.Fatalf("CreateMultipartUpload: %v", err)
-	}
-	if _, err := cl.UploadPart(ctx, &s3.UploadPartInput{
+	require.NoError(t, err, "CreateMultipartUpload")
+	_, err = cl.UploadPart(ctx, &s3.UploadPartInput{
 		Bucket: aws.String(bucket), Key: aws.String(mpKey), UploadId: create.UploadId,
 		PartNumber: aws.Int32(1), Body: bytes.NewReader(tagged(patternBytes(512<<10), 0x55)),
-	}); err != nil {
-		t.Fatalf("UploadPart: %v", err)
-	}
+	})
+	require.NoError(t, err, "UploadPart")
 	// The part rows are the only index to the blob and the teardown destroys
 	// them, so read the digest while the session is still open.
 	partDigest := partBlobDigests(t, ctx, s, aws.ToString(create.UploadId), 1)[0]
@@ -85,25 +82,21 @@ func TestForgeDeleteBucketReleases(t *testing.T) {
 	// run when the drain reaches it — asserted below rather than assumed, by
 	// the blob's location rows, which a release deletes when it commits: one
 	// that already ran would leave the drain leg untested.
-	if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
+	_, err = cl.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(bucket), Key: aws.String(objKey),
 		Body: bytes.NewReader(tagged(patternBytes(512<<10), 0x66)),
-	}); err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
+	})
+	require.NoError(t, err, "PutObject")
 	objDigests := objectBlobDigestsHex(t, ctx, s, bucket, objKey)
-	if _, err := cl.DeleteObject(ctx, &s3.DeleteObjectInput{
+	_, err = cl.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(bucket), Key: aws.String(objKey),
-	}); err != nil {
-		t.Fatalf("DeleteObject: %v", err)
-	}
-	if n := countRowsForDigests(t, ctx, s, "ingot.blob_locations", "digest", objDigests); n != len(objDigests) {
-		t.Fatalf("located blobs = %d, want %d: the release ran before the delete, leaving the drain leg untested", n, len(objDigests))
-	}
+	})
+	require.NoError(t, err, "DeleteObject")
+	n := countRowsForDigests(t, ctx, s, "ingot.blob_locations", "digest", objDigests)
+	require.Equal(t, len(objDigests), n, "located blobs: the release ran before the delete, leaving the drain leg untested")
 
-	if _, err := delCl.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		t.Fatalf("DeleteBucket: %v", err)
-	}
+	_, err = delCl.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)})
+	require.NoError(t, err, "DeleteBucket")
 
 	// The open upload's accepted part was removed from piri.
 	waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/release", partDigest)
@@ -112,13 +105,10 @@ func TestForgeDeleteBucketReleases(t *testing.T) {
 	for _, d := range objDigests {
 		waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/release", digestB58(t, d))
 	}
-	if n := countRowsForDigests(t, ctx, s, "ingot.blob_locations", "digest", objDigests); n != 0 {
-		t.Fatalf("located blobs left after DeleteBucket = %d, want 0", n)
-	}
+	require.Zero(t, countRowsForDigests(t, ctx, s, "ingot.blob_locations", "digest", objDigests), "located blobs left after DeleteBucket")
 
-	if _, err := delCl.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err == nil {
-		t.Fatalf("HeadBucket after DeleteBucket succeeded, want NoSuchBucket")
-	}
+	_, err = delCl.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)})
+	require.Error(t, err, "HeadBucket after DeleteBucket succeeded, want NoSuchBucket")
 	t.Logf("delete bucket released an open upload's part (%s) and a queued object blob on the deleting key's own proofs", partDigest)
 }
 
@@ -127,8 +117,6 @@ func TestForgeDeleteBucketReleases(t *testing.T) {
 func digestB58(t *testing.T, hexDigest string) string {
 	t.Helper()
 	raw, err := hex.DecodeString(hexDigest)
-	if err != nil {
-		t.Fatalf("decode digest hex %q: %v", hexDigest, err)
-	}
+	require.NoError(t, err, "decode digest hex %q", hexDigest)
 	return digestutil.Format(multihash.Multihash(raw))
 }

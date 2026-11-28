@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 	"lukechampine.com/blake3"
 	"lukechampine.com/blake3/bao"
@@ -30,50 +31,37 @@ func TestCIDHeader(t *testing.T) {
 
 	sum := blake3.Sum256(data)
 	digest, err := mh.Encode(sum[:], mh.BLAKE3)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	want := cid.NewCidV1(cid.Raw, digest).String()
 
 	bucket, key := "bk", "k"
 	t.Run("head", func(t *testing.T) {
 		rc := newRequestCtx()
-		if _, err := b.HeadObject(rc, &s3.HeadObjectInput{Bucket: &bucket, Key: &key}); err != nil {
-			t.Fatalf("HeadObject: %v", err)
-		}
-		if got := string(rc.Response.Header.Peek(cidHeader)); got != want {
-			t.Fatalf("%s = %q, want %q", cidHeader, got, want)
-		}
+		_, err := b.HeadObject(rc, &s3.HeadObjectInput{Bucket: &bucket, Key: &key})
+		require.NoError(t, err, "HeadObject")
+		got := string(rc.Response.Header.Peek(cidHeader))
+		require.Equal(t, want, got, "%s", cidHeader)
 	})
 	t.Run("get", func(t *testing.T) {
 		rc := newRequestCtx()
 		out, err := b.GetObject(rc, &s3.GetObjectInput{Bucket: &bucket, Key: &key})
-		if err != nil {
-			t.Fatalf("GetObject: %v", err)
-		}
+		require.NoError(t, err, "GetObject")
 		got, err := io.ReadAll(out.Body)
-		if err != nil || !bytes.Equal(got, data) {
-			t.Fatalf("body mismatch (%v)", err)
-		}
-		if got := string(rc.Response.Header.Peek(cidHeader)); got != want {
-			t.Fatalf("%s = %q, want %q", cidHeader, got, want)
-		}
+		require.NoError(t, err, "read body")
+		require.Equal(t, data, got, "body")
+		require.Equal(t, want, string(rc.Response.Header.Peek(cidHeader)), "%s", cidHeader)
 	})
 	t.Run("ranged get", func(t *testing.T) {
 		rc := newRequestCtx()
 		out, err := b.GetObject(rc, &s3.GetObjectInput{Bucket: &bucket, Key: &key, Range: aws.String("bytes=4000-4200")})
-		if err != nil {
-			t.Fatalf("GetObject: %v", err)
-		}
+		require.NoError(t, err, "GetObject")
 		_, _ = io.ReadAll(out.Body)
-		if got := string(rc.Response.Header.Peek(cidHeader)); got != want {
-			t.Fatalf("%s = %q, want %q", cidHeader, got, want)
-		}
+		got := string(rc.Response.Header.Peek(cidHeader))
+		require.Equal(t, want, got, "%s", cidHeader)
 	})
 	t.Run("plain context", func(t *testing.T) {
-		if _, err := b.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &bucket, Key: &key}); err != nil {
-			t.Fatalf("HeadObject: %v", err)
-		}
+		_, err := b.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &bucket, Key: &key})
+		require.NoError(t, err, "HeadObject")
 	})
 }
 
@@ -89,35 +77,23 @@ func TestBlake3Attribute(t *testing.T) {
 	res, err := b.GetObjectAttributes(context.Background(), &s3.GetObjectAttributesInput{
 		Bucket: &bucket, Key: &key, ObjectAttributes: []types.ObjectAttributes{"Blake3"},
 	})
-	if err != nil {
-		t.Fatalf("GetObjectAttributes: %v", err)
-	}
-	if res.Blake3 == nil {
-		t.Fatal("no Blake3 attribute")
-	}
+	require.NoError(t, err, "GetObjectAttributes")
+	require.NotNil(t, res.Blake3, "no Blake3 attribute")
 	root := blake3.Sum256(data)
 	digest, _ := mh.Encode(root[:], mh.BLAKE3)
-	if want := cid.NewCidV1(cid.Raw, digest).String(); res.Blake3.CID != want {
-		t.Fatalf("CID = %s, want %s", res.Blake3.CID, want)
-	}
-	if want := blake3tree.ChunkLog(int64(len(data))); res.Blake3.ChunkLog != want {
-		t.Fatalf("ChunkLog = %d, want %d", res.Blake3.ChunkLog, want)
-	}
+	want := cid.NewCidV1(cid.Raw, digest).String()
+	require.Equal(t, want, res.Blake3.CID, "CID")
+	require.Equal(t, blake3tree.ChunkLog(int64(len(data))), res.Blake3.ChunkLog, "ChunkLog")
 	outboard, err := base64.StdEncoding.DecodeString(res.Blake3.Outboard)
-	if err != nil {
-		t.Fatalf("Outboard is not base64: %v", err)
-	}
+	require.NoError(t, err, "Outboard is not base64")
 	// What a client does: load root, chunk log and outboard into a Bao
 	// library and verify the blocks it read.
 	group := int(res.Blake3.ChunkLog)
-	if want, _ := bao.EncodeBuf(data, group, true); !bytes.Equal(outboard, want) {
-		t.Fatalf("outboard differs from the Bao library's encoding")
-	}
+	encoded, _ := bao.EncodeBuf(data, group, true)
+	require.True(t, bytes.Equal(outboard, encoded), "outboard differs from the Bao library's encoding")
 	block := blake3tree.BlockSize(res.Blake3.ChunkLog)
 	for off := int64(0); off < int64(len(data)); off += block {
-		if !bao.VerifyChunk(data[off:min(off+block, int64(len(data)))], outboard, group, uint64(off), root) {
-			t.Fatalf("block at %d not verified", off)
-		}
+		require.True(t, bao.VerifyChunk(data[off:min(off+block, int64(len(data)))], outboard, group, uint64(off), root), "block at %d not verified", off)
 	}
 }
 
@@ -133,22 +109,14 @@ func TestBlake3AttributeGating(t *testing.T) {
 	res, err := b.GetObjectAttributes(rc, &s3.GetObjectAttributesInput{
 		Bucket: &bucket, Key: &key, ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesEtag},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Blake3 != nil {
-		t.Fatal("Blake3 built although only ETag was requested")
-	}
-	if res.ETag == nil {
-		t.Fatal("ETag missing")
-	}
-	if got := rc.Response.Header.Peek(cidHeader); len(got) != 0 {
-		t.Fatalf("GetObjectAttributes set %s = %q", cidHeader, got)
-	}
+	require.NoError(t, err)
+	require.Nil(t, res.Blake3, "Blake3 built although only ETag was requested")
+	require.NotNil(t, res.ETag, "ETag missing")
+	got := rc.Response.Header.Peek(cidHeader)
+	require.Empty(t, got, "GetObjectAttributes set %s = %q", cidHeader, got)
 	res, err = b.GetObjectAttributes(context.Background(), &s3.GetObjectAttributesInput{Bucket: &bucket, Key: &key})
-	if err != nil || res.Blake3 == nil {
-		t.Fatalf("with no attribute list the attribute must be built: %v", err)
-	}
+	require.NoError(t, err, "with no attribute list the attribute must be built")
+	require.NotNil(t, res.Blake3, "with no attribute list the attribute must be built")
 }
 
 // newRequestCtx returns a request context as a server hands one to a handler:

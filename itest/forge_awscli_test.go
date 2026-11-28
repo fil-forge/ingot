@@ -3,7 +3,6 @@
 package itest
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/moby/moby/api/types/container"
+	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
@@ -45,9 +45,7 @@ func TestForgeAWSCLI(t *testing.T) {
 
 	// The CLI container sees the host's mapped ingot port, not 127.0.0.1.
 	ep, err := url.Parse(endpoint)
-	if err != nil {
-		t.Fatalf("parse ingot endpoint %q: %v", endpoint, err)
-	}
+	require.NoError(t, err, "parse ingot endpoint %q", endpoint)
 	containerEndpoint := "http://host.docker.internal:" + ep.Port()
 
 	const size = 20 << 20
@@ -55,9 +53,7 @@ func TestForgeAWSCLI(t *testing.T) {
 	want := patternBytes(size)
 	work := t.TempDir()
 	inPath := filepath.Join(work, "in.bin")
-	if err := os.WriteFile(inPath, want, 0o644); err != nil {
-		t.Fatalf("write input: %v", err)
-	}
+	require.NoError(t, os.WriteFile(inPath, want, 0o644), "write input")
 
 	// Path-style addressing: the CLI defaults to virtual-host style for a
 	// hostname endpoint, and bucket.host.docker.internal does not resolve.
@@ -103,23 +99,15 @@ func TestForgeAWSCLI(t *testing.T) {
 	if cli != nil {
 		t.Cleanup(func() { _ = cli.Terminate(context.Background()) })
 	}
-	if err != nil {
-		t.Fatalf("run aws-cli container: %v", err)
-	}
+	require.NoError(t, err, "run aws-cli container")
 	state, err := cli.State(ctx)
-	if err != nil {
-		t.Fatalf("aws-cli container state: %v", err)
-	}
+	require.NoError(t, err, "aws-cli container state")
 	logs := string(fileFromContainer(t, ctx, cli, "/work/run.log"))
-	if state.ExitCode != 0 {
-		t.Fatalf("aws-cli script exited %d:\n%s", state.ExitCode, logs)
-	}
+	require.Zero(t, state.ExitCode, "aws-cli script exited %d:\n%s", state.ExitCode, logs)
 	t.Logf("aws-cli output:\n%s", logs)
 
 	got := fileFromContainer(t, ctx, cli, "/work/out.bin")
-	if !bytes.Equal(got, want) {
-		t.Fatalf("aws s3 cp round trip mismatch: got %d bytes, want %d", len(got), len(want))
-	}
+	require.Equal(t, want, got, "aws s3 cp round trip mismatch")
 
 	var head struct {
 		ContentLength     int64  `json:"ContentLength"`
@@ -128,18 +116,13 @@ func TestForgeAWSCLI(t *testing.T) {
 		ChecksumType      string `json:"ChecksumType"`
 	}
 	headJSON := fileFromContainer(t, ctx, cli, "/work/head.json")
-	if err := json.Unmarshal(headJSON, &head); err != nil {
-		t.Fatalf("parse head-object output: %v", err)
-	}
+	require.NoError(t, json.Unmarshal(headJSON, &head), "parse head-object output")
 	t.Logf("head-object:\n%s", headJSON)
-	if head.ContentLength != size {
-		t.Fatalf("head-object ContentLength = %d, want %d", head.ContentLength, size)
-	}
+	require.Equal(t, int64(size), head.ContentLength, "head-object ContentLength")
 	// 20 MiB at the CLI's default 8 MiB part size is three parts (8, 8 and
 	// 4 MiB): the CLI chose multipart on its own, and ingot completed it.
-	if et := strings.Trim(head.ETag, `"`); !strings.HasSuffix(et, "-3") {
-		t.Fatalf("head-object ETag = %q, want a 3-part multipart ETag", et)
-	}
+	et := strings.Trim(head.ETag, `"`)
+	require.True(t, strings.HasSuffix(et, "-3"), "head-object ETag = %q, want a 3-part multipart ETag", et)
 	// The CLI declared CRC64NVME on CreateMultipartUpload and sent a value
 	// per part without being asked. The reported full-object checksum must be
 	// the CRC64NVME of the plaintext. That alone cannot tell the declared
@@ -147,14 +130,12 @@ func TestForgeAWSCLI(t *testing.T) {
 	// CRC64NVME), so the session row is checked too: its algorithm is what
 	// the client's CreateMultipartUpload carried, and only a declared session
 	// validates the client's per-part and final values.
-	if wantSum := crc64NVMEBase64(want); head.ChecksumCRC64NVME != wantSum || head.ChecksumType != "FULL_OBJECT" {
-		t.Fatalf("head-object checksum = %q/%q, want %q/FULL_OBJECT (CRC64NVME of the plaintext)", head.ChecksumCRC64NVME, head.ChecksumType, wantSum)
-	}
+	wantSum := crc64NVMEBase64(want)
+	require.Equal(t, wantSum, head.ChecksumCRC64NVME, "head-object checksum = %q/%q, want %q/FULL_OBJECT (CRC64NVME of the plaintext)", head.ChecksumCRC64NVME, head.ChecksumType, wantSum)
+	require.Equal(t, "FULL_OBJECT", head.ChecksumType, "head-object checksum = %q/%q, want %q/FULL_OBJECT (CRC64NVME of the plaintext)", head.ChecksumCRC64NVME, head.ChecksumType, wantSum)
 	declared := ingotSQL(t, ctx, s, fmt.Sprintf(
 		`SELECT checksum_algorithm FROM ingot.multipart_sessions WHERE bucket = '%s' AND object_key = '%s'`, bucket, key))
-	if declared != "CRC64NVME" {
-		t.Fatalf("multipart session checksum_algorithm = %q, want CRC64NVME as declared by the CLI's CreateMultipartUpload", declared)
-	}
+	require.Equal(t, "CRC64NVME", declared, "multipart session checksum_algorithm = %q, want CRC64NVME as declared by the CLI's CreateMultipartUpload", declared)
 }
 
 // crc64NVMEBase64 is the S3 x-amz-checksum-crc64nvme encoding of data: the
@@ -174,13 +155,9 @@ func crc64NVMEBase64(data []byte) string {
 func fileFromContainer(t *testing.T, ctx context.Context, c testcontainers.Container, path string) []byte {
 	t.Helper()
 	rc, err := c.CopyFileFromContainer(ctx, path)
-	if err != nil {
-		t.Fatalf("copy %s from container: %v", path, err)
-	}
+	require.NoError(t, err, "copy %s from container", path)
 	defer rc.Close()
 	b, err := io.ReadAll(rc)
-	if err != nil {
-		t.Fatalf("read %s from container: %v", path, err)
-	}
+	require.NoError(t, err, "read %s from container", path)
 	return b
 }
